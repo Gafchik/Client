@@ -3,8 +3,10 @@ import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
 import path from "node:path";
 import { Repository } from "typeorm";
+import { ProjectMemoryEntryEntity } from "../../persistence/project-memory.entity.js";
 import { ProjectEntity } from "../../persistence/project.entity.js";
 import { TeamEntity } from "../../persistence/team.entity.js";
+import { SaveProjectMemoryDto } from "./dto/save-project-memory.dto.js";
 import { SaveProjectDto } from "./dto/save-project.dto.js";
 
 @Injectable()
@@ -12,6 +14,8 @@ export class ProjectsService {
   constructor(
     @InjectRepository(ProjectEntity)
     private readonly projectsRepository: Repository<ProjectEntity>,
+    @InjectRepository(ProjectMemoryEntryEntity)
+    private readonly projectMemoryRepository: Repository<ProjectMemoryEntryEntity>,
     @InjectRepository(TeamEntity)
     private readonly teamsRepository: Repository<TeamEntity>,
     private readonly configService: ConfigService,
@@ -37,6 +41,39 @@ export class ProjectsService {
     });
     if (!project) throw new NotFoundException("Project not found");
     return project;
+  }
+
+  async listMemory(projectId: string) {
+    await this.getById(projectId);
+    return this.projectMemoryRepository.find({
+      where: { projectId, isActive: true },
+      order: { updatedAt: "DESC" },
+    });
+  }
+
+  async saveMemory(input: SaveProjectMemoryDto) {
+    const project = await this.projectsRepository.findOneBy({ id: input.projectId });
+    if (!project) throw new Error("projectId is invalid");
+    const existing = input.id ? await this.projectMemoryRepository.findOneBy({ id: input.id }) : null;
+
+    const entity = this.projectMemoryRepository.create({
+      id: existing?.id || `memory-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      projectId: project.id,
+      title: input.title?.trim() || existing?.title || "Project memory",
+      summary: input.summary?.trim() || existing?.summary || "",
+      details: input.details?.trim() || existing?.details || "",
+      kind: input.kind?.trim() || existing?.kind || "feature",
+      tags: Array.isArray(input.tags) ? input.tags.map((tag) => String(tag).trim()).filter(Boolean) : existing?.tags || [],
+      relatedFiles: Array.isArray(input.relatedFiles)
+        ? input.relatedFiles.map((file) => String(file).trim()).filter(Boolean)
+        : existing?.relatedFiles || [],
+      sourceRunId: input.sourceRunId ?? existing?.sourceRunId ?? null,
+      isActive: true,
+      createdAt: existing?.createdAt || new Date(),
+      updatedAt: new Date(),
+    });
+
+    return this.projectMemoryRepository.save(entity);
   }
 
   async save(input: SaveProjectDto) {

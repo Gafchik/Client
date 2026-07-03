@@ -63,6 +63,20 @@ export interface Project {
   updatedAt?: string;
 }
 
+export interface ProjectMemoryEntry {
+  id: string;
+  projectId: string;
+  title: string;
+  summary: string;
+  details: string;
+  kind: string;
+  tags: string[];
+  relatedFiles: string[];
+  sourceRunId?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface Chat {
   id: string;
   projectId: string;
@@ -111,6 +125,15 @@ export interface TaskItem {
   sourceChatId?: string | null;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface TaskCommentItem {
+  id: string;
+  taskId: string;
+  type: "status_change" | "result";
+  content: string;
+  author?: string | null;
+  createdAt?: string;
 }
 
 export interface RunItem {

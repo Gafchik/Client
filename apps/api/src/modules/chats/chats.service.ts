@@ -187,6 +187,7 @@ export class ChatsService {
 
     const taskSnapshot = await this.tasksService.list(project.id);
     const orchestrator = (team.config as any)?.agents?.orchestrator || (team.config as any)?.agents?.pm;
+    const teamLanguage = this.resolveTeamLanguage((team.config as any)?.language);
     if (!orchestrator?.model) {
       throw new Error("Orchestrator model is not configured");
     }
@@ -205,6 +206,9 @@ export class ChatsService {
             role: "system",
             content: [
               "You are the orchestrator and representative of the AI team.",
+              `Team communication language: ${teamLanguage.label}.`,
+              `All natural-language text in your JSON response must be written only in ${teamLanguage.label}.`,
+              `Do not answer in English unless the team language is ${teamLanguage.code}.`,
               "You answer user questions about the project and the team.",
               "You know the exact team roster, including each member name, role, label, and model.",
               "When the user asks who someone is, first check the provided team roster and answer from it.",
@@ -229,6 +233,7 @@ export class ChatsService {
                   id: team.id,
                   name: team.name,
                   description: team.description,
+                  language: teamLanguage.code,
                   roles: Object.entries((team.config as any)?.agents || {}).map(([role, agent]: [string, any]) => ({
                     role,
                     name: agent?.name,
@@ -358,6 +363,29 @@ export class ChatsService {
       message: assistantMessage,
       createdTasks,
       autoRunId,
+    };
+  }
+
+  private resolveTeamLanguage(rawLanguage?: string | null) {
+    const normalized = String(rawLanguage || "en").trim().toLowerCase();
+    const dictionary: Record<string, string> = {
+      en: "English",
+      ru: "Russian",
+      uk: "Ukrainian",
+      de: "German",
+      fr: "French",
+      es: "Spanish",
+      it: "Italian",
+      pt: "Portuguese",
+      pl: "Polish",
+      tr: "Turkish",
+      zh: "Chinese",
+      ja: "Japanese",
+    };
+
+    return {
+      code: normalized || "en",
+      label: dictionary[normalized] || normalized || "English",
     };
   }
 }

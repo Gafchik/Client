@@ -4,6 +4,7 @@ import { TypeOrmModule } from "@nestjs/typeorm";
 import { ChatEntity } from "../persistence/chat.entity.js";
 import { MessageEntity } from "../persistence/message.entity.js";
 import { ProjectEntity } from "../persistence/project.entity.js";
+import { ProjectMemoryEntryEntity } from "../persistence/project-memory.entity.js";
 import { ProviderEntity } from "../persistence/provider.entity.js";
 import { TeamEntity } from "../persistence/team.entity.js";
 import { RunEntity } from "../persistence/run.entity.js";
@@ -16,6 +17,7 @@ import { ProjectsModule } from "./projects/projects.module.js";
 import { ProvidersModule } from "./providers/providers.module.js";
 import { SettingsModule } from "./settings/settings.module.js";
 import { TaskEntity } from "../persistence/task.entity.js";
+import { TaskCommentEntity } from "../persistence/task-comment.entity.js";
 import { TasksModule } from "./tasks/tasks.module.js";
 
 @Module({
@@ -33,7 +35,7 @@ import { TasksModule } from "./tasks/tasks.module.js";
         username: configService.get<string>("DATABASE_USER", "postgres"),
         password: configService.get<string>("DATABASE_PASSWORD", "postgres"),
         database: configService.get<string>("DATABASE_NAME", "ai_agent_team"),
-        entities: [ProviderEntity, ProjectEntity, ChatEntity, MessageEntity, TeamEntity, RunEntity, TaskEntity],
+        entities: [ProviderEntity, ProjectEntity, ProjectMemoryEntryEntity, ChatEntity, MessageEntity, TeamEntity, RunEntity, TaskEntity, TaskCommentEntity],
         synchronize: true,
       }),
     }),

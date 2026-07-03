@@ -63,10 +63,12 @@ export class TeamsService implements OnModuleInit {
             id: input.providerId || defaultProvider.id,
           });
 
+    const normalizedLanguage = typeof input.language === "string" ? input.language.trim().toLowerCase() : "";
+
     const merged = {
       ...fallback,
       ...input,
-      language: typeof input.language === "string" && input.language.trim() ? input.language.trim() : fallback.language,
+      language: normalizedLanguage || fallback.language,
       budget: {
         ...fallback.budget,
         ...(input.budget ?? {}),

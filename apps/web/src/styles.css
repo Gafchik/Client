@@ -758,6 +758,53 @@ textarea {
   justify-content: flex-end;
 }
 
+.task-comments-block {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.task-comments-block strong,
+.task-comment-head span {
+  color: var(--text);
+}
+
+.task-comments-list {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.task-comment-item {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(11, 17, 28, 0.72);
+  border: 1px solid rgba(140, 162, 213, 0.12);
+}
+
+.task-comment-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.task-comment-head small,
+.task-comment-item p {
+  color: var(--muted);
+}
+
+.task-comment-item p {
+  margin: 0;
+  line-height: 1.45;
+}
+
 .danger-button {
   color: #ffb4b4;
   background: rgba(195, 72, 72, 0.12);

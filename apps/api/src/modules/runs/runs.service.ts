@@ -301,8 +301,11 @@ export class RunsService {
       }
     };
 
-    const context = await this.buildWorkspaceContext(run.projectPath, run.task, config.workspace);
+    let context = await this.buildWorkspaceContext(run.projectPath, run.task, config.workspace);
+    const projectMemory = run.projectId ? await this.projectsService.listMemory(run.projectId) : [];
+    context.projectMemory = projectMemory;
     await emit("run:context", { fileCount: context.fileCount });
+    await emit("memory:loaded", { entries: projectMemory.length });
 
     await setAgentActivity("pm", "working", "Анализирует запрос и решает, кого подключать.");
     const orchestrator = await this.callAgent(config, "pm", this.buildPmPrompt(run.task, context, config), emit);
@@ -320,10 +323,30 @@ export class RunsService {
     const shouldUseAnalyst = delegationRoles.has("analyst");
     const shouldUseDeveloper = delegationRoles.has("developer");
     const shouldUseTester = delegationRoles.has("tester");
+    const requiresConcreteChanges = this.requiresConcreteChanges(run.task, orchestrator.artifact);
+
+    if (shouldUseDeveloper) {
+      await emit("agent:note", {
+        agentName: this.agentIdentity(config, "coder", "Kai").name,
+        role: this.agentIdentity(config, "coder", "Kai").role,
+        label: this.agentIdentity(config, "coder", "Kai").label,
+        detail: requiresConcreteChanges
+          ? "Ожидаются реальные изменения в файлах проекта."
+          : "Проверяет, нужны ли реальные изменения в коде или достаточно ответа без правок.",
+      });
+    }
 
     const analyst = shouldUseAnalyst
       ? await (async () => {
           await setAgentActivity("researcher", "working", "Собирает контекст и уточняет постановку.");
+          await emit("agent:note", {
+            agentName: this.agentIdentity(config, "researcher", "Mira").name,
+            role: this.agentIdentity(config, "researcher", "Mira").role,
+            label: this.agentIdentity(config, "researcher", "Mira").label,
+            detail: projectMemory.length
+              ? `Изучает память проекта: ${projectMemory.length} записей, затем сверяет код.`
+              : "Память проекта пока пуста, поэтому сразу исследует кодовую базу.",
+          });
           const result = await this.callAgent(
             config,
             "researcher",
@@ -343,6 +366,18 @@ export class RunsService {
         label: this.agentIdentity(config, "researcher", "Mira").label,
         usage: analyst.usage,
       });
+      context = await this.expandWorkspaceContext(
+        context,
+        config.workspace,
+        this.collectContextQueries(run.task, orchestrator.artifact, analyst.artifact),
+        18,
+      );
+      await emit("agent:note", {
+        agentName: this.agentIdentity(config, "researcher", "Mira").name,
+        role: this.agentIdentity(config, "researcher", "Mira").role,
+        label: this.agentIdentity(config, "researcher", "Mira").label,
+        detail: `Подобрал для разработчика расширенный контекст: ${context.fileSnippets.length} файловых сниппетов.`,
+      });
     } else {
       await emit("agent:skipped", {
         agentName: this.agentIdentity(config, "researcher", "Mira").name,
@@ -355,18 +390,68 @@ export class RunsService {
     const developer = shouldUseDeveloper
       ? await (async () => {
           await setAgentActivity("coder", "working", "Готовит изменения и операции по файлам.");
-          const result = await this.callAgent(
+          let result = await this.callAgent(
             config,
             "coder",
             this.buildDeveloperPrompt(run.task, context, orchestrator.artifact, analyst.artifact, config),
             emit,
           );
-          await setAgentActivity("coder", "idle", "Изменения подготовлены.");
-          return result;
+          const extraUsages = [] as any[];
+
+          if (requiresConcreteChanges && (!Array.isArray(result.artifact?.operations) || result.artifact.operations.length === 0)) {
+            await emit("developer:empty-operations", {
+              agentName: this.agentIdentity(config, "coder", "Kai").name,
+              role: this.agentIdentity(config, "coder", "Kai").role,
+              label: this.agentIdentity(config, "coder", "Kai").label,
+              detail: "Не вернул ни одной правки по кодовой задаче. Запрашиваем конкретные изменения повторно.",
+            });
+            context = await this.expandWorkspaceContext(
+              context,
+              config.workspace,
+              this.collectContextQueries(run.task, orchestrator.artifact, analyst.artifact, result.artifact),
+              18,
+            );
+            await setAgentActivity("coder", "working", "Не вернул правки. Повторно формирует конкретные изменения.");
+            result = await this.callAgent(
+              config,
+              "coder",
+              this.buildDeveloperRevisionPrompt(
+                run.task,
+                context,
+                orchestrator.artifact,
+                analyst.artifact,
+                result.artifact,
+                config,
+              ),
+              emit,
+            );
+            extraUsages.push(result.usage);
+          }
+
+          await setAgentActivity(
+            "coder",
+            "idle",
+            Array.isArray(result.artifact?.operations) && result.artifact.operations.length > 0
+              ? `Подготовил ${result.artifact.operations.length} изменений в проекте.`
+              : "Не подготовил конкретные изменения.",
+          );
+          await emit("agent:note", {
+            agentName: this.agentIdentity(config, "coder", "Kai").name,
+            role: this.agentIdentity(config, "coder", "Kai").role,
+            label: this.agentIdentity(config, "coder", "Kai").label,
+            detail: result.artifact?.summary || "Подготовил результат по задаче.",
+          });
+          return {
+            ...result,
+            extraUsages,
+          };
         })()
-      : { artifact: null, usage: null };
+      : { artifact: null, usage: null, extraUsages: [] };
     if (shouldUseDeveloper && developer.usage) {
       trackUsage("developer", developer.usage);
+      for (const usage of developer.extraUsages ?? []) {
+        trackUsage("developer", usage);
+      }
       await this.writeArtifact(runRoot, "03-developer.json", developer.artifact);
       await emit("agent:done", {
         agentName: this.agentIdentity(config, "coder", "Kai").name,
@@ -382,6 +467,50 @@ export class RunsService {
         reason: "orchestrator_not_required",
       });
     }
+
+     if (shouldUseDeveloper && requiresConcreteChanges && (!Array.isArray(developer.artifact?.operations) || developer.artifact.operations.length === 0)) {
+       await emit("run:blocked", {
+         agentName: this.agentIdentity(config, "coder", "Kai").name,
+         role: this.agentIdentity(config, "coder", "Kai").role,
+         label: this.agentIdentity(config, "coder", "Kai").label,
+         detail: "Кодовая задача не привела к изменениям файлов. Прогон остановлен, чтобы не создавать ложное ощущение выполненной работы.",
+       });
+       
+       // Generate partial report with all collected data before throwing error
+       const partialReport = {
+         runId: run.id,
+         projectPath: run.projectPath,
+         task: run.task,
+         approvals: {
+           testerStatus: "blocked",
+         },
+         orchestrator: orchestrator.artifact,
+         analyst: analyst.artifact,
+         developer: developer.artifact,
+         tester: null,
+         orchestratorResponse: {
+           message: "Developer did not return any file changes for a code task.",
+           error: "blocked_no_file_changes",
+           summary: developer.artifact?.summary || "No changes returned",
+           details: developer.artifact?.notes || [],
+         },
+         applyResult: { applied: [], skipped: [] },
+         usageSummary,
+         projectMemoryUsed: projectMemory.map((entry) => ({
+           id: entry.id,
+           title: entry.title,
+           summary: entry.summary,
+           kind: entry.kind,
+           tags: entry.tags,
+           relatedFiles: entry.relatedFiles,
+         })),
+         generatedAt: new Date().toISOString(),
+       };
+       
+       await this.writeArtifact(runRoot, "final-report.json", partialReport);
+       
+       throw new Error("Developer did not return any file changes for a code task.");
+     }
 
     let applyResult: {
       applied: Array<{ path: string; action: string; reason: string }>;
@@ -529,14 +658,33 @@ export class RunsService {
       orchestratorResponse: orchestratorResponse.artifact,
       applyResult,
       usageSummary,
+      projectMemoryUsed: projectMemory.map((entry) => ({
+        id: entry.id,
+        title: entry.title,
+        summary: entry.summary,
+        kind: entry.kind,
+        tags: entry.tags,
+        relatedFiles: entry.relatedFiles,
+      })),
       generatedAt: new Date().toISOString(),
     };
 
     await this.writeArtifact(runRoot, "final-report.json", finalReport);
+    if (run.projectId) {
+      await this.updateProjectMemory(run.projectId, run.id, run.task, finalReport);
+      await emit("memory:updated", { projectId: run.projectId });
+    }
     return finalReport;
   }
 
-  private async buildWorkspaceContext(projectPath: string, task: string, workspaceConfig: TeamConfig["workspace"]) {
+  private async buildWorkspaceContext(projectPath: string, task: string, workspaceConfig: TeamConfig["workspace"]): Promise<{
+    root: string;
+    fileCount: number;
+    tree: string[];
+    fileSnippets: Array<{ path: string; chars: number; snippet: string }>;
+    allFiles: Array<{ fullPath: string; relativePath: string; score: number }>;
+    projectMemory?: Array<any>;
+  }> {
     const root = path.resolve(projectPath);
     const allFiles: Array<{ fullPath: string; relativePath: string }> = [];
 
@@ -606,8 +754,83 @@ export class RunsService {
       root,
       fileCount: allFiles.length,
       tree: allFiles.map((item) => item.relativePath).sort(),
+      allFiles: rankedFiles,
       fileSnippets,
     };
+  }
+
+  private async expandWorkspaceContext(
+    context: {
+      root: string;
+      fileCount: number;
+      tree: string[];
+      fileSnippets: Array<{ path: string; chars: number; snippet: string }>;
+      allFiles: Array<{ fullPath: string; relativePath: string; score: number }>;
+      projectMemory?: Array<any>;
+    },
+    workspaceConfig: TeamConfig["workspace"],
+    queries: string[],
+    limit = 12,
+  ) {
+    const existing = new Set(context.fileSnippets.map((item) => item.path));
+    const normalizedTerms = Array.from(
+      new Set(
+        queries
+          .flatMap((item) => String(item || "").split(/[\s,;:\n]+/))
+          .map((item) => item.toLowerCase().replace(/[^a-z0-9а-яіїє_.\-/]+/gi, ""))
+          .filter((item) => item.length >= 3),
+      ),
+    );
+
+    if (!normalizedTerms.length) {
+      return context;
+    }
+
+    const extraFiles = context.allFiles
+      .filter((file) => !existing.has(file.relativePath))
+      .map((file) => {
+        const haystack = file.relativePath.toLowerCase();
+        let score = file.score;
+        for (const term of normalizedTerms) {
+          if (haystack.includes(term)) score += 10;
+          if (path.basename(haystack).includes(term)) score += 12;
+        }
+        return { ...file, score };
+      })
+      .sort((a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath))
+      .slice(0, Math.min(limit, Math.max(0, 30 - context.fileSnippets.length)));
+
+    for (const file of extraFiles) {
+      try {
+        const content = await fs.readFile(file.fullPath, "utf8");
+        context.fileSnippets.push({
+          path: file.relativePath,
+          chars: content.length,
+          snippet: content.slice(0, workspaceConfig.maxCharsPerFile),
+        });
+      } catch {
+        context.fileSnippets.push({
+          path: file.relativePath,
+          chars: 0,
+          snippet: "[Could not read file as utf8 text]",
+        });
+      }
+    }
+
+    return context;
+  }
+
+  private collectContextQueries(task: string, orchestratorArtifact: any, analystArtifact?: any, developerArtifact?: any) {
+    return [
+      task,
+      orchestratorArtifact?.goal,
+      ...(Array.isArray(orchestratorArtifact?.deliverables) ? orchestratorArtifact.deliverables : []),
+      ...(Array.isArray(analystArtifact?.relevantFiles) ? analystArtifact.relevantFiles : []),
+      ...(Array.isArray(analystArtifact?.implementationHints) ? analystArtifact.implementationHints : []),
+      ...(Array.isArray(analystArtifact?.findings) ? analystArtifact.findings : []),
+      ...(Array.isArray(developerArtifact?.notes) ? developerArtifact.notes : []),
+      developerArtifact?.summary,
+    ].filter(Boolean);
   }
 
   private async callAgent(
@@ -909,8 +1132,30 @@ export class RunsService {
   }
 
   private languageInstruction(config: TeamConfig) {
-    const language = (config.language || "en").trim().toLowerCase();
-    return `All natural-language strings inside your JSON must be written in ${language}.`;
+    const language = this.resolveLanguageLabel((config.language || "en").trim().toLowerCase());
+    return [
+      `All natural-language strings inside your JSON must be written only in ${language}.`,
+      `Do not switch to English unless the requested team language is English.`,
+    ].join(" ");
+  }
+
+  private resolveLanguageLabel(language: string) {
+    const dictionary: Record<string, string> = {
+      en: "English",
+      ru: "Russian",
+      uk: "Ukrainian",
+      de: "German",
+      fr: "French",
+      es: "Spanish",
+      it: "Italian",
+      pt: "Portuguese",
+      pl: "Polish",
+      tr: "Turkish",
+      zh: "Chinese",
+      ja: "Japanese",
+    };
+
+    return dictionary[language] || language || "English";
   }
 
   private agentIdentity(config: TeamConfig, role: string, fallbackLabel: string) {
@@ -973,6 +1218,10 @@ ${this.languageInstruction(config)}
 Your name is ${self.name}. Your role title is ${self.label}.
 You are the analyst. Your job is to clarify the request, study project context,
 and prepare implementation guidance for the developer.
+First use the provided project memory to reuse known knowledge and prior decisions.
+Only if the memory is insufficient should you rely on code inspection.
+You are given a partial set of focused file snippets plus a broader project file list.
+Do not claim files are missing unless they are absent from the provided project file list.
 Output schema:
 {
   "summary": "string",
@@ -982,7 +1231,22 @@ Output schema:
   "implementationHints": ["string"],
   "acceptanceCriteria": ["string"]
 }`,
-      userPrompt: `Task:\n${task}\n\nOrchestrator artifact:\n${JSON.stringify(orchestratorArtifact, null, 2)}\n\nFile snippets:\n${JSON.stringify(
+      userPrompt: `Task:\n${task}\n\nOrchestrator artifact:\n${JSON.stringify(orchestratorArtifact, null, 2)}\n\nProject memory:\n${JSON.stringify(
+        (context.projectMemory ?? []).map((entry: any) => ({
+          title: entry.title,
+          summary: entry.summary,
+          details: entry.details,
+          kind: entry.kind,
+          tags: entry.tags,
+          relatedFiles: entry.relatedFiles,
+        })),
+        null,
+        2,
+      )}\n\nProject file list:\n${JSON.stringify(
+        context.tree.slice(0, 400),
+        null,
+        2,
+      )}\n\nFile snippets:\n${JSON.stringify(
         context.fileSnippets,
         null,
         2,
@@ -1004,6 +1268,10 @@ ${this.languageInstruction(config)}
 Your name is ${self.name}. Your role title is ${self.label}.
 You are the developer. Implement the task using the analyst guidance and project context.
 Produce concrete file operations.
+If the task requires code or UI changes, operations must not be empty.
+Do not answer with high-level advice only when concrete implementation is expected.
+You are given a partial set of focused file snippets plus a broader project file list.
+Do not claim files are missing unless they are absent from the provided project file list.
 Output schema:
 {
   "summary": "string",
@@ -1022,6 +1290,19 @@ Output schema:
         orchestratorArtifact,
         null,
         2
+      )}\n\nProject memory:\n${JSON.stringify(
+        (context.projectMemory ?? []).map((entry: any) => ({
+          title: entry.title,
+          summary: entry.summary,
+          kind: entry.kind,
+          relatedFiles: entry.relatedFiles,
+        })),
+        null,
+        2,
+      )}\n\nProject file list:\n${JSON.stringify(
+        context.tree.slice(0, 400),
+        null,
+        2,
       )}\n\nAnalyst artifact:\n${JSON.stringify(
         analystArtifact,
         null,
@@ -1032,6 +1313,135 @@ Output schema:
         2,
       )}`,
     };
+  }
+
+  private buildDeveloperRevisionPrompt(
+    task: string,
+    context: any,
+    orchestratorArtifact: any,
+    analystArtifact: any,
+    previousDeveloperArtifact: any,
+    config: TeamConfig,
+  ) {
+    const self = this.agentIdentity(config, "coder", "Kai");
+    return {
+      systemPrompt: `${this.sharedRules()}
+${this.languageInstruction(config)}
+Your name is ${self.name}. Your role title is ${self.label}.
+You are retrying because your previous answer did not include concrete file changes.
+For this retry, you must either:
+1. return at least one valid file operation, or
+2. clearly state a blocking reason in notes and keep operations empty only if implementation is impossible.
+Do not return vague guidance without concrete edits when the task is implementable.
+You are given a partial set of focused file snippets plus a broader project file list.
+Do not claim files are missing unless they are absent from the provided project file list.
+Output schema:
+{
+  "summary": "string",
+  "operations": [
+    {
+      "path": "relative/path",
+      "action": "create|update",
+      "reason": "string",
+      "content": "full file content"
+    }
+  ],
+  "notes": ["string"],
+  "testsToRun": ["string"]
+}`,
+      userPrompt: `Task:\n${task}\n\nOrchestrator artifact:\n${JSON.stringify(
+        orchestratorArtifact,
+        null,
+        2,
+      )}\n\nProject memory:\n${JSON.stringify(
+        (context.projectMemory ?? []).map((entry: any) => ({
+          title: entry.title,
+          summary: entry.summary,
+          kind: entry.kind,
+          relatedFiles: entry.relatedFiles,
+        })),
+        null,
+        2,
+      )}\n\nProject file list:\n${JSON.stringify(
+        context.tree.slice(0, 400),
+        null,
+        2,
+      )}\n\nAnalyst artifact:\n${JSON.stringify(
+        analystArtifact,
+        null,
+        2,
+      )}\n\nPrevious developer artifact:\n${JSON.stringify(
+        previousDeveloperArtifact,
+        null,
+        2,
+      )}\n\nWorkspace file snippets:\n${JSON.stringify(
+        context.fileSnippets,
+        null,
+        2,
+      )}`,
+    };
+  }
+
+  private requiresConcreteChanges(task: string, orchestratorArtifact: any) {
+    const haystack = [
+      task,
+      orchestratorArtifact?.goal,
+      ...(Array.isArray(orchestratorArtifact?.deliverables) ? orchestratorArtifact.deliverables : []),
+      ...(Array.isArray(orchestratorArtifact?.successCriteria) ? orchestratorArtifact.successCriteria : []),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
+    return /(fix|implement|change|update|edit|refactor|create|build|wire|patch|rewrite|feature|ui|frontend|backend|code|file|endpoint|component|screen|chat|task|status|сдел|исправ|добав|измени|обнов|реализ|перепиш|почини|экран|чат|код|файл|роут|эндпоинт)/i.test(
+      haystack,
+    );
+  }
+
+  private async updateProjectMemory(projectId: string, runId: string, task: string, finalReport: any) {
+    const relatedFiles = [
+      ...(Array.isArray(finalReport?.developer?.operations) ? finalReport.developer.operations.map((item: any) => item.path) : []),
+      ...(Array.isArray(finalReport?.analyst?.relevantFiles) ? finalReport.analyst.relevantFiles : []),
+    ]
+      .filter(Boolean)
+      .slice(0, 20);
+
+    const tags = Array.from(
+      new Set(
+        task
+          .split(/\s+/)
+          .map((word: string) => word.toLowerCase().replace(/[^a-z0-9а-яіїє_-]+/gi, ""))
+          .filter((word: string) => word.length >= 3),
+      ),
+    ).slice(0, 12);
+
+    const summary =
+      finalReport?.orchestratorResponse?.message ||
+      finalReport?.developer?.summary ||
+      finalReport?.analyst?.summary ||
+      task;
+
+    const details = [
+      finalReport?.analyst?.summary ? `Analysis: ${finalReport.analyst.summary}` : "",
+      Array.isArray(finalReport?.analyst?.findings) && finalReport.analyst.findings.length
+        ? `Findings: ${finalReport.analyst.findings.join("; ")}`
+        : "",
+      finalReport?.developer?.summary ? `Implementation: ${finalReport.developer.summary}` : "",
+      finalReport?.tester?.summary ? `Validation: ${finalReport.tester.summary}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    await this.projectsService.saveMemory({
+      projectId,
+      sourceRunId: runId,
+      title: task.slice(0, 140),
+      summary,
+      details,
+      kind: this.requiresConcreteChanges(task, finalReport?.orchestrator) ? "feature" : "research",
+      tags,
+      relatedFiles,
+    });
   }
 
   private buildTesterPrompt(task: string, orchestratorArtifact: any, analystArtifact: any, developerArtifact: any, testResults: any[], config: TeamConfig) {

@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "./api";
-import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, Provider, RunItem, TaskItem, Team } from "./types";
+import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, TaskCommentItem, TaskItem, Team } from "./types";
 
 const state = reactive({
   providers: [] as Provider[],
@@ -19,6 +19,9 @@ const state = reactive({
     byRole: {},
   } as ChatStats,
   tasks: [] as TaskItem[],
+  taskComments: {} as Record<string, TaskCommentItem[]>,
+  taskCommentDrafts: {} as Record<string, string>,
+  projectMemory: [] as ProjectMemoryEntry[],
   runs: [] as RunItem[],
   models: [] as ModelCatalogItem[],
   settings: null as null | {
@@ -52,6 +55,8 @@ const TEAM_LANGUAGES = [
   { value: "en", label: "English" },
   { value: "ru", label: "Русский" },
   { value: "uk", label: "Українська" },
+  { value: "ar", label: "العربية" },
+  { value: "hi", label: "हिन्दी" },
   { value: "de", label: "Deutsch" },
   { value: "fr", label: "Français" },
   { value: "es", label: "Español" },
@@ -61,6 +66,7 @@ const TEAM_LANGUAGES = [
   { value: "tr", label: "Türkçe" },
   { value: "zh", label: "中文" },
   { value: "ja", label: "日本語" },
+  { value: "ko", label: "한국어" },
 ] as const;
 const taskDrafts = reactive<Record<"backlog" | "in_progress" | "done", { title: string; description: string }>>({
   backlog: { title: "", description: "" },
@@ -222,11 +228,20 @@ function formatActivityEntry(entry: { at: string; event: string; payload?: unkno
   if (entry.event === "agent:retry-success") {
     return `${actor.agentName} (${actor.label}): прислал валидный JSON, выполнение продолжено`;
   }
+  if (entry.event === "agent:note") {
+    return `${actor.agentName} (${actor.label}): ${actor.detail}`;
+  }
   if (entry.event === "agent:done") {
     return `${actor.agentName} (${actor.label}): завершил этап`;
   }
   if (entry.event === "agent:skipped") {
     return `${actor.agentName} (${actor.label}): сейчас не задействован`;
+  }
+  if (entry.event === "developer:empty-operations") {
+    return `${actor.agentName} (${actor.label}): не вернул правки, получает повторную задачу на конкретные изменения`;
+  }
+  if (entry.event === "run:blocked") {
+    return `${actor.agentName} (${actor.label}): прогон остановлен, потому что по кодовой задаче не было реальных правок`;
   }
   if (entry.event === "file:processing") {
     const payload = entry.payload as { path?: string; action?: string };
@@ -268,8 +283,11 @@ const activityFeed = computed(() =>
         "agent:activity",
         "agent:retry",
         "agent:retry-success",
+        "agent:note",
         "agent:done",
         "agent:skipped",
+        "developer:empty-operations",
+        "run:blocked",
         "file:processing",
         "file:applied",
         "file:skipped",
@@ -280,15 +298,29 @@ const activityFeed = computed(() =>
         "tests:skipped",
       ].includes(entry.event),
     )
-    .slice(-10)
+    .slice(-24)
     .reverse(),
 );
 const liveTeamMessages = computed(() =>
   latestRunEvents.value
     .filter((entry) =>
-      ["agent:activity", "agent:retry", "agent:retry-success"].includes(entry.event) &&
-      entry.payload &&
-      typeof entry.payload === "object",
+      [
+        "agent:activity",
+        "agent:retry",
+        "agent:retry-success",
+        "agent:note",
+        "agent:done",
+        "agent:skipped",
+        "developer:empty-operations",
+        "run:blocked",
+        "file:processing",
+        "file:applied",
+        "file:skipped",
+        "test:started",
+        "test:finished",
+        "tests:done",
+        "tests:skipped",
+      ].includes(entry.event),
     )
     .map((entry) => {
       const payload = eventActor(entry.payload);
@@ -471,11 +503,20 @@ async function refreshChats(projectId?: string) {
 async function refreshTasks(projectId?: string) {
   if (!projectId) {
     state.tasks = [];
+    state.projectMemory = [];
+    state.taskComments = {};
     return;
   }
 
-  const response = await api.tasks(projectId);
+  const [response, memoryResponse] = await Promise.all([api.tasks(projectId), api.projectMemory(projectId)]);
   state.tasks = response.tasks;
+  state.projectMemory = memoryResponse.entries;
+  await Promise.all(state.tasks.map((task) => loadTaskComments(task.id)));
+}
+
+async function loadTaskComments(taskId: string) {
+  const response = await api.taskComments(taskId);
+  state.taskComments[taskId] = response.comments;
 }
 
 async function openChat(id: string) {
@@ -539,12 +580,12 @@ async function createTeam() {
       providerId: state.selectedProviderId || null,
       language: createDefaultTeamLanguage(),
       budget: { dailyWeightedTokens: 50000000, timezone: "Europe/Kiev" },
-      workspace: {
-        maxFiles: 12,
-        maxCharsPerFile: 12000,
-        includeExtensions: [".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".css", ".html", ".py", ".php"],
-        ignoreDirs: [".git", "node_modules", "dist", "build"],
-      },
+       workspace: {
+         maxFiles: 12,
+         maxCharsPerFile: 12000,
+         includeExtensions: [".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".css", ".html", ".py", ".php", ".vue"],
+         ignoreDirs: [".git", "node_modules", "dist", "build"],
+       },
       run: { maxReviewRounds: 1, applyChanges: true },
       testing: { commands: [] },
       agents: createDefaultAgents(),
@@ -672,6 +713,7 @@ async function saveTask(task: TaskItem) {
     const index = state.tasks.findIndex((item) => item.id === response.task.id);
     if (index === -1) state.tasks.unshift(response.task);
     else state.tasks[index] = response.task;
+    await loadTaskComments(response.task.id);
   } finally {
     state.busy = false;
   }
@@ -693,10 +735,36 @@ async function moveTask(task: TaskItem, direction: "left" | "right") {
   const nextIndex = direction === "left" ? currentIndex - 1 : currentIndex + 1;
   const nextStatus = order[nextIndex];
   if (!nextStatus) return;
-  await saveTask({
-    ...task,
-    status: nextStatus,
-  });
+  state.busy = true;
+  try {
+    const response = await api.updateTaskStatus(task.id, {
+      status: nextStatus,
+      author: selectedProjectTeam.value?.agents?.orchestrator?.name || "Alex",
+      comment: `${selectedProjectTeam.value?.agents?.orchestrator?.name || "Alex"} перевел задачу в ${nextStatus}`,
+    });
+    const index = state.tasks.findIndex((item) => item.id === response.task.id);
+    if (index === -1) state.tasks.unshift(response.task);
+    else state.tasks[index] = response.task;
+    await loadTaskComments(task.id);
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function addTaskComment(taskId: string) {
+  const draft = (state.taskCommentDrafts[taskId] || "").trim();
+  if (!draft) return;
+  state.busy = true;
+  try {
+    await api.addTaskResultComment(taskId, {
+      content: draft,
+      author: selectedProjectTeam.value?.agents?.orchestrator?.name || "Alex",
+    });
+    state.taskCommentDrafts[taskId] = "";
+    await loadTaskComments(taskId);
+  } finally {
+    state.busy = false;
+  }
 }
 
 async function sendChatMessage() {
@@ -1286,6 +1354,27 @@ onBeforeUnmount(() => {
                       </button>
                     </div>
                   </div>
+                  <div class="task-comments-block">
+                    <strong>Комментарии оркестратора</strong>
+                    <div v-if="state.taskComments[taskItem.id]?.length" class="task-comments-list">
+                      <article v-for="comment in state.taskComments[taskItem.id]" :key="comment.id" class="task-comment-item">
+                        <div class="task-comment-head">
+                          <span>{{ comment.author || "system" }}</span>
+                          <small>{{ comment.type }}</small>
+                        </div>
+                        <p>{{ comment.content }}</p>
+                      </article>
+                    </div>
+                    <div v-else class="empty-block">Комментариев пока нет.</div>
+                    <textarea
+                      v-model="state.taskCommentDrafts[taskItem.id]"
+                      rows="3"
+                      placeholder="Оркестратор фиксирует промежуточный результат, причину смены статуса или итог"
+                    />
+                    <button class="ghost-button" :disabled="state.busy" @click="addTaskComment(taskItem.id)">
+                      Добавить комментарий
+                    </button>
+                  </div>
                 </article>
               </div>
             </section>
@@ -1538,6 +1627,27 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="report-view">{{ reportText() }}</div>
+        </div>
+
+        <div class="panel span-3 panel-stack">
+          <div class="section-heading">
+            <div>
+              <h3>Память проекта</h3>
+              <p>Накопленный контекст по фичам, исследованиям и прошлым решениям команды.</p>
+            </div>
+            <span class="pill">{{ state.projectMemory.length }} записей</span>
+          </div>
+          <div v-if="state.projectMemory.length" class="token-role-list">
+            <article v-for="entry in state.projectMemory" :key="entry.id" class="token-role-card">
+              <strong>{{ entry.title }}</strong>
+              <span>{{ entry.kind }}</span>
+              <p>{{ entry.summary }}</p>
+              <small v-if="entry.relatedFiles?.length">Файлы: {{ entry.relatedFiles.join(", ") }}</small>
+            </article>
+          </div>
+          <div v-else class="empty-block">
+            Память проекта пока пуста. После исследований и завершенных задач команда начнет автоматически ее пополнять.
+          </div>
         </div>
       </section>
     </main>

@@ -1,4 +1,4 @@
-import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, Provider, RunItem, TaskItem, Team } from "./types";
+import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, TaskCommentItem, TaskItem, Team } from "./types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -53,6 +53,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify(project),
     }),
+  projectMemory: (projectId: string) =>
+    request<{ entries: ProjectMemoryEntry[] }>(`/api/projects/${projectId}/memory`),
+  saveProjectMemory: (entry: Partial<ProjectMemoryEntry>) =>
+    request<{ entry: ProjectMemoryEntry }>("/api/projects/memory", {
+      method: "POST",
+      body: JSON.stringify(entry),
+    }),
   deleteProject: (id: string) =>
     request<{ ok: boolean }>(`/api/projects/${id}`, {
       method: "DELETE",
@@ -81,6 +88,18 @@ export const api = {
     request<{ task: TaskItem }>("/api/tasks", {
       method: "POST",
       body: JSON.stringify(task),
+    }),
+  taskComments: (taskId: string) =>
+    request<{ comments: TaskCommentItem[] }>(`/api/tasks/${taskId}/comments`),
+  addTaskResultComment: (taskId: string, payload: { content: string; author?: string }) =>
+    request<{ comment: TaskCommentItem }>(`/api/tasks/${taskId}/comments/result`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateTaskStatus: (taskId: string, payload: { status: TaskItem["status"]; comment?: string; author?: string }) =>
+    request<{ task: TaskItem }>(`/api/tasks/${taskId}/status`, {
+      method: "POST",
+      body: JSON.stringify(payload),
     }),
   deleteTask: (id: string) =>
     request<{ ok: boolean }>(`/api/tasks/${id}`, {
