@@ -1,5 +1,6 @@
-import { Controller, Get, Param } from "@nestjs/common";
+import { Body, Controller, Get, Param, Post } from "@nestjs/common";
 import { RunsService } from "./runs.service.js";
+import { StartRunDto } from "./dto/start-run.dto.js";
 import { safeJsonParse } from "../../shared/json.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -12,6 +13,13 @@ export class RunsController {
   async listRuns() {
     const runs = await this.runsService.list();
     return { runs };
+  }
+
+  @Post("runs")
+  async startRun(@Body() dto: StartRunDto) {
+    const { runId } = await this.runsService.startRun(dto);
+    await this.runsService.executeRunSteps(runId);
+    return { runId };
   }
 
   @Get("runs/:id")

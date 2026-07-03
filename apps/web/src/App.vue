@@ -1121,6 +1121,44 @@ async function sendChatMessage() {
   }
 }
 
+async function runTask() {
+  if (!selectedChat.value || !chatDraft.value.trim()) return;
+  const draft = chatDraft.value.trim();
+  state.busy = true;
+  chatDraft.value = "";
+  try {
+    await saveProject();
+    const response = await api.startRun({ chatId: selectedChat.value.id, task: draft });
+    state.selectedRunId = response.runId;
+    state.runStatus = "queued";
+    state.runEvents = [];
+    state.runError = "";
+    state.report = null;
+    startPolling(response.runId);
+  } catch (error) {
+    chatDraft.value = draft;
+    throw error;
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function resumeRun(runId: string) {
+  if (!selectedChat.value) return;
+  state.busy = true;
+  try {
+    state.runStatus = "queued";
+    state.runEvents = [];
+    state.runError = "";
+    state.report = null;
+    startPolling(runId);
+  } catch (error) {
+    throw error;
+  } finally {
+    state.busy = false;
+  }
+}
+
 function applyModel(role: string, modelId: string) {
   if (!selectedTeam.value) return;
   const model = state.models.find((item) => item.id === modelId);
@@ -1402,29 +1440,31 @@ onBeforeUnmount(() => {
       </section>
 
       <section v-if="activeTab === 'workspace'" class="workspace-layout">
-        <div class="workspace-sidebar panel panel-stack">
+        <div class="workspace-sidebar panel">
           <div class="section-heading">
             <div>
               <h3>Работа с проектом</h3>
               <p>Выбери проект, назначь команду и открой рабочий чат с оркестратором.</p>
             </div>
           </div>
-          <label class="full-block">
-            <span>Проект</span>
-            <select v-model="state.selectedProjectId">
-              <option v-for="project in state.projects" :key="project.id" :value="project.id">
-                {{ project.name }}
-              </option>
-            </select>
-          </label>
-          <label v-if="selectedProject" class="full-block">
-            <span>Команда проекта</span>
-            <select v-model="selectedProject.teamId">
-              <option v-for="team in state.teams" :key="team.id" :value="team.id">
-                {{ team.name }}
-              </option>
-            </select>
-          </label>
+          <div class="form-row">
+            <label>
+              <span>Проект</span>
+              <select v-model="state.selectedProjectId">
+                <option v-for="project in state.projects" :key="project.id" :value="project.id">
+                  {{ project.name }}
+                </option>
+              </select>
+            </label>
+            <label v-if="selectedProject">
+              <span>Команда проекта</span>
+              <select v-model="selectedProject.teamId">
+                <option v-for="team in state.teams" :key="team.id" :value="team.id">
+                  {{ team.name }}
+                </option>
+              </select>
+            </label>
+          </div>
           <div class="inline-actions">
             <button class="primary-button" :disabled="state.busy || !selectedProject" @click="saveProject">Сохранить выбор команды</button>
             <button class="ghost-button" :disabled="!selectedProject || state.busy" @click="createChat">Новый чат</button>
@@ -1454,6 +1494,15 @@ onBeforeUnmount(() => {
                 <span class="stat" title="Weighted tokens">{{ state.chatStats.totalWeightedTokens.toLocaleString() }} wgt</span>
                 <span class="stat" title="Runs">{{ state.chatStats.runCount }} runs</span>
               </div>
+              <button 
+                v-if="state.selectedRunId && (state.runStatus === 'failed' || state.runStatus === 'stopped' || state.runStatus === 'error')" 
+                class="ghost-button mini" 
+                :disabled="state.busy" 
+                @click="resumeRun(state.selectedRunId)"
+                title="Продолжить работу"
+              >
+                ▶ Продолжить
+              </button>
               <button class="ghost-button mini danger-button" :disabled="state.busy || !selectedChat" @click="selectedChat && deleteChat(selectedChat.id)" title="Удалить чат">
                 ×
               </button>
@@ -1865,6 +1914,14 @@ onBeforeUnmount(() => {
           </label>
           <button class="primary-button full-width" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="runTask">
             Запустить
+          </button>
+          <button 
+            v-if="state.selectedRunId && (state.runStatus === 'failed' || state.runStatus === 'stopped' || state.runStatus === 'error')" 
+            class="ghost-button full-width" 
+            :disabled="state.busy" 
+            @click="resumeRun(state.selectedRunId)"
+          >
+            ▶ Продолжить работу
           </button>
           <div class="status-card" :class="{ hidden: !state.runStatus }">
             <strong>Статус: {{ state.runStatus || "-" }}</strong>

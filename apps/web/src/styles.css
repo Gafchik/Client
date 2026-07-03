@@ -312,6 +312,19 @@ label span,
   min-height: 0;
 }
 
+.workspace-sidebar {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.workspace-sidebar > * {
+  flex: 1;
+  min-width: 200px;
+}
+
 .workspace-chat {
   display: flex;
   flex-direction: column;
