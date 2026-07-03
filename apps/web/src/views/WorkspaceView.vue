@@ -1,11 +1,19 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
-import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, TaskCommentItem, TaskItem, Team } from "../types";
+import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, Team } from "../types";
 
 const router = useRouter();
 const route = useRoute();
+
+// Inject global data
+const { providers: globalProviders, teams: globalTeams, projects: globalProjects, loading: globalLoading } = inject("globalData", {
+  providers: ref<Provider[]>([]),
+  teams: ref<Team[]>([]),
+  projects: ref<Project[]>([]),
+  loading: ref(true),
+});
 
 const state = reactive({
   providers: [] as Provider[],
@@ -17,9 +25,6 @@ const state = reactive({
   chatStats: {
     requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {},
   } as ChatStats,
-  tasks: [] as TaskItem[],
-  taskComments: {} as Record<string, TaskCommentItem[]>,
-  taskCommentDrafts: {} as Record<string, string>,
   projectMemory: [] as ProjectMemoryEntry[],
   runs: [] as RunItem[],
   models: [] as ModelCatalogItem[],
@@ -34,13 +39,11 @@ const state = reactive({
   runEvents: [] as Array<{ at: string; event: string; payload?: unknown }>,
   runError: "",
   busy: false,
-  sidebarOpen: false,
   toasts: [] as Array<{ id: number; type: 'success' | 'error' | 'info'; message: string }>,
-  deleteConfirm: null as null | { type: 'project' | 'chat' | 'task'; id: string; name: string; onConfirm: () => Promise<void> },
+  deleteConfirm: null as null | { type: 'project' | 'chat'; id: string; name: string; onConfirm: () => Promise<void> },
   streamingMessage: null as null | { id: string; content: string; role: string },
 });
 
-const activeTab = ref<"workspace" | "projects" | "teams" | "providers">("workspace");
 const chatDraft = ref("");
 const messagesListRef = ref<HTMLElement | null>(null);
 let isMounted = false;
@@ -129,35 +132,43 @@ function formatMessageContent(item: any): string { if (!item.content) return '';
 function formatTime(iso: string): string { return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); }
 
 async function loadInitialData() {
-  const [providersResponse, teamsResponse, projectsResponse, runsResponse, modelsResponse, settingsResponse] = await Promise.all([api.providers(), api.teams(), api.projects(), api.runs(), api.models(), api.settings()]);
-  state.providers = providersResponse.providers;
-  state.models = modelsResponse.items;
-  state.teams = teamsResponse.teams;
-  state.projects = projectsResponse.projects;
+  if (globalProviders.value.length) {
+    state.providers = globalProviders.value;
+    state.teams = globalTeams.value;
+    state.projects = globalProjects.value;
+  } else {
+    const [providersResponse, teamsResponse, projectsResponse] = await Promise.all([api.providers(), api.teams(), api.projects()]);
+    state.providers = providersResponse.providers;
+    state.teams = teamsResponse.teams;
+    state.projects = projectsResponse.projects;
+  }
+  
+  const [runsResponse, modelsResponse, settingsResponse] = await Promise.all([api.runs(), api.models(), api.settings()]);
   state.runs = runsResponse.runs;
+  state.models = modelsResponse.items;
   state.settings = settingsResponse;
+  
   state.selectedProviderId = state.providers[0]?.id || "";
   state.selectedTeamId = state.teams[0]?.id || "";
   state.selectedProjectId = state.projects[0]?.id || "";
-  if (state.selectedProjectId) { await refreshChats(state.selectedProjectId); await refreshTasks(state.selectedProjectId); }
+  
+  if (state.selectedProjectId) { await refreshChats(state.selectedProjectId); }
   if (state.runs[0]) await openRun(state.runs[0].id);
 }
 
 async function refreshChats(projectId?: string) { if (!projectId) { state.chats = []; state.selectedChatId = ""; state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; return; } const response = await api.chats(projectId); state.chats = response.chats; state.selectedChatId = state.chats[0]?.id || ""; if (state.selectedChatId) await openChat(state.selectedChatId); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } }
-async function refreshTasks(projectId?: string) { if (!projectId) { state.tasks = []; state.projectMemory = []; state.taskComments = {}; return; } const [response, memoryResponse] = await Promise.all([api.tasks(projectId), api.projectMemory(projectId)]); state.tasks = response.tasks; state.projectMemory = memoryResponse.entries; await Promise.all(state.tasks.map((task) => loadTaskComments(task.id))); }
-async function loadTaskComments(taskId: string) { const response = await api.taskComments(taskId); state.taskComments[taskId] = response.comments; }
 async function openChat(id: string) { state.selectedChatId = id; const response = await api.chatById(id); state.messages = response.messages; state.chatRuns = response.runs; state.chatStats = response.stats; await nextTick(); scrollMessagesToBottom("auto"); }
 async function openRun(id: string) { state.selectedRunId = id; const response = await api.runById(id); state.report = response.report; state.runStatus = response.run.status; state.runEvents = response.run.events ?? []; state.runError = response.run.error ?? ""; }
 function showToast(type: 'success' | 'error' | 'info', message: string) { const id = ++toastId; state.toasts.push({ id, type, message }); setTimeout(() => { const idx = state.toasts.findIndex(t => t.id === id); if (idx !== -1) state.toasts.splice(idx, 1); }, 4000); }
-function confirmDelete(type: 'project' | 'chat' | 'task', id: string, name: string, onConfirm: () => Promise<void>) { state.deleteConfirm = { type, id, name, onConfirm }; }
+function confirmDelete(type: 'project' | 'chat', id: string, name: string, onConfirm: () => Promise<void>) { state.deleteConfirm = { type, id, name, onConfirm }; }
 async function executeDelete() { if (!state.deleteConfirm) return; const { onConfirm } = state.deleteConfirm; state.deleteConfirm = null; try { await onConfirm(); showToast('success', 'Удалено'); } catch (e) { showToast('error', e instanceof Error ? e.message : 'Ошибка удаления'); } }
 async function createChat() { if (!selectedProject.value || !(selectedProject.value.teamId || state.selectedTeamId)) return; state.busy = true; try { const response = await api.saveChat({ projectId: selectedProject.value.id, teamId: selectedProject.value.teamId || state.selectedTeamId, title: `Чат ${state.chats.length + 1}`, summary: "" }); state.chats.unshift(response.chat); state.selectedChatId = response.chat.id; await openChat(response.chat.id); showToast('success', 'Чат создан'); } catch (e) { showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
 async function deleteChat(id: string) { const chat = state.chats.find(c => c.id === id); if (!chat) return; confirmDelete('chat', id, chat.title, async () => { state.busy = true; try { await api.deleteChat(id); state.chats = state.chats.filter(c => c.id !== id); if (state.selectedChatId === id) { const fallback = state.chats[0] || null; state.selectedChatId = fallback?.id || ""; if (fallback) await openChat(fallback.id); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } } showToast('success', 'Чат удалён'); } finally { state.busy = false; } }); }
-async function sendChatMessage() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); state.busy = true; chatDraft.value = ""; try { await saveProject(); const response = await api.sendChatMessage(selectedChat.value.id, draft); await openChat(selectedChat.value.id); if (selectedProject.value) await refreshTasks(selectedProject.value.id); if (response.createdTasks.length) state.runStatus = `orchestrator_created_${response.createdTasks.length}_tasks`; if (response.autoRunId) { state.selectedRunId = response.autoRunId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; startPolling(response.autoRunId); } } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
-async function runTask() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); state.busy = true; chatDraft.value = ""; try { await saveProject(); const response = await api.startRun({ chatId: selectedChat.value.id, task: draft }); state.selectedRunId = response.runId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; startPolling(response.runId); showToast('success', 'Работа запущена'); } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
-async function saveProject() { if (!selectedProject.value) return; state.busy = true; try { const response = await api.saveProject(selectedProject.value); const idx = state.projects.findIndex((i) => i.id === response.project.id); if (idx === -1) state.projects.unshift(response.project); else state.projects[idx] = response.project; state.selectedProjectId = response.project.id; showToast('success', 'Проект сохранён'); } catch (e) { showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
+async function sendChatMessage() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); state.busy = true; chatDraft.value = ""; try { const response = await api.sendChatMessage(selectedChat.value.id, draft); await openChat(selectedChat.value.id); if (response.autoRunId) { state.selectedRunId = response.autoRunId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; startPolling(response.autoRunId); } } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
+async function runTask() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); state.busy = true; chatDraft.value = ""; try { const response = await api.startRun({ chatId: selectedChat.value.id, task: draft }); state.selectedRunId = response.runId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; startPolling(response.runId); showToast('success', 'Работа запущена'); } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
 function startPolling(runId: string) { if (pollTimer) window.clearInterval(pollTimer); const tick = async () => { try { const response = await api.job(runId); state.runStatus = response.status; state.runEvents = response.events ?? []; state.runError = response.error ?? ""; const runsResponse = await api.runs(); state.runs = runsResponse.runs; await nextTick(); scrollMessagesToBottom("smooth"); if (response.status === "done" || response.status === "failed") { if (pollTimer) window.clearInterval(pollTimer); await openRun(runId); if (state.selectedChatId) await openChat(state.selectedChatId); } } catch (e) { console.error('Poll error:', e); } }; void tick(); pollTimer = window.setInterval(() => void tick(), 2000); }
 function scrollMessagesToBottom(behavior: ScrollBehavior = "smooth") { const container = messagesListRef.value; if (!container) return; try { container.scrollTo({ top: container.scrollHeight, behavior }); } catch {} }
+function isUserAtBottom(): boolean { const container = messagesListRef.value; if (!container) return true; const { scrollTop, scrollHeight, clientHeight } = container; return scrollHeight - scrollTop - clientHeight < 50; }
 function copyMessage(text: string) { if (!text) return; navigator.clipboard.writeText(text).then(() => showToast('success', 'Скопировано')).catch(() => showToast('error', 'Не удалось скопировать')); }
 function reportText(): string { if (!state.report) return "Пока нет отчёта."; const r = state.report as any; return [`Task: ${r.task}`, `Project: ${r.projectPath}`, `Reviewer approved: ${r.approvals?.reviewerApproved ? "yes" : "no"}`, `Tester status: ${r.approvals?.testerStatus ?? "-"}`, "", r.spec?.summary ? `Spec: ${r.spec.summary}` : "", r.reviewer?.summary ? `Review: ${r.reviewer.summary}` : "", r.tester?.summary ? `Test: ${r.tester.summary}` : "", r.usageSummary ? `Tokens: actual ${r.usageSummary.totalActualTokens}, weighted ${r.usageSummary.totalWeightedTokens}` : ""].filter(Boolean).join("\n"); }
 
@@ -166,8 +177,8 @@ function handleWsMessage(msg: any) { if (msg.event === "token:stream") { const {
 function disconnectWebSocket() { if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer); if (ws) { ws.disconnect(); ws = null; } }
 
 watch(() => state.selectedChatId, async (v) => { if (v) { await openChat(v); if (ws && ws.connected) ws.emit("join:chat", { chatId: v }); } });
-watch(() => state.selectedProjectId, async (v) => { await refreshChats(v); await refreshTasks(v); const p = state.projects.find(i => i.id === v); if (p?.teamId) state.selectedTeamId = p.teamId; if (ws && ws.connected && v) ws.emit("join:project", { projectId: v }); });
-watch(() => displayedMessages.value.length, async (curr, prev) => { if (curr === prev) return; if (!isMounted) return; await nextTick(); scrollMessagesToBottom(prev === 0 ? "auto" : "smooth"); });
+watch(() => state.selectedProjectId, async (v) => { await refreshChats(v); const p = state.projects.find(i => i.id === v); if (p?.teamId) state.selectedTeamId = p.teamId; if (ws && ws.connected && v) ws.emit("join:project", { projectId: v }); });
+watch(() => displayedMessages.value.length, async (curr, prev) => { if (curr === prev) return; if (!isMounted) return; await nextTick(); if (prev === 0 || isUserAtBottom()) scrollMessagesToBottom(prev === 0 ? "auto" : "smooth"); });
 
 onMounted(() => { isMounted = true; void loadInitialData(); connectWebSocket(); });
 onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(pollTimer); disconnectWebSocket(); });
@@ -175,40 +186,37 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 
 <template>
   <div class="workspace-view">
-    <header class="workspace-header">
-      <div class="context-bar">
-        <div class="context-select">
-          <label>Проект</label>
-          <select class="form-select" v-model="state.selectedProjectId" @change="onProjectChange">
-            <option v-for="p in state.projects" :key="p.id" :value="p.id">{{ p.name }}</option>
-          </select>
-        </div>
-        <div class="context-select" v-if="selectedProject">
-          <label>Команда</label>
-          <select class="form-select" v-model="selectedProject.teamId">
-            <option value="">Не назначена</option>
-            <option v-for="t in state.teams" :key="t.id" :value="t.id">{{ t.name }}</option>
-          </select>
-        </div>
-        <div class="context-select">
-          <label>Провайдер</label>
-          <select class="form-select" v-model="state.selectedProviderId">
-            <option v-for="p in state.providers" :key="p.id" :value="p.id">{{ p.name }}</option>
-          </select>
-        </div>
-        <div class="context-select">
-          <label>Чат</label>
-          <select class="form-select" v-model="state.selectedChatId">
-            <option value="">Создай чат</option>
-            <option v-for="c in state.chats" :key="c.id" :value="c.id">{{ c.title }}</option>
-          </select>
-        </div>
-        <div class="context-actions">
-          <button class="btn btn-primary" @click="createChat" :disabled="state.busy || !selectedProject || !(selectedProject.teamId || state.selectedTeamId)">Новый чат</button>
-          <button class="btn btn-ghost" @click="saveProject" :disabled="state.busy || !selectedProject">Сохранить проект</button>
-        </div>
+    <div class="context-bar">
+      <div class="context-select">
+        <label>Проект</label>
+        <select class="form-select" v-model="state.selectedProjectId">
+          <option v-for="p in state.projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
       </div>
-    </header>
+      <div class="context-select" v-if="selectedProject">
+        <label>Команда</label>
+        <select class="form-select" v-model="selectedProject.teamId">
+          <option value="">Не назначена</option>
+          <option v-for="t in state.teams" :key="t.id" :value="t.id">{{ t.name }}</option>
+        </select>
+      </div>
+      <div class="context-select">
+        <label>Провайдер</label>
+        <select class="form-select" v-model="state.selectedProviderId">
+          <option v-for="p in state.providers" :key="p.id" :value="p.id">{{ p.name }}</option>
+        </select>
+      </div>
+      <div class="context-select">
+        <label>Чат</label>
+        <select class="form-select" v-model="state.selectedChatId">
+          <option value="">Создай чат</option>
+          <option v-for="c in state.chats" :key="c.id" :value="c.id">{{ c.title }}</option>
+        </select>
+      </div>
+      <div class="context-actions">
+        <button class="btn btn-primary" @click="createChat" :disabled="state.busy || !selectedProject || !(selectedProject.teamId || state.selectedTeamId)">Новый чат</button>
+      </div>
+    </div>
 
     <main class="chat-area">
       <div ref="messagesListRef" class="chat-messages">
@@ -243,7 +251,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
     </main>
 
     <div v-if="state.deleteConfirm" class="modal-overlay" @click.self="state.deleteConfirm = null">
-      <div class="modal"><div class="modal-header"><h3 class="modal-title">Подтвердить удаление</h3></div><div class="modal-body"><div class="delete-confirm"><div class="delete-confirm-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div><h3 class="delete-confirm-title">Удалить {{ state.deleteConfirm.type === 'project' ? 'проект' : state.deleteConfirm.type === 'chat' ? 'чат' : 'задачу' }}?</h3><p class="delete-confirm-text"><strong>{{ state.deleteConfirm.name }}</strong> будет удалён{{ state.deleteConfirm.type === 'project' ? ' вместе со всеми чатами, задачами, запусками и памятью' : '' }}. Это действие нельзя отменить.</p></div></div><div class="modal-footer"><button class="btn btn-ghost" @click="state.deleteConfirm = null">Отмена</button><button class="btn btn-danger" :disabled="state.busy" @click="executeDelete">Удалить</button></div></div>
+      <div class="modal"><div class="modal-header"><h3 class="modal-title">Подтвердить удаление</h3></div><div class="modal-body"><div class="delete-confirm"><div class="delete-confirm-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></div><h3 class="delete-confirm-title">Удалить {{ state.deleteConfirm.type === 'project' ? 'проект' : 'чат' }}?</h3><p class="delete-confirm-text"><strong>{{ state.deleteConfirm.name }}</strong> будет удалён{{ state.deleteConfirm.type === 'project' ? ' вместе со всеми чатами, запусками и памятью' : '' }}. Это действие нельзя отменить.</p></div></div><div class="modal-footer"><button class="btn btn-ghost" @click="state.deleteConfirm = null">Отмена</button><button class="btn btn-danger" :disabled="state.busy" @click="executeDelete">Удалить</button></div></div>
     </div>
 
     <div v-for="toast in state.toasts" :key="toast.id" class="toast" :class="toast.type"><span class="toast-icon"><svg v-if="toast.type === 'success'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg><svg v-else-if="toast.type === 'error'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg><svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span><span class="toast-message">{{ toast.message }}</span></div>
@@ -252,8 +260,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 
 <style scoped>
 .workspace-view { display:flex; flex-direction:column; height:100vh; }
-.workspace-header { padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
-.context-bar { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; max-width:1400px; margin:0 auto; }
+.context-bar { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--panel); }
 .context-select { display:flex; flex-direction:column; gap:4px; min-width:160px; flex:1; }
 .context-select label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
 .context-select .form-select { padding:8px 12px; border-radius:var(--radius-sm); border:1px solid var(--line); background:var(--bg); color:var(--text); font:inherit; min-height:38px; }

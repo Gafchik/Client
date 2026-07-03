@@ -8,7 +8,6 @@ import { TeamEntity } from "../../persistence/team.entity.js";
 import { RunEntity } from "../../persistence/run.entity.js";
 import { SaveChatDto } from "./dto/save-chat.dto.js";
 import { TeamsService } from "../teams/teams.service.js";
-import { TasksService } from "../tasks/tasks.service.js";
 import { safeJsonParse } from "../../shared/json.js";
 import { RunsService } from "../runs/runs.service.js";
 import { WsGateway } from "../ws/ws.gateway.js";
@@ -29,7 +28,6 @@ export class ChatsService {
     @InjectRepository(RunEntity)
     private readonly runsRepository: Repository<RunEntity>,
     private readonly teamsService: TeamsService,
-    private readonly tasksService: TasksService,
     @Inject(forwardRef(() => RunsService))
     private readonly runsService: RunsService,
     private readonly wsGateway: WsGateway,
@@ -189,7 +187,6 @@ export class ChatsService {
 
     await this.addMessage(chat.id, "user", content, { type: "conversation" });
 
-    const taskSnapshot = await this.tasksService.list(project.id);
     const orchestrator = (team.config as any)?.agents?.orchestrator || (team.config as any)?.agents?.pm;
     const teamLanguage = this.resolveTeamLanguage((team.config as any)?.language);
     if (!orchestrator?.model) {
@@ -238,12 +235,6 @@ export class ChatsService {
                     temperature: agent?.temperature,
                   })),
                 },
-                tasks: taskSnapshot.map((task) => ({
-                  id: task.id,
-                  title: task.title,
-                  description: task.description,
-                  status: task.status,
-                })),
                 chatHistory: messages.slice(-12).map((message) => ({
                   role: message.role,
                   content: message.content,
@@ -317,52 +308,16 @@ export class ChatsService {
     };
     const orchestratorPayload = safeJsonParse<any>(text || "{}", {
       message: text || "Оркестратор не вернул ответ.",
-      suggestedTasks: [],
       teamSummary: [],
       shouldExecute: false,
       executionTask: "",
     });
     const requestId = `chatreq-${Date.now()}`;
 
-    const createdTasks = [];
-    for (const task of orchestratorPayload.suggestedTasks || []) {
-      if (!task?.title) continue;
-      createdTasks.push(
-        await this.tasksService.save({
-          projectId: project.id,
-          title: task.title,
-          description: task.description || "",
-          status: task.status || "backlog",
-          sourceChatId: chat.id,
-        }),
-      );
-    }
-
     let autoRunId: string | null = null;
     const shouldExecute = Boolean(orchestratorPayload.shouldExecute);
     const executionTask = String(orchestratorPayload.executionTask || content).trim();
     if (shouldExecute && executionTask) {
-      if (!createdTasks.length) {
-        createdTasks.push(
-          await this.tasksService.save({
-            projectId: project.id,
-            title: executionTask.slice(0, 120),
-            description: executionTask,
-            status: "in_progress",
-            sourceChatId: chat.id,
-          }),
-        );
-      } else {
-        const primaryTask = createdTasks[0];
-        if (primaryTask.status !== "in_progress") {
-          const updatedTask = await this.tasksService.save({
-            ...primaryTask,
-            status: "in_progress",
-          });
-          createdTasks[0] = updatedTask;
-        }
-      }
-
       const run = await this.runsService.startRun({
         chatId: chat.id,
         task: executionTask,
@@ -375,9 +330,6 @@ export class ChatsService {
 
     const finalMessage = [
       orchestratorPayload.message || "Оркестратор обработал сообщение.",
-      createdTasks.length ? "" : null,
-      createdTasks.length ? `Создано задач: ${createdTasks.length}` : null,
-      ...createdTasks.map((task) => `- [${task.status}] ${task.title}`),
       autoRunId ? "" : null,
       autoRunId ? `Команда запущена в работу. Run ID: ${autoRunId}` : null,
     ]
@@ -388,7 +340,6 @@ export class ChatsService {
       type: "conversation",
       requestId,
       usage,
-      createdTaskIds: createdTasks.map((task) => task.id),
       autoRunId,
       orchestratorPayload,
     });
@@ -396,7 +347,7 @@ export class ChatsService {
     return {
       chat,
       message: assistantMessage,
-      createdTasks,
+      createdTasks: [],
       autoRunId,
     };
   }
@@ -437,11 +388,9 @@ Do not answer in English unless the team language is {{teamLanguageCode}}.
 You answer user questions about the project and the team.
 You know the exact team roster, including each member name, role, label, and model.
 When the user asks who someone is, first check the provided team roster and answer from it.
-If the answer does not require work, do not create any task.
-Create tasks only when the user explicitly asks to do work or when real follow-up execution is needed.
-If work should start immediately, set shouldExecute to true and provide executionTask.
+If the user asks to do work, you coordinate the team directly.
 Return valid JSON only.
-Output schema: {"message":"string","suggestedTasks":[{"title":"string","description":"string","status":"backlog|in_progress|done"}],"teamSummary":["string"],"shouldExecute":boolean,"executionTask":"string"}`;
+Output schema: {"message":"string","teamSummary":["string"],"shouldExecute":boolean,"executionTask":"string"}`;
     }
     return template
       .replace(/{{teamLanguage}}/g, languageLabel)

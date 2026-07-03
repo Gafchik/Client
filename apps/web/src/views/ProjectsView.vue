@@ -1,11 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, inject, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
 import type { Project, Team } from "../types";
 
 const route = useRoute();
 const router = useRouter();
+
+// Inject global data
+const { providers: globalProviders, teams: globalTeams, projects: globalProjects, loading: globalLoading } = inject("globalData", {
+  providers: ref<Provider[]>([]),
+  teams: ref<Team[]>([]),
+  projects: ref<Project[]>([]),
+  loading: ref(true),
+});
 
 const projects = ref<Project[]>([]);
 const teams = ref<Team[]>([]);
@@ -16,9 +24,14 @@ const newProject = ref({ name: "", description: "", localPath: "", teamId: "" as
 const folderPickerSupported = typeof window !== "undefined" && "showDirectoryPicker" in window;
 
 async function loadData() {
-  const [projectsRes, teamsRes] = await Promise.all([api.projects(), api.teams()]);
-  projects.value = projectsRes.projects;
-  teams.value = teamsRes.teams;
+  if (globalProjects.value.length) {
+    projects.value = globalProjects.value;
+    teams.value = globalTeams.value;
+  } else {
+    const [projectsRes, teamsRes] = await Promise.all([api.projects(), api.teams()]);
+    projects.value = projectsRes.projects;
+    teams.value = teamsRes.teams;
+  }
   const id = route.params.id as string | undefined;
   if (id) {
     selectedProject.value = projects.value.find(p => p.id === id) || null;
@@ -188,8 +201,8 @@ onMounted(loadData);
 </template>
 
 <style scoped>
-.view-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
-.view-grid { display:grid; grid-template-columns:300px 1fr; gap:20px; }
+.view-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; padding:0 20px; }
+.view-grid { display:grid; grid-template-columns:300px 1fr; gap:20px; padding:0 20px 20px; }
 .projects-sidebar { min-height:500px; }
 .projects-list { display:flex; flex-direction:column; gap:8px; }
 .project-item { padding:12px; border-radius:var(--radius); background:var(--panel); border:1px solid var(--line); cursor:pointer; transition:all .15s; }

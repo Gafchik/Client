@@ -1,4 +1,4 @@
-import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, TaskCommentItem, TaskItem, Team } from "./types";
+import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, Team } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
 
@@ -27,90 +27,67 @@ export const api = {
         LOCAL_PROJECTS_ROOT: string;
         CONTAINER_PROJECTS_ROOT: string;
       };
-    }>("/api/settings"),
-  models: () => request<{ items: ModelCatalogItem[] }>("/api/catalog/models"),
-  providers: () => request<{ providers: Provider[] }>("/api/providers"),
+    }>("/settings"),
+  models: () => request<{ items: ModelCatalogItem[] }>("/catalog/models"),
+  providers: () => request<{ providers: Provider[] }>("/providers"),
   saveProvider: (provider: Partial<Provider>) =>
-    request<{ provider: Provider }>("/api/providers", {
+    request<{ provider: Provider }>("/providers", {
       method: "POST",
       body: JSON.stringify(provider),
     }),
   deleteProvider: (id: string) =>
-    request<{ ok: boolean }>(`/api/providers/${id}`, {
+    request<{ ok: boolean }>(`/providers/${id}`, {
       method: "DELETE",
     }),
-  teams: () => request<{ teams: Team[] }>("/api/teams"),
+  teams: () => request<{ teams: Team[] }>("/teams"),
   saveTeam: (team: Partial<Team>) =>
-    request<{ team: Team }>("/api/teams", {
+    request<{ team: Team }>("/teams", {
       method: "POST",
       body: JSON.stringify(team),
     }),
   deleteTeam: (id: string) =>
-    request<{ ok: boolean }>(`/api/teams/${id}`, {
+    request<{ ok: boolean }>(`/teams/${id}`, {
       method: "DELETE",
     }),
-  projects: () => request<{ projects: Project[] }>("/api/projects"),
+  projects: () => request<{ projects: Project[] }>("/projects"),
   saveProject: (project: Partial<Project>) =>
-    request<{ project: Project }>("/api/projects", {
+    request<{ project: Project }>("/projects", {
       method: "POST",
       body: JSON.stringify(project),
     }),
   projectMemory: (projectId: string) =>
-    request<{ entries: ProjectMemoryEntry[] }>(`/api/projects/${projectId}/memory`),
+    request<{ entries: ProjectMemoryEntry[] }>(`/projects/${projectId}/memory`),
   saveProjectMemory: (entry: Partial<ProjectMemoryEntry>) =>
-    request<{ entry: ProjectMemoryEntry }>("/api/projects/memory", {
+    request<{ entry: ProjectMemoryEntry }>("/projects/memory", {
       method: "POST",
       body: JSON.stringify(entry),
     }),
   deleteProject: (id: string) =>
-    request<{ ok: boolean }>(`/api/projects/${id}`, {
+    request<{ ok: boolean }>(`/projects/${id}`, {
       method: "DELETE",
     }),
   chats: (projectId?: string) =>
-    request<{ chats: Chat[] }>(`/api/chats${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
+    request<{ chats: Chat[] }>(`/chats${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
   chatById: (id: string) =>
-    request<{ chat: Chat; messages: ChatMessage[]; runs: RunItem[]; stats: ChatStats }>(`/api/chats/${id}`),
+    request<{ chat: Chat; messages: ChatMessage[]; runs: RunItem[]; stats: ChatStats }>(`/chats/${id}`),
   saveChat: (chat: Partial<Chat>) =>
-    request<{ chat: Chat }>("/api/chats", {
+    request<{ chat: Chat }>("/chats", {
       method: "POST",
       body: JSON.stringify(chat),
     }),
   sendChatMessage: (chatId: string, content: string) =>
-    request<{ chat: Chat; message: ChatMessage; createdTasks: TaskItem[]; autoRunId?: string | null }>(`/api/chats/${chatId}/messages`, {
+    request<{ chat: Chat; message: ChatMessage; autoRunId?: string | null }>(`/chats/${chatId}/messages`, {
       method: "POST",
       body: JSON.stringify({ content }),
     }),
   deleteChat: (id: string) =>
-    request<{ ok: boolean }>(`/api/chats/${id}`, {
+    request<{ ok: boolean }>(`/chats/${id}`, {
       method: "DELETE",
     }),
-  tasks: (projectId?: string) =>
-    request<{ tasks: TaskItem[] }>(`/api/tasks${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
-  saveTask: (task: Partial<TaskItem>) =>
-    request<{ task: TaskItem }>("/api/tasks", {
-      method: "POST",
-      body: JSON.stringify(task),
-    }),
-  taskComments: (taskId: string) =>
-    request<{ comments: TaskCommentItem[] }>(`/api/tasks/${taskId}/comments`),
-  addTaskResultComment: (taskId: string, payload: { content: string; author?: string }) =>
-    request<{ comment: TaskCommentItem }>(`/api/tasks/${taskId}/comments/result`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    }),
-  updateTaskStatus: (taskId: string, payload: { status: TaskItem["status"]; comment?: string; author?: string }) =>
-    request<{ task: TaskItem }>(`/api/tasks/${taskId}/status`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    }),
-  deleteTask: (id: string) =>
-    request<{ ok: boolean }>(`/api/tasks/${id}`, {
-      method: "DELETE",
-    }),
-  runs: () => request<{ runs: RunItem[] }>("/api/runs"),
-  runById: (id: string) => request<{ run: RunItem; report: unknown }>(`/api/runs/${id}`),
+  runs: () => request<{ runs: RunItem[] }>("/runs"),
+  runById: (id: string) => request<{ run: RunItem; report: unknown }>(`/runs/${id}`),
   startRun: (payload: { chatId: string; task: string }) =>
-    request<{ runId: string }>("/api/runs", {
+    request<{ runId: string }>("/runs", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -120,5 +97,5 @@ export const api = {
       status: string;
       error?: string;
       events: Array<{ at: string; event: string; payload?: unknown }>;
-    }>(`/api/jobs/${id}`),
+    }>(`/jobs/${id}`),
 };

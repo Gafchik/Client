@@ -1,11 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, inject, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
 import type { Team, Provider, ModelCatalogItem } from "../types";
 
 const route = useRoute();
 const router = useRouter();
+
+// Inject global data
+const { providers: globalProviders, teams: globalTeams, projects: globalProjects, loading: globalLoading } = inject("globalData", {
+  providers: ref<Provider[]>([]),
+  teams: ref<Team[]>([]),
+  projects: ref<Project[]>([]),
+  loading: ref(true),
+});
 
 const teams = ref<Team[]>([]);
 const providers = ref<Provider[]>([]);
@@ -47,10 +55,17 @@ const modelGroups = computed(() =>
 );
 
 async function loadData() {
-  const [teamsRes, providersRes, modelsRes] = await Promise.all([api.teams(), api.providers(), api.models()]);
-  teams.value = teamsRes.teams;
-  providers.value = providersRes.providers;
+  if (globalTeams.value.length) {
+    teams.value = globalTeams.value;
+    providers.value = globalProviders.value;
+  } else {
+    const [teamsRes, providersRes] = await Promise.all([api.teams(), api.providers()]);
+    teams.value = teamsRes.teams;
+    providers.value = providersRes.providers;
+  }
+  const modelsRes = await api.models();
   models.value = modelsRes.items;
+
   const id = route.params.id as string | undefined;
   if (id) {
     selectedTeam.value = teams.value.find(t => t.id === id) || null;
@@ -227,8 +242,8 @@ onMounted(loadData);
 </template>
 
 <style scoped>
-.view-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
-.view-grid { display:grid; grid-template-columns:300px 1fr; gap:20px; }
+.view-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; padding:0 20px; }
+.view-grid { display:grid; grid-template-columns:300px 1fr; gap:20px; padding:0 20px 20px; }
 .teams-sidebar { min-height:500px; }
 .teams-list { display:flex; flex-direction:column; gap:8px; }
 .team-item { padding:12px; border-radius:var(--radius); background:var(--panel); border:1px solid var(--line); cursor:pointer; }

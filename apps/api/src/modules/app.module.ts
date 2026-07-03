@@ -16,9 +16,6 @@ import { HealthModule } from "./health/health.module.js";
 import { ProjectsModule } from "./projects/projects.module.js";
 import { ProvidersModule } from "./providers/providers.module.js";
 import { SettingsModule } from "./settings/settings.module.js";
-import { TaskEntity } from "../persistence/task.entity.js";
-import { TaskCommentEntity } from "../persistence/task-comment.entity.js";
-import { TasksModule } from "./tasks/tasks.module.js";
 import { WsModule } from "./ws/ws.module.js";
 
 @Module({
@@ -36,7 +33,7 @@ import { WsModule } from "./ws/ws.module.js";
         username: configService.get<string>("DATABASE_USER", "postgres"),
         password: configService.get<string>("DATABASE_PASSWORD", "postgres"),
         database: configService.get<string>("DATABASE_NAME", "ai_agent_team"),
-        entities: [ProviderEntity, ProjectEntity, ProjectMemoryEntryEntity, ChatEntity, MessageEntity, TeamEntity, RunEntity, TaskEntity, TaskCommentEntity],
+        entities: [ProviderEntity, ProjectEntity, ProjectMemoryEntryEntity, ChatEntity, MessageEntity, TeamEntity, RunEntity],
         synchronize: true,
       }),
     }),
@@ -48,7 +45,6 @@ import { WsModule } from "./ws/ws.module.js";
     CatalogModule,
     HealthModule,
     SettingsModule,
-    TasksModule,
     WsModule,
   ],
 })

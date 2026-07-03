@@ -109,30 +109,9 @@ export interface ChatMessage {
       name?: string;
       label?: string;
     };
-    createdTaskIds?: string[];
     orchestratorPayload?: Record<string, unknown>;
     [key: string]: unknown;
   } | null;
-  createdAt?: string;
-}
-
-export interface TaskItem {
-  id: string;
-  projectId: string;
-  title: string;
-  description: string;
-  status: "backlog" | "in_progress" | "done";
-  sourceChatId?: string | null;
-  createdAt?: string;
-  updatedAt?: string;
-}
-
-export interface TaskCommentItem {
-  id: string;
-  taskId: string;
-  type: "status_change" | "result";
-  content: string;
-  author?: string | null;
   createdAt?: string;
 }
 

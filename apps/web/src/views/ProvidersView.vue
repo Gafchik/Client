@@ -1,11 +1,19 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from "vue";
+import { inject, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
 import type { Provider } from "../types";
 
 const route = useRoute();
 const router = useRouter();
+
+// Inject global data
+const { providers: globalProviders, teams: globalTeams, projects: globalProjects, loading: globalLoading } = inject("globalData", {
+  providers: ref<Provider[]>([]),
+  teams: ref<Team[]>([]),
+  projects: ref<Project[]>([]),
+  loading: ref(true),
+});
 
 const providers = ref<Provider[]>([]);
 const selectedProvider = ref<Provider | null>(null);
@@ -14,8 +22,12 @@ const showCreateForm = ref(false);
 const newProvider = ref({ name: "", baseUrl: "https://api.rout.my/v1", apiKey: "", modelsUrl: "https://api.rout.my/v1/models", isCurrent: false });
 
 async function loadData() {
-  const res = await api.providers();
-  providers.value = res.providers;
+  if (globalProviders.value.length) {
+    providers.value = globalProviders.value;
+  } else {
+    const res = await api.providers();
+    providers.value = res.providers;
+  }
   const id = route.params.id as string | undefined;
   if (id) {
     selectedProvider.value = providers.value.find(p => p.id === id) || null;
@@ -135,8 +147,8 @@ onMounted(loadData);
 </template>
 
 <style scoped>
-.view-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
-.view-grid { display:grid; grid-template-columns:300px 1fr; gap:20px; }
+.view-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; padding:0 20px; }
+.view-grid { display:grid; grid-template-columns:300px 1fr; gap:20px; padding:0 20px 20px; }
 .providers-sidebar { min-height:500px; }
 .providers-list { display:flex; flex-direction:column; gap:8px; }
 .provider-item { padding:12px; border-radius:var(--radius); background:var(--panel); border:1px solid var(--line); cursor:pointer; }
