@@ -1,0 +1,21 @@
+{
+  "name": "ai-agent-team",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Docker-first monorepo with Vue 3 + Vite frontend, NestJS backend, Postgres, and an AI agent team orchestrator.",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "build": "npm run build -w apps/api && npm run build -w apps/web",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
