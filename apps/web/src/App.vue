@@ -510,6 +510,145 @@ const unifiedChatStream = computed(() => {
           content: `🧪 Тесты: ${passed} пройдено, ${failed} упало`,
           createdAt: entry.at,
         });
+      } else if (entry.event === 'agent:note') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `note-${entry.at}-${payload.role}`,
+          type: 'agent-status',
+          agentRole: payload.role,
+          name: payload.agentName,
+          label: payload.label,
+          content: payload.detail,
+          createdAt: entry.at,
+          status: 'working',
+        });
+      } else if (entry.event === 'agent:retry') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `retry-${entry.at}-${payload.role}`,
+          type: 'agent-status',
+          agentRole: payload.role,
+          name: payload.agentName,
+          label: payload.label,
+          content: `↻ Ответ не распарсился, автоповтор ${payload.attempt || '?'}/3`,
+          createdAt: entry.at,
+          status: 'working',
+        });
+      } else if (entry.event === 'agent:retry-success') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `retry-success-${entry.at}-${payload.role}`,
+          type: 'agent-status',
+          agentRole: payload.role,
+          name: payload.agentName,
+          label: payload.label,
+          content: `✓ Прислал валидный JSON, выполнение продолжено`,
+          createdAt: entry.at,
+          status: 'done',
+        });
+      } else if (entry.event === 'developer:empty-operations') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `empty-ops-${entry.at}-${payload.role}`,
+          type: 'agent-status',
+          agentRole: payload.role,
+          name: payload.agentName,
+          label: payload.label,
+          content: `⚠ Не вернул правки, получает повторную задачу на конкретные изменения`,
+          createdAt: entry.at,
+          status: 'working',
+        });
+      } else if (entry.event === 'file:processing') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `file-proc-${entry.at}-${payload.path}`,
+          type: 'agent-status',
+          agentRole: 'developer',
+          name: 'Kai',
+          label: 'Разработчик',
+          content: `📝 ${payload.action === 'create' ? 'Создает' : 'Обновляет'} файл: ${payload.path}`,
+          createdAt: entry.at,
+          status: 'working',
+        });
+      } else if (entry.event === 'file:applied') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `file-applied-${entry.at}-${payload.path}`,
+          type: 'agent-status',
+          agentRole: 'developer',
+          name: 'Kai',
+          label: 'Разработчик',
+          content: `✓ ${payload.action === 'create' ? 'Создал' : 'Обновил'} файл: ${payload.path}`,
+          createdAt: entry.at,
+          status: 'done',
+        });
+      } else if (entry.event === 'file:skipped') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `file-skipped-${entry.at}-${payload.path}`,
+          type: 'agent-status',
+          agentRole: 'developer',
+          name: 'Kai',
+          label: 'Разработчик',
+          content: `⊘ Пропустил файл: ${payload.path} (${payload.reason})`,
+          createdAt: entry.at,
+          status: 'idle',
+        });
+      } else if (entry.event === 'test:started') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `test-start-${entry.at}-${payload.command}`,
+          type: 'agent-status',
+          agentRole: 'tester',
+          name: 'Nova',
+          label: 'Тестировщик',
+          content: `🧪 Запускает тест: ${payload.command}`,
+          createdAt: entry.at,
+          status: 'working',
+        });
+      } else if (entry.event === 'test:finished') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `test-finish-${entry.at}-${payload.command}`,
+          type: 'agent-status',
+          agentRole: 'tester',
+          name: 'Nova',
+          label: 'Тестировщик',
+          content: `${payload.success ? '✓' : '✗'} Тест ${payload.success ? 'пройден' : 'упал'}: ${payload.command} (code ${payload.code ?? '-'})`,
+          createdAt: entry.at,
+          status: payload.success ? 'done' : 'error',
+        });
+      } else if (entry.event === 'memory:loaded') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `mem-load-${entry.at}`,
+          type: 'system',
+          content: `📚 Загружена память проекта: ${payload.entries} записей`,
+          createdAt: entry.at,
+        });
+      } else if (entry.event === 'memory:saved-from-analyst-final') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `mem-save-${entry.at}`,
+          type: 'system',
+          content: `💾 Аналитик сохранил в память: ${payload.entriesSaved} записей`,
+          createdAt: entry.at,
+        });
+      } else if (entry.event === 'memory:updated') {
+        stream.push({
+          id: `mem-upd-${entry.at}`,
+          type: 'system',
+          content: `🔄 Память проекта обновлена`,
+          createdAt: entry.at,
+        });
+      } else if (entry.event === 'run:context') {
+        const payload = entry.payload as any;
+        stream.push({
+          id: `ctx-${entry.at}`,
+          type: 'system',
+          content: `📂 Контекст: ${payload.fileCount} файлов, БД: ${payload.hasDatabase ? 'да' : 'нет'}`,
+          createdAt: entry.at,
+        });
       }
     }
   }
@@ -1365,13 +1504,14 @@ onBeforeUnmount(() => {
                   <span v-else-if="item.type === 'token-summary'">📊</span>
                 </div>
                 <div class="message-bubble">
-                  <div class="message-header">
-                    <span class="message-name">{{ messageName(item) }}</span>
-                    <span class="message-time">{{ formatTime(item.createdAt) }}</span>
-                    <span v-if="item.status === 'working'" class="status-indicator working" title="Работает...">●</span>
-                    <span v-else-if="item.status === 'done'" class="status-indicator done" title="Завершено">✓</span>
-                    <span v-else-if="item.status === 'idle'" class="status-indicator idle" title="Пропущен">⊘</span>
-                  </div>
+                    <div class="message-header">
+                      <span class="message-name">{{ messageName(item) }}</span>
+                      <span class="message-time">{{ formatTime(item.createdAt) }}</span>
+                      <span v-if="item.status === 'working'" class="status-indicator working" title="Работает...">●</span>
+                      <span v-else-if="item.status === 'done'" class="status-indicator done" title="Завершено">✓</span>
+                      <span v-else-if="item.status === 'idle'" class="status-indicator idle" title="Пропущен">⊘</span>
+                      <span v-else-if="item.status === 'error'" class="status-indicator error" title="Ошибка">✗</span>
+                    </div>
                   <div class="message-content" v-html="formatMessageContent(item)"></div>
                   <div v-if="item.meta?.usage" class="message-usage">
                     <span>{{ item.meta.usage.totalTokens.toLocaleString() }} actual</span>

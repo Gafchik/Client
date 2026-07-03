@@ -65,3 +65,6 @@ export class RunEntity {
   @Column("timestamptz", { nullable: true })
   finishedAt!: Date | null;
 }
+
+// Алиас для обратной совместимости
+export { RunEntity as Run };

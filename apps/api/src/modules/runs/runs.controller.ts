@@ -18,6 +18,8 @@ export class RunsController {
   @Get("runs/:id")
   async getRun(@Param("id") id: string) {
     const run = await this.runsService.getById(id);
+    if (!run) return { run: null, report: null };
+    
     let report = null;
 
     if (run.runDir) {
@@ -35,6 +37,8 @@ export class RunsController {
   @Get("runs/:id/summary")
   async getRunSummary(@Param("id") id: string) {
     const run = await this.runsService.getById(id);
+    if (!run) return { run: null, summary: null };
+    
     let report: any = null;
 
     if (run.runDir) {
