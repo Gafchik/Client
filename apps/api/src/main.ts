@@ -7,8 +7,6 @@ async function bootstrap() {
     cors: true,
   });
 
-  app.setGlobalPrefix("api");
-
   const port = Number(process.env.PORT || 3000);
   await app.listen(port, "0.0.0.0");
 }
