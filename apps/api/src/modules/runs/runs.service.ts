@@ -3,6 +3,8 @@ import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
 import { ChatEntity } from "../../persistence/chat.entity.js";
 import { ProjectEntity } from "../../persistence/project.entity.js";
+import { ProviderEntity } from "../../persistence/provider.entity.js";
+import { TaskEntity } from "../../persistence/task.entity.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Repository } from "typeorm";
@@ -11,6 +13,8 @@ import { TeamEntity } from "../../persistence/team.entity.js";
 import { ChatsService } from "../chats/chats.service.js";
 import { ProjectsService } from "../projects/projects.service.js";
 import { TeamsService } from "../teams/teams.service.js";
+import { TasksService } from "../tasks/tasks.service.js";
+import { ProvidersService } from "../providers/providers.service.js";
 import { StartRunDto } from "./dto/start-run.dto.js";
 import { extractJson, safeJsonParse } from "../../shared/json.js";
 import type { TeamConfig } from "../../shared/types.js";
@@ -34,8 +38,14 @@ export class RunsService {
     private readonly chatsRepository: Repository<ChatEntity>,
     @InjectRepository(ProjectEntity)
     private readonly projectsRepository: Repository<ProjectEntity>,
+    @InjectRepository(ProviderEntity)
+    private readonly providersRepository: Repository<ProviderEntity>,
+    @InjectRepository(TaskEntity)
+    private readonly tasksRepository: Repository<TaskEntity>,
     private readonly teamsService: TeamsService,
     private readonly projectsService: ProjectsService,
+    private readonly tasksService: TasksService,
+    private readonly providersService: ProvidersService,
     @Inject(forwardRef(() => ChatsService))
     private readonly chatsService: ChatsService,
     private readonly configService: ConfigService,
@@ -304,7 +314,13 @@ export class RunsService {
     let context = await this.buildWorkspaceContext(run.projectPath, run.task, config.workspace);
     const projectMemory = run.projectId ? await this.projectsService.listMemory(run.projectId) : [];
     context.projectMemory = projectMemory;
-    await emit("run:context", { fileCount: context.fileCount });
+    
+    // Load database context: projects, tasks, teams, providers
+    const project = run.projectId ? await this.projectsRepository.findOne({ where: { id: run.projectId } }) : null;
+    const teamIdForContext = run.teamId ? run.teamId : (project?.teamId ? project.teamId : undefined);
+    // @ts-expect-error TypeScript narrows incorrectly
+    context.database = await this.buildDatabaseContext(run.projectId, teamIdForContext);
+    await emit("run:context", { fileCount: context.fileCount, hasDatabase: !!context.database });
     await emit("memory:loaded", { entries: projectMemory.length });
 
     await setAgentActivity("pm", "working", "Анализирует запрос и решает, кого подключать.");
@@ -398,12 +414,15 @@ export class RunsService {
           );
           const extraUsages = [] as any[];
 
-          if (requiresConcreteChanges && (!Array.isArray(result.artifact?.operations) || result.artifact.operations.length === 0)) {
+          const hasRealOperations = Array.isArray(result.artifact?.operations) && 
+            result.artifact.operations.some((op: any) => op.content && op.content.trim().length > 0);
+          
+          if (requiresConcreteChanges && !hasRealOperations) {
             await emit("developer:empty-operations", {
               agentName: this.agentIdentity(config, "coder", "Kai").name,
               role: this.agentIdentity(config, "coder", "Kai").role,
               label: this.agentIdentity(config, "coder", "Kai").label,
-              detail: "Не вернул ни одной правки по кодовой задаче. Запрашиваем конкретные изменения повторно.",
+              detail: "Не вернул ни одной правки с содержимым (content пустой или отсутствует). Запрашиваем конкретные изменения повторно.",
             });
             context = await this.expandWorkspaceContext(
               context,
@@ -411,7 +430,7 @@ export class RunsService {
               this.collectContextQueries(run.task, orchestrator.artifact, analyst.artifact, result.artifact),
               18,
             );
-            await setAgentActivity("coder", "working", "Не вернул правки. Повторно формирует конкретные изменения.");
+            await setAgentActivity("coder", "working", "Не вернул правки с содержимым. Повторно формирует конкретные изменения.");
             result = await this.callAgent(
               config,
               "coder",
@@ -538,6 +557,28 @@ export class RunsService {
       await emit("files:skipped", { reason: "developer_not_requested" });
     }
 
+    // Apply database operations if any
+    let dbApplyResult: any = { applied: [], skipped: [] };
+    if (shouldUseDeveloper && Array.isArray(developer.artifact?.databaseOperations) && developer.artifact.databaseOperations.length > 0) {
+      await emit("agent:activity", {
+        agentName: this.agentIdentity(config, "coder", "Kai").name,
+        role: this.agentIdentity(config, "coder", "Kai").role,
+        label: this.agentIdentity(config, "coder", "Kai").label,
+        status: "working",
+        detail: `Выполняет ${developer.artifact.databaseOperations.length} операций с базой данных.`,
+      });
+      dbApplyResult = await this.applyDatabaseOperations(developer.artifact.databaseOperations, emit);
+      await this.writeArtifact(runRoot, "06-db-apply-result.json", dbApplyResult);
+      await emit("db:applied", dbApplyResult);
+      await emit("agent:activity", {
+        agentName: this.agentIdentity(config, "coder", "Kai").name,
+        role: this.agentIdentity(config, "coder", "Kai").role,
+        label: this.agentIdentity(config, "coder", "Kai").label,
+        status: "idle",
+        detail: "Операции с базой данных выполнены.",
+      });
+    }
+
     const testResults = [] as any[];
     if (shouldUseTester) {
       await emit("agent:activity", {
@@ -564,68 +605,251 @@ export class RunsService {
       await emit("tests:skipped", { reason: "tester_not_requested" });
     }
 
-    const tester = shouldUseTester
-      ? await (async () => {
-          await setAgentActivity("tester", "working", "Проверяет результат и прогоняет тесты.");
-          const result = await this.callAgent(
-            config,
-            "tester",
-            this.buildTesterPrompt(run.task, orchestrator.artifact, analyst.artifact, developer.artifact, testResults, config),
-            emit,
-          );
-          await setAgentActivity("tester", "idle", "Проверка завершена.");
-          return result;
-        })()
-      : { artifact: null, usage: null };
-    if (shouldUseTester && tester.usage) {
-      trackUsage("tester", tester.usage);
-      await this.writeArtifact(runRoot, "08-tester.json", tester.artifact);
+    let currentDeveloperArtifact = developer.artifact;
+    let currentTestResults = testResults;
+    let currentTesterArtifact = null;
+    let fixAttempts = 0;
+    const maxFixAttempts = 2;
+
+    // Test-fix loop: if tester finds issues, send back to developer
+    while (fixAttempts < maxFixAttempts) {
+      const tester = shouldUseTester
+        ? await (async () => {
+            await setAgentActivity("tester", "working", fixAttempts === 0 ? "Проверяет результат и прогоняет тесты." : `Повторная проверка после исправлений (попытка ${fixAttempts + 1}).`);
+            const result = await this.callAgent(
+              config,
+              "tester",
+              this.buildTesterPrompt(run.task, orchestrator.artifact, analyst.artifact, currentDeveloperArtifact, currentTestResults, config),
+              emit,
+            );
+            await setAgentActivity("tester", "idle", "Проверка завершена.");
+            return result;
+          })()
+        : { artifact: null, usage: null };
+      
+      currentTesterArtifact = tester.artifact;
+      
+      if (shouldUseTester && tester.usage) {
+        trackUsage("tester", tester.usage);
+        await this.writeArtifact(runRoot, `08-tester-${fixAttempts === 0 ? 'initial' : `fix-${fixAttempts}`}.json`, tester.artifact);
+        await emit("agent:done", {
+          agentName: this.agentIdentity(config, "tester", "Nova").name,
+          role: tester.usage.resolvedAgentName,
+          label: this.agentIdentity(config, "tester", "Nova").label,
+          usage: tester.usage,
+        });
+      } else {
+        await emit("agent:skipped", {
+          agentName: this.agentIdentity(config, "tester", "Nova").name,
+          role: this.agentIdentity(config, "tester", "Nova").role,
+          label: this.agentIdentity(config, "tester", "Nova").label,
+          reason: "orchestrator_not_required",
+        });
+      }
+
+      // Check if tester passed
+      const testerStatus = tester.artifact?.status;
+      const hasCriticalIssues = testerStatus === "failed" || (testerStatus === "warning" && Array.isArray(tester.artifact?.findings) && tester.artifact.findings.length > 0);
+      
+      if (!hasCriticalIssues || !shouldUseDeveloper) {
+        break; // Tests passed or no developer to fix
+      }
+
+      // Tester found issues - send back to developer with tester feedback
+      fixAttempts++;
+      await emit("agent:note", {
+        agentName: this.agentIdentity(config, "coder", "Kai").name,
+        role: this.agentIdentity(config, "coder", "Kai").role,
+        label: this.agentIdentity(config, "coder", "Kai").label,
+        detail: `Тестер вернул статус "${testerStatus}". Исправляем найденные проблемы: ${tester.artifact?.findings?.join("; ") || "см. детали"}`,
+      });
+
+      await setAgentActivity("coder", "working", `Исправляет ошибки по отзыву тестера (попытка ${fixAttempts}/${maxFixAttempts}).`);
+      
+      const fixResult = await this.callAgent(
+        config,
+        "coder",
+        this.buildDeveloperFixPrompt(
+          run.task,
+          context,
+          orchestrator.artifact,
+          analyst.artifact,
+          currentDeveloperArtifact,
+          tester.artifact,
+          currentTestResults,
+          config,
+        ),
+        emit,
+      );
+      
+      trackUsage("developer", fixResult.usage);
+      currentDeveloperArtifact = fixResult.artifact;
+      await this.writeArtifact(runRoot, `03-developer-fix-${fixAttempts}.json`, fixResult.artifact);
+      
       await emit("agent:done", {
-        agentName: this.agentIdentity(config, "tester", "Nova").name,
-        role: tester.usage.resolvedAgentName,
-        label: this.agentIdentity(config, "tester", "Nova").label,
-        usage: tester.usage,
+        agentName: this.agentIdentity(config, "coder", "Kai").name,
+        role: fixResult.usage.resolvedAgentName,
+        label: this.agentIdentity(config, "coder", "Kai").label,
+        usage: fixResult.usage,
       });
-    } else {
-      await emit("agent:skipped", {
-        agentName: this.agentIdentity(config, "tester", "Nova").name,
-        role: this.agentIdentity(config, "tester", "Nova").role,
-        label: this.agentIdentity(config, "tester", "Nova").label,
-        reason: "orchestrator_not_required",
-      });
+
+      // Re-apply changes
+      if (config.run.applyChanges && Array.isArray(fixResult.artifact?.operations) && fixResult.artifact.operations.length > 0) {
+        await emit("agent:activity", {
+          agentName: this.agentIdentity(config, "coder", "Kai").name,
+          role: this.agentIdentity(config, "coder", "Kai").role,
+          label: this.agentIdentity(config, "coder", "Kai").label,
+          status: "working",
+          detail: `Применяет исправления к ${fixResult.artifact.operations.length} файлам.`,
+        });
+        const applyResult = await this.applyOperations(run.projectPath, fixResult.artifact.operations, runRoot, emit);
+        await this.writeArtifact(runRoot, `06-apply-fix-${fixAttempts}.json`, applyResult);
+        await emit("files:applied", applyResult);
+        await emit("agent:activity", {
+          agentName: this.agentIdentity(config, "coder", "Kai").name,
+          role: this.agentIdentity(config, "coder", "Kai").role,
+          label: this.agentIdentity(config, "coder", "Kai").label,
+          status: "idle",
+          detail: "Исправления применены.",
+        });
+      }
+
+      // Apply database operations from fix
+      if (Array.isArray(fixResult.artifact?.databaseOperations) && fixResult.artifact.databaseOperations.length > 0) {
+        await emit("agent:activity", {
+          agentName: this.agentIdentity(config, "coder", "Kai").name,
+          role: this.agentIdentity(config, "coder", "Kai").role,
+          label: this.agentIdentity(config, "coder", "Kai").label,
+          status: "working",
+          detail: `Выполняет ${fixResult.artifact.databaseOperations.length} операций с базой данных (fix).`,
+        });
+        const dbFixResult = await this.applyDatabaseOperations(fixResult.artifact.databaseOperations, emit);
+        await this.writeArtifact(runRoot, `06-db-apply-fix-${fixAttempts}.json`, dbFixResult);
+        await emit("db:applied", dbFixResult);
+        await emit("agent:activity", {
+          agentName: this.agentIdentity(config, "coder", "Kai").name,
+          role: this.agentIdentity(config, "coder", "Kai").role,
+          label: this.agentIdentity(config, "coder", "Kai").label,
+          status: "idle",
+          detail: "Операции с базой данных (fix) выполнены.",
+        });
+      }
+
+      // Re-run tests
+      currentTestResults = [];
+      if (shouldUseTester) {
+        await emit("agent:activity", {
+          agentName: this.agentIdentity(config, "tester", "Nova").name,
+          role: this.agentIdentity(config, "tester", "Nova").role,
+          label: this.agentIdentity(config, "tester", "Nova").label,
+          status: "working",
+          detail: `Перезапускает ${config.testing.commands?.length ?? 0} тестовых команд после исправлений.`,
+        });
+        for (const command of config.testing.commands ?? []) {
+          await emit("test:started", { command });
+          currentTestResults.push(await this.runShell(command, run.projectPath, emit));
+        }
+        await this.writeArtifact(runRoot, `07-local-tests-fix-${fixAttempts}.json`, currentTestResults);
+        await emit("tests:done", currentTestResults);
+        await emit("agent:activity", {
+          agentName: this.agentIdentity(config, "tester", "Nova").name,
+          role: this.agentIdentity(config, "tester", "Nova").role,
+          label: this.agentIdentity(config, "tester", "Nova").label,
+          status: "idle",
+          detail: "Повторные тесты завершены.",
+        });
+      }
     }
 
-    const orchestratorCanAnswerDirectly =
-      !shouldUseAnalyst && !shouldUseDeveloper && !shouldUseTester && Boolean(orchestrator.artifact?.messageToUser);
+    // Use the final developer artifact for the rest of the pipeline
+    const finalDeveloperArtifact = currentDeveloperArtifact;
+    const finalTesterArtifact = currentTesterArtifact;
 
-    const orchestratorResponse = orchestratorCanAnswerDirectly
-      ? {
-          artifact: {
-            message: orchestrator.artifact.messageToUser,
-            teamSummary: orchestrator.artifact.teamUnderstanding ?? [],
-            risks: orchestrator.artifact.constraints ?? [],
-            nextSteps: orchestrator.artifact.deliverables ?? [],
-          },
-          usage: null,
-        }
-      : await (async () => {
-          await setAgentActivity("pm", "working", "Готовит финальный ответ пользователю.");
-          const result = await this.callAgent(
-            config,
-            "pm",
-            this.buildOrchestratorFinalPrompt(
-              run.task,
-              orchestrator.artifact,
-              analyst.artifact,
-              developer.artifact,
-              tester.artifact,
+      // Step 5: Analyst updates documentation based on test results and developer changes
+      const analystFinal = shouldUseDeveloper && shouldUseAnalyst
+        ? await (async () => {
+            await setAgentActivity("researcher", "working", "Обновляет документацию по итогам разработки и тестирования.");
+            const result = await this.callAgent(
               config,
-            ),
-            emit,
-          );
-          await setAgentActivity("pm", "idle", "Финальный ответ подготовлен.");
-          return result;
-        })();
+              "researcher",
+              this.buildAnalystFinalPrompt(
+                run.task,
+                orchestrator.artifact,
+                analyst.artifact,
+                finalDeveloperArtifact,
+                finalTesterArtifact,
+                projectMemory,
+                config,
+              ),
+              emit,
+            );
+            await setAgentActivity("researcher", "idle", "Документация обновлена.");
+            return result;
+          })()
+        : null;
+     
+     if (shouldUseDeveloper && shouldUseAnalyst && analystFinal?.usage) {
+       trackUsage("analyst", analystFinal.usage);
+       await this.writeArtifact(runRoot, "06-analyst-final.json", analystFinal.artifact);
+       await emit("agent:done", {
+         agentName: this.agentIdentity(config, "researcher", "Mira").name,
+         role: analystFinal.usage.resolvedAgentName,
+         label: this.agentIdentity(config, "researcher", "Mira").label,
+         usage: analystFinal.usage,
+       });
+       
+       // Save analyst final insights to project memory
+       if (run.projectId && Array.isArray(analystFinal.artifact?.updatedMemory)) {
+         for (const memoryEntry of analystFinal.artifact.updatedMemory) {
+           await this.projectsService.saveMemory({
+             projectId: run.projectId,
+             title: memoryEntry.title || run.task.slice(0, 140),
+             summary: memoryEntry.summary || "",
+             details: memoryEntry.summary || "",
+             kind: memoryEntry.kind || "feature",
+             tags: memoryEntry.tags || [],
+             relatedFiles: memoryEntry.relatedFiles || [],
+             sourceRunId: run.id,
+           });
+         }
+         await emit("memory:saved-from-analyst-final", { 
+           projectId: run.projectId,
+           entriesSaved: analystFinal.artifact.updatedMemory.length 
+         });
+       }
+     }
+
+     const orchestratorCanAnswerDirectly =
+       !shouldUseAnalyst && !shouldUseDeveloper && !shouldUseTester && Boolean(orchestrator.artifact?.messageToUser);
+
+      const orchestratorResponse = orchestratorCanAnswerDirectly
+       ? {
+           artifact: {
+             message: orchestrator.artifact.messageToUser,
+             teamSummary: orchestrator.artifact.teamUnderstanding ?? [],
+             risks: orchestrator.artifact.constraints ?? [],
+             nextSteps: orchestrator.artifact.deliverables ?? [],
+           },
+           usage: null,
+         }
+       : await (async () => {
+           await setAgentActivity("pm", "working", "Готовит финальный ответ пользователю.");
+           const result = await this.callAgent(
+             config,
+             "pm",
+             this.buildOrchestratorFinalPrompt(
+               run.task,
+               orchestrator.artifact,
+               analyst.artifact,
+               finalDeveloperArtifact,
+               finalTesterArtifact,
+               config,
+             ),
+             emit,
+           );
+           await setAgentActivity("pm", "idle", "Финальный ответ подготовлен.");
+           return result;
+         })();
     if (orchestratorResponse.usage) {
       trackUsage("orchestrator", orchestratorResponse.usage);
       await emit("agent:done", {
@@ -649,12 +873,12 @@ export class RunsService {
       projectPath: run.projectPath,
       task: run.task,
       approvals: {
-        testerStatus: tester.artifact?.status ?? "not_requested",
+        testerStatus: finalTesterArtifact?.status ?? "not_requested",
       },
       orchestrator: orchestrator.artifact,
       analyst: analyst.artifact,
-      developer: developer.artifact,
-      tester: tester.artifact,
+      developer: finalDeveloperArtifact,
+      tester: finalTesterArtifact,
       orchestratorResponse: orchestratorResponse.artifact,
       applyResult,
       usageSummary,
@@ -684,6 +908,7 @@ export class RunsService {
     fileSnippets: Array<{ path: string; chars: number; snippet: string }>;
     allFiles: Array<{ fullPath: string; relativePath: string; score: number }>;
     projectMemory?: Array<any>;
+    database?: any;
   }> {
     const root = path.resolve(projectPath);
     const allFiles: Array<{ fullPath: string; relativePath: string }> = [];
@@ -1084,6 +1309,91 @@ export class RunsService {
     return { applied, skipped };
   }
 
+  private async applyDatabaseOperations(
+    operations: Array<any>,
+    emit?: (event: string, payload?: unknown) => Promise<void>,
+  ) {
+    const applied: Array<any> = [];
+    const skipped: Array<any> = [];
+
+    for (const operation of operations) {
+      if (emit) {
+        await emit("db:processing", { operation });
+      }
+
+      try {
+        let result: any;
+        switch (operation.type) {
+          case "delete_tasks": {
+            const { projectId, filter } = operation;
+            if (!projectId) {
+              throw new Error("projectId is required for delete_tasks");
+            }
+            const where: any = { projectId };
+            if (filter?.status) {
+              where.status = Array.isArray(filter.status) ? { $in: filter.status } : filter.status;
+            }
+            const tasks = await this.tasksRepository.find({ where });
+            for (const task of tasks) {
+              await this.tasksRepository.remove(task);
+            }
+            result = { deletedCount: tasks.length, taskIds: tasks.map(t => t.id) };
+            break;
+          }
+          case "update_task_status": {
+            const { taskId, status, reason } = operation;
+            if (!taskId || !status) {
+              throw new Error("taskId and status are required for update_task_status");
+            }
+            const task = await this.tasksRepository.findOneBy({ id: taskId });
+            if (!task) {
+              throw new Error(`Task ${taskId} not found`);
+            }
+            task.status = status;
+            task.updatedAt = new Date();
+            await this.tasksRepository.save(task);
+            // Add comment
+            await this.tasksService.addResultComment(taskId, {
+              content: `Status changed by agent: ${reason || `Set to ${status}`}`,
+              author: "agent",
+            });
+            result = { taskId, status, previousStatus: task.status };
+            break;
+          }
+          case "create_task": {
+            const { projectId, title, description, status, reason } = operation;
+            if (!projectId || !title) {
+              throw new Error("projectId and title are required for create_task");
+            }
+            const saved = await this.tasksService.save({
+              projectId,
+              title,
+              description: description || "",
+              status: status || "backlog",
+            });
+            result = { taskId: saved.id, title: saved.title, status: saved.status };
+            break;
+          }
+          default:
+            throw new Error(`Unknown database operation type: ${operation.type}`);
+        }
+
+        applied.push({ operation, result });
+        if (emit) {
+          await emit("db:applied", { operation, result });
+        }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        skipped.push({ operation, reason: errorMsg });
+        if (emit) {
+          await emit("db:skipped", { operation, reason: errorMsg });
+        }
+      }
+    }
+
+    return { applied, skipped };
+  }
+
   private async runShell(command: string, cwd: string, emit?: (event: string, payload?: unknown) => Promise<void>) {
     const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
@@ -1185,6 +1495,8 @@ Your name is ${self.name}. Your role title is ${self.label}.
 You are the orchestrator and public representative of the whole team.
 You are the single entry point for the user. You must understand who is in the team,
 what each role is responsible for, and decide how to delegate the work.
+You have access to DATABASE CONTEXT (projects, tasks, teams, providers, project memory).
+Use this to understand the current state before delegating.
 Delegate only when another role is truly needed. If you can answer the user yourself,
 keep delegationPlan empty and put the direct answer into messageToUser.
 Output schema:
@@ -1206,12 +1518,15 @@ Output schema:
         },
         null,
         2,
-      )}`,
+      )}\n\nDatabase context:\n${JSON.stringify(context.database ?? {}, null, 2)}`,
     };
   }
 
   private buildAnalystPrompt(task: string, context: any, orchestratorArtifact: any, config: TeamConfig) {
     const self = this.agentIdentity(config, "researcher", "Mira");
+    const delegationPlan = orchestratorArtifact?.delegationPlan ?? [];
+    const hasDelegationPlan = Array.isArray(delegationPlan) && delegationPlan.length > 0;
+    
     return {
       systemPrompt: `${this.sharedRules()}
 ${this.languageInstruction(config)}
@@ -1222,6 +1537,13 @@ First use the provided project memory to reuse known knowledge and prior decisio
 Only if the memory is insufficient should you rely on code inspection.
 You are given a partial set of focused file snippets plus a broader project file list.
 Do not claim files are missing unless they are absent from the provided project file list.
+
+CRITICAL: If the orchestrator's delegationPlan contains specific taskIds and rules for classification (e.g., deduplication, status updates), you MUST return a CONCRETE ACTION PLAN in implementationHints as a JSON array:
+[
+  {"taskId": "task-...", "action": "close_as_duplicate_of|keep_as_original|keep_active", "targetOriginalId": "task-...", "newStatus": "done|in_progress|backlog"}
+]
+for EACH taskId mentioned in the delegationPlan. Do NOT write "need to read files" — the orchestrator will provide file data separately. Your job is CLASSIFICATION based on the rules given.
+
 Output schema:
 {
   "summary": "string",
@@ -1231,7 +1553,7 @@ Output schema:
   "implementationHints": ["string"],
   "acceptanceCriteria": ["string"]
 }`,
-      userPrompt: `Task:\n${task}\n\nOrchestrator artifact:\n${JSON.stringify(orchestratorArtifact, null, 2)}\n\nProject memory:\n${JSON.stringify(
+      userPrompt: `Task:\n${task}\n\nOrchestrator artifact (includes delegationPlan with rules and taskIds):\n${JSON.stringify(orchestratorArtifact, null, 2)}\n\n${hasDelegationPlan ? `DELEGATION PLAN TASK IDs TO CLASSIFY:\n${delegationPlan.map((d: any) => d.objective).join("\n")}\n\n` : ""}Database context:\n${JSON.stringify(context.database ?? {}, null, 2)}\n\nProject memory:\n${JSON.stringify(
         (context.projectMemory ?? []).map((entry: any) => ({
           title: entry.title,
           summary: entry.summary,
@@ -1266,12 +1588,15 @@ Output schema:
       systemPrompt: `${this.sharedRules()}
 ${this.languageInstruction(config)}
 Your name is ${self.name}. Your role title is ${self.label}.
-You are the developer. Implement the task using the analyst guidance and project context.
-Produce concrete file operations.
-If the task requires code or UI changes, operations must not be empty.
-Do not answer with high-level advice only when concrete implementation is expected.
-You are given a partial set of focused file snippets plus a broader project file list.
-Do not claim files are missing unless they are absent from the provided project file list.
+You are the developer. Implement the task STRICTLY following the analyst's guidance.
+The analyst has studied the codebase and provided implementation hints, relevant files, and acceptance criteria.
+You MUST:
+1. Follow the analyst's implementationHints and relevantFiles exactly
+2. Ensure your changes satisfy the analyst's acceptanceCriteria
+3. Only modify files listed in relevantFiles unless absolutely necessary
+4. Produce concrete file operations - operations array must not be empty for code tasks
+5. Return full file content for each operation (not diffs)
+If you cannot implement per analyst guidance, explain in notes why and what's blocking.
 Output schema:
 {
   "summary": "string",
@@ -1283,6 +1608,28 @@ Output schema:
       "content": "full file content"
     }
   ],
+  "databaseOperations": [
+    {
+      "type": "delete_tasks",
+      "projectId": "string",
+      "filter": { "status": ["backlog", "in_progress"] },
+      "reason": "string"
+    },
+    {
+      "type": "update_task_status",
+      "taskId": "string",
+      "status": "backlog|todo|in_progress|review|done",
+      "reason": "string"
+    },
+    {
+      "type": "create_task",
+      "projectId": "string",
+      "title": "string",
+      "description": "string",
+      "status": "backlog|todo|in_progress|review|done",
+      "reason": "string"
+    }
+  ],
   "notes": ["string"],
   "testsToRun": ["string"]
 }`,
@@ -1290,7 +1637,11 @@ Output schema:
         orchestratorArtifact,
         null,
         2
-      )}\n\nProject memory:\n${JSON.stringify(
+      )}\n\n=== ANALYST GUIDANCE (MANDATORY TO FOLLOW) ===\n${JSON.stringify(
+        analystArtifact,
+        null,
+        2
+      )}\n\nDatabase context:\n${JSON.stringify(context.database ?? {}, null, 2)}\n\nProject memory:\n${JSON.stringify(
         (context.projectMemory ?? []).map((entry: any) => ({
           title: entry.title,
           summary: entry.summary,
@@ -1303,10 +1654,6 @@ Output schema:
         context.tree.slice(0, 400),
         null,
         2,
-      )}\n\nAnalyst artifact:\n${JSON.stringify(
-        analystArtifact,
-        null,
-        2
       )}\n\nWorkspace file snippets:\n${JSON.stringify(
         context.fileSnippets,
         null,
@@ -1328,13 +1675,9 @@ Output schema:
       systemPrompt: `${this.sharedRules()}
 ${this.languageInstruction(config)}
 Your name is ${self.name}. Your role title is ${self.label}.
-You are retrying because your previous answer did not include concrete file changes.
-For this retry, you must either:
-1. return at least one valid file operation, or
-2. clearly state a blocking reason in notes and keep operations empty only if implementation is impossible.
-Do not return vague guidance without concrete edits when the task is implementable.
-You are given a partial set of focused file snippets plus a broader project file list.
-Do not claim files are missing unless they are absent from the provided project file list.
+You are retrying because your previous answer did not include concrete file changes OR the tester found issues.
+You MUST follow the analyst's guidance strictly. The analyst has provided implementationHints, relevantFiles, and acceptanceCriteria.
+Fix the implementation to satisfy all acceptance criteria.
 Output schema:
 {
   "summary": "string",
@@ -1353,6 +1696,10 @@ Output schema:
         orchestratorArtifact,
         null,
         2,
+      )}\n\n=== ANALYST GUIDANCE (MANDATORY TO FOLLOW) ===\n${JSON.stringify(
+        analystArtifact,
+        null,
+        2
       )}\n\nProject memory:\n${JSON.stringify(
         (context.projectMemory ?? []).map((entry: any) => ({
           title: entry.title,
@@ -1366,12 +1713,77 @@ Output schema:
         context.tree.slice(0, 400),
         null,
         2,
-      )}\n\nAnalyst artifact:\n${JSON.stringify(
-        analystArtifact,
+      )}\n\nPrevious developer artifact (had issues):\n${JSON.stringify(
+        previousDeveloperArtifact,
         null,
         2,
-      )}\n\nPrevious developer artifact:\n${JSON.stringify(
+      )}\n\nWorkspace file snippets:\n${JSON.stringify(
+        context.fileSnippets,
+        null,
+        2,
+      )}`,
+    };
+  }
+
+  private buildDeveloperFixPrompt(
+    task: string,
+    context: any,
+    orchestratorArtifact: any,
+    analystArtifact: any,
+    previousDeveloperArtifact: any,
+    testerArtifact: any,
+    testResults: any[],
+    config: TeamConfig,
+  ) {
+    const self = this.agentIdentity(config, "coder", "Kai");
+    return {
+      systemPrompt: `${this.sharedRules()}
+${this.languageInstruction(config)}
+Your name is ${self.name}. Your role title is ${self.label}.
+You are fixing issues found by the tester. The tester returned status "${testerArtifact?.status}" with findings.
+You MUST follow the analyst's guidance strictly AND address all tester findings.
+Fix the implementation to satisfy all acceptance criteria AND pass tests.
+Output schema:
+{
+  "summary": "string",
+  "operations": [
+    {
+      "path": "relative/path",
+      "action": "create|update",
+      "reason": "string",
+      "content": "full file content"
+    }
+  ],
+  "notes": ["string"],
+  "testsToRun": ["string"]
+}`,
+      userPrompt: `Task:\n${task}\n\nOrchestrator artifact:\n${JSON.stringify(
+        orchestratorArtifact,
+        null,
+        2
+      )}\n\n=== ANALYST GUIDANCE (MANDATORY TO FOLLOW) ===\n${JSON.stringify(
+        analystArtifact,
+        null,
+        2
+      )}\n\n=== TESTER FEEDBACK (MUST FIX) ===\n${JSON.stringify(
+        testerArtifact,
+        null,
+        2
+      )}\n\nLocal test results:\n${JSON.stringify(testResults, null, 2)}\n\nPrevious developer artifact (had issues):\n${JSON.stringify(
         previousDeveloperArtifact,
+        null,
+        2
+      )}\n\nProject memory:\n${JSON.stringify(
+        (context.projectMemory ?? []).map((entry: any) => ({
+          title: entry.title,
+          summary: entry.summary,
+          kind: entry.kind,
+          relatedFiles: entry.relatedFiles,
+        })),
+        null,
+        2,
+      )}\n\nProject file list:\n${JSON.stringify(
+        context.tree.slice(0, 400),
         null,
         2,
       )}\n\nWorkspace file snippets:\n${JSON.stringify(
@@ -1507,5 +1919,148 @@ Output schema:
         2,
       )}`,
     };
+  }
+
+  private buildAnalystFinalPrompt(task: string, orchestratorArtifact: any, analystArtifact: any, developerArtifact: any, testerArtifact: any, projectMemory: any[], config: TeamConfig) {
+    const self = this.agentIdentity(config, "researcher", "Mira");
+    return {
+      systemPrompt: `${this.sharedRules()}
+${this.languageInstruction(config)}
+Your name is ${self.name}. Your role title is ${self.label}.
+You are the analyst. Your task is to update the project memory based on what was just implemented and tested.
+Consolidate the learnings into actionable insights that will help future tasks.
+Output schema:
+{
+  "summary": "string",
+  "updatedMemory": [
+    {
+      "title": "string",
+      "summary": "string",
+      "kind": "feature|research|decision",
+      "tags": ["string"],
+      "relatedFiles": ["string"]
+    }
+  ],
+  "lessonsLearned": ["string"],
+  "nextResearchTopics": ["string"]
+}`,
+      userPrompt: `Task:\n${task}\n\nInitial analyst findings:\n${JSON.stringify(
+        analystArtifact,
+        null,
+        2,
+      )}\n\nImplementation result:\n${JSON.stringify(
+        developerArtifact,
+        null,
+        2,
+      )}\n\nTest results:\n${JSON.stringify(
+        testerArtifact,
+        null,
+        2,
+      )}\n\nCurrent project memory:\n${JSON.stringify(
+        projectMemory.map((entry: any) => ({
+          title: entry.title,
+          summary: entry.summary,
+          kind: entry.kind,
+          tags: entry.tags,
+          relatedFiles: entry.relatedFiles,
+        })),
+        null,
+        2,
+      )}`,
+    };
+  }
+
+  private async buildDatabaseContext(projectId?: string, teamId?: string | null) {
+    const context: any = {};
+    
+    if (projectId) {
+      const project = await this.projectsRepository.findOne({ where: { id: projectId }, relations: ['team'] });
+      if (project) {
+        context.project = {
+          id: project.id,
+          name: project.name,
+          description: project.description,
+          localPath: project.localPath,
+          containerPath: project.containerPath,
+          teamId: project.teamId,
+        };
+        
+        // Tasks for this project
+        const tasks = await this.tasksRepository.find({ 
+          where: { projectId },
+          order: { updatedAt: 'DESC' },
+          take: 100,
+        });
+        context.tasks = tasks.map(t => ({
+          id: t.id,
+          title: t.title,
+          description: t.description,
+          status: t.status,
+          sourceChatId: t.sourceChatId,
+          createdAt: t.createdAt,
+          updatedAt: t.updatedAt,
+        }));
+        
+        // Project memory
+        const memory = await this.projectsService.listMemory(projectId);
+        context.projectMemory = memory.map(m => ({
+          id: m.id,
+          title: m.title,
+          summary: m.summary,
+          details: m.details,
+          kind: m.kind,
+          tags: m.tags,
+          relatedFiles: m.relatedFiles,
+          sourceRunId: m.sourceRunId,
+        }));
+      }
+    }
+    
+    if (teamId) {
+      const team = await this.teamsService.getById(teamId).catch(() => null);
+      if (team) {
+        const config = (team.config || {}) as Record<string, any>;
+        context.team = {
+          id: team.id,
+          name: team.name,
+          description: team.description,
+          providerId: team.providerId,
+          language: config.language,
+          budget: config.budget,
+          workspace: config.workspace,
+          run: config.run,
+          testing: config.testing,
+          agents: Object.entries(config.agents || {}).map(([role, agent]: [string, any]) => ({
+            role,
+            name: agent?.name,
+            label: agent?.label,
+            model: agent?.model,
+            multiplier: agent?.multiplier,
+            temperature: agent?.temperature,
+          })),
+        };
+      }
+    }
+    
+    // All providers
+    const providers = await this.providersRepository.find();
+    context.providers = providers.map(p => ({
+      id: p.id,
+      name: p.name,
+      baseUrl: p.baseUrl,
+      modelsUrl: p.modelsUrl,
+      isCurrent: p.isCurrent,
+    }));
+    
+    // All teams (summary) - use repository directly
+    const teams = await this.projectsRepository.manager.getRepository(TeamEntity).find();
+    context.teams = teams.map(t => ({
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      providerId: t.providerId,
+    }));
+    
+    return context;
   }
 }

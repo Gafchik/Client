@@ -276,59 +276,6 @@ function formatActivityEntry(entry: { at: string; event: string; payload?: unkno
   return `Событие: ${entry.event}`;
 }
 
-function avatarColor(item: any): string {
-  const colors: Record<string, string> = {
-    orchestrator: '#6366f1',
-    pm: '#6366f1',
-    analyst: '#10b981',
-    researcher: '#10b981',
-    developer: '#f59e0b',
-    coder: '#f59e0b',
-    tester: '#ef4444',
-    system: '#6b7280',
-    user: '#3b82f6',
-  };
-  const role = item.agentRole || item.role || 'system';
-  return colors[role] || colors.system;
-}
-
-function agentInitial(item: any): string {
-  const name = item.name || item.label || '?';
-  return name.charAt(0).toUpperCase();
-}
-
-function messageName(item: any): string {
-  if (item.type === 'user') return 'Вы';
-  if (item.type === 'assistant' || item.type === 'run-summary') return `${item.name || 'Alex'} (${item.label || 'Оркестратор'})`;
-  if (item.type === 'agent-status') return `${item.name || 'Agent'} (${item.label || item.agentRole})`;
-  if (item.type === 'system') return 'Система';
-  if (item.type === 'token-summary') return 'Токены';
-  return 'Неизвестно';
-}
-
-function formatMessageContent(item: any): string {
-  if (!item.content) return '';
-  const escaped = item.content
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\n/g, '<br>');
-  if (item.type === 'agent-status') {
-    return `<span class="agent-status-text">${escaped}</span>`;
-  }
-  if (item.type === 'system') {
-    return `<span class="system-text">${escaped}</span>`;
-  }
-  if (item.type === 'run-summary') {
-    return `<div class="run-summary-text">${escaped}</div>`;
-  }
-  return escaped;
-}
-
-function formatTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-}
-
 const activityFeed = computed(() =>
   latestRunEvents.value
     .filter((entry) =>
@@ -409,137 +356,6 @@ const displayedMessages = computed(() => {
   }
   return merged.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
 });
-
-const unifiedChatStream = computed(() => {
-  const stream: Array<{
-    id: string;
-    type: 'user' | 'assistant' | 'system' | 'agent-status' | 'run-summary' | 'token-summary';
-    role?: string;
-    name?: string;
-    label?: string;
-    content: string;
-    createdAt: string;
-    meta?: any;
-    status?: 'working' | 'idle' | 'done' | 'error';
-    agentRole?: string;
-  }> = [];
-
-  for (const msg of displayedMessages.value) {
-    if (msg.role === 'user') {
-      stream.push({
-        id: msg.id,
-        type: 'user',
-        content: msg.content,
-        createdAt: msg.createdAt,
-        meta: msg.meta,
-      });
-    } else {
-      stream.push({
-        id: msg.id,
-        type: 'assistant',
-        role: msg.meta?.usage?.role || 'assistant',
-        name: msg.meta?.usage?.name || 'Alex',
-        label: msg.meta?.usage?.label || 'Оркестратор',
-        content: msg.content,
-        createdAt: msg.createdAt,
-        meta: msg.meta,
-      });
-    }
-  }
-
-  if (state.runEvents.length) {
-    for (const entry of state.runEvents) {
-      if (entry.event === 'agent:activity' && entry.payload) {
-        const payload = entry.payload as any;
-        stream.push({
-          id: `activity-${entry.at}-${payload.role}`,
-          type: 'agent-status',
-          agentRole: payload.role,
-          name: payload.agentName,
-          label: payload.label,
-          content: payload.detail,
-          createdAt: entry.at,
-          status: payload.status,
-        });
-      } else if (entry.event === 'agent:done' && entry.payload) {
-        const payload = entry.payload as any;
-        stream.push({
-          id: `done-${entry.at}-${payload.role}`,
-          type: 'agent-status',
-          agentRole: payload.role,
-          name: payload.agentName,
-          label: payload.label,
-          content: `✓ Завершил: ${payload.detail || 'этап'}`,
-          createdAt: entry.at,
-          status: 'done',
-        });
-      } else if (entry.event === 'agent:skipped' && entry.payload) {
-        const payload = entry.payload as any;
-        stream.push({
-          id: `skipped-${entry.at}-${payload.role}`,
-          type: 'agent-status',
-          agentRole: payload.role,
-          name: payload.agentName,
-          label: payload.label,
-          content: `⊘ Пропущен: ${payload.reason || 'не требуется'}`,
-          createdAt: entry.at,
-          status: 'idle',
-        });
-      } else if (entry.event === 'run:blocked') {
-        stream.push({
-          id: `blocked-${entry.at}`,
-          type: 'system',
-          content: `⚠ Запуск остановлен: ${(entry.payload as any)?.detail}`,
-          createdAt: entry.at,
-        });
-      } else if (entry.event === 'files:applied') {
-        const payload = entry.payload as any;
-        stream.push({
-          id: `applied-${entry.at}`,
-          type: 'system',
-          content: `📝 Применено изменений: ${payload.applied?.length || 0}, пропущено: ${payload.skipped?.length || 0}`,
-          createdAt: entry.at,
-        });
-      } else if (entry.event === 'tests:done') {
-        const payload = entry.payload as any;
-        const passed = payload?.filter((t: any) => t.success).length || 0;
-        const failed = payload?.filter((t: any) => !t.success).length || 0;
-        stream.push({
-          id: `tests-${entry.at}`,
-          type: 'system',
-          content: `🧪 Тесты: ${passed} пройдено, ${failed} упало`,
-          createdAt: entry.at,
-        });
-      }
-    }
-  }
-
-  if (state.report) {
-    const report = state.report as any;
-    stream.push({
-      id: `summary-${state.selectedRunId}`,
-      type: 'run-summary',
-      name: 'Alex',
-      label: 'Оркестратор',
-      content: report.orchestratorResponse?.message || 'Запуск завершен',
-      createdAt: report.generatedAt || new Date().toISOString(),
-      meta: { usageSummary: report.usageSummary },
-    });
-
-    if (report.usageSummary) {
-      stream.push({
-        id: `tokens-${state.selectedRunId}`,
-        type: 'token-summary',
-        content: '',
-        createdAt: report.generatedAt || new Date().toISOString(),
-        meta: { usageSummary: report.usageSummary },
-      });
-    }
-  }
-
-  return stream.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
-});
-
 const tokenRoleStats = computed(() =>
   Object.entries(state.chatStats.byRole)
     .map(([role, usage]) => ({ role, ...usage }))
@@ -1325,114 +1141,138 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="workspace-chat panel panel-stack">
-          <div class="chat-header">
-            <div class="chat-header-left">
-              <h3>{{ selectedChat?.title || "Новый чат" }}</h3>
-              <span v-if="state.runStatus" class="run-status-badge" :class="state.runStatus">{{ state.runStatus }}</span>
+          <div class="workspace-chat-header">
+            <div>
+              <h3>Чат с оркестратором</h3>
+              <p>Большой рабочий чат. Здесь можно обсуждать проект, ставить задачи и просить оркестратора создать новые задачи.</p>
             </div>
-            <div class="chat-header-right">
-              <div class="chat-stats-mini">
-                <span class="stat" title="Actual tokens">{{ state.chatStats.totalActualTokens.toLocaleString() }} act</span>
-                <span class="stat" title="Weighted tokens">{{ state.chatStats.totalWeightedTokens.toLocaleString() }} wgt</span>
-                <span class="stat" title="Runs">{{ state.chatStats.runCount }} runs</span>
-              </div>
-              <button class="ghost-button mini danger-button" :disabled="state.busy || !selectedChat" @click="selectedChat && deleteChat(selectedChat.id)" title="Удалить чат">
-                ×
+            <div class="workspace-chat-actions">
+              <div class="pill">{{ selectedChat?.title || "Без чата" }}</div>
+              <button class="ghost-button mini danger-button" :disabled="state.busy || !selectedChat" @click="selectedChat && deleteChat(selectedChat.id)">
+                Удалить чат
               </button>
             </div>
           </div>
-
-          <div ref="messagesListRef" class="chat-messages">
-            <div v-if="unifiedChatStream.length === 0" class="chat-empty">
-              <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-              </svg>
-              <p>Выбери проект, создай чат и отправь первую задачу оркестратору.</p>
+          <div class="chat-progress-strip">
+            <article class="progress-chip">
+              <span>Текущий фокус</span>
+              <strong>{{ progressSummary.currentTask?.title || (progressSummary.inProgressCount ? `${progressSummary.inProgressCount} задач в работе` : "Нет активной задачи") }}</strong>
+            </article>
+            <article class="progress-chip">
+              <span>Сделано</span>
+              <strong>{{ progressSummary.doneCount }}</strong>
+            </article>
+            <article class="progress-chip">
+              <span>Бэклог</span>
+              <strong>{{ progressSummary.backlogCount }}</strong>
+            </article>
+          </div>
+          <div class="activity-panel">
+            <div class="section-heading compact-heading">
+              <div>
+                <h3>Что делает команда</h3>
+                <p>Живой лог работы оркестратора и агентов.</p>
+              </div>
             </div>
+            <div class="activity-feed">
+              <article v-for="entry in activityFeed" :key="`${entry.at}-${entry.event}`" class="activity-item">
+                <strong>{{ formatActivityEntry(entry) }}</strong>
+                <span>{{ new Date(entry.at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) }}</span>
+              </article>
+              <div v-if="!activityFeed.length" class="empty-block activity-empty">
+                Пока нет живых событий. Запусти задачу или дай оркестратору поручение на выполнение.
+              </div>
+            </div>
+          </div>
+          <div ref="messagesListRef" class="messages-list">
+            <article v-for="message in displayedMessages" :key="message.id" class="message-card" :class="[message.role, { 'team-live-message': String(message.id).startsWith('live-') }]">
+              <strong>
+                {{
+                  message.role === 'assistant'
+                    ? `${message.meta?.usage?.name || 'Alex'} (${message.meta?.usage?.label || 'Оркестратор'})`
+                    : 'user'
+                }}
+              </strong>
+              <pre>{{ message.content }}</pre>
+              <div v-if="message.meta?.usage" class="message-usage">
+                {{ message.meta.usage.totalTokens.toLocaleString() }} actual ·
+                {{ message.meta.usage.weightedTokens.toLocaleString() }} weighted ·
+                {{ message.meta.usage.model }}
+              </div>
+            </article>
+          </div>
+          <div v-if="!state.messages.length" class="empty-block">
+            Выбери проект, создай чат и отправь первую задачу оркестратору.
+          </div>
+          <div class="workspace-composer">
+            <textarea v-model="chatDraft" rows="5" placeholder="Например: кто в команде, что сейчас в работе, добавь задачу на экспорт CSV" />
+            <div class="inline-actions">
+              <button class="primary-button full-width" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage">
+                Написать оркестратору
+              </button>
+              <button class="ghost-button full-width" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="runTask">
+                Запустить выполнение
+              </button>
+            </div>
+          </div>
+        </div>
 
-            <div v-else class="message-stream">
-              <div 
-                v-for="item in unifiedChatStream" 
-                :key="item.id" 
-                class="message-row"
-                :class="[item.type, item.status]"
+        <div class="workspace-rail">
+          <div class="panel panel-stack rail-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Состав команды</h3>
+                <p>Кто сейчас в команде проекта и чем занят.</p>
+              </div>
+            </div>
+            <div class="team-roster">
+              <article
+                v-for="agent in teamRosterStatus"
+                :key="agent.role"
+                class="roster-card"
               >
-                <div class="message-avatar" :style="{ backgroundColor: avatarColor(item) }">
-                  <span v-if="item.type === 'user'">👤</span>
-                  <span v-else-if="item.type === 'assistant' || item.type === 'run-summary'">{{ agentInitial(item) }}</span>
-                  <span v-else-if="item.type === 'agent-status'">{{ agentInitial(item) }}</span>
-                  <span v-else-if="item.type === 'system'">⚙</span>
-                  <span v-else-if="item.type === 'token-summary'">📊</span>
+                <div class="roster-head">
+                  <span class="agent-lamp" :class="{ working: agent.isWorking }"></span>
+                  <strong>{{ agent.name }}</strong>
                 </div>
-                <div class="message-bubble">
-                  <div class="message-header">
-                    <span class="message-name">{{ messageName(item) }}</span>
-                    <span class="message-time">{{ formatTime(item.createdAt) }}</span>
-                    <span v-if="item.status === 'working'" class="status-indicator working" title="Работает...">●</span>
-                    <span v-else-if="item.status === 'done'" class="status-indicator done" title="Завершено">✓</span>
-                    <span v-else-if="item.status === 'idle'" class="status-indicator idle" title="Пропущен">⊘</span>
-                  </div>
-                  <div class="message-content" v-html="formatMessageContent(item)"></div>
-                  <div v-if="item.meta?.usage" class="message-usage">
-                    <span>{{ item.meta.usage.totalTokens.toLocaleString() }} actual</span>
-                    <span>·</span>
-                    <span>{{ item.meta.usage.weightedTokens.toLocaleString() }} weighted</span>
-                    <span>·</span>
-                    <span>{{ item.meta.usage.model }}</span>
-                    <span v-if="item.meta.usage.multiplier">(×{{ item.meta.usage.multiplier }})</span>
-                  </div>
-                  <div v-if="item.type === 'token-summary' && item.meta?.usageSummary" class="token-summary-detail">
-                    <div class="token-total">
-                      <span>Всего: {{ item.meta.usageSummary.totalActualTokens.toLocaleString() }} actual</span>
-                      <span>·</span>
-                      <span>{{ item.meta.usageSummary.totalWeightedTokens.toLocaleString() }} weighted</span>
-                    </div>
-                    <div class="token-by-role">
-                      <div v-for="(usage, role) in item.meta.usageSummary.byAgent" :key="role" class="token-role-row">
-                        <span class="role-name">{{ role }}</span>
-                        <span>{{ usage.actualTokens.toLocaleString() }} act</span>
-                        <span>{{ usage.weightedTokens.toLocaleString() }} wgt</span>
-                        <span>(×{{ usage.multiplier }})</span>
-                      </div>
-                    </div>
-                  </div>
+                <span>{{ agent.label }}</span>
+                <small>{{ agent.role }} · {{ agent.model }}</small>
+                <p>{{ agent.detail }}</p>
+                <div class="roster-usage">
+                  <span>{{ agent.actualTokens.toLocaleString() }} actual</span>
+                  <span>{{ agent.weightedTokens.toLocaleString() }} weighted</span>
                 </div>
-              </div>
-            </div>
-
-            <div v-if="state.busy && state.runEvents.length" class="typing-indicator">
-              <span class="dot"></span>
-              <span class="dot"></span>
-              <span class="dot"></span>
-              <span>Агенты работают...</span>
+              </article>
             </div>
           </div>
 
-          <div class="chat-composer">
-            <div class="composer-input-wrapper">
-              <textarea 
-                v-model="chatDraft" 
-                rows="3" 
-                placeholder="Например: кто в команде, что сейчас в работе, добавь задачу на экспорт CSV"
-                @keydown.enter.exact.shift="sendChatMessage"
-                @keydown.enter.prevent="runTask"
-              ></textarea>
-              <div class="composer-hint">Enter — отправить сообщение, Shift+Enter — запустить выполнение</div>
+          <div class="panel panel-stack rail-panel">
+            <div class="section-heading">
+              <div>
+                <h3>Токены</h3>
+                <p>Статистика по чату и участникам команды.</p>
+              </div>
             </div>
-            <div class="composer-actions">
-              <button class="primary-button" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M22 2L11 13"></path>
-                  <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
-                </svg>
-                Отправить
-              </button>
-              <button class="secondary-button" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="runTask">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polygon points="5 3 19 12 5 21 5 3"></polygon>
-                </svg>
-                Запуск
-              </button>
+            <div class="token-summary-grid">
+              <article class="token-summary-card">
+                <span>Всего actual</span>
+                <strong>{{ state.chatStats.totalActualTokens.toLocaleString() }}</strong>
+              </article>
+              <article class="token-summary-card">
+                <span>Всего weighted</span>
+                <strong>{{ state.chatStats.totalWeightedTokens.toLocaleString() }}</strong>
+              </article>
+            </div>
+            <div class="token-role-list">
+              <article v-for="item in tokenRoleStats" :key="item.role" class="token-role-card">
+                <strong>{{ item.name || item.label || item.role }}</strong>
+                <span>{{ item.model || item.role }}</span>
+                <small>{{ item.calls }} вызовов</small>
+                <div class="roster-usage">
+                  <span>{{ item.actualTokens.toLocaleString() }} actual</span>
+                  <span>{{ item.weightedTokens.toLocaleString() }} weighted</span>
+                </div>
+              </article>
             </div>
           </div>
         </div>
