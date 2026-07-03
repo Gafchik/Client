@@ -334,6 +334,9 @@ export class ChatsService {
       const run = await this.runsService.startRun({
         chatId: chat.id,
         task: executionTask,
+        teamId: resolvedTeamId,
+        teamName: team.name,
+        projectPath: project.localPath,
       });
       autoRunId = run.runId;
     }

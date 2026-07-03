@@ -32,8 +32,12 @@ export class RunsService {
 
   async startRun(dto: StartRunDto): Promise<{ runId: string }> {
     const run = this.runRepo.create({
+      id: crypto.randomUUID(),
       chatId: dto.chatId,
       task: dto.task,
+      teamId: dto.teamId,
+      teamName: dto.teamName,
+      projectPath: dto.projectPath,
       status: 'running',
       startedAt: new Date(),
     });

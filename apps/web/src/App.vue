@@ -1129,27 +1129,6 @@ function applyModel(role: string, modelId: string) {
   selectedTeam.value.agents[role].multiplier = model.multiplier;
 }
 
-async function runTask() {
-  if (!selectedChat.value || !chatDraft.value.trim()) return;
-  state.busy = true;
-  try {
-    await saveProject();
-    await saveTeam();
-    const response = await api.startRun({
-      chatId: selectedChat.value.id,
-      task: chatDraft.value,
-    });
-    state.selectedRunId = response.runId;
-    state.runStatus = "queued";
-    state.runEvents = [];
-    state.runError = "";
-    state.report = null;
-    startPolling(response.runId);
-  } finally {
-    state.busy = false;
-  }
-}
-
 function startPolling(runId: string) {
   if (pollTimer) window.clearInterval(pollTimer);
   const tick = async () => {
@@ -1555,9 +1534,9 @@ onBeforeUnmount(() => {
                 rows="3" 
                 placeholder="Например: кто в команде, что сейчас в работе, добавь задачу на экспорт CSV"
                 @keydown.enter.exact.shift="sendChatMessage"
-                @keydown.enter.prevent="runTask"
+                @keydown.enter.prevent="sendChatMessage"
               ></textarea>
-              <div class="composer-hint">Enter — отправить сообщение, Shift+Enter — запустить выполнение</div>
+              <div class="composer-hint">Enter — отправить сообщение</div>
             </div>
             <div class="composer-actions">
               <button class="primary-button" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage">
@@ -1566,12 +1545,6 @@ onBeforeUnmount(() => {
                   <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
                 </svg>
                 Отправить
-              </button>
-              <button class="secondary-button" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="runTask">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polygon points="5 3 19 12 5 21 5 3"></polygon>
-                </svg>
-                Запуск
               </button>
             </div>
           </div>
