@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
 import path from "node:path";
+import * as fs from "fs";
 import { Repository } from "typeorm";
 import { ProjectMemoryEntryEntity } from "../../persistence/project-memory.entity.js";
 import { ProjectEntity } from "../../persistence/project.entity.js";
@@ -83,6 +84,21 @@ export class ProjectsService {
       throw new Error("localPath is required");
     }
     const team = input.teamId ? await this.teamsRepository.findOneBy({ id: input.teamId }) : existing?.teamId ? await this.teamsRepository.findOneBy({ id: existing.teamId }) : null;
+
+    const absoluteLocalPath = path.resolve(localPath);
+    const localRoot = path.resolve(this.configService.get<string>("LOCAL_PROJECTS_ROOT", "/Users/evgenii"));
+    
+    if (!absoluteLocalPath.startsWith(localRoot)) {
+      throw new Error(`Project path must be inside ${localRoot}`);
+    }
+
+    if (!fs.existsSync(absoluteLocalPath)) {
+      try {
+        fs.mkdirSync(absoluteLocalPath, { recursive: true });
+      } catch (e) {
+        throw new Error(`Cannot create directory ${localPath}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
 
     const entity = this.projectsRepository.create({
       id: existing?.id || `project-${Date.now()}`,

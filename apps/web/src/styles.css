@@ -1177,6 +1177,32 @@ textarea {
   margin-left: auto;
 }
 
+.copy-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 140ms ease;
+  margin-left: 8px;
+}
+
+.copy-button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--line-strong);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+.copy-button:active {
+  transform: scale(0.95);
+}
+
 .status-indicator {
   font-size: 10px;
   line-height: 1;

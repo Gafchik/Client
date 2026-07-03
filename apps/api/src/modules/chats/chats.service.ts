@@ -11,6 +11,8 @@ import { TeamsService } from "../teams/teams.service.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { safeJsonParse } from "../../shared/json.js";
 import { RunsService } from "../runs/runs.service.js";
+import * as fs from "fs";
+import * as path from "path";
 
 @Injectable()
 export class ChatsService {
@@ -192,6 +194,8 @@ export class ChatsService {
       throw new Error("Orchestrator model is not configured");
     }
 
+    const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code);
+
     const response = await fetch(`${team.provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
@@ -204,20 +208,7 @@ export class ChatsService {
         messages: [
           {
             role: "system",
-            content: [
-              "You are the orchestrator and representative of the AI team.",
-              `Team communication language: ${teamLanguage.label}.`,
-              `All natural-language text in your JSON response must be written only in ${teamLanguage.label}.`,
-              `Do not answer in English unless the team language is ${teamLanguage.code}.`,
-              "You answer user questions about the project and the team.",
-              "You know the exact team roster, including each member name, role, label, and model.",
-              "When the user asks who someone is, first check the provided team roster and answer from it.",
-              "If the answer does not require work, do not create any task.",
-              "Create tasks only when the user explicitly asks to do work or when real follow-up execution is needed.",
-              "If work should start immediately, set shouldExecute to true and provide executionTask.",
-              "Return valid JSON only.",
-              'Output schema: {"message":"string","suggestedTasks":[{"title":"string","description":"string","status":"backlog|in_progress|done"}],"teamSummary":["string"],"shouldExecute":boolean,"executionTask":"string"}',
-            ].join("\n"),
+            content: systemPrompt,
           },
           {
             role: "user",
@@ -390,5 +381,29 @@ export class ChatsService {
       code: normalized || "en",
       label: dictionary[normalized] || normalized || "English",
     };
+  }
+
+  private loadOrchestratorPrompt(languageLabel: string, languageCode: string): string {
+    const promptPath = path.join(process.cwd(), "src/modules/chats/prompts/orchestrator.system.txt");
+    let template = "";
+    try {
+      template = fs.readFileSync(promptPath, "utf-8");
+    } catch {
+      template = `You are the orchestrator and representative of the AI team.
+Team communication language: {{teamLanguage}}.
+All natural-language text in your JSON response must be written only in {{teamLanguage}}.
+Do not answer in English unless the team language is {{teamLanguageCode}}.
+You answer user questions about the project and the team.
+You know the exact team roster, including each member name, role, label, and model.
+When the user asks who someone is, first check the provided team roster and answer from it.
+If the answer does not require work, do not create any task.
+Create tasks only when the user explicitly asks to do work or when real follow-up execution is needed.
+If work should start immediately, set shouldExecute to true and provide executionTask.
+Return valid JSON only.
+Output schema: {"message":"string","suggestedTasks":[{"title":"string","description":"string","status":"backlog|in_progress|done"}],"teamSummary":["string"],"shouldExecute":boolean,"executionTask":"string"}`;
+    }
+    return template
+      .replace(/{{teamLanguage}}/g, languageLabel)
+      .replace(/{{teamLanguageCode}}/g, languageCode);
   }
 }

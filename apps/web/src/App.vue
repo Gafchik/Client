@@ -329,6 +329,16 @@ function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 }
 
+function copyMessage(item: any) {
+  const text = item.content || '';
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => {
+    console.log('Message copied to clipboard');
+  }).catch(err => {
+    console.error('Failed to copy:', err);
+  });
+}
+
 const activityFeed = computed(() =>
   latestRunEvents.value
     .filter((entry) =>
@@ -940,10 +950,12 @@ async function createProject() {
   state.busy = true;
   try {
     const root = state.settings?.env.LOCAL_PROJECTS_ROOT || "/Users/evgenii";
+    const projectName = `project-${state.projects.length + 1}`;
+    const localPath = `${root}/${projectName}`;
     const response = await api.saveProject({
       name: `Проект ${state.projects.length + 1}`,
       description: "",
-      localPath: root,
+      localPath,
       teamId: state.selectedTeamId || null,
     });
     state.projects.unshift(response.project);
@@ -1539,6 +1551,16 @@ onBeforeUnmount(() => {
                       <span v-else-if="item.status === 'done'" class="status-indicator done" title="Завершено">✓</span>
                       <span v-else-if="item.status === 'idle'" class="status-indicator idle" title="Пропущен">⊘</span>
                       <span v-else-if="item.status === 'error'" class="status-indicator error" title="Ошибка">✗</span>
+                      <button 
+                        class="copy-button" 
+                        @click="copyMessage(item)" 
+                        title="Копировать сообщение"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                      </button>
                     </div>
                   <div class="message-content" v-html="formatMessageContent(item)"></div>
                   <div v-if="item.meta?.usage" class="message-usage">
