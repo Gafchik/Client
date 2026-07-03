@@ -1374,6 +1374,20 @@ export class RunsService {
             result = { taskId: saved.id, title: saved.title, status: saved.status };
             break;
           }
+          case "delete_project": {
+            const { projectId } = operation;
+            if (!projectId) {
+              throw new Error("projectId is required for delete_project");
+            }
+            // Delete project and related data
+            await this.projectsRepository.delete(projectId);
+            // Also delete related tasks, chats, runs
+            await this.tasksRepository.delete({ projectId });
+            await this.chatsRepository.delete({ projectId });
+            await this.runsRepository.delete({ projectId });
+            result = { projectId, deleted: true };
+            break;
+          }
           default:
             throw new Error(`Unknown database operation type: ${operation.type}`);
         }
@@ -1627,6 +1641,11 @@ Output schema:
       "title": "string",
       "description": "string",
       "status": "backlog|todo|in_progress|review|done",
+      "reason": "string"
+    },
+    {
+      "type": "delete_project",
+      "projectId": "string",
       "reason": "string"
     }
   ],
