@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Param, Post } from "@nestjs/common";
+import { Logger } from "@nestjs/common";
 import { RunsService } from "./runs.service.js";
 import { StartRunDto } from "./dto/start-run.dto.js";
 import { safeJsonParse } from "../../shared/json.js";
@@ -7,6 +8,7 @@ import path from "node:path";
 
 @Controller()
 export class RunsController {
+  private readonly logger = new Logger(RunsController.name);
   constructor(private readonly runsService: RunsService) {}
 
   @Get("runs")
@@ -18,6 +20,7 @@ export class RunsController {
   @Post("runs")
   async startRun(@Body() dto: StartRunDto) {
     const { runId } = await this.runsService.startRun(dto);
+    // Блокируем ответ — ждём завершения выполнения
     await this.runsService.executeRunSteps(runId);
     return { runId };
   }

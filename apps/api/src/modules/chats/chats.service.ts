@@ -1,4 +1,4 @@
-import { forwardRef, Inject, Injectable, NotFoundException } from "@nestjs/common";
+import { forwardRef, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { ChatEntity } from "../../persistence/chat.entity.js";
@@ -8,7 +8,7 @@ import { TeamEntity } from "../../persistence/team.entity.js";
 import { RunEntity } from "../../persistence/run.entity.js";
 import { SaveChatDto } from "./dto/save-chat.dto.js";
 import { TeamsService } from "../teams/teams.service.js";
-import { safeJsonParse } from "../../shared/json.js";
+import { parseJsonSafely, safeJsonParse } from "../../shared/json.js";
 import { RunsService } from "../runs/runs.service.js";
 import { WsGateway } from "../ws/ws.gateway.js";
 import * as fs from "fs";
@@ -16,6 +16,8 @@ import * as path from "path";
 
 @Injectable()
 export class ChatsService {
+  private readonly logger = new Logger(ChatsService.name);
+
   constructor(
     @InjectRepository(ChatEntity)
     private readonly chatsRepository: Repository<ChatEntity>,
@@ -165,9 +167,8 @@ export class ChatsService {
   }
 
   async remove(id: string) {
-    const chat = await this.chatsRepository.findOneBy({ id });
-    if (!chat) throw new NotFoundException("Chat not found");
-    await this.chatsRepository.remove(chat);
+    const result = await this.chatsRepository.delete(id);
+    if (result.affected === 0) throw new NotFoundException("Chat not found");
     return { ok: true };
   }
 
@@ -306,17 +307,54 @@ export class ChatsService {
       name: orchestrator.name || "Alex",
       label: orchestrator.label || "Оркестратор",
     };
-    const orchestratorPayload = safeJsonParse<any>(text || "{}", {
-      message: text || "Оркестратор не вернул ответ.",
-      teamSummary: [],
-      shouldExecute: false,
-      executionTask: "",
-    });
+    
+    // Используем parseJsonSafely для лучшей обработки ошибок и логирования
+    const parseResult = parseJsonSafely<any>(text || "{}");
+    if (!parseResult.success) {
+      this.logger.warn(`Orchestrator returned invalid JSON: ${parseResult.error}. Raw response: ${text.slice(0, 500)}`);
+    }
+    
+    const orchestratorPayload = parseResult.success && parseResult.data 
+      ? parseResult.data 
+      : {
+          message: text || "Оркестратор не вернул ответ.",
+          teamSummary: [],
+          shouldExecute: false,
+          executionTask: "",
+        };
+    
+    // Эвристический fallback: если JSON не распарсился, но сообщение пользователя содержит ключевые слова действий,
+    // пытаемся извлечь задачу из сообщения пользователя
+    let shouldExecute = Boolean(orchestratorPayload.shouldExecute);
+    let executionTask = String(orchestratorPayload.executionTask || content).trim();
+    
+    if (!parseResult.success && !shouldExecute) {
+      const actionKeywords = [
+        'создай', 'создать', 'добавь', 'добавить', 'исправь', 'исправить', 
+        'реализуй', 'реализовать', 'напиши', 'написать', 'сделай', 'сделать',
+        'обнови', 'обновить', 'удали', 'удалить', 'рефактор', 'рефакторинг',
+        'тест', 'тестируй', 'провери', 'проверить', 'запусти', 'запустить',
+        'create', 'add', 'fix', 'implement', 'write', 'make', 'update', 'delete',
+        'refactor', 'test', 'run', 'execute', 'build', 'deploy'
+      ];
+      const lowerContent = content.toLowerCase();
+      const hasActionKeyword = actionKeywords.some(keyword => lowerContent.includes(keyword));
+      
+      if (hasActionKeyword) {
+        this.logger.log(`Heuristic fallback triggered: user message contains action keywords, forcing execution`);
+        shouldExecute = true;
+        executionTask = content;
+      }
+    }
+    
+    // Логируем решение оркестратора
+    this.logger.log(`Orchestrator decision: shouldExecute=${shouldExecute}, executionTask="${executionTask}"`);
+    
     const requestId = `chatreq-${Date.now()}`;
 
     let autoRunId: string | null = null;
-    const shouldExecute = Boolean(orchestratorPayload.shouldExecute);
-    const executionTask = String(orchestratorPayload.executionTask || content).trim();
+    let finalOrchestratorMessage = orchestratorPayload.message || "Оркестратор обработал сообщение.";
+    
     if (shouldExecute && executionTask) {
       const run = await this.runsService.startRun({
         chatId: chat.id,
@@ -326,23 +364,112 @@ export class ChatsService {
         projectPath: project.localPath,
       });
       autoRunId = run.runId;
+      // Локальная константа со строгим типом string — TS не сужает let autoRunId
+      // внутри замыкания .then(), поэтому используем activeRunId для фонового вызова.
+      const activeRunId = run.runId;
+
+      // Сохраняем начальное сообщение оркестратора (план) и СРАЗУ возвращаем ответ.
+      // Выполнение команды агентами запускаем В ФОНЕ — чтобы фронтенд немедленно
+      // получил autoRunId, начал поллинг и показывал прогресс/стрим агентов в реальном времени.
+      // Финальное сообщение ("Сделано" / "Ошибка") сохранится в чат после завершения run.
+      const initialMessage = [
+        finalOrchestratorMessage,
+        `Команда запущена в работу. Run ID: ${autoRunId}`,
+      ].join("\n");
+
+      const assistantMessage = await this.addMessage(chat.id, "assistant", initialMessage, {
+        type: "conversation",
+        requestId,
+        usage,
+        autoRunId,
+        orchestratorPayload,
+      });
+
+      this.logger.log(`Saved initial assistant message to chat ${chat.id}: ${assistantMessage.id}`);
+
+      // Фоновое выполнение команды агентов (НЕ блокирует HTTP-ответ).
+      // После завершения сохраняем финальный отчёт оркестратора в чат.
+      void this.runsService.executeRunSteps(activeRunId)
+        .then(async () => {
+          try {
+            const completedRun = await this.runsService.getJob(activeRunId);
+            if (!completedRun?.run) {
+              await this.addMessage(chat.id, "assistant", "Работа завершена, но отчёт недоступен.", {
+                type: "conversation",
+                requestId,
+                autoRunId,
+                orchestratorPayload,
+                finalReport: true,
+              });
+              return;
+            }
+            const runEntity = completedRun.run;
+            const report: any = completedRun.report || runEntity.finalReport;
+
+            let finalMessage = "";
+            if (runEntity.status === 'completed') {
+              finalMessage = report?.message || report?.summary || "✅ Сделано. Работа успешно завершена.";
+            } else if (runEntity.status === 'failed') {
+              finalMessage = `❌ Ошибка: работа не удалась после ${runEntity.retryCount || 3} попыток. ${runEntity.error || 'Неизвестная ошибка'}`;
+              if (report?.message) finalMessage += `\n\n${report.message}`;
+            } else {
+              finalMessage = `Статус: ${runEntity.status}`;
+            }
+
+            if (report?.filesChanged?.length) {
+              finalMessage += `\n\n📁 Изменённые файлы:\n${report.filesChanged.map((f: string) => `  • ${f}`).join('\n')}`;
+            }
+            if (report?.testResult) {
+              finalMessage += `\n\n🧪 Тесты: ${report.testResult === 'passed' ? '✅ Пройдены' : '❌ Провалены'}`;
+            }
+            if (report?.nextSteps?.length) {
+              finalMessage += `\n\n📋 Следующие шаги:\n${report.nextSteps.map((s: string) => `  • ${s}`).join('\n')}`;
+            }
+
+            await this.addMessage(chat.id, "assistant", finalMessage, {
+              type: "conversation",
+              requestId,
+              autoRunId,
+              orchestratorPayload,
+              finalReport: true,
+            });
+            this.logger.log(`Saved final report message to chat ${chat.id} for run ${autoRunId}`);
+          } catch (err) {
+            this.logger.error(`Failed to save final report for run ${autoRunId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        })
+        .catch(async (error) => {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          this.logger.error(`Run ${autoRunId} failed: ${errorMsg}`);
+          try {
+            await this.addMessage(chat.id, "assistant", `❌ Ошибка при выполнении: ${errorMsg}`, {
+              type: "conversation",
+              requestId,
+              autoRunId,
+              orchestratorPayload,
+              finalReport: true,
+            });
+          } catch { /* ignore */ }
+        });
+
+      return {
+        chat,
+        message: assistantMessage,
+        createdTasks: [],
+        autoRunId,
+      };
     }
 
-    const finalMessage = [
-      orchestratorPayload.message || "Оркестратор обработал сообщение.",
-      autoRunId ? "" : null,
-      autoRunId ? `Команда запущена в работу. Run ID: ${autoRunId}` : null,
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    const assistantMessage = await this.addMessage(chat.id, "assistant", finalMessage, {
+    // Диалоговый режим: выполнение не требуется — сохраняем обычный ответ оркестратора
+    const assistantMessage = await this.addMessage(chat.id, "assistant", finalOrchestratorMessage, {
       type: "conversation",
       requestId,
       usage,
       autoRunId,
       orchestratorPayload,
     });
+
+    this.logger.log(`Saved assistant message to chat ${chat.id}: ${assistantMessage.id}`);
 
     return {
       chat,

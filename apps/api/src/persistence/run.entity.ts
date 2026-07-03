@@ -64,6 +64,9 @@ export class RunEntity {
 
   @Column("timestamptz", { nullable: true })
   finishedAt!: Date | null;
+
+  @Column("int", { default: 0 })
+  retryCount!: number;
 }
 
 // Алиас для обратной совместимости

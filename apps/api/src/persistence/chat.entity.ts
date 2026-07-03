@@ -50,6 +50,6 @@ export class ChatEntity {
   @OneToMany(() => MessageEntity, (message) => message.chat)
   messages!: MessageEntity[];
 
-  @OneToMany(() => RunEntity, (run) => run.chat)
+  @OneToMany(() => RunEntity, (run) => run.chat, { cascade: true })
   runs!: RunEntity[];
 }

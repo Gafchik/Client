@@ -3,7 +3,8 @@ import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMe
 const API_BASE = import.meta.env.VITE_API_URL || "";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}/api${url}`, {
+  const base = API_BASE ? `${API_BASE}/api` : "/api";
+  const response = await fetch(`${base}${url}`, {
     headers: {
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
@@ -86,7 +87,7 @@ export const api = {
     }),
   runs: () => request<{ runs: RunItem[] }>("/runs"),
   runById: (id: string) => request<{ run: RunItem; report: unknown }>(`/runs/${id}`),
-  startRun: (payload: { chatId: string; task: string }) =>
+  startRun: (payload: { chatId: string; task: string; teamId: string; teamName: string; projectPath: string }) =>
     request<{ runId: string }>("/runs", {
       method: "POST",
       body: JSON.stringify(payload),

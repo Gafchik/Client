@@ -11,7 +11,6 @@ interface AuthenticatedSocket extends Socket {
 
 @WebSocketGateway({
   cors: { origin: "*" },
-  namespace: "/ws",
   path: "/ws/socket.io",
 })
 @Injectable()
