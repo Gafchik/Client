@@ -7,6 +7,11 @@ import { Repository } from "typeorm";
 import { ProjectMemoryEntryEntity } from "../../persistence/project-memory.entity.js";
 import { ProjectEntity } from "../../persistence/project.entity.js";
 import { TeamEntity } from "../../persistence/team.entity.js";
+import { ChatEntity } from "../../persistence/chat.entity.js";
+import { MessageEntity } from "../../persistence/message.entity.js";
+import { RunEntity } from "../../persistence/run.entity.js";
+import { TaskEntity } from "../../persistence/task.entity.js";
+import { TaskCommentEntity } from "../../persistence/task-comment.entity.js";
 import { SaveProjectMemoryDto } from "./dto/save-project-memory.dto.js";
 import { SaveProjectDto } from "./dto/save-project.dto.js";
 
@@ -19,6 +24,16 @@ export class ProjectsService {
     private readonly projectMemoryRepository: Repository<ProjectMemoryEntryEntity>,
     @InjectRepository(TeamEntity)
     private readonly teamsRepository: Repository<TeamEntity>,
+    @InjectRepository(ChatEntity)
+    private readonly chatsRepository: Repository<ChatEntity>,
+    @InjectRepository(MessageEntity)
+    private readonly messagesRepository: Repository<MessageEntity>,
+    @InjectRepository(RunEntity)
+    private readonly runsRepository: Repository<RunEntity>,
+    @InjectRepository(TaskEntity)
+    private readonly tasksRepository: Repository<TaskEntity>,
+    @InjectRepository(TaskCommentEntity)
+    private readonly taskCommentsRepository: Repository<TaskCommentEntity>,
     private readonly configService: ConfigService,
   ) {}
 
@@ -117,6 +132,25 @@ export class ProjectsService {
 
   async remove(id: string) {
     const project = await this.getById(id);
+    
+    // Явное каскадное удаление связанных данных
+    const chatIds = (await this.chatsRepository.find({ where: { projectId: id }, select: { id: true } })).map(c => c.id);
+    
+    if (chatIds.length) {
+      await this.messagesRepository.delete({ chatId: chatIds[0] }); // TypeORM не поддерживает IN в delete, делаем по одному
+      for (const chatId of chatIds) {
+        await this.messagesRepository.delete({ chatId });
+      }
+      await this.runsRepository.delete({ chatId: chatIds[0] });
+      for (const chatId of chatIds) {
+        await this.runsRepository.delete({ chatId });
+      }
+    }
+    
+    await this.tasksRepository.delete({ projectId: id });
+    await this.projectMemoryRepository.delete({ projectId: id });
+    await this.chatsRepository.delete({ projectId: id });
+    
     await this.projectsRepository.remove(project);
     return { ok: true };
   }

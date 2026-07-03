@@ -1,7 +1,9 @@
 import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, TaskCommentItem, TaskItem, Team } from "./types";
 
+const API_BASE = import.meta.env.VITE_API_URL || "";
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
+  const response = await fetch(`${API_BASE}/api${url}`, {
     headers: {
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
@@ -18,7 +20,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  health: () => request<{ ok: boolean }>("/api/health"),
+  health: () => request<{ ok: boolean }>("/health"),
   settings: () =>
     request<{
       env: {

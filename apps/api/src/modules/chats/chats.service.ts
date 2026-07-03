@@ -11,6 +11,7 @@ import { TeamsService } from "../teams/teams.service.js";
 import { TasksService } from "../tasks/tasks.service.js";
 import { safeJsonParse } from "../../shared/json.js";
 import { RunsService } from "../runs/runs.service.js";
+import { WsGateway } from "../ws/ws.gateway.js";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -31,6 +32,7 @@ export class ChatsService {
     private readonly tasksService: TasksService,
     @Inject(forwardRef(() => RunsService))
     private readonly runsService: RunsService,
+    private readonly wsGateway: WsGateway,
   ) {}
 
   async list(projectId?: string) {
@@ -196,7 +198,8 @@ export class ChatsService {
 
     const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code);
 
-    const response = await fetch(`${team.provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    // Стриминговый запрос к LLM
+    const streamResponse = await fetch(`${team.provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -205,6 +208,7 @@ export class ChatsService {
       body: JSON.stringify({
         model: orchestrator.model,
         temperature: orchestrator.temperature ?? 0.2,
+        stream: true,
         messages: [
           {
             role: "system",
@@ -254,20 +258,57 @@ export class ChatsService {
       }),
     });
 
-    if (!response.ok) {
-      throw new Error(`API request failed (${response.status}): ${await response.text()}`);
+    if (!streamResponse.ok) {
+      throw new Error(`API request failed (${streamResponse.status}): ${await streamResponse.text()}`);
     }
 
-    const data = safeJsonParse<any>(await response.text(), {});
-    const rawMessage = data?.choices?.[0]?.message?.content;
-    const text = Array.isArray(rawMessage)
-      ? rawMessage.map((part: any) => (typeof part === "string" ? part : part?.text ?? "")).join("\n")
-      : rawMessage;
+    // Читаем стрим и отправляем токены через WebSocket
+    let fullContent = "";
+    let totalUsage: any = null;
+    const reader = streamResponse.body?.getReader();
+    const decoder = new TextDecoder();
+
+    if (reader) {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const dataStr = line.slice(6).trim();
+            if (dataStr === "[DONE]") continue;
+            try {
+              const data = JSON.parse(dataStr);
+              const delta = data.choices?.[0]?.delta?.content;
+              if (delta) {
+                fullContent += delta;
+                this.wsGateway.broadcastTokenStream(chat.id, {
+                  role: "orchestrator",
+                  content: delta,
+                  done: false,
+                });
+              }
+              if (data.usage) totalUsage = data.usage;
+            } catch { }
+          }
+        }
+      }
+    }
+
+    // Финальный токен
+    this.wsGateway.broadcastTokenStream(chat.id, {
+      role: "orchestrator",
+      content: "",
+      done: true,
+    });
+
+    const text = fullContent;
     const usage = {
-      promptTokens: data?.usage?.prompt_tokens ?? 0,
-      completionTokens: data?.usage?.completion_tokens ?? 0,
-      totalTokens: data?.usage?.total_tokens ?? 0,
-      weightedTokens: Math.ceil((data?.usage?.total_tokens ?? 0) * (orchestrator.multiplier ?? 1)),
+      promptTokens: totalUsage?.prompt_tokens ?? 0,
+      completionTokens: totalUsage?.completion_tokens ?? 0,
+      totalTokens: totalUsage?.total_tokens ?? 0,
+      weightedTokens: Math.ceil((totalUsage?.total_tokens ?? 0) * (orchestrator.multiplier ?? 1)),
       multiplier: orchestrator.multiplier ?? 1,
       model: orchestrator.model,
       role: "orchestrator",

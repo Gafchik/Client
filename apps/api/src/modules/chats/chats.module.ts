@@ -10,6 +10,7 @@ import { ChatsService } from "./chats.service.js";
 import { RunsModule } from "../runs/runs.module.js";
 import { TeamsModule } from "../teams/teams.module.js";
 import { TasksModule } from "../tasks/tasks.module.js";
+import { WsModule } from "../ws/ws.module.js";
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { TasksModule } from "../tasks/tasks.module.js";
     TeamsModule,
     TasksModule,
     forwardRef(() => RunsModule),
+    WsModule,
   ],
   controllers: [ChatsController],
   providers: [ChatsService],

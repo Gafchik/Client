@@ -19,6 +19,7 @@ import { SettingsModule } from "./settings/settings.module.js";
 import { TaskEntity } from "../persistence/task.entity.js";
 import { TaskCommentEntity } from "../persistence/task-comment.entity.js";
 import { TasksModule } from "./tasks/tasks.module.js";
+import { WsModule } from "./ws/ws.module.js";
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { TasksModule } from "./tasks/tasks.module.js";
     HealthModule,
     SettingsModule,
     TasksModule,
+    WsModule,
   ],
 })
 export class AppModule {}
