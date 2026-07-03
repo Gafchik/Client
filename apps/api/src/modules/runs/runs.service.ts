@@ -1,4 +1,4 @@
-import { forwardRef, Inject, Injectable, Logger } from '@nestjs/common';
+import { forwardRef, Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Run } from '../../persistence/run.entity';
@@ -48,7 +48,7 @@ interface TestResult {
 }
 
 @Injectable()
-export class RunsService {
+export class RunsService implements OnModuleInit {
   private readonly logger = new Logger(RunsService.name);
 
   constructor(
@@ -60,6 +60,59 @@ export class RunsService {
     private readonly chatsService: ChatsService,
     private readonly wsGateway: WsGateway,
   ) {}
+
+  /**
+   * Recovery «зомби»-ранов при старте приложения.
+   *
+   * Если процесс API упал (kill -9, OOM, краш контейнера) посреди executeRunSteps,
+   * в БД остаются run'ы со status='running' и без finishedAt. Никто их больше не
+   * поднимет — executeRunSteps имеет гварду "already running, skipping", а фронт
+   * не поллит их (chatId у них часто пустой после cascade). Это и были
+   * «зомби» fbaf14a0 / f6c2d316, которые пользователь видел как зависший чат.
+   *
+   * На старте модуля помечаем все stale 'running' → 'failed' с понятной ошибкой,
+   * чтобы они перестали считаться «активными» и не висели вечно.
+   */
+  async onModuleInit(): Promise<void> {
+    try {
+      const stale = await this.runRepo.find({ where: { status: 'running' } });
+      if (!stale.length) return;
+      this.logger.warn(`Found ${stale.length} stale running run(s) on startup — marking as failed (recovery)`);
+      for (const run of stale) {
+        run.status = 'failed';
+        run.finishedAt = new Date();
+        if (!run.error) run.error = 'Process restarted while run was in progress (stale recovery)';
+        await this.runRepo.save(run);
+        this.logger.log(`Recovered stale run ${run.id} (chatId=${run.chatId ?? '<null>'})`);
+      }
+    } catch (error) {
+      this.logger.error(`Stale run recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Удаляет все run'ы, привязанные к чату. Вызывается из ChatsService.remove()
+   * ПЕРЕД удалением самого чата — чтобы orphan-зомби (run без chatId) больше
+   * не плодились. Раньше FK был onDelete: SET NULL, поэтому при удалении чата
+   * runs просто теряли chatId и оставались в БД навсегда как мусор/зомби.
+   *
+   * Удаляем явно, а не полагаемся только на CASCADE FK: synchronize:true не
+   * всегда пересоздаёт FK при смене onDelete, поэтому дублируем удаление в коде
+   * — это гарантирует очистку независимо от состояния схемы БД.
+   */
+  async deleteRunsByChat(chatId: string): Promise<number> {
+    try {
+      const result = await this.runRepo.delete({ chatId });
+      const affected = result.affected ?? 0;
+      if (affected > 0) {
+        this.logger.log(`Deleted ${affected} run(s) for chat ${chatId} (cascade on chat delete)`);
+      }
+      return affected;
+    } catch (error) {
+      this.logger.error(`Failed to delete runs for chat ${chatId}: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
+    }
+  }
 
   async startRun(dto: StartRunDto): Promise<{ runId: string }> {
     const run = this.runRepo.create({
@@ -218,6 +271,15 @@ export class RunsService {
     const projectPath = (project.localPath || '').replace(hostProjectsRoot, containerProjectsRoot);
     const projectName = project.name || 'Unknown Project';
 
+    // Режим прогона: 'diagnostics' (только анализ, БЕЗ правок кода) или
+    // 'implementation' (внести изменения). Определяем ДЕТЕРМИНИРОВАННО по
+    // тексту задачи, а НЕ полагаемся на LLM: слабая модель на planning-шаге
+    // оркестратора часто игнорирует "код не пишите" и всё равно ставит
+    // разработчику задачу писать код. Фиксит баг "разраб пишет код, хотя
+    // пользователь явно просил только проверить".
+    const runMode = this.detectRunMode(run.task);
+    this.logger.log(`Run ${runId} mode: ${runMode} (task="${run.task.slice(0, 80)}")`);
+
     // Цикл ретраев (максимум 3 попытки)
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       // Перезагружаем ран для актуального retryCount
@@ -248,7 +310,7 @@ export class RunsService {
         // Повторный token:stream создавал второй пузырь текста в чате (дубль).
         const orchestratorResult = await this.callAgentStream(
           runId, chatId, 'orchestrator', orchestratorAgent, language,
-          this.buildOrchestratorPrompt(run, chat.messages, project, teamConfig, projectPath),
+          this.buildOrchestratorPrompt(run, chat.messages, project, teamConfig, projectPath, runMode),
           () => { /* no-op: не дублируем стрим оркестратора в чат */ }
         );
 
@@ -288,7 +350,7 @@ export class RunsService {
 
         const analystResult = await this.callAgentStream(
           runId, chatId, 'analyst', analystAgent, language,
-          this.buildAnalystPrompt(run, plan, project, chat.messages, projectPath, workspace),
+          this.buildAnalystPrompt(run, plan, project, chat.messages, projectPath, workspace, runMode),
           (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'analyst', content: delta, done: false })
         );
 
@@ -321,7 +383,7 @@ export class RunsService {
 
         const developerResult = await this.callAgentStream(
           runId, chatId, 'developer', developerAgent, language,
-          this.buildDeveloperPrompt(run, devSpec, project, workspace, projectPath),
+          this.buildDeveloperPrompt(run, devSpec, project, workspace, projectPath, runMode),
           (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'developer', content: delta, done: false })
         );
 
@@ -403,7 +465,7 @@ export class RunsService {
 
         const finalReport = await this.callAgentStream(
           runId, chatId, 'orchestrator', orchestratorAgent, language,
-          this.buildFinalReportPrompt(run, plan, spec, codeChanges, testResults, memoryUpdate),
+          this.buildFinalReportPrompt(run, plan, spec, codeChanges, testResults, memoryUpdate, runMode),
           (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'orchestrator', content: delta, done: false })
         );
 
@@ -426,7 +488,17 @@ export class RunsService {
         if (run) {
           run.status = testResults.passed ? 'completed' : 'failed';
           run.finishedAt = new Date();
-          run.finalReport = finalReport.artifact || { summary: finalReport.rawResponse };
+          const finalArtifact: Record<string, unknown> =
+            (finalReport.artifact as Record<string, unknown>) || { summary: finalReport.rawResponse };
+          // Гарантируем, что в finalReport сохранён diagnosis аналитика —
+          // чтобы chats.service мог собрать итоговый ответ пользователю даже
+          // если LLM-финалка перепечатала план вместо результата (баг
+          // "финальный ответ = дубль планировочного сообщения").
+          if (runMode === 'diagnostics' && Array.isArray((spec as any)?.diagnosis) && !Array.isArray((finalArtifact as any).diagnosis)) {
+            (finalArtifact as any).diagnosis = (spec as any).diagnosis;
+          }
+          if (runMode === 'diagnostics') (finalArtifact as any).mode = 'diagnostics';
+          run.finalReport = finalArtifact;
           await this.runRepo.save(run);
         }
         success = true;
@@ -699,14 +771,27 @@ export class RunsService {
   private parseDeveloperMarkerFormat(text: string): Record<string, unknown> | null {
     try {
       if (!text || typeof text !== 'string') return null;
-      // Требуем хотя бы один маркер FILE, иначе это не маркерный формат.
-      if (!/^[ \t]*FILE:/m.test(text)) return null;
-
-      const files: Array<Record<string, unknown>> = [];
 
       // Сводка (необязательна).
       const summaryMatch = text.match(/^[ \t]*SUMMARY:[ \t]*(.+?)$/m);
       const summary = summaryMatch ? summaryMatch[1].trim() : '';
+
+      // ДИАГНОСТИЧЕСКИЙ ответ: только SUMMARY, БЕЗ блоков FILE.
+      // Промпт разработчика в режиме diagnostics прямо требует вернуть
+      // "SUMMARY: Нет изменений..." — это НЕ JSON и не маркерный FILE-формат,
+      // поэтому старая проверка (/^[ \t]*FILE:/m) отбрасывала его и разработчик
+      // падал с "Failed to parse JSON after all fallback strategies" 3 раза →
+      // run failed. Здесь признаём SUMMARY-only ответ валидным артефактом
+      // "нет изменений": files: [], summary — конвейер идёт дальше к тестеру.
+      if (!/^[ \t]*FILE:/m.test(text)) {
+        if (summary) {
+          return { files: [], summary };
+        }
+        return null;
+      }
+
+      const files: Array<Record<string, unknown>> = [];
+
 
       // Разбиваем на блоки по маркеру FILE:.
       const fileBlocks = text.split(/^[ \t]*FILE:[ \t]*/m).slice(1);
@@ -1115,14 +1200,25 @@ export class RunsService {
     }
   }
 
-  private buildOrchestratorPrompt(run: Run, messages: any[], project: any, teamConfig: TeamConfig, projectPath: string): string {
+  private buildOrchestratorPrompt(run: Run, messages: any[], project: any, teamConfig: TeamConfig, projectPath: string, runMode: 'diagnostics' | 'implementation'): string {
     const recentMessages = messages?.slice(-10).map(m => `${m.role}: ${m.content}`).join('\n') || 'Нет истории';
     const index = projectPath ? this.buildProjectIndex(projectPath, teamConfig.workspace, 50) : '';
+    // Режим уже определён детерминированно в executeRunSteps. Сообщаем его
+    // модели как ФАКТ (не вопрос) — она не должна «решать» заново. Раньше
+    // слабая модель на этом шаге игнорила «код не пишите» и всё равно ставила
+    // разрабу задачу кодить. Теперь режим зафиксирован в промпте явно.
+    const modeLine = runMode === 'diagnostics'
+      ? `РЕЖИМ: ДИАГНОСТИКА (только анализ, БЕЗ правок кода). Пользователь явно просил проверить/найти причину, НЕ писать код. Разработчик НЕ должен трогать файлы.`
+      : `РЕЖИМ: РЕАЛИЗАЦИЯ (внести точечные правки в код).`;
+    const devAssignment = runMode === 'diagnostics'
+      ? 'НЕ вносить правок в код. Только подтвердить выводы аналитика. Вернуть SUMMARY: Нет изменений.'
+      : 'Внести точечные правки по ТЗ аналитика.';
     return `Ты — Оркестратор. Проанализируй задачу и создай план работы для команды.
 
 ПРОЕКТ: ${project.name || 'Unknown'}
 ПУТЬ: ${project.localPath || ''}
 ЗАДАЧА: ${run.task}
+${modeLine}
 
 КАРТА ПРОЕКТА (используй только эти реальные пути, не выдумывай файлы):
 ${index}
@@ -1135,25 +1231,54 @@ ${recentMessages}
 ПРАВИЛА (КРИТИЧНО):
 1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON-ОБЪЕКТ. Никакого markdown, никаких \`\`\`json блоков, никакого текста до или после { }.
 2. Запуск УЖЕ идёт — команда всегда работает. ВСЕГДА заполняй assignments для аналитика, разработчика и тестера.
-3. Для диагностических задач («проверь почему», «найди причину», «код не пишите», «просто проверьте»): аналитик исследует код и находит причину, разработчику дай задачу «не вносить правок, только подтвердить выводы аналитика» (он вернёт «Нет изменений»), тестер проверяет логику. Итоговый отчёт соберёт диагноз.
-4. Для задач на изменения: аналитик пишет ТЗ, разработчик вносит точечные правки, тестер проверяет.
-5. НЕ выдумывай пути файлов — используй только КАРТУ ПРОЕКТА выше.
-
+3. РЕЖИМ уже задан выше — НЕ меняй его. В assignments.developer пишИ ровно: "${devAssignment}"
+4. НЕ выдумывай пути файлов — используй только КАРТУ ПРОЕКТА выше.
 
 Схема ответа:
 {"message":"string - что ты понял и что сделает команда","teamSummary":["string"],"shouldExecute":true,"executionTask":"string - краткая задача для команды","plan":["string - шаги"],"assignments":{"analyst":"string","developer":"string","tester":"string"}}
 
-ПРИМЕР (диагностическая задача — код не пишем):
-{"message":"Понял. Назначу аналитика для поиска причины.","teamSummary":["Alex: координирует","Mira: исследует код"],"shouldExecute":true,"executionTask":"Найти причину X, код не менять","plan":["Анализ кода","Подтверждение причины"],"assignments":{"analyst":"Изучить код и найти причину","developer":"Не вносить правок, подтвердить выводы аналитика","tester":"Проверить логику вывода"}}
+ПРИМЕР (ДИАГНОСТИКА):
+{"message":"Понял. Назначу аналитика для поиска причины.","teamSummary":["Alex: координирует","Mira: исследует код"],"shouldExecute":true,"executionTask":"Найти причину X, код не менять","plan":["Анализ кода","Подтверждение причины"],"assignments":{"analyst":"Изучить код и найти причину","developer":"НЕ вносить правок в код. Только подтвердить выводы аналитика. Вернуть SUMMARY: Нет изменений.","tester":"Проверить логику вывода"}}
 
-ПРИМЕР (задача на изменения):
-{"message":"Понял. Назначу аналитика и разработчика.","teamSummary":["Alex: координирует","Mira: пишет ТЗ"],"shouldExecute":true,"executionTask":"Исправить баг X в модуле Y","plan":["Анализ","Реализация","Тесты"],"assignments":{"analyst":"Найти причину в коде","developer":"Внести точечные правки","tester":"Проверить"}}
-
+ПРИМЕР (РЕАЛИЗАЦИЯ):
+{"message":"Понял. Назначу аналитика и разработчика.","teamSummary":["Alex: координирует","Mira: пишет ТЗ"],"shouldExecute":true,"executionTask":"Исправить баг X в модуле Y","plan":["Анализ","Реализация","Тесты"],"assignments":{"analyst":"Найти причину в коде","developer":"Внести точечные правки по ТЗ аналитика.","tester":"Проверить"}}
 
 Если вернёшь невалидный JSON — весь запуск упадёт.`;
   }
 
-  private buildAnalystPrompt(run: Run, plan: any, project: any, messages: any[], projectPath: string, workspace: any): string {
+  /**
+   * Детерминированное определение режима прогона по тексту задачи.
+   * 'diagnostics' — пользователь хочет только проверить/найти причину/диагноз,
+   *   явно запрещает писать код. В этом режиме разработчик НЕ трогает файлы,
+   *   а финальный отчёт содержит diagnosis аналитика.
+   * 'implementation' — задача на реальное изменение кода.
+   * Определяем по ключевым словам, а НЕ по решению LLM — слабые модели часто
+   * игнорят «код не пишите» на planning-шаге и всё равно дают разрабу кодить.
+   */
+  private detectRunMode(task: string): 'diagnostics' | 'implementation' {
+    const t = String(task || '').toLowerCase();
+    if (!t.trim()) return 'implementation';
+    const diagKeywords = [
+      'код не пиш', 'не пишите код', 'не писать код', 'без кода', 'только провер',
+      'просто провер', 'проверь почему', 'проверьте почему', 'почему так',
+      'почему возник', 'найди причину', 'найти причину', 'в чём причина', 'в чем причина',
+      'диагност', 'разберись почему', 'разберись в чем', 'объясни почему',
+      'только анализ', 'только диагност', 'не трогай код', 'не меняй код',
+      "don't write code", 'no code', 'diagnos', 'investigate why', 'find the cause',
+      'just check', 'only check', 'why does', 'root cause',
+    ];
+    const hasDiag = diagKeywords.some((k) => t.includes(k));
+    if (hasDiag) return 'diagnostics';
+    // Если задача сформулирована как вопрос («почему», «зачем», «как работает»)
+    // и НЕ содержит глаголов изменения — тоже диагностика.
+    const isQuestion = /\b(почему|зачем|как (работает|устроен)|отчего|due to|why)\b/.test(t);
+    const implVerbs = ['создай', 'создать', 'добавь', 'добавить', 'исправь', 'исправить', 'реализуй', 'реализовать', 'напиши', 'написать', 'сделай', 'сделать', 'обнови', 'обновить', 'удали', 'удалить', 'рефактор', 'create', 'add', 'fix', 'implement', 'write', 'make', 'update', 'delete', 'refactor'];
+    const hasImpl = implVerbs.some((k) => t.includes(k));
+    if (isQuestion && !hasImpl) return 'diagnostics';
+    return 'implementation';
+  }
+
+  private buildAnalystPrompt(run: Run, plan: any, project: any, messages: any[], projectPath: string, workspace: any, runMode: 'diagnostics' | 'implementation'): string {
     const index = projectPath ? this.buildProjectIndex(projectPath, workspace, 80) : '';
     // Подгружаем содержимое файлов, упомянутых оркестратором в плане (если он
     // назвал конкретные пути), чтобы аналитик опирался на реальный код, а не
@@ -1170,6 +1295,40 @@ ${recentMessages}
         if (body) fileContext += `\n--- ${p} (текущее содержимое) ---\n${body}\n`;
       }
     } catch { }
+
+    // В режиме диагностики аналитик НЕ выдаёт files[] — иначе разработчик
+    // увидит файлы и начнёт их править (баг «разраб пишет код, хотя просили
+    // только проверить»). Вместо этого аналитик возвращает diagnosis[] —
+    // конкретные выводы: файл, функция, механизм проблемы.
+    if (runMode === 'diagnostics') {
+      return `Ты — Аналитик. Проведи ДИАГНОСТИКУ кода проекта и найди причину. РЕЖИМ: только анализ, БЕЗ правок кода.
+
+ПРОЕКТ: ${project.name || 'Unknown'}
+ПУТЬ: ${project.localPath || ''}
+ЗАДАЧА: ${run.task}
+ПЛАН ОРКЕСТРАТОРА: ${JSON.stringify(plan, null, 2)}
+
+КАРТА ПРОЕКТА:
+${index}
+${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на него, не придумывай структуру):\n${fileContext}` : ''}
+
+Твоя задача — изучить РЕАЛЬНЫЙ код и найти ТОЧНУЮ причину описанной проблемы. Укажи конкретные файлы, функции и механизм, который вызывает эффект. НЕ предлагай писать/менять код — только диагноз.
+
+ПРАВИЛА (КРИТИЧНО):
+1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON. Никакого markdown, никакого текста вне { }.
+2. В diagnosis.file указывай ТОЛЬКО пути из КАРТЫ ПРОЕКТА. Не выдумывай файлы.
+3. НЕ возвращай поле "files" — в этом режиме правок кода НЕ будет. Верни "diagnosis".
+4. Каждый пункт diagnosis должен быть конкретным: файл + функция/строка + что именно вызывает эффект.
+
+Схема:
+{"feature":"string - краткое название диагноза","description":"string - суть проблемы","diagnosis":[{"file":"string - реальный путь","location":"string - функция/метод/блок","issue":"string - что именно вызывает эффект","evidence":"string - цитата или описание логики"}],"rootCause":"string - главная причина одним абзацем","recommendations":["string - что можно сделать (описание, не код)"],"risks":["string"]}
+
+ПРИМЕР:
+{"feature":"Раздувание payload при удалении чата","description":"При удалении чата сериализуется весь диалог и конфигурация","diagnosis":[{"file":"apps/api/src/modules/chats/chats.service.ts","location":"sendMessageToOrchestrator / getById","issue":"В payload попадают все сообщения и meta с usage","evidence":"messages.slice(-12) + meta.usage суммируется по всем ролям"}],"rootCause":"getById отдаёт в чат всю историю + usageSummary всех run'ов, а удаление/сохранение сериализует это целиком.","recommendations":["Ограничить payload только нужными полями","Не вкладывать usageSummary в ответ удаления"],"risks":["Можно потерять нужные данные"]}
+
+Если вернёшь невалидный JSON — запуск упадёт.`;
+    }
+
     return `Ты — Аналитик. Напиши ТЗ для разработчика, опираясь на РЕАЛЬНЫЙ код проекта.
 
 ПРОЕКТ: ${project.name || 'Unknown'}
@@ -1197,10 +1356,39 @@ ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на нег
 Если вернёшь невалидный JSON — запуск упадёт.`;
   }
 
-  private buildDeveloperPrompt(run: Run, spec: any, project: any, workspace: any, projectPath: string): string {
+  private buildDeveloperPrompt(run: Run, spec: any, project: any, workspace: any, projectPath: string, runMode: 'diagnostics' | 'implementation'): string {
     const ignoreDirs = Array.isArray(workspace.ignoreDirs) ? workspace.ignoreDirs.join(', ') : '';
     const filesList = (spec.files || []).map((f: any) => `- ${f.path}: ${f.action} — ${f.description}`).join('\n') || 'нет файлов';
     const requirements = (spec.requirements || []).map((r: any) => `- ${r}`).join('\n') || 'нет требований';
+
+    // В режиме диагностики разработчик НЕ должен трогать код. Возвращаем
+    // короткий промпт, который заставляет его ответить «Нет изменений».
+    // Раньше разраб получал ТЗ с files[] и кодил 6 файлов, хотя пользователь
+    // явно писал «код не пишите» — это и был жалоба пользователя.
+    if (runMode === 'diagnostics') {
+      const diagnosisText = Array.isArray((spec as any)?.diagnosis)
+        ? (spec as any).diagnosis.map((d: any) => `- ${d.file} / ${d.location || '?'}: ${d.issue || ''}`).join('\n')
+        : '';
+      return `Ты — Разработчик. РЕЖИМ: ДИАГНОСТИКА. Код править ЗАПРЕЩЕНО — пользователь явно просил НЕ писать код.
+
+ПРОЕКТ: ${project.name || 'Unknown'}
+ЗАДАЧА: ${run.task}
+
+ВЫВОДЫ АНАЛИТИКА (диагноз):
+${diagnosisText || '(аналитик не дал диагноз)'}
+
+Твоя задача — только ПОДТВЕРДИТЬ или дополнить выводы аналитика техническими замечаниями (если они есть). НЕ создавай, НЕ изменяй и НЕ удаляй файлы.
+
+ОТВЕТ (строго так, без блоков FILE):
+
+SUMMARY: Нет изменений. Диагноз аналитика подтверждён.${diagnosisText ? '' : ' (аналитик не дал диагноз — оставляю как есть)'}
+
+ПРАВИЛА:
+1. НЕ оборачивай ответ в JSON. Никаких блоков FILE:, никаких патчей.
+2. Возвращай ТОЛЬКО строку SUMMARY: Нет изменений... как написано выше.
+3. Если хочешь добавить техническое замечание к диагнозу — впиши его после слова "Диагноз аналитика подтверждён." в той же строке SUMMARY.
+4. Любой блок FILE в этом режиме = НАРУШЕНИЕ.`;
+    }
 
     // Подгружаем текущее содержимое каждого файла из ТЗ, чтобы разработчик
     // видел legacy-код и делал точечные SEARCH/REPLACE патчи вместо полной
@@ -1308,23 +1496,44 @@ PATCH_END
 Если тестов нет — верни {"passed":true,"tests":[],"errors":[]}.`;
   }
 
-  private buildFinalReportPrompt(run: Run, plan: any, spec: any, codeChanges: any, testResults: any, memoryUpdate: any): string {
-    return `Ты — Оркестратор. Напиши итоговый отчет пользователю.
+  private buildFinalReportPrompt(run: Run, plan: any, spec: any, codeChanges: any, testResults: any, memoryUpdate: any, runMode: 'diagnostics' | 'implementation'): string {
+    // Усиливаем промпт финалки: работа УЖЕ выполнена, нужно ИТОГ, а не
+    // перепечатка плана. Раньше слабая модель возвращала {message:"Понял
+    // задачу, назначу..."} — то есть перепечатывала planning-сообщение, и
+    // пользователь не получал реального ответа. Теперь явно требуем итог и
+    // передаём diagnosis аналитика, чтобы модель опиралась на результат, а не
+    // на план.
+    const diagnosisText = Array.isArray((spec as any)?.diagnosis)
+      ? (spec as any).diagnosis.map((d: any) => `- ${d.file} / ${d.location || '?'}: ${d.issue || ''}${d.evidence ? ` (доказательство: ${d.evidence})` : ''}`).join('\n')
+      : '';
+    const rootCause = (spec as any)?.rootCause ? `\nГЛАВНАЯ ПРИЧИНА: ${(spec as any).rootCause}` : '';
+    const modeDirective = runMode === 'diagnostics'
+      ? `Это ДИАГНОСТИЧЕСКАЯ задача. Код НЕ изменялся (так и задумано). Итоговый отчёт — это ДИАГНОЗ: причину, конкретные файлы/функции, механизм проблемы и рекомендации.`
+      : `Это задача на реализацию. Код уже изменён разработчиком и проверен тестером. Итоговый отчёт — что реально сделано.`;
+
+    return `Ты — Оркестратор. Работа команды УЖЕ завершена. Напиши ИТОГОВЫЙ ОТЧЁТ пользователю — РЕЗУЛЬТАТ, а НЕ повтор плана.
 
 ЗАДАЧА: ${run.task}
-ПЛАН: ${JSON.stringify(plan, null, 2)}
-ТЗ: ${JSON.stringify(spec, null, 2)}
-ИЗМЕНЕНИЯ: ${JSON.stringify(codeChanges, null, 2)}
+${modeDirective}
+ПЛАН (только для контекста, НЕ повторяй его в отчёте): ${JSON.stringify(plan, null, 2)}
+ТЗ/ДИАГНОЗ АНАЛИТИКА: ${JSON.stringify(spec, null, 2)}
+ИЗМЕНЕНИЯ КОДА: ${JSON.stringify(codeChanges, null, 2)}
 ТЕСТЫ: ${JSON.stringify(testResults, null, 2)}
+${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на это в сообщении):\n${diagnosisText}` : ''}${rootCause}
 
-Напиши краткий отчет на языке пользователя: что сделано, какие файлы изменены, результат тестов, следующие шаги.
+КРИТИЧНО:
+1. "message" — это ОТВЕТ ПОЛЬЗОВАТЕЛЮ на его вопрос/задачу. НЕ начинай с "Понял задачу" или "Назначу". Не повторяй план. Работа уже сделана.
+2. В режиме ДИАГНОСТИКИ в "message" изложи конкретную причину проблемы (файлы, функции, механизм) и рекомендации — это и есть ответ, который ждёт пользователь.
+3. В режиме РЕАЛИЗАЦИИ в "message" кратко напиши, что реально изменено и результат тестов.
+4. ВЕРНИ ТОЛЬКО валидный JSON, без markdown и текста вне { }.
 
-Верни ТОЛЬКО валидный JSON:
+Схема:
 {
-  "message": "string - итоговое сообщение пользователю",
-  "summary": "string - краткая сводка",
-  "filesChanged": ["string"],
+  "message": "string - итоговый ответ пользователю (РЕЗУЛЬТАТ, не план)",
+  "summary": "string - краткая сводка в одно-два предложения",
+  "filesChanged": ["string - реальные пути изменённых файлов, если есть"],
   "testResult": "passed|failed",
+  "diagnosis": ["string - пункты диагноза, только для диагностического режима"],
   "nextSteps": ["string"]
 }`;
   }

@@ -167,6 +167,18 @@ export class ChatsService {
   }
 
   async remove(id: string) {
+    // Сначала явно удаляем все run'ы этого чата. Раньше FK runs.chatId был
+    // onDelete: SET NULL — поэтому при удалении чата runs просто теряли chatId
+    // и оставались в БД навсегда как orphan-зомби (status='running', никто их
+    // больше не поллит, а executeRunSteps их skips по гварде "already running").
+    // Это и были «зомби» fbaf14a0/f6c2d316, из-за которых чат висел заблокирован.
+    // Теперь: (1) FK переведён на CASCADE, (2) здесь дублируем удаление в коде —
+    // двойная защита, не зависящая от того, пересоздал ли synchronize FK.
+    try {
+      await this.runsService.deleteRunsByChat(id);
+    } catch (error) {
+      this.logger?.warn?.(`deleteRunsByChat failed for chat ${id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const result = await this.chatsRepository.delete(id);
     if (result.affected === 0) throw new NotFoundException("Chat not found");
     return { ok: true };
@@ -406,12 +418,42 @@ export class ChatsService {
             const runEntity = completedRun.run;
             const report: any = completedRun.report || runEntity.finalReport;
 
+            // Защита от бага "финальный ответ = дубль планировочного сообщения".
+            // Слабая LLM-финалка иногда перепечатывает план ("Понял задачу,
+            // назначу...") вместо итога. Если детектим это — и у нас есть
+            // diagnosis аналитика (режим диагностики) или summary — собираем
+            // настоящий ответ из артефактов run, а не из мусорного message.
+            const looksLikePlanDup = (msg: string) => /^(понял|назначу|проверю|нужно проверить|давайте|сейчас назначу)/i.test(String(msg || '').trim());
+
             let finalMessage = "";
             if (runEntity.status === 'completed') {
-              finalMessage = report?.message || report?.summary || "✅ Сделано. Работа успешно завершена.";
+              const rawMessage = report?.message || report?.summary || "";
+
+              if (looksLikePlanDup(rawMessage) && report?.mode === 'diagnostics' && Array.isArray(report?.diagnosis) && report.diagnosis.length) {
+                // Перепечатка плана в диагностике — собираем реальный диагноз.
+                const diagLines = report.diagnosis.map((d: any) => {
+                  const file = d?.file || d?.file || '';
+                  const loc = d?.location ? ` (${d.location})` : '';
+                  const issue = d?.issue || '';
+                  return `• ${file}${loc}: ${issue}`.trim();
+                });
+                finalMessage = report?.rootCause || report?.summary || 'Найдена причина:';
+                if (diagLines.length) finalMessage += `\n\n${diagLines.join('\n')}`;
+                if (Array.isArray(report?.recommendations) && report.recommendations.length) {
+                  finalMessage += `\n\nРекомендации:\n${report.recommendations.map((r: string) => `• ${r}`).join('\n')}`;
+                }
+                this.logger.log(`Detected plan-duplication in final report; rebuilt message from diagnosis for run ${autoRunId}`);
+              } else if (looksLikePlanDup(rawMessage) && Array.isArray(report?.diagnosis) && report.diagnosis.length) {
+                // Реализация, но финалка перепечатала план — хотя бы покажем
+                // что было сделано из filesChanged/testResult ниже, а message
+                // заменим на нейтральное "Работа выполнена".
+                finalMessage = report?.summary || 'Работа выполнена.';
+              } else {
+                finalMessage = rawMessage || "✅ Сделано. Работа успешно завершена.";
+              }
             } else if (runEntity.status === 'failed') {
               finalMessage = `❌ Ошибка: работа не удалась после ${runEntity.retryCount || 3} попыток. ${runEntity.error || 'Неизвестная ошибка'}`;
-              if (report?.message) finalMessage += `\n\n${report.message}`;
+              if (report?.message && !looksLikePlanDup(report.message)) finalMessage += `\n\n${report.message}`;
             } else {
               finalMessage = `Статус: ${runEntity.status}`;
             }

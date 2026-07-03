@@ -25,7 +25,7 @@ export class RunEntity {
   @JoinColumn({ name: "projectId" })
   project!: ProjectEntity | null;
 
-  @ManyToOne(() => ChatEntity, (chat) => chat.runs, { onDelete: "SET NULL", nullable: true })
+  @ManyToOne(() => ChatEntity, (chat) => chat.runs, { onDelete: "CASCADE", nullable: true })
   @JoinColumn({ name: "chatId" })
   chat!: ChatEntity | null;
 
