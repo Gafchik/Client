@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, OnModuleInit } from "@nestjs/common";
+import { Inject, Injectable, NotFoundException, OnModuleInit } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 import { ProviderEntity } from "../../persistence/provider.entity.js";
@@ -15,6 +15,7 @@ export class TeamsService implements OnModuleInit {
     private readonly teamsRepository: Repository<TeamEntity>,
     @InjectRepository(ProviderEntity)
     private readonly providersRepository: Repository<ProviderEntity>,
+    @Inject(ProvidersService)
     private readonly providersService: ProvidersService,
   ) {}
 

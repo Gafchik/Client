@@ -1,7 +1,7 @@
 import { WebSocketGateway, WebSocketServer, SubscribeMessage, OnGatewayConnection, OnGatewayDisconnect, ConnectedSocket, MessageBody } from "@nestjs/websockets";
 import { Server, Socket } from "socket.io";
 import { JwtService } from "@nestjs/jwt";
-import { Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger } from "@nestjs/common";
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -21,7 +21,7 @@ export class WsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private readonly logger = new Logger(WsGateway.name);
   private clientRooms = new Map<string, Set<string>>();
 
-  constructor(private readonly jwtService: JwtService) {}
+  constructor(@Inject(JwtService) private readonly jwtService: JwtService) {}
 
   async handleConnection(client: AuthenticatedSocket) {
     try {

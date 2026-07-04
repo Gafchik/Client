@@ -1,5 +1,4 @@
-import { Body, Controller, Get, Param, Post } from "@nestjs/common";
-import { Logger } from "@nestjs/common";
+import { Body, Controller, Get, Inject, Logger, Param, Post } from "@nestjs/common";
 import { RunsService } from "./runs.service.js";
 import { StartRunDto } from "./dto/start-run.dto.js";
 import { safeJsonParse } from "../../shared/json.js";
@@ -9,7 +8,7 @@ import path from "node:path";
 @Controller()
 export class RunsController {
   private readonly logger = new Logger(RunsController.name);
-  constructor(private readonly runsService: RunsService) {}
+  constructor(@Inject(RunsService) private readonly runsService: RunsService) {}
 
   @Get("runs")
   async listRuns() {

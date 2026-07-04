@@ -11,6 +11,12 @@
     "dev:api": "npm run start:dev -w apps/api",
     "dev:web": "npm run dev -w apps/web",
     "build": "npm run build -w apps/api && npm run build -w apps/web",
+    "db:up": "docker compose up -d db",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f db",
+    "dev:kill": "sh scripts/kill-dev.sh",
+    "prestart": "npm run dev:kill && npm run db:up",
+    "start": "concurrently -k -n api,web -c blue,green \"npm:dev:api\" \"npm:dev:web\"",
     "docker:up": "docker compose up --build",
     "docker:rebuild": "docker compose up --build -d",
     "docker:down": "docker compose down",
@@ -19,5 +25,10 @@
   },
   "engines": {
     "node": ">=24.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.3",
+    "dotenv-cli": "^11.0.0",
+    "tsx": "^4.23.0"
   }
 }

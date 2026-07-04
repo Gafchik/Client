@@ -1,10 +1,10 @@
-import { Body, Controller, Delete, Get, Param, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Inject, Param, Post } from "@nestjs/common";
 import { TeamsService } from "./teams.service.js";
 import { SaveTeamDto } from "./dto/save-team.dto.js";
 
 @Controller("teams")
 export class TeamsController {
-  constructor(private readonly teamsService: TeamsService) {}
+  constructor(@Inject(TeamsService) private readonly teamsService: TeamsService) {}
 
   @Get()
   async listTeams() {

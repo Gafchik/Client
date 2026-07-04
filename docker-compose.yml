@@ -1,3 +1,6 @@
+# Только БД поднимается в Docker. API и фронт запускаются локально
+# (npm run start) — это даёт hot-reload и прямой доступ к локальному диску
+# для агентов, без пересборки образов и маппинга путей контейнера.
 services:
   db:
     image: postgres:16-alpine
@@ -15,42 +18,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
-
-  api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
-      target: runner
-    environment:
-      NODE_ENV: production
-      PORT: 3000
-      DATABASE_HOST: db
-      DATABASE_PORT: 5432
-      DATABASE_NAME: ${POSTGRES_DB:-ai_agent_team}
-      DATABASE_USER: ${POSTGRES_USER:-postgres}
-      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      LOCAL_PROJECTS_ROOT: ${LOCAL_PROJECTS_ROOT:-/Users/evgenii}
-      CONTAINER_PROJECTS_ROOT: ${CONTAINER_PROJECTS_ROOT:-/host-projects}
-      STORAGE_ROOT: /app/storage
-      TZ: ${TZ:-Europe/Kiev}
-    depends_on:
-      db:
-        condition: service_healthy
-    ports:
-      - "${API_PORT:-3000}:3000"
-    volumes:
-      - ./storage:/app/storage
-      - ${LOCAL_PROJECTS_ROOT:-/Users/evgenii}:${CONTAINER_PROJECTS_ROOT:-/host-projects}
-
-  web:
-    build:
-      context: .
-      dockerfile: apps/web/Dockerfile
-      target: runner
-    depends_on:
-      - api
-    ports:
-      - "5173:80"
 
 volumes:
   postgres_data:

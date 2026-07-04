@@ -33,9 +33,11 @@ export class ChatsService {
     private readonly teamsRepository: Repository<TeamEntity>,
     @InjectRepository(RunEntity)
     private readonly runsRepository: Repository<RunEntity>,
+    @Inject(TeamsService)
     private readonly teamsService: TeamsService,
     @Inject(forwardRef(() => RunsService))
     private readonly runsService: RunsService,
+    @Inject(WsGateway)
     private readonly wsGateway: WsGateway,
   ) {}
 
@@ -406,7 +408,8 @@ export class ChatsService {
     // и разработчик переписывал 6 файлов вопреки явной просьбе пользователя.
     const userStopPhrases = [
       'не пишите код', 'не пишу код', 'код не пишите', 'код не писать',
-      'только проверить', 'только проверь', 'просто проверить', 'просто проверь',
+      'только проверить', 'только проверь', 'только проверьте',
+      'просто проверить', 'просто проверь', 'просто проверьте',
       'без правок', 'без изменений', 'ничего не меняй', 'не меняй код',
       "don't write code", 'no code changes', 'just check', 'read only', 'без изменения кода',
     ];

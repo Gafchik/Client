@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
 import path from "node:path";
@@ -28,6 +28,7 @@ export class ProjectsService {
     private readonly messagesRepository: Repository<MessageEntity>,
     @InjectRepository(RunEntity)
     private readonly runsRepository: Repository<RunEntity>,
+    @Inject(ConfigService)
     private readonly configService: ConfigService,
   ) {}
 

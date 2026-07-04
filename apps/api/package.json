@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
-    "start:dev": "node --watch --loader ts-node/esm src/main.ts"
+    "start:dev": "tsx watch src/main.ts"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.9",
@@ -23,6 +23,8 @@
     "typeorm": "^0.3.24"
   },
   "devDependencies": {
+    "@swc-node/register": "^1.11.1",
+    "@swc/core": "^1.15.43",
     "@types/node": "^22.10.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.2"

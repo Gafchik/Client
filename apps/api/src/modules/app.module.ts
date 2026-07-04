@@ -20,9 +20,12 @@ import { WsModule } from "./ws/ws.module.js";
 
 @Module({
   imports: [
+    // envFilePath массивом: при запуске из корня (npm run start) CWD=root
+    // и `.env` найдётся; при `npm run -w apps/api` CWD=apps/api и нужен
+    // `../../.env` (корень монорепо). Берётся первый существующий файл.
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: ".env",
+      envFilePath: [".env", "../../.env", "../.env"],
     }),
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
@@ -35,6 +38,10 @@ import { WsModule } from "./ws/ws.module.js";
         database: configService.get<string>("DATABASE_NAME", "ai_agent_team"),
         entities: [ProviderEntity, ProjectEntity, ProjectMemoryEntryEntity, ChatEntity, MessageEntity, TeamEntity, RunEntity],
         synchronize: true,
+        // Страховка от race: если API стартует раньше, чем Postgres в Docker
+        // стал healthy, TypeOrm сам подождёт и переподключится вместо падения.
+        retryAttempts: 15,
+        retryDelay: 2000,
       }),
     }),
     ProvidersModule,

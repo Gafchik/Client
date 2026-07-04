@@ -1,10 +1,10 @@
-import { Body, Controller, Delete, Get, Param, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Inject, Param, Post } from "@nestjs/common";
 import { ProvidersService } from "./providers.service.js";
 import { SaveProviderDto } from "./dto/save-provider.dto.js";
 
 @Controller("providers")
 export class ProvidersController {
-  constructor(private readonly providersService: ProvidersService) {}
+  constructor(@Inject(ProvidersService) private readonly providersService: ProvidersService) {}
 
   @Get()
   async listProviders() {

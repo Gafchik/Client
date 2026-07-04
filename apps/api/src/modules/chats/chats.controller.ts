@@ -1,11 +1,11 @@
-import { Body, Controller, Delete, Get, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Inject, Param, Post, Query } from "@nestjs/common";
 import { ChatsService } from "./chats.service.js";
 import { SaveChatDto } from "./dto/save-chat.dto.js";
 import { SendChatMessageDto } from "./dto/send-chat-message.dto.js";
 
 @Controller("chats")
 export class ChatsController {
-  constructor(private readonly chatsService: ChatsService) {}
+  constructor(@Inject(ChatsService) private readonly chatsService: ChatsService) {}
 
   @Get()
   async listChats(@Query("projectId") projectId?: string) {

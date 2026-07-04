@@ -89,10 +89,13 @@ export class RunsService implements OnModuleInit {
   constructor(
     @InjectRepository(Run)
     private readonly runRepo: Repository<Run>,
+    @Inject(TeamsService)
     private readonly teamsService: TeamsService,
+    @Inject(ProjectsService)
     private readonly projectsService: ProjectsService,
     @Inject(forwardRef(() => ChatsService))
     private readonly chatsService: ChatsService,
+    @Inject(WsGateway)
     private readonly wsGateway: WsGateway,
   ) {}
 

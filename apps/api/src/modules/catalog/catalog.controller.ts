@@ -1,4 +1,4 @@
-import { Controller, Get, Logger, Query } from "@nestjs/common";
+import { Controller, Get, Inject, Logger, Query } from "@nestjs/common";
 import { MODEL_CATALOG } from "../../shared/model-catalog.js";
 import { ProvidersService } from "../providers/providers.service.js";
 
@@ -13,7 +13,7 @@ export class CatalogController {
     MODEL_CATALOG.map((m) => [m.id, m] as const),
   );
 
-  constructor(private readonly providersService: ProvidersService) {}
+  constructor(@Inject(ProvidersService) private readonly providersService: ProvidersService) {}
 
   @Get("models")
   async getModels(@Query("providerId") providerId?: string) {

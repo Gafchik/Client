@@ -1,11 +1,11 @@
-import { Body, Controller, Delete, Get, Param, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Inject, Param, Post } from "@nestjs/common";
 import { ProjectsService } from "./projects.service.js";
 import { SaveProjectMemoryDto } from "./dto/save-project-memory.dto.js";
 import { SaveProjectDto } from "./dto/save-project.dto.js";
 
 @Controller("projects")
 export class ProjectsController {
-  constructor(private readonly projectsService: ProjectsService) {}
+  constructor(@Inject(ProjectsService) private readonly projectsService: ProjectsService) {}
 
   @Get()
   async listProjects() {
