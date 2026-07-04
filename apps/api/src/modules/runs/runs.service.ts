@@ -1547,6 +1547,24 @@ export class RunsService implements OnModuleInit {
               parseResult = { success: true, data: fixed, rawResponse: fullContent };
             }
           }
+          // 4) NATURAL LANGUAGE FALLBACK: если модель ответила обычным текстом
+          // (не маркеры, не JSON) — например "Я не могу завершить задачу, так как
+          // предоставлен неполный код" — это НЕ парсинг-ошибка, а валидный ответ
+          // агента "нет изменений". Без этого fallback 3 попытки тратятся на
+          // ретраи, которые не изменят ответ модели. Лучше считать это "нет
+          // изменений" с summary = текст модели.
+          if (!parseResult.success && fullContent && fullContent.length > 20) {
+            const hasMarkers = /^[ \t]*(SUMMARY:|FILE:|PATCH_START|CONTENT_START)/m.test(fullContent);
+            const looksLikeJson = fullContent.trim().startsWith('{');
+            if (!hasMarkers && !looksLikeJson) {
+              this.logger.log(`Agent ${stepName}: returned natural language (no markers/JSON), treating as "no changes" for run ${runId}: ${fullContent.slice(0, 200)}`);
+              parseResult = {
+                success: true,
+                data: { files: [], summary: fullContent.trim().slice(0, 2000) },
+                rawResponse: fullContent,
+              };
+            }
+          }
         }
       } else {
         parseResult = parseJsonSafely(fullContent);
