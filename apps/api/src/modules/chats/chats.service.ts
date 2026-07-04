@@ -341,21 +341,36 @@ export class ChatsService {
     let executionTask = String(orchestratorPayload.executionTask || content).trim();
     
     if (!parseResult.success && !shouldExecute) {
+      // Эвристика включается ТОЛЬКО когда оркестратор не вернул валидный JSON.
+      // «проверь/проверить/посмотри/изучи/разберись» — это диагностика, а не
+      // правки кода, поэтому их здесь НЕТ. Иначе фраза «проверьте почему такой
+      // большой конфирм диалог, код не пишите» форсила запуск команды и
+      // разработчик переписывал файлы вопреки просьбе.
       const actionKeywords = [
-        'создай', 'создать', 'добавь', 'добавить', 'исправь', 'исправить', 
+        'создай', 'создать', 'добавь', 'добавить', 'исправь', 'исправить',
         'реализуй', 'реализовать', 'напиши', 'написать', 'сделай', 'сделать',
-        'обнови', 'обновить', 'удали', 'удалить', 'рефактор', 'рефакторинг',
-        'тест', 'тестируй', 'провери', 'проверить', 'запусти', 'запустить',
-        'create', 'add', 'fix', 'implement', 'write', 'make', 'update', 'delete',
-        'refactor', 'test', 'run', 'execute', 'build', 'deploy'
+        'обнови', 'обновить', 'удали файл', 'рефактор', 'рефакторинг',
+        'тестируй', 'запусти', 'запустить',
+        'create', 'add', 'fix', 'implement', 'write', 'make', 'update',
+        'refactor', 'run', 'execute', 'build', 'deploy'
+      ];
+      // Стоп-фразы: пользователь явно просит БЕЗ правок — никогда не форсим.
+      const stopPhrases = [
+        'не пишите код', 'не пишу код', 'код не пишите', 'код не писать',
+        'только проверить', 'только проверь', 'просто проверить', 'просто проверь',
+        'без правок', 'без изменений', 'ничего не меняй', 'не меняй код',
+        "don't write code", 'no code changes', 'just check', 'read only', 'без изменения кода'
       ];
       const lowerContent = content.toLowerCase();
-      const hasActionKeyword = actionKeywords.some(keyword => lowerContent.includes(keyword));
-      
+      const hasStopPhrase = stopPhrases.some(p => lowerContent.includes(p));
+      const hasActionKeyword = !hasStopPhrase && actionKeywords.some(keyword => lowerContent.includes(keyword));
+
       if (hasActionKeyword) {
         this.logger.log(`Heuristic fallback triggered: user message contains action keywords, forcing execution`);
         shouldExecute = true;
         executionTask = content;
+      } else if (hasStopPhrase) {
+        this.logger.log(`Heuristic fallback skipped: stop phrase detected, keeping shouldExecute=false`);
       }
     }
     
@@ -428,11 +443,13 @@ export class ChatsService {
             let finalMessage = "";
             if (runEntity.status === 'completed') {
               const rawMessage = report?.message || report?.summary || "";
+              const isPlanDup = looksLikePlanDup(rawMessage);
+              const hasDiagnosis = Array.isArray(report?.diagnosis) && report.diagnosis.length;
 
-              if (looksLikePlanDup(rawMessage) && report?.mode === 'diagnostics' && Array.isArray(report?.diagnosis) && report.diagnosis.length) {
+              if (isPlanDup && report?.mode === 'diagnostics' && hasDiagnosis) {
                 // Перепечатка плана в диагностике — собираем реальный диагноз.
                 const diagLines = report.diagnosis.map((d: any) => {
-                  const file = d?.file || d?.file || '';
+                  const file = d?.file || '';
                   const loc = d?.location ? ` (${d.location})` : '';
                   const issue = d?.issue || '';
                   return `• ${file}${loc}: ${issue}`.trim();
@@ -443,11 +460,20 @@ export class ChatsService {
                   finalMessage += `\n\nРекомендации:\n${report.recommendations.map((r: string) => `• ${r}`).join('\n')}`;
                 }
                 this.logger.log(`Detected plan-duplication in final report; rebuilt message from diagnosis for run ${autoRunId}`);
-              } else if (looksLikePlanDup(rawMessage) && Array.isArray(report?.diagnosis) && report.diagnosis.length) {
+              } else if (isPlanDup && hasDiagnosis) {
                 // Реализация, но финалка перепечатала план — хотя бы покажем
                 // что было сделано из filesChanged/testResult ниже, а message
                 // заменим на нейтральное "Работа выполнена".
                 finalMessage = report?.summary || 'Работа выполнена.';
+              } else if (isPlanDup) {
+                // Финалка перепечатала план, а diagnosis пуст (аналитик не дал
+                // диагноз). Раньше в этот else-ветке уходил rawMessage = дубль
+                // "Понял задачу. Нужно проверить..." — пользователь видел бред.
+                // Теперь отдаём нейтральный итог по режиму, без перепечатки плана.
+                finalMessage = report?.mode === 'diagnostics'
+                  ? 'Проверка завершена: код не изменялся. Аналитик не сформировал конкретный диагноз — попробуйте уточнить вопрос.'
+                  : (report?.summary || 'Работа выполнена.');
+                this.logger.log(`Plan-duplication in final report without diagnosis; using neutral message for run ${autoRunId}`);
               } else {
                 finalMessage = rawMessage || "✅ Сделано. Работа успешно завершена.";
               }

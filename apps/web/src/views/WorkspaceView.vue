@@ -420,12 +420,11 @@ function onUserScroll() {
   const atBottom = isUserAtBottom();
   shouldAutoScroll = atBottom;
   userHasScrolled = !atBottom;
-  console.log('[Scroll] User scrolled, atBottom:', atBottom, 'shouldAutoScroll:', shouldAutoScroll, 'userHasScrolled:', userHasScrolled);
 }
 function copyMessage(text: string) { if (!text) return; navigator.clipboard.writeText(text).then(() => showToast('success', 'Скопировано')).catch(() => showToast('error', 'Не удалось скопировать')); }
 function reportText(): string { if (!state.report) return "Пока нет отчёта."; const r = state.report as any; return [`Task: ${r.task}`, `Project: ${r.projectPath}`, `Reviewer approved: ${r.approvals?.reviewerApproved ? "yes" : "no"}`, `Tester status: ${r.approvals?.testerStatus ?? "-"}`, "", r.spec?.summary ? `Spec: ${r.spec.summary}` : "", r.reviewer?.summary ? `Review: ${r.reviewer.summary}` : "", r.tester?.summary ? `Test: ${r.tester.summary}` : "", r.usageSummary ? `Tokens: actual ${r.usageSummary.totalActualTokens}, weighted ${r.usageSummary.totalWeightedTokens}` : ""].filter(Boolean).join("\n"); }
 
-function connectWebSocket() { if (ws) { ws.disconnect(); ws = null; } console.log('[WS] Connecting...'); import('socket.io-client').then(({ io }) => { const wsUrl = import.meta.env.DEV ? `${window.location.protocol}//${window.location.hostname}:5173` : window.location.origin; console.log('[WS] wsUrl:', wsUrl); try { ws = io(wsUrl, { path: '/ws/socket.io', transports: ['websocket', 'polling'], autoConnect: true }); ws.on('connect', () => { console.log("[WS] Connected, socket.id:", ws.id); if (state.selectedChatId) ws.emit("join:chat", { chatId: state.selectedChatId }); if (state.selectedProjectId) ws.emit("join:project", { projectId: state.selectedProjectId }); }); ws.on('token:stream', (msg: any) => { console.log('[WS] token:stream', msg); handleWsMessage({ event: "token:stream", data: msg }); }); ws.on('run:event', (msg: any) => { console.log('[WS] run:event', msg); handleWsMessage({ event: "run:event", data: msg }); }); ws.on('agent:activity', (msg: any) => { console.log('[WS] agent:activity', msg); handleWsMessage({ event: "agent:activity", data: msg }); }); ws.on('disconnect', (reason: string) => { console.log("[WS] Disconnected:", reason); wsReconnectTimer = window.setTimeout(connectWebSocket, 3000); }); ws.on('connect_error', (err: any) => { console.error("[WS] Connection error:", err); }); } catch (err) { console.error("[WS] Failed to create socket.io connection:", err); ws = null; } }).catch(err => { console.error("[WS] Failed to load socket.io-client:", err); ws = null; }); }
+function connectWebSocket() { if (ws) { ws.disconnect(); ws = null; } import('socket.io-client').then(({ io }) => { const wsUrl = import.meta.env.DEV ? `${window.location.protocol}//${window.location.hostname}:5173` : window.location.origin; try { ws = io(wsUrl, { path: '/ws/socket.io', transports: ['websocket', 'polling'], autoConnect: true }); ws.on('connect', () => { if (state.selectedChatId) ws.emit("join:chat", { chatId: state.selectedChatId }); if (state.selectedProjectId) ws.emit("join:project", { projectId: state.selectedProjectId }); }); ws.on('token:stream', (msg: any) => { handleWsMessage({ event: "token:stream", data: msg }); }); ws.on('run:event', (msg: any) => { handleWsMessage({ event: "run:event", data: msg }); }); ws.on('agent:activity', (msg: any) => { handleWsMessage({ event: "agent:activity", data: msg }); }); ws.on('disconnect', () => { wsReconnectTimer = window.setTimeout(connectWebSocket, 3000); }); ws.on('connect_error', () => {}); } catch { ws = null; } }).catch(() => { ws = null; }); }
 function handleWsMessage(msg: any) { 
   if (msg.event === "token:stream") { 
     const { role, content, done, usage } = msg.data; 
@@ -445,24 +444,12 @@ function handleWsMessage(msg: any) {
     const { runId, event: runEvent, data } = msg.data; 
     if (runId === state.selectedRunId) { 
       state.runEvents.push({ at: msg.timestamp, event: runEvent, payload: data }); 
-      console.log('[WS] run:event added to runEvents:', runEvent, 'total:', state.runEvents.length);
-      // Trigger scroll for new run events
-      nextTick(() => {
-        if (shouldAutoScroll && !userHasScrolled) {
-          scrollMessagesToBottom('smooth');
-        }
-      });
+      nextTick(() => { if (shouldAutoScroll && !userHasScrolled) scrollMessagesToBottom('smooth'); });
     } 
   } else if (msg.event === "agent:activity") { 
     const data = msg.data; 
     state.runEvents.push({ at: msg.timestamp, event: "agent:activity", payload: data }); 
-    console.log('[WS] agent:activity added:', data.role, data.detail);
-    // Trigger scroll for new agent activity
-    nextTick(() => {
-      if (shouldAutoScroll && !userHasScrolled) {
-        scrollMessagesToBottom('smooth');
-      }
-    });
+    nextTick(() => { if (shouldAutoScroll && !userHasScrolled) scrollMessagesToBottom('smooth'); });
   } 
 }
 function disconnectWebSocket() { if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer); if (ws) { ws.disconnect(); ws = null; } }
@@ -515,35 +502,29 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
     </div>
 
     <main class="chat-area">
-      <div v-if="state.runEvents.length && state.runStatus === 'running'" class="run-progress-bar">
-        <div class="progress-steps">
-          <div v-for="(step, idx) in progressSteps" :key="step.key" :class="['progress-step', { active: step.key === state.currentStep, done: progressSteps.indexOf(step) < progressSteps.indexOf(currentStepObj) }]">
-
-            <div class="step-icon" :style="{ background: step.color }">{{ step.icon }}</div>
-            <div class="step-label">{{ step.label }}</div>
-            <div v-if="idx < progressSteps.length - 1" class="step-connector"></div>
-          </div>
-        </div>
-        <div class="progress-detail">
-          <span class="current-agent">{{ currentAgentName }}</span>
-          <span class="current-detail">{{ state.currentStepDetail }}</span>
-
-        </div>
-      </div>
       <div ref="messagesListRef" class="chat-messages" @scroll="onUserScroll">
         <div v-if="unifiedChatStream.length === 0 && !state.streamingMessage" class="chat-empty">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           <p>Выбери проект, создай чат и отправь первую задачу оркестратору.</p>
         </div>
-        <div v-else>
-          <div v-for="item in unifiedChatStream" :key="item.id" class="message" :class="[item.type, item.status]">
-            <div class="message-avatar" :class="item.agentRole || item.role" :style="{ background: 'var(--accent)' }">{{ item.type === 'user' ? '👤' : item.type === 'system' ? '⚙' : item.type === 'token-summary' ? '📊' : agentInitial(item) }}</div>
-            <div class="message-bubble">
-              <div class="message-header"><span class="message-name">{{ messageName(item) }}</span><span class="message-time">{{ formatTime(item.createdAt) }}</span><span v-if="item.status" class="message-status" :class="item.status"><span class="status-dot" :class="item.status"></span>{{ item.status === 'working' ? 'Работает' : item.status === 'done' ? 'Готово' : item.status === 'idle' ? 'Пропущен' : 'Ошибка' }}</span></div>
-              <div class="message-content" v-html="formatMessageContent(item)"></div>
-              <div v-if="item.meta?.usage" class="message-actions"><button class="action-btn" @click="copyMessage(item.content)" title="Копировать"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+        <div v-else class="chat-stream-inner">
+          <template v-for="item in unifiedChatStream" :key="item.id">
+            <div v-if="item.type === 'agent-status' || item.type === 'system'" class="agent-line" :class="item.status || ''">
+              <span class="agent-line-dot" :class="(item.status as string) || 'working'"></span>
+              <span class="agent-line-text">
+                <span v-if="item.name || item.agentRole" class="agent-line-name">{{ item.name || item.agentRole }}</span>
+                <span v-html="formatMessageContent(item)"></span>
+              </span>
             </div>
-          </div>
+            <div v-else class="message" :class="[item.type, item.status]">
+              <div class="message-avatar" :class="item.agentRole || item.role">{{ item.type === 'user' ? '👤' : agentInitial(item) }}</div>
+              <div class="message-bubble">
+                <div class="message-header"><span class="message-name">{{ messageName(item) }}</span><span class="message-time">{{ formatTime(item.createdAt) }}</span><span v-if="item.status" class="message-status" :class="item.status"><span class="status-dot" :class="item.status"></span>{{ item.status === 'working' ? 'Работает' : item.status === 'done' ? 'Готово' : item.status === 'idle' ? 'Пропущен' : 'Ошибка' }}</span></div>
+                <div class="message-content" v-html="formatMessageContent(item)"></div>
+                <div v-if="item.meta?.usage" class="message-actions"><button class="action-btn" @click="copyMessage(item.content)" title="Копировать"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+              </div>
+            </div>
+          </template>
           <div v-if="state.streamingMessage" class="message assistant working">
             <div class="message-avatar" :class="streamingAvatarClass">{{ streamingAvatarLetter }}</div>
             <div class="message-bubble">
@@ -551,8 +532,6 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
               <div class="message-content" v-html="formatMessageContent({ content: streamingDisplayContent })"></div>
             </div>
           </div>
-
-          <div v-if="state.busy && state.runEvents.length" class="typing-indicator"><span class="typing-dots"><span></span><span></span><span></span></span>Агенты работают...</div>
         </div>
       </div>
 
@@ -584,9 +563,25 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .context-actions { display:flex; gap:8px; margin-left:auto; }
 
 .chat-area { flex:1; display:flex; flex-direction:column; min-height:0; }
-.chat-messages { flex:1; overflow:auto; padding:20px; display:flex; flex-direction:column; gap:16px; }
+.chat-messages { flex:1; overflow:auto; padding:20px; display:flex; flex-direction:column; gap:10px; }
+.chat-stream-inner { display:flex; flex-direction:column; gap:10px; }
 .chat-empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--muted); text-align:center; gap:12px; }
 .chat-empty svg { width:48px; height:48px; opacity:.5; }
+
+/* Компактные строки телеметрии агентов (вместо пузырей для каждого статуса).
+   Раньше каждый agent:activity рисовался как полноценный пузырь с аватаром —
+   чат превращался в лог, «прыгал» и не был похож на чат. Теперь статус —
+   короткая однострочная метка слева, как в мессенджерах («N набирает…»). */
+.agent-line { display:flex; align-items:center; gap:8px; max-width:900px; margin:0 auto; width:100%; padding:2px 4px; font-size:12px; color:var(--muted); line-height:1.4; }
+.agent-line-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; background:#6b7280; }
+.agent-line-dot.working { background:#f59e0b; animation:pulse 1.5s infinite; }
+.agent-line-dot.done { background:#10b981; }
+.agent-line-dot.idle { background:#6b7280; }
+.agent-line-dot.error { background:#ef4444; }
+.agent-line-text { display:flex; align-items:baseline; gap:6px; flex-wrap:wrap; min-width:0; }
+.agent-line-name { font-weight:600; color:var(--text); font-size:12px; }
+.agent-line .agent-status-text, .agent-line .system-text { font-size:12px; color:var(--muted); }
+.agent-line.error .agent-status-text, .agent-line.error .system-text { color:#ef4444; }
 .message { display:flex; gap:12px; max-width:900px; margin:0 auto; width:100%; }
 .message-avatar { width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:600; color:#fff; flex-shrink:0; }
 .message-avatar.orchestrator { background:#6366f1; }
@@ -619,21 +614,6 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .typing-dots span:nth-child(1) { animation-delay:-.32s; }
 .typing-dots span:nth-child(2) { animation-delay:-.16s; }
 @keyframes bounce { 0%,80%,100%{transform:scale(0)} 40%{transform:scale(1)} }
-
-.run-progress-bar { padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
-.progress-steps { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; overflow-x: auto; padding-bottom: 4px; }
-.progress-step { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 70px; opacity: 0.4; transition: opacity 0.3s; }
-.progress-step.active { opacity: 1; }
-.progress-step.done { opacity: 0.7; }
-.progress-step.done .step-icon { background: #10b981 !important; }
-.step-icon { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; color: white; }
-.step-label { font-size: 10px; text-align: center; white-space: nowrap; color: var(--muted); }
-.progress-step.active .step-label { color: var(--text); font-weight: 500; }
-.step-connector { width: 24px; height: 2px; background: var(--line); margin-bottom: 14px; }
-.progress-step.done + .step-connector { background: #10b981; }
-.progress-detail { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--muted); }
-.current-agent { font-weight: 600; color: var(--accent); text-transform: capitalize; }
-.current-detail { max-width: 400px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .chat-composer { padding:16px 20px; border-top:1px solid var(--line); background:var(--panel); }
 .composer-input { flex:1; }

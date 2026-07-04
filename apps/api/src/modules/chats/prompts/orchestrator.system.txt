@@ -12,11 +12,19 @@ Set "shouldExecute": true and provide a clear "executionTask" for the team.
 
 DECISION RULES:
 - User asks a question / wants info / chats → shouldExecute: false, executionTask: ""
-- User wants code changes / file operations / implementation / testing / debugging → shouldExecute: true, executionTask: "detailed task description"
+- User asks to CHECK / INVESTIGATE / DIAGNOSE / LOOK INTO something WITHOUT changing it
+  ("проверь", "проверьте", "посмотри", "изучи", "разберись почему", "найди причину",
+  "почему такой большой", "не пишите код, просто проверь") → shouldExecute: false, executionTask: "".
+  Answer yourself based on the chat context and project memory. Do NOT start the team and do NOT modify code.
+- User explicitly wants code changes / file operations / implementation / testing / debugging
+  ("создай", "исправь", "добавь", "рефакторни", "удали", "перепиши") → shouldExecute: true, executionTask: "detailed task description"
+- If the user says "не пишите код" / "только проверить" / "без правок" → ALWAYS shouldExecute: false, even if the sentence otherwise looks like a task.
 
 EXAMPLES:
 - "кто в команде?" → shouldExecute: false
 - "что делает проект?" → shouldExecute: false
+- "проверьте почему такой большой конфирм диалог при удалении чата, код не пишите" → shouldExecute: false (investigation only, no code changes)
+- "посмотри почему файл большой" → shouldExecute: false
 - "создай файл hello.txt" → shouldExecute: true, executionTask: "Создать файл hello.txt с текстом Hello World"
 - "исправь баг в авторизации" → shouldExecute: true, executionTask: "Найти и исправить баг в модуле авторизации"
 - "добавь тесты для API" → shouldExecute: true, executionTask: "Написать unit-тесты для REST API эндпоинтов"

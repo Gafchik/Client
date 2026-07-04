@@ -10,6 +10,7 @@ import { ChatsService } from '../chats/chats.service';
 import { WsGateway } from '../ws/ws.gateway';
 import * as fs from 'fs';
 import * as path from 'path';
+import { execSync } from 'node:child_process';
 
 interface LlmResponse {
   content: string;
@@ -372,7 +373,11 @@ export class RunsService implements OnModuleInit {
         await this.saveProjectMemory(projectId, chatId, spec, language);
 
         // 3. DEVELOPER
-        await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', 'Начинаю реализацию по ТЗ');
+        // В diagnostic-режиме разработчик НЕ трогает код. Раньше здесь хардкод
+        // «Начинаю реализацию по ТЗ» + «Код написан» вещался ВСЕГДА — даже когда
+        // пользователь явно просил «код не пишите». В чате горело «Код написан»,
+        // хотя код не менялся. Это ломало доверие («агенты врут/тупые»).
+        await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', runMode === 'diagnostics' ? 'Изучаю выводы аналитика' : 'Начинаю реализацию по ТЗ');
 
         const devSpec = {
           files: (spec as any).files || [],
@@ -406,21 +411,63 @@ export class RunsService implements OnModuleInit {
           throw new Error(`Developer failed: ${developerResult.error}`);
         }
 
-        await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'done', 'Код написан');
+        await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'done', runMode === 'diagnostics' ? 'Диагноз подтверждён, код не трогал' : 'Код написан');
 
         const codeChanges = developerResult.artifact || {};
         const files = (codeChanges as any).files;
-        const applyChanges = teamConfig.run?.applyChanges !== false; // по умолчанию true
-        if (files && Array.isArray(files)) {
-          for (const fileChange of files) {
-            await this.applyFileChange(projectPath, fileChange, applyChanges);
-            const verb = applyChanges ? 'Изменён' : 'Запланирован (dry-run, не записан)';
-            await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', `${verb} файл: ${fileChange.path} (${fileChange.action})`);
+        let applyChanges = teamConfig.run?.applyChanges !== false; // по умолчанию true
+        // ЖЁСТКАЯ защита режима диагностики: даже если разработчик ослушался и
+        // вернул блоки FILE (а слабые модели регулярно это делают), мы НИКОГДА
+        // не пишем их на диск и НЕ спамим «Изменён файл» в чат. Иначе фраза
+        // «проверьте … код не пишите» приводила к тому, что в чат вылетало
+        // 6 строк «Изменён файл: …» — ровно то, на что жаловался пользователь.
+        const isDiagnostics = runMode === 'diagnostics';
+        if (isDiagnostics) {
+          applyChanges = false;
+        }
+        if (files && Array.isArray(files) && files.length) {
+          if (isDiagnostics) {
+            // В диагностике молча игнорируем любые правки — не портим проект
+            // и не плодим фейковые «Изменён файл» в чате.
+            this.logger.log(`[diagnostics] ignored ${files.length} file change(s) from developer (run ${runId})`);
+          } else {
+            for (const fileChange of files) {
+              // Фильтр: аналитик ведёт доку проекта в БД (project memory), а НЕ
+              // в репозитории. Поэтому .md/README/docs файлы из ТЗ игнорируем —
+              // не засоряем чужой проект документацией. Фикс жалобы «написали
+              // тут какую-то доку в репозитории».
+              if (this.isDocumentationPath(fileChange.path)) {
+                await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', `Документация «${fileChange.path}» — оставляю в памяти проекта (БД), в репо не пишу`);
+                continue;
+              }
+              // Фильтр мусорных/временных файлов. Слабые модели «имитируют»
+              // shell-команды (git log, git diff) созданием файлов вроде
+              // git_log_output.txt / scratch.txt / output_*.txt и НЕ удаляют
+              // их за собой — репо засоряется. Фикс жалобы «они создали
+              // git_log_output.txt и не удалили за собой». Такие пути НИКОГДА
+              // не пишутся на диск.
+              if (this.isJunkPath(fileChange.path)) {
+                await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'error', `Мусорный файл «${fileChange.path}» — не пишу в репо (временные/лог/выводные файлы запрещены, используй память проекта)`);
+                continue;
+              }
+              const verb = applyChanges ? 'Изменён' : 'Запланирован (dry-run, не записан)';
+              // applyFileChange теперь устойчив: один плохой путь (ENOTDIR —
+              // например когда в середине пути стоит файл вместо директории,
+              // как в dog-borrowing-back/src/domain/dog/aggregates) НЕ роняет
+              // весь run. Логируем ошибку в чат и идём к следующему файлу.
+              // Раньше throw здесь срывал все 3 попытки, и чат падал в «Ошибка».
+              const res = await this.applyFileChange(projectPath, fileChange, applyChanges);
+              if (res.ok) {
+                await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', `${verb} файл: ${fileChange.path} (${fileChange.action})`);
+              } else {
+                await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'error', `Не удалось применить ${fileChange.path}: ${res.error}`);
+              }
+            }
           }
         }
 
         // 4. TESTER
-        await this.broadcastActivity(runId, chatId, 'tester', testName, testLabel, 'working', 'Запускаю тесты');
+        await this.broadcastActivity(runId, chatId, 'tester', testName, testLabel, 'working', runMode === 'diagnostics' ? 'Проверяю выводы аналитика' : 'Запускаю тесты');
 
         const testerResult = await this.callAgentStream(
           runId, chatId, 'tester', testerAgent, language,
@@ -1031,50 +1078,188 @@ export class RunsService implements OnModuleInit {
     }
   }
 
+  /**
+   * Приводит путь из ТЗ разработчика к относительному виду внутри проекта.
+   * Слабые модели регулярно пишут АБСОЛЮТНЫЕ пути вида
+   *   /host-projects/<project>/src/...
+   * или даже полные host-пути. path.join(projectPath, absPath) с абсолютным
+   * вторым аргументом ВЫБРАСЫВАЕТ projectPath и пишет файл чёрт знает где
+   * (иногда — в чужой проект). Здесь нормализуем: обрезаем projectPath /
+   * префикс host-projects/<projBase>/ и всегда работаем по относительному
+   * пути внутри проекта. Фикс бага, когда правки «уезжали» из проекта.
+   */
+  private relPathWithinProject(projectPath: string, relOrAbs: string): string {
+    let p = String(relOrAbs || '').trim();
+    if (!p) return '';
+    const normProject = path.resolve(projectPath).replace(/\/+$/, '');
+    const projBase = path.basename(normProject);
+    // Windows-слеши на всякий случай.
+    p = p.replace(/\\/g, '/').trim();
+    // Если путь абсолютный и лежит внутри проекта — берём относительную часть.
+    try {
+      const abs = path.resolve(p);
+      if (abs === normProject) return '';
+      if (abs.startsWith(normProject + '/')) {
+        return path.relative(normProject, abs);
+      }
+    } catch { }
+    // Обрезаем ведущие слеши (модель пишет /src/... вместо src/...).
+    p = p.replace(/^\/+/, '');
+    // Срезаем возможный префикс "host-projects/<projBase>/" если модель
+    // писала контейнерный путь без ведущего слеша.
+    if (projBase) {
+      const hostPrefix = `host-projects/${projBase}/`;
+      if (p.startsWith(hostPrefix)) p = p.slice(hostPrefix.length);
+      else if (p === `host-projects/${projBase}`) p = '';
+      else if (p.startsWith(`${projBase}/`)) p = p.slice(`${projBase}/`.length);
+      else if (p === projBase) p = '';
+    }
+    // Защита от выхода за пределы проекта (../).
+    p = p.replace(/^(\.\.\/)+/, '');
+    return p;
+  }
+
   private async applyFileChange(
     projectPath: string,
     fileChange: { path: string; action: string; content?: string; description?: string; patches?: Array<{ search: string; replace: string }> },
     applyChanges = true,
-  ): Promise<void> {
-    const fullPath = path.join(projectPath, fileChange.path);
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const relPath = this.relPathWithinProject(projectPath, fileChange.path);
+      if (!relPath) return { ok: true };
+      const fullPath = path.join(projectPath, relPath);
 
-    // dry-run: НЕ трогаем диск. Только логируем намерение. Так команда с
-    // run.applyChanges=false работает как "только предложения" и не портит
-    // файлы — это безопасно для диагностических/исследовательских запусков.
-    if (!applyChanges) {
-      this.logger.log(`[dry-run] skip applying ${fileChange.action} to ${fileChange.path}`);
-      return;
-    }
+      // dry-run: НЕ трогаем диск. Только логируем намерение. Так команда с
+      // run.applyChanges=false работает как "только предложения" и не портит
+      // файлы — это безопасно для диагностических/исследовательских запусков.
+      if (!applyChanges) {
+        this.logger.log(`[dry-run] skip applying ${fileChange.action} to ${relPath}`);
+        return { ok: true };
+      }
 
-    const dir = path.dirname(fullPath);
+      const dir = path.dirname(fullPath);
 
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
 
-    if (fileChange.action === 'create' || fileChange.action === 'update') {
-      // Патч-режим: применяем точечные SEARCH/REPLACE к существующему файлу.
-      // Это критично для legacy-спагетти: не нужно переписывать весь файл целиком,
-      // экономим токены и не теряем существующую логику.
-      const patches = Array.isArray(fileChange.patches) ? fileChange.patches : [];
-      if (fileChange.action === 'update' && patches.length > 0 && fs.existsSync(fullPath)) {
-        let current = fs.readFileSync(fullPath, 'utf-8');
-        for (const p of patches) {
-          if (typeof p.search !== 'string' || typeof p.replace !== 'string') continue;
-          if (current.includes(p.search)) {
-            current = current.replace(p.search, p.replace);
+      if (fileChange.action === 'create' || fileChange.action === 'update') {
+        // Патч-режим: применяем точечные SEARCH/REPLACE к существующему файлу.
+        // Это критично для legacy-спагетти: не нужно переписывать весь файл целиком,
+        // экономим токены и не теряем существующую логику.
+        const patches = Array.isArray(fileChange.patches) ? fileChange.patches : [];
+        if (fileChange.action === 'update' && patches.length > 0 && fs.existsSync(fullPath)) {
+          let current = fs.readFileSync(fullPath, 'utf-8');
+          for (const p of patches) {
+            if (typeof p.search !== 'string' || typeof p.replace !== 'string') continue;
+            if (current.includes(p.search)) {
+              current = current.replace(p.search, p.replace);
+            } else {
+              this.logger.warn(`Patch search block not found in ${relPath}; skipping that patch.`);
+            }
+          }
+          fs.writeFileSync(fullPath, current, 'utf-8');
+          return { ok: true };
+        }
+        fs.writeFileSync(fullPath, fileChange.content ?? '', 'utf-8');
+      } else if (fileChange.action === 'delete') {
+        if (fs.existsSync(fullPath)) {
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            // Это директория, а не файл. fs.unlinkSync на директории падает с
+            // EISDIR/ENOTDIR и ронял весь run. Используем rmSync recursive —
+            // как git удаляет папки. Фикс «ENOTDIR при mkdir aggregates».
+            fs.rmSync(fullPath, { recursive: true, force: true });
           } else {
-            this.logger.warn(`Patch search block not found in ${fileChange.path}; skipping that patch.`);
+            fs.unlinkSync(fullPath);
           }
         }
-        fs.writeFileSync(fullPath, current, 'utf-8');
-        return;
       }
-      fs.writeFileSync(fullPath, fileChange.content ?? '', 'utf-8');
-    } else if (fileChange.action === 'delete') {
-      if (fs.existsSync(fullPath)) {
-        fs.unlinkSync(fullPath);
-      }
+      return { ok: true };
+    } catch (error) {
+      // Любая ошибка диска (ENOTDIR — в пути есть файл вместо директории,
+      // EACCES, ENOSPC, ENOENT и т.п.) теперь НЕ роняет весь run. Возвращаем
+      // ошибку вызывающему — он транслирует её в чат и продолжает остальные
+      // файлы. Раньше throw здесь срывал все 3 попытки прогона.
+      const msg = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`applyFileChange failed for ${fileChange.path}: ${msg}`);
+      return { ok: false, error: msg };
+    }
+  }
+
+  /**
+   * Защита от засорения репозитория документацией. Аналитик ведёт доку
+   * проекта в БД (project memory через saveProjectMemory), а НЕ файлами
+   * в репо. Поэтому .md/README/docs/.rst из ТЗ разработчика игнорируем —
+   * не пишем их на диск. Фикс жалобы «они мне написали тут какую-то доку
+   * в репозитории».
+   */
+  private isDocumentationPath(relPath: string): boolean {
+    const p = String(relPath || '').toLowerCase().trim();
+    if (!p) return false;
+    const base = p.split('/').pop() || '';
+    if (p.endsWith('.md') || p.endsWith('.mdx') || p.endsWith('.rst')) return true;
+    if (base.startsWith('readme')) return true;
+    if (p.startsWith('docs/') || p.includes('/docs/')) return true;
+    if (p.startsWith('documentation/') || p.includes('/documentation/')) return true;
+    return false;
+  }
+
+  /**
+   * Защита от засорения репозитория мусорными/временными файлами. Слабые
+   * модели «имитируют» shell-команды (git log, git diff, npm test) созданием
+   * текстовых файлов-«выводов» (git_log_output.txt, scratch.txt, output_*.txt)
+   * и НЕ удаляют их за собой — репо засоряется. Фикс жалобы «они создали
+   * git_log_output.txt и не удалили за собой». Такие пути НИКОГДА не пишутся.
+   */
+  private isJunkPath(relPath: string): boolean {
+    const p = String(relPath || '').toLowerCase().trim();
+    if (!p) return true;
+    const base = p.split('/').pop() || '';
+    if (p.endsWith('.log') || p.endsWith('.tmp') || p.endsWith('.temp') || p.endsWith('.out') || p.endsWith('.bak') || p.endsWith('.swp')) return true;
+    if (p.endsWith('.txt')) {
+      // .txt почти всегда — мусорная имитация вывода команды. Разрешаем только
+      // явные данные проекта (data/ и public/), остальное блокируем.
+      if (!p.startsWith('data/') && !p.includes('/data/') && !p.startsWith('public/') && !p.includes('/public/')) return true;
+    }
+    if (base.startsWith('git_log') || base.startsWith('gitlog') || base.startsWith('git_diff') || base.startsWith('gitdiff') || base.startsWith('git_status')) return true;
+    if (base.startsWith('scratch') || base.startsWith('temp_') || base.startsWith('tmp_') || base.startsWith('output_') || base.startsWith('console_') || base.startsWith('log_') || base.startsWith('debug_')) return true;
+    if (p.startsWith('tmp/') || p.startsWith('temp/') || p.startsWith('scratch/') || p.includes('/tmp/') || p.includes('/scratch/')) return true;
+    return false;
+  }
+
+  /**
+   * Даёт агентам РЕАЛЬНЫЙ git-контекст проекта (ветка, последние коммиты,
+   * незакоммиченные изменения). Раньше у агентов не было shell-доступа, и
+   * слабая модель «имитировала» `git log` созданием файла git_log_output.txt
+   * (и не удаляла его). Теперь сервер сам выполняет git log/status/diff и
+   * вкладывает результат в промпт — агентам НЕ нужно плодить файлы, у них
+   * уже есть актуальный контекст. Если git недоступен — возвращаем пустую
+   * строку (безопасно, промпты работают и без неё).
+   */
+  private getGitContext(projectPath: string): string {
+    try {
+      if (!projectPath || !fs.existsSync(projectPath)) return '';
+      const dotGit = path.join(projectPath, '.git');
+      if (!fs.existsSync(dotGit)) return '';
+      const run = (cmd: string): string => {
+        try {
+          return execSync(cmd, { cwd: projectPath, encoding: 'utf-8', timeout: 8000, maxBuffer: 1024 * 512 })
+            .toString().trim();
+        } catch {
+          return '';
+        }
+      };
+      const branch = run('git rev-parse --abbrev-ref HEAD');
+      const log = run('git log --oneline -n 15 --no-decorate');
+      const status = run('git status --short');
+      const parts: string[] = [];
+      if (branch) parts.push(`Ветка: ${branch}`);
+      if (log) parts.push(`Последние коммиты (git log --oneline -n 15):\n${log}`);
+      if (status) parts.push(`Незакоммиченные изменения (git status --short):\n${status || '(рабочее дерево чистое)'}`);
+      return parts.length ? parts.join('\n\n') : '';
+    } catch {
+      return '';
     }
   }
 
@@ -1203,6 +1388,7 @@ export class RunsService implements OnModuleInit {
   private buildOrchestratorPrompt(run: Run, messages: any[], project: any, teamConfig: TeamConfig, projectPath: string, runMode: 'diagnostics' | 'implementation'): string {
     const recentMessages = messages?.slice(-10).map(m => `${m.role}: ${m.content}`).join('\n') || 'Нет истории';
     const index = projectPath ? this.buildProjectIndex(projectPath, teamConfig.workspace, 50) : '';
+    const gitContext = projectPath ? this.getGitContext(projectPath) : '';
     // Режим уже определён детерминированно в executeRunSteps. Сообщаем его
     // модели как ФАКТ (не вопрос) — она не должна «решать» заново. Раньше
     // слабая модель на этом шаге игнорила «код не пишите» и всё равно ставила
@@ -1222,11 +1408,12 @@ ${modeLine}
 
 КАРТА ПРОЕКТА (используй только эти реальные пути, не выдумывай файлы):
 ${index}
+${gitContext ? `\nGIT-КОНТЕКСТ (актуальный, серверный — НЕ создавай файлы для git log/diff, он уже здесь):\n${gitContext}` : ''}
 
 ИСТОРИЯ ЧАТА (последние 10):
 ${recentMessages}
 
-Твоя задача — понять, что именно делать, и раздать роли команде. НЕ пиши код. НЕ анализируй файлы подробно (это работа аналитика).
+Твоя задача — понять, что именно делать, и раздать роли команде. НЕ пиши код. НЕ анализируй файлы подробно (это работа аналитика). НЕ требуй от команды создавать временные/лог/текстовые файлы — git-контекст уже в промпте выше.
 
 ПРАВИЛА (КРИТИЧНО):
 1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON-ОБЪЕКТ. Никакого markdown, никаких \`\`\`json блоков, никакого текста до или после { }.
@@ -1280,6 +1467,7 @@ ${recentMessages}
 
   private buildAnalystPrompt(run: Run, plan: any, project: any, messages: any[], projectPath: string, workspace: any, runMode: 'diagnostics' | 'implementation'): string {
     const index = projectPath ? this.buildProjectIndex(projectPath, workspace, 80) : '';
+    const gitContext = projectPath ? this.getGitContext(projectPath) : '';
     // Подгружаем содержимое файлов, упомянутых оркестратором в плане (если он
     // назвал конкретные пути), чтобы аналитик опирался на реальный код, а не
     // фантазировал. Ограничиваем по размеру.
@@ -1310,6 +1498,7 @@ ${recentMessages}
 
 КАРТА ПРОЕКТА:
 ${index}
+${gitContext ? `\nGIT-КОНТЕКСТ (актуальный, серверный — НЕ создавай файлы для git log/diff, он уже здесь):\n${gitContext}` : ''}
 ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на него, не придумывай структуру):\n${fileContext}` : ''}
 
 Твоя задача — изучить РЕАЛЬНЫЙ код и найти ТОЧНУЮ причину описанной проблемы. Укажи конкретные файлы, функции и механизм, который вызывает эффект. НЕ предлагай писать/менять код — только диагноз.
@@ -1338,6 +1527,7 @@ ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на нег
 
 КАРТА ПРОЕКТА:
 ${index}
+${gitContext ? `\nGIT-КОНТЕКСТ (актуальный, серверный — НЕ создавай файлы для git log/diff, он уже здесь):\n${gitContext}` : ''}
 ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на него, не придумывай структуру):\n${fileContext}` : ''}
 
 Твоя задача — точно описать ЧТО менять и ГДЕ, указывая только РЕАЛЬНЫЕ пути из карты выше. НЕ пиши сам код — это работа разработчика. Будь конкретен: файл, функция, что изменить.
@@ -1346,6 +1536,7 @@ ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на нег
 1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON. Никакого markdown, никакого текста вне { }.
 2. В files.path указывай ТОЛЬКО пути, которые есть в КАРТЕ ПРОЕКТА. Не выдумывай файлы.
 3. Для существующих файлов ставь action:"update" (разработчик сделает патч), для новых — action:"create".
+4. НЕ добавляй в files[] документацию, README, файлы .md/.mdx/.rst, файлы из docs/. Документацию проекта ты ВЕДЁШЬ В ПАМЯТИ ПРОЕКТА (БД) — полями description/requirements/acceptanceCriteria, а НЕ файлами в репозитории. В files[] только КОД. Если хочешь зафиксировать архитектурное решение — опиши его в description/requirements, не создавай .md.
 
 Схема:
 {"feature":"string","description":"string","requirements":["string"],"api":{"endpoints":["string"]},"dataModels":["string"],"files":[{"path":"string - реальный путь","action":"create|update","description":"string - что менять","reason":"string - зачем"}],"acceptanceCriteria":["string"],"risks":["string"]}
@@ -1452,6 +1643,9 @@ DESCRIPTION: что сделано
 4. Между маркерами пиши код КАК ЕСТЬ — реальные переносы строк и обычные кавычки, без \\n и без экранирования.
 5. Если изменений не требуется — верни только SUMMARY: Нет изменений (без блоков FILE).
 6. Маркеры FILE:, ACTION:, DESCRIPTION:, SUMMARY: — каждый с новой строки, без пробелов перед двоеточием.
+7. НЕ создавай .md/README/документационные файлы. Документацию проекта ведёт Аналитик в памяти проекта (БД), а не в репозитории. Создавай только КОД. Если в ТЗ есть .md — пропусти его.
+8. НЕ создавай мусорные/временные/логовые/текстовые файлы: git_log_output.txt, scratch.txt, output_*.txt, *.log, *.tmp, *.out и подобные. git-контекст УЖЕ в промпте (сервер выполняет git log/status сам). Если нужно сохранить вывод — используй SUMMARY, а не файл. Все .txt/.log/.tmp пути будут отклонены.
+9. Пиши пути ОТНОСИТЕЛЬНО корня проекта (например src/domain/dog/aggregates/Dog.ts), БЕЗ ведущего /host-projects/... и БЕЗ абсолютных путей. Абсолютные пути будут нормализованы.
 
 ПРИМЕР полного ответа:
 
