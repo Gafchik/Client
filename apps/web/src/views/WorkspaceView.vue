@@ -149,7 +149,14 @@ const unifiedChatStream = computed(() => {
     } else {
       const orchPayload = msg.meta?.orchestratorPayload;
       const usage = msg.meta?.usage;
-      const displayContent = String(orchPayload?.message ?? msg.content ?? "");
+      // Финальный отчёт (meta.finalReport=true) хранит настоящий итог работы
+      // агентов в msg.content (диагноз/summary). orchestratorPayload.message —
+      // это план "Понял задачу...", который НЕ должен затирать финалку.
+      // Раньше приоритет orchPayload.message рисовал перепечатку плана в конце.
+      const isFinalReport = msg.meta?.finalReport === true || msg.meta?.finalReport === 'true';
+      const displayContent = isFinalReport
+        ? String(msg.content ?? "")
+        : String(orchPayload?.message ?? msg.content ?? "");
       stream.push({ 
         id: msg.id, 
         type: 'assistant', 
@@ -161,6 +168,7 @@ const unifiedChatStream = computed(() => {
         meta: msg.meta 
       });
     }
+
   }
   
   if (state.runEvents.length) {
