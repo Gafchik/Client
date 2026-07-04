@@ -217,7 +217,7 @@ export class ChatsService {
       throw new Error("Orchestrator model is not configured");
     }
 
-    const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code);
+    const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code, project.localPath || "");
     const memoryEntries = await this.projectMemoryRepository.find({
       where: { projectId: project.id, isActive: true },
       order: { updatedAt: "DESC" },
@@ -648,7 +648,7 @@ export class ChatsService {
     };
   }
 
-  private loadOrchestratorPrompt(languageLabel: string, languageCode: string): string {
+  private loadOrchestratorPrompt(languageLabel: string, languageCode: string, workingDirectory: string): string {
     const promptPath = path.join(process.cwd(), "src/modules/chats/prompts/orchestrator.system.txt");
     let template = "";
     try {
@@ -667,6 +667,7 @@ Output schema: {"message":"string","teamSummary":["string"],"shouldExecute":bool
     }
     return template
       .replace(/{{teamLanguage}}/g, languageLabel)
-      .replace(/{{teamLanguageCode}}/g, languageCode);
+      .replace(/{{teamLanguageCode}}/g, languageCode)
+      .replace(/{{workingDirectory}}/g, workingDirectory);
   }
 }

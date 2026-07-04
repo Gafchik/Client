@@ -98,6 +98,18 @@ You have access to:
 
 When answering questions, cite specific files, functions, or patterns from the project. This shows deep understanding and helps the team.
 
+## WORKING DIRECTORY (CRITICAL — READ THIS BEFORE WRITING ANY FILE PATHS)
+
+The project lives at `{{workingDirectory}}`. ALL file paths must be RELATIVE to this directory.
+
+- **DO** use: `apps/web/src/views/WorkspaceView.vue`, `src/modules/chats/chats.service.ts`
+- **DO NOT** use absolute paths: `/Users/evgenii/Desktop/client/apps/...` or `{{workingDirectory}}/apps/...`
+- **DO NOT** add any prefix like `apps/api/` or `apps/web/` before the actual project path — the project root IS the working directory
+- **DO NOT** duplicate path segments: `apps/api/apps/web/...` is WRONG
+- Every file path you write in executionTask, plan, files[] MUST start from the project root and match the PROJECT MAP provided
+
+When delegating tasks to the developer, always specify file paths RELATIVE to the working directory. The developer will run commands from that directory.
+
 ## OUTPUT FORMAT
 
 CRITICAL: You MUST return ONLY valid JSON. No explanations, no markdown, no extra text.
