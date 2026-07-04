@@ -1498,12 +1498,23 @@ export class RunsService implements OnModuleInit {
       // retry с новым запросом, где модель, возможно, ответит в content.
       if (!fullContent && reasoningContent) {
         if (stepName === 'developer') {
-          this.logger.warn(`Agent ${stepName}: content was empty, reasoningContent has ${reasoningContent.length} chars but it's reasoning text, not marker format — treating as empty for run ${runId}`);
-          // НЕ присваиваем fullContent = reasoningContent для developer.
-          // reasoningContent содержит размышления модели, а не SUMMARY:/FILE: формат.
-          // Помечаем finishReason = 'length' если reasoning обрезан — это сигнал
-          // что модель потратила все токены на "мышление" и не успела ответить.
-          if (!finishReason) finishReason = 'reasoning_only';
+          // Проверяем: возможно модель (reasoning-модель) положила структурированный
+          // ответ (SUMMARY:/FILE:/PATCH_START) в reasoning_content вместо content.
+          // Это бывает у o1/o3/gpt-5.x когда промпт содержит "respond only with JSON"
+          // или маркерный формат — модель "думает" в reasoning и отвечает тоже там.
+          const reasoningHasMarkers = /^[ \t]*(SUMMARY:|FILE:|PATCH_START|CONTENT_START)/m.test(reasoningContent);
+          const reasoningHasJson = reasoningContent.trim().startsWith('{');
+          if (reasoningHasMarkers || reasoningHasJson) {
+            this.logger.log(`Agent ${stepName}: content was empty, but reasoningContent contains ${reasoningHasMarkers ? 'markers' : 'JSON'} — using it as response for run ${runId} (${reasoningContent.length} chars)`);
+            fullContent = reasoningContent;
+          } else {
+            this.logger.warn(`Agent ${stepName}: content was empty, reasoningContent has ${reasoningContent.length} chars but it's reasoning text, not marker format — treating as empty for run ${runId}`);
+            // НЕ присваиваем fullContent = reasoningContent для developer.
+            // reasoningContent содержит размышления модели, а не SUMMARY:/FILE: формат.
+            // Помечаем finishReason = 'length' если reasoning обрезан — это сигнал
+            // что модель потратила все токены на "мышление" и не успела ответить.
+            if (!finishReason) finishReason = 'reasoning_only';
+          }
         } else {
           this.logger.log(`Agent ${stepName}: content was empty, using reasoningContent (${reasoningContent.length} chars) for run ${runId}`);
           fullContent = reasoningContent;
@@ -1581,6 +1592,23 @@ export class RunsService implements OnModuleInit {
         }
       } else {
         parseResult = parseJsonSafely(fullContent);
+
+        // NATURAL LANGUAGE FALLBACK для analyst/reviewer/tester:
+        // Модель может вернуть текст вместо JSON (особенно слабые модели,
+        // или когда reasoning-модель кладёт ответ в reasoning_content).
+        // Без этого fallback 3 попытки тратятся на ретраи, которые не
+        // изменят ответ модели. Лучше считать это валидным ответом и
+        // извлечь из текста то, что можем.
+        if (!parseResult.success && fullContent && fullContent.length > 20) {
+          const looksLikeJson = fullContent.trim().startsWith('{') || fullContent.trim().startsWith('[');
+          if (!looksLikeJson) {
+            const naturalFallback = this.buildNaturalLanguageFallback(stepName, fullContent);
+            if (naturalFallback) {
+              this.logger.log(`Agent ${stepName}: returned natural language (no JSON), extracting fallback for run ${runId}: ${fullContent.slice(0, 200)}`);
+              parseResult = { success: true, data: naturalFallback, rawResponse: fullContent };
+            }
+          }
+        }
       }
       
       // Дамп ответа агента на диск — чисто отладочный, по умолчанию выключен.
@@ -3489,6 +3517,56 @@ ${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на э
     const t = String(task || '').toLowerCase();
     if (!t.trim()) return false;
     return /\b(следующ|next steps|что дальше|what next|дальше|roadmap|план действий|action items)\b/i.test(t);
+  }
+
+  /**
+   * Natural language fallback для analyst/reviewer/tester.
+   * Когда модель возвращает текст вместо JSON, извлекаем из текста
+   * минимальную структуру, достаточную для продолжения конвейера.
+   * Без этого 3 попытки тратятся на ретраи, которые не изменят ответ модели.
+   */
+  private buildNaturalLanguageFallback(stepName: string, text: string): Record<string, unknown> | null {
+    if (!text || text.length < 20) return null;
+    const trimmed = text.trim();
+
+    if (stepName === 'analyst') {
+      // Аналитик вернул текст вместо JSON — оборачиваем в минимальную структуру spec.
+      return {
+        feature: 'Анализ (из текстового ответа)',
+        description: trimmed.slice(0, 3000),
+        requirements: [],
+        files: [],
+        diagnosis: [],
+        rootCause: '',
+        recommendations: [],
+        risks: [],
+      };
+    }
+
+    if (stepName === 'reviewer') {
+      return {
+        summary: trimmed.slice(0, 2000),
+        findings: [],
+        files: [],
+      };
+    }
+
+    if (stepName === 'tester') {
+      return {
+        passed: true,
+        summary: trimmed.slice(0, 2000),
+        tests: [],
+        errors: [],
+      };
+    }
+
+    if (stepName === 'orchestrator') {
+      // Для оркестратора есть extractPlanFromText — не дублируем.
+      return null;
+    }
+
+    // Неизвестный шаг — не извлекаем.
+    return null;
   }
 
   private buildFallbackFinalReport(
