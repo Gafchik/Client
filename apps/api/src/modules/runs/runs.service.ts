@@ -1375,17 +1375,38 @@ export class RunsService implements OnModuleInit {
         ? `You are ${agent.name ?? agent.label ?? stepName}. Respond in ${language}. Use the MARKER format exactly as instructed in the task (SUMMARY:, FILE:, ACTION:, DESCRIPTION:, CONTENT_START/CONTENT_END, PATCH_START/SEARCH:/REPLACE:/PATCH_END). Do NOT wrap the answer in JSON. Do NOT use markdown code fences. Write code between markers AS-IS, without escaping quotes or newlines.`
         : `You are ${agent.name ?? agent.label ?? stepName}. Respond in ${language}. Return ONLY valid JSON. No markdown, no code fences, no text before or after the JSON object.`;
 
-      const requestBody = JSON.stringify({
+      // Для reasoning-моделей (o1, o3, gpt-5.x, DeepSeek-R1) используем
+      // max_completion_tokens вместо max_tokens. С max_tokens reasoning-модель
+      // может потратить ВСЕ токены на "мышление" (reasoning_content) и вернуть
+      // пустой content — именно это вызывало "Empty or invalid response".
+      // max_completion_tokens явно отделяет бюджет вывода от reasoning.
+      const maxTokens = agent.maxTokens ?? Number(process.env.AGENT_MAX_TOKENS ?? 16000);
+      const bodyObj: Record<string, unknown> = {
         model,
         temperature,
         stream: true,
-        max_tokens: agent.maxTokens ?? Number(process.env.AGENT_MAX_TOKENS ?? 16000),
-        reasoning_effort: process.env.LLM_REASONING_EFFORT ?? 'medium',
         messages: [
           { role: 'system', content: systemContent },
           { role: 'user', content: prompt },
         ],
-      });
+      };
+      // reasoning-модели (gpt-5.x, o1, o3, deepseek-r1) требуют max_completion_tokens;
+      // обычные модели (deepseek-v4, gpt-4, claude) используют max_tokens.
+      // ВАЖНО: deepseek-v4-pro / deepseek-v4-flash — это НЕ reasoning-модели,
+      // только deepseek-r1 является reasoning.
+      const isReasoningModel = /gpt-5|o[1-4]|deepseek-r1/i.test(model);
+      if (isReasoningModel) {
+        bodyObj.max_completion_tokens = maxTokens;
+      } else {
+        bodyObj.max_tokens = maxTokens;
+      }
+      // reasoning_effort передаём только если задан в env — не все провайдеры
+      // его поддерживают, и он может вызывать 400 ошибки.
+      const reasoningEffort = process.env.LLM_REASONING_EFFORT;
+      if (reasoningEffort && isReasoningModel) {
+        bodyObj.reasoning_effort = reasoningEffort;
+      }
+      const requestBody = JSON.stringify(bodyObj);
 
       const response = await createLlmStreamRequest({
         url: `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`,
