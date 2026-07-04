@@ -1563,6 +1563,19 @@ export class RunsService implements OnModuleInit {
                 data: { files: [], summary: fullContent.trim().slice(0, 2000) },
                 rawResponse: fullContent,
               };
+              // Показываем текст developer'а в чате как понятное сообщение,
+              // а не как "пишет код". Без этого пользователь видит стрим
+              // токенов (выглядит как "разработчик работает"), но не видит
+              // реальный текст "Я не могу завершить задачу, т.к. предоставлен
+              // неполный код". Теперь текст модели явно сохраняется в чат.
+              try {
+                await this.broadcastActivity(
+                  runId, chatId, stepName,
+                  agent.name ?? stepName, agent.label ?? stepName,
+                  'working',
+                  `Ответ без правок: ${fullContent.trim().slice(0, 500)}`,
+                );
+              } catch { /* не критично */ }
             }
           }
         }
