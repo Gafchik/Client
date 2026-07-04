@@ -5,7 +5,7 @@ export function createDefaultTeam(name = "Core Team") {
     id: `team-${Date.now()}`,
     name,
     description: "Базовая команда: оркестратор -> аналитик -> разработчик -> тестировщик",
-    language: "en",
+    language: "ru",
     budget: {
       dailyWeightedTokens: 50000000,
       timezone: process.env.TZ || "Europe/Kiev",

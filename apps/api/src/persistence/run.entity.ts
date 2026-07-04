@@ -35,6 +35,15 @@ export class RunEntity {
   @Column("text")
   task!: string;
 
+  /**
+   * Исходное сообщение пользователя (как он написал в чат). Используется
+   * детерминированным detectRunMode, чтобы стоп-фраза «код не пишите» не
+   * терялась при переложении задачи в executionTask оркестратором.
+   * nullable, т.к. старые runs и запуски не из чата его не имеют.
+   */
+  @Column("text", { nullable: true })
+  originalMessage!: string | null;
+
   @Column("text")
   projectPath!: string;
 

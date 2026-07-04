@@ -399,6 +399,25 @@ export class ChatsService {
       }
     }
     
+    // Серверный оверрайд (защита от слабой модели): если в ИСХОДНОМ сообщении
+    // пользователя есть стоп-фраза «код не пишите / только проверить / без правок»,
+    // принудительно выключаем запуск команды — даже если оркестратор вернул
+    // shouldExecute=true. Раньше оркестратор мог «забыть» стоп-фразу в executionTask,
+    // и разработчик переписывал 6 файлов вопреки явной просьбе пользователя.
+    const userStopPhrases = [
+      'не пишите код', 'не пишу код', 'код не пишите', 'код не писать',
+      'только проверить', 'только проверь', 'просто проверить', 'просто проверь',
+      'без правок', 'без изменений', 'ничего не меняй', 'не меняй код',
+      "don't write code", 'no code changes', 'just check', 'read only', 'без изменения кода',
+    ];
+    const userLower = content.toLowerCase();
+    const userHasStopPhrase = userStopPhrases.some(p => userLower.includes(p));
+    if (userHasStopPhrase && shouldExecute) {
+      this.logger.log(`Server override: stop phrase in user message forces shouldExecute=false`);
+      shouldExecute = false;
+      executionTask = '';
+    }
+
     // Логируем решение оркестратора
     this.logger.log(`Orchestrator decision: shouldExecute=${shouldExecute}, executionTask="${executionTask}"`);
     
@@ -411,6 +430,10 @@ export class ChatsService {
       const run = await this.runsService.startRun({
         chatId: chat.id,
         task: executionTask,
+        // ИСХОДНОЕ сообщение пользователя нужно runs.service для детерминированного
+        // detectRunMode: executionTask оркестратора часто теряет стоп-фразу «код не
+        // пишите», и режим ошибочно определялся как implementation → разраб кодил.
+        originalMessage: content,
         teamId: resolvedTeamId,
         teamName: team.name,
         projectPath: project.localPath,
