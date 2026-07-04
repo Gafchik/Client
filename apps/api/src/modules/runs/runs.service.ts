@@ -783,6 +783,39 @@ export class RunsService implements OnModuleInit {
 
           codeChanges = (developerResult.artifact || {}) as Record<string, unknown>;
 
+          // АВТОКОНВЕРТАЦИЯ create → update для существующих файлов.
+          // Developer-модель часто возвращает ACTION: create для файлов, которые
+          // уже существуют на диске — потому что в ТЗ аналитик написал "создай",
+          // а файл уже был. applyFileChange при create перезаписывает файл целиком
+          // (стирая весь legacy-код), вместо точечного патча. Автоматически
+          // конвертируем create → update, чтобы существующий контент не терялся.
+          try {
+            const devFiles = Array.isArray((codeChanges as any)?.files) ? (codeChanges as any).files : [];
+            for (const f of devFiles) {
+              if (typeof f?.path !== 'string' || f.action !== 'create') continue;
+              const rel = this.relPathWithinProject(projectPath, f.path);
+              if (!rel) continue;
+              const fullPath = path.join(projectPath, rel);
+              if (fs.existsSync(fullPath)) {
+                // Файл существует — конвертируем create → update.
+                // Если у файла нет patches — создаём "заменить всё содержимое" патч.
+                const hasPatches = Array.isArray(f.patches) && f.patches.length > 0;
+                const hasContent = typeof f.content === 'string' && f.content.trim().length > 0;
+                if (!hasPatches && hasContent) {
+                  // Превращаем content в patch: SEARCH=current, REPLACE=new
+                  // (но только если файл небольшой, иначе — перезапись допустима)
+                  const currentContent = fs.readFileSync(fullPath, 'utf-8');
+                  f.patches = [{ search: currentContent.slice(0, 5000), replace: f.content }];
+                  delete f.content;
+                }
+                f.action = 'update';
+                this.logger.log(`Auto-converted create→update for existing file: ${f.path} (run ${runId})`);
+              }
+            }
+          } catch (convErr) {
+            this.logger.warn(`Auto-convert create→update failed: ${convErr instanceof Error ? convErr.message : String(convErr)}`);
+          }
+
           // САМОПРОВЕРКА РАЗРАБОТЧИКА (pre-flight валидация SEARCH с фидбеком).
           // До применения патчей проверяем, что каждый SEARCH-блок РЕАЛЬНО
           // присутствует в текущем коде. Если нет — плохой SEARCH раньше тихо
@@ -1346,8 +1379,8 @@ export class RunsService implements OnModuleInit {
         model,
         temperature,
         stream: true,
-        max_tokens: agent.maxTokens ?? Number(process.env.AGENT_MAX_TOKENS ?? 8000),
-        reasoning_effort: process.env.LLM_REASONING_EFFORT ?? 'high',
+        max_tokens: agent.maxTokens ?? Number(process.env.AGENT_MAX_TOKENS ?? 16000),
+        reasoning_effort: process.env.LLM_REASONING_EFFORT ?? 'medium',
         messages: [
           { role: 'system', content: systemContent },
           { role: 'user', content: prompt },
@@ -1458,9 +1491,23 @@ export class RunsService implements OnModuleInit {
       // всё через reasoning_content, как gpt-5-mini при некоторых промптах),
       // берём reasoningContent как основной ответ. Без этого developer-шаг
       // падал с "Empty or invalid response" — модель "думала", но "не отвечала".
+      // ВАЖНО: для developer reasoningContent НЕ подходит как fallback — там
+      // текст размышлений ("I'm trying to figure out..."), а не маркерный формат
+      // (SUMMARY:/FILE:/PATCH_START). Парсинг всё равно упадёт, но с лишними
+      // ретраями. Лучше сразу вернуть ошибку "empty content" — система сделает
+      // retry с новым запросом, где модель, возможно, ответит в content.
       if (!fullContent && reasoningContent) {
-        this.logger.log(`Agent ${stepName}: content was empty, using reasoningContent (${reasoningContent.length} chars) for run ${runId}`);
-        fullContent = reasoningContent;
+        if (stepName === 'developer') {
+          this.logger.warn(`Agent ${stepName}: content was empty, reasoningContent has ${reasoningContent.length} chars but it's reasoning text, not marker format — treating as empty for run ${runId}`);
+          // НЕ присваиваем fullContent = reasoningContent для developer.
+          // reasoningContent содержит размышления модели, а не SUMMARY:/FILE: формат.
+          // Помечаем finishReason = 'length' если reasoning обрезан — это сигнал
+          // что модель потратила все токены на "мышление" и не успела ответить.
+          if (!finishReason) finishReason = 'reasoning_only';
+        } else {
+          this.logger.log(`Agent ${stepName}: content was empty, using reasoningContent (${reasoningContent.length} chars) for run ${runId}`);
+          fullContent = reasoningContent;
+        }
       }
 
       // Диагностика пустого ответа: логируем сырые SSE-события, чтобы понять
@@ -3267,16 +3314,17 @@ DESCRIPTION: что сделано
 
 ПРАВИЛА (НАРУШЕНИЕ = ПРОВАЛ):
 1. НЕ оборачивай ответ в JSON и НЕ используй markdown-блоки \`\`\`. Только маркеры выше.
-2. Для ОБНОВЛЕНИЯ существующего файла используй PATCH_START/SEARCH:/REPLACE:/PATCH_END. Скопируй точный фрагмент из текущего кода в SEARCH. Это сохраняет остальной legacy-код.
-3. Для СОЗДАНИЯ нового файла используй ACTION: create + CONTENT_START/CONTENT_END.
-4. Между маркерами пиши код КАК ЕСТЬ — реальные переносы строк и обычные кавычки, без \\n и без экранирования.
-5. Если изменений не требуется — верни только SUMMARY: Нет изменений (без блоков FILE).
-6. Маркеры FILE:, ACTION:, DESCRIPTION:, SUMMARY: — каждый с новой строки, без пробелов перед двоеточием.
-7. Если для работы нужна консольная команда, добавь блок COMMAND/CWD/REASON. Не выдумывай результат команды, сервер выполнит её отдельно после подтверждения пользователя.
-8. НЕ создавай .md/README/документационные файлы. Документацию проекта ведёт Аналитик в памяти проекта (БД), а не в репозитории. Создавай только КОД. Если в ТЗ есть .md — пропусти его.
-9. НЕ создавай мусорные/временные/логовые/текстовые файлы: git_log_output.txt, scratch.txt, output_*.txt, *.log, *.tmp, *.out и подобные. git-контекст УЖЕ в промпте (сервер выполняет git log/status сам). Если нужно сохранить вывод — используй SUMMARY, а не файл. Все .txt/.log/.tmp пути будут отклонены.
-10. Пиши пути ОТНОСИТЕЛЬНО корня проекта (например src/domain/dog/aggregates/Dog.ts), БЕЗ ведущего /host-projects/... и БЕЗ абсолютных путей. Абсолютные пути будут нормализованы.
-11. САМОПРОВЕРКА ПЕРЕД ОТДАЧЕЙ (КРИТИЧНО): прежде чем вернуть ответ, мысленно перепрочитай КАЖДЫЙ свой SEARCH-блок и сверь с СУЩЕСТВУЮЩИМ КОДОМ выше. SEARCH должен быть БУКВАЛЬНОЙ копией фрагмента текущего файла (те же отступы, переносы, кавычки). Если SEARCH не совпадает с реальным кодом символ-в-символ — патч будет отклонён сервером. Проверь также: не сломал ли REPLACE импорты/синтаксис, нет ли дублей, согласованы ли call-сайты, если меняешь сигнатуру/экспорт. Если хоть один SEARCH вызывает сомнение — перепиши его по реальному коду. Сервер всё равно перепроверит каждый SEARCH по текущему файлу и вернёт тебе рассинхрон на исправление, но лучше сделать верно с первого раза.
+2. Для ОБНОВЛЕНИЯ существующего файла используй ACTION: update + PATCH_START/SEARCH:/REPLACE:/PATCH_END. Скопируй точный фрагмент из текущего кода в SEARCH. Это сохраняет остальной legacy-код.
+3. Для СОЗДАНИЯ НОВОГО файла (которого НЕТ в списке СУЩЕСТВУЮЩИЙ КОД ФАЙЛОВ выше) используй ACTION: create + CONTENT_START/CONTENT_END.
+4. КРИТИЧНО: НЕ используй ACTION: create для файлов, которые УЖЕ ЕСТЬ в списке «СУЩЕСТВУЮЩИЙ КОД ФАЙЛОВ». Если файл существует — ты ОБЯЗАН использовать ACTION: update + PATCH_START/SEARCH:/REPLACE:. ACTION: create для существующего файла будет ОТКЛЁН. Если файл существует в списке выше, но ТЗ говорит «создай» — это означает «обнови», используй update.
+5. Между маркерами пиши код КАК ЕСТЬ — реальные переносы строк и обычные кавычки, без \\n и без экранирования.
+6. Если изменений не требуется — верни только SUMMARY: Нет изменений (без блоков FILE).
+7. Маркеры FILE:, ACTION:, DESCRIPTION:, SUMMARY: — каждый с новой строки, без пробелов перед двоеточием.
+8. Если для работы нужна консольная команда, добавь блок COMMAND/CWD/REASON. Не выдумывай результат команды, сервер выполнит её отдельно после подтверждения пользователя.
+9. НЕ создавай .md/README/документационные файлы. Документацию проекта ведёт Аналитик в памяти проекта (БД), а не в репозитории. Создавай только КОД. Если в ТЗ есть .md — пропусти его.
+10. НЕ создавай мусорные/временные/логовые/текстовые файлы: git_log_output.txt, scratch.txt, output_*.txt, *.log, *.tmp, *.out и подобные. git-контекст УЖЕ в промпте (сервер выполняет git log/status сам). Если нужно сохранить вывод — используй SUMMARY, а не файл. Все .txt/.log/.tmp пути будут отклонены.
+11. Пиши пути ОТНОСИТЕЛЬНО корня проекта (например src/domain/dog/aggregates/Dog.ts), БЕЗ ведущего /host-projects/... и БЕЗ абсолютных путей. Абсолютные пути будут нормализованы.
+12. САМОПРОВЕРКА ПЕРЕД ОТДАЧЕЙ (КРИТИЧНО): прежде чем вернуть ответ, мысленно перепрочитай КАЖДЫЙ свой SEARCH-блок и сверь с СУЩЕСТВУЮЩИМ КОДОМ выше. SEARCH должен быть БУКВАЛЬНОЙ копией фрагмента текущего файла (те же отступы, переносы, кавычки). Если SEARCH не совпадает с реальным кодом символ-в-символ — патч будет отклонён сервером. Проверь также: не сломал ли REPLACE импорты/синтаксис, нет ли дублей, согласованы ли call-сайты, если меняешь сигнатуру/экспорт. Если хоть один SEARCH вызывает сомнение — перепиши его по реальному коду. Сервер всё равно перепроверит каждый SEARCH по текущему файлу и вернёт тебе рассинхрон на исправление, но лучше сделать верно с первого раза.
 
 ПРИМЕР полного ответа:
 
