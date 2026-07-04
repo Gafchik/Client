@@ -94,10 +94,10 @@ export class TeamsService implements OnModuleInit {
           ? (input.testing as any).commands
           : fallback.testing.commands,
       },
-      agents: {
-        ...fallback.agents,
-        ...(input.agents ?? {}),
-      },
+      agents: this.mergeAgentConfigs(
+        fallback.agents as Record<string, unknown>,
+        input.agents as Record<string, unknown> | undefined,
+      ),
     };
 
     const existing = input.id ? await this.teamsRepository.findOneBy({ id: input.id }) : null;
@@ -112,6 +112,30 @@ export class TeamsService implements OnModuleInit {
     });
 
     return this.teamsRepository.save(entity);
+  }
+
+  /**
+   * Глубокий мердж конфигов агентов. Фронт часто шлёт частичный апдейт
+   * (только model без multiplier/name/label/temperature) — shallow-мердж
+   * сносил остальные поля, из-за чего у части агентов пропадал множитель
+   * после сохранения команды. Теперь каждое поле агента сохраняется,
+   * если фронт его не прислал.
+   */
+  private mergeAgentConfigs(
+    fallback: Record<string, unknown>,
+    input: Record<string, unknown> | undefined,
+  ): Record<string, unknown> {
+    const fb = (fallback ?? {}) as Record<string, Record<string, unknown>>;
+    const inAgents = (input ?? {}) as Record<string, Record<string, unknown>>;
+    const roles = new Set<string>([...Object.keys(fb), ...Object.keys(inAgents)]);
+    const result: Record<string, unknown> = {};
+    for (const role of roles) {
+      result[role] = {
+        ...(fb[role] ?? {}),
+        ...(inAgents[role] ?? {}),
+      };
+    }
+    return result;
   }
 
   async remove(id: string) {

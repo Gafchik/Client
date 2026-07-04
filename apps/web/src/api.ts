@@ -29,7 +29,15 @@ export const api = {
         CONTAINER_PROJECTS_ROOT: string;
       };
     }>("/settings"),
-  models: () => request<{ items: ModelCatalogItem[] }>("/catalog/models"),
+  // providerId обязателен по смыслу: каталог моделей должен тянуться из
+  // modelsUrl ВЫБРАННОГО провайдера (он хранится в БД у каждого провайдера
+  // свой). Раньше шлался запрос без providerId → бэкенд возвращал модели
+  // активного/дефолтного провайдера, и при смене провайдера у команды список
+  // моделей не менялся (сторонние провайдеры «тянули» чужой список).
+  models: (providerId?: string) =>
+    request<{ items: ModelCatalogItem[] }>(
+      `/catalog/models${providerId ? `?providerId=${encodeURIComponent(providerId)}` : ""}`,
+    ),
   providers: () => request<{ providers: Provider[] }>("/providers"),
   saveProvider: (provider: Partial<Provider>) =>
     request<{ provider: Provider }>("/providers", {

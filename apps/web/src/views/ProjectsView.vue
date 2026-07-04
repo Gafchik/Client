@@ -2,7 +2,7 @@
 import { computed, inject, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
-import type { Project, Team } from "../types";
+import type { Project, Team, Provider } from "../types";
 
 const route = useRoute();
 const router = useRouter();

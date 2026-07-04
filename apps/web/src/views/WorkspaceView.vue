@@ -48,7 +48,6 @@ const state = reactive({
 
 const chatDraft = ref("");
 const messagesListRef = ref<HTMLElement | null>(null);
-const agentLogsRef = ref<HTMLElement | null>(null);
 let isMounted = false;
 let pollTimer: number | null = null;
 let toastId = 0;
@@ -63,12 +62,30 @@ const selectedProvider = computed(() => state.providers.find((item) => item.id =
 const selectedTeam = computed(() => state.teams.find((item) => item.id === state.selectedTeamId) ?? null);
 const selectedProject = computed(() => state.projects.find((item) => item.id === state.selectedProjectId) ?? null);
 const selectedChat = computed(() => state.chats.find((item) => item.id === state.selectedChatId) ?? null);
+const EMPTY_AGENTS = {
+  orchestrator: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 },
+  developer: { name: "", label: "", model: "", multiplier: 1, temperature: 0.15 },
+  tester: { name: "", label: "", model: "", multiplier: 1, temperature: 0.1 },
+  analyst: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 },
+};
+function emptyTeam(): Team {
+  return {
+    id: "",
+    name: "",
+    description: "",
+    providerId: "",
+    language: "ru",
+    budget: { dailyWeightedTokens: 0, timezone: "UTC" },
+    workspace: { maxFiles: 0, maxCharsPerFile: 0, includeExtensions: [], ignoreDirs: [] },
+    run: { maxReviewRounds: 0, applyChanges: false },
+    testing: { commands: [] },
+    agents: EMPTY_AGENTS,
+  } as unknown as Team;
+}
 const selectedProjectTeam = computed(() => {
   const project = selectedProject.value;
-  if (!project?.teamId) {
-    return { name: "", providerId: "", agents: { orchestrator: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 }, developer: { name: "", label: "", model: "", multiplier: 1, temperature: 0.15 }, tester: { name: "", label: "", model: "", multiplier: 1, temperature: 0.1 }, analyst: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 } } } as Team;
-  }
-  return state.teams.find((item) => item.id === project.teamId) ?? { name: "", providerId: "", agents: { orchestrator: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 }, developer: { name: "", label: "", model: "", multiplier: 1, temperature: 0.15 }, tester: { name: "", label: "", model: "", multiplier: 1, temperature: 0.1 }, analyst: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 } } } as Team;
+  if (!project?.teamId) return emptyTeam();
+  return state.teams.find((item) => item.id === project.teamId) ?? emptyTeam();
 });
 
 const modelGroups = computed(() => state.models.reduce<Record<string, ModelCatalogItem[]>>((groups, model) => { if (!groups[model.provider]) groups[model.provider] = []; groups[model.provider].push(model); return groups; }, {}));
@@ -103,7 +120,7 @@ const currentAgentName = computed(() => {
 });
 
 const unifiedChatStream = computed(() => {
-  const stream: Array<{ id: string; type: 'user' | 'assistant' | 'system' | 'agent-status' | 'run-summary' | 'token-summary'; role?: string; name?: string; label?: string; content: string; createdAt: string; meta?: any; status?: 'working' | 'idle' | 'done' | 'error'; agentRole?: string }> = [];
+  const stream: Array<{ id: string; type: 'user' | 'assistant' | 'system' | 'agent-status' | 'run-summary' | 'token-summary'; role?: string; name?: string; label?: string; content: string; createdAt?: string; meta?: any; status?: 'working' | 'idle' | 'done' | 'error'; agentRole?: string }> = [];
   
   // Track seen activity IDs to avoid duplicates between runEvents and saved messages
   const seenActivityIds = new Set<string>();
@@ -132,7 +149,7 @@ const unifiedChatStream = computed(() => {
     } else {
       const orchPayload = msg.meta?.orchestratorPayload;
       const usage = msg.meta?.usage;
-      const displayContent = orchPayload?.message || msg.content;
+      const displayContent = String(orchPayload?.message ?? msg.content ?? "");
       stream.push({ 
         id: msg.id, 
         type: 'assistant', 
@@ -257,42 +274,7 @@ function avatarColor(role: string): string { const colors: Record<string, string
 function agentInitial(item: any): string { const name = item.name || item.label || '?'; return name.charAt(0).toUpperCase(); }
 function messageName(item: any): string { if (item.type === 'user') return 'Вы'; if (item.type === 'assistant' || item.type === 'run-summary') return `${item.name || 'Alex'} (${item.label || 'Оркестратор'})`; if (item.type === 'agent-status') return `${item.name || 'Agent'} (${item.label || item.agentRole})`; if (item.type === 'system') return 'Система'; if (item.type === 'token-summary') return 'Токены'; return 'Неизвестно'; }
 function formatMessageContent(item: any): string { if (!item.content) return ''; let content = String(item.content); content = content.replace(/\\n/g, '\n'); const escaped = content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>'); if (item.type === 'agent-status') return `<span class="agent-status-text">${escaped}</span>`; if (item.type === 'system') return `<span class="system-text">${escaped}</span>`; if (item.type === 'run-summary') return `<div class="run-summary-text">${escaped}</div>`; return escaped; }
-function formatTime(iso: string): string { return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
-
-function logTypeLabel(type: string): string {
-  const labels: Record<string, string> = {
-    thinking: '💭 Мысль',
-    tool: '🔧 Инструмент',
-    file_read: '📖 Чтение',
-    file_write: '📝 Запись',
-    terminal: '💻 Терминал',
-    error: '❌ Ошибка',
-    status: '📌 Статус',
-  };
-  return labels[type] || type;
-}
-
-function formatLogContent(log: AgentLogEntry): string {
-  const escaped = log.content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-  if (log.type === 'thinking') return `<span class="thinking-text">${escaped}</span>`;
-  if (log.type === 'file_write' || log.type === 'file_read') return `<span class="file-text">${escaped}</span>`;
-  if (log.type === 'terminal') return `<span class="terminal-text">${escaped}</span>`;
-  if (log.type === 'error') return `<span class="error-text">${escaped}</span>`;
-  return `<span class="status-text">${escaped}</span>`;
-}
-
-function formatLogDetails(log: AgentLogEntry): string {
-  if (!log.details) return '';
-  if (log.type === 'terminal' && log.details.output) {
-    const escaped = String(log.details.output).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-    return `<pre class="terminal-output">${escaped}</pre>`;
-  }
-  if (log.type === 'error' && log.details.output) {
-    const escaped = String(log.details.output).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-    return `<pre class="error-output">${escaped}</pre>`;
-  }
-  return '';
-}
+function formatTime(iso?: string): string { if (!iso) return ''; return new Date(iso).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
 
 async function loadInitialData() {
   if (globalProviders.value.length) {
@@ -306,10 +288,25 @@ async function loadInitialData() {
     state.projects = projectsResponse.projects;
   }
   
-  const [runsResponse, modelsResponse, settingsResponse] = await Promise.all([api.runs(), api.models(), api.settings()]);
+  const [runsResponse, settingsResponse] = await Promise.all([api.runs(), api.settings()]);
   state.runs = runsResponse.runs;
-  state.models = modelsResponse.items;
   state.settings = settingsResponse;
+
+  // Модели тянем по провайдеру первого проекта/команды (у каждого провайдера
+  // свой modelsUrl в БД). Раньше грузили без providerId → всегда дефолтный
+  // провайдер, и сторонние провайдеры «подтягивали» чужие модели + множитель
+  // не совпадал с реальным у выбранной модели.
+  const initialProviderId = (() => {
+    const proj = state.projects[0];
+    const team = proj ? state.teams.find(t => t.id === proj.teamId) : state.teams[0];
+    return team?.providerId || state.providers[0]?.id || "";
+  })();
+  if (initialProviderId) {
+    const modelsResponse = await api.models(initialProviderId);
+    state.models = modelsResponse.items;
+  } else {
+    state.models = [];
+  }
   
   state.selectedProviderId = state.providers[0]?.id || "";
   state.selectedTeamId = state.teams[0]?.id || "";
@@ -330,7 +327,44 @@ async function createChat() { if (!selectedProject.value || !(selectedProject.va
 async function deleteChat(id: string) { const chat = state.chats.find(c => c.id === id); if (!chat) return; confirmDelete('chat', id, chat.title, async () => { state.busy = true; try { await api.deleteChat(id); state.chats = state.chats.filter(c => c.id !== id); if (state.selectedChatId === id) { const fallback = state.chats[0] || null; state.selectedChatId = fallback?.id || ""; if (fallback) await openChat(fallback.id); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } } showToast('success', 'Чат удалён'); } finally { state.busy = false; } }); }
 async function sendChatMessage() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); state.busy = true; chatDraft.value = ""; try { const response = await api.sendChatMessage(selectedChat.value.id, draft); await openChat(selectedChat.value.id); if (response.autoRunId) { state.selectedRunId = response.autoRunId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; state.currentStep = 'orchestrator'; state.currentStepDetail = 'Анализирую задачу и планирую работу команды'; clearAgentLogs(); startPolling(response.autoRunId); /* busy stays true: polling resets it when run completes */ } else { state.busy = false; } } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); state.busy = false; } }
 async function runTask() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); const project = selectedProject.value; const team = selectedProjectTeam.value; if (!project || !team) return; state.busy = true; chatDraft.value = ""; try { const response = await api.startRun({ chatId: selectedChat.value.id, task: draft, teamId: team.id, teamName: team.name, projectPath: project.localPath || '' }); state.selectedRunId = response.runId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; state.currentStep = 'orchestrator'; state.currentStepDetail = 'Анализирую задачу и планирую работу команды'; clearAgentLogs(); startPolling(response.runId); showToast('success', 'Работа запущена'); /* busy stays true until run completes via polling */ } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); state.busy = false; } }
-function startPolling(runId: string) { if (pollTimer) window.clearInterval(pollTimer); const tick = async () => { try { const response = await api.job(runId); state.runStatus = response.status; state.runEvents = response.events ?? []; state.runError = response.error ?? ""; updateCurrentStep(response.events ?? []); const runsResponse = await api.runs(); state.runs = runsResponse.runs; await nextTick(); scrollMessagesToBottom("smooth"); if (response.status === "completed" || response.status === "done" || response.status === "failed") { if (pollTimer) window.clearInterval(pollTimer); state.currentStep = ''; state.currentStepDetail = ''; state.streamingMessage = null; state.busy = false; await openRun(runId); if (state.selectedChatId) await openChat(state.selectedChatId); } } catch (e) { console.error('Poll error:', e); } }; void tick(); pollTimer = window.setInterval(() => void tick(), 2000); }
+function startPolling(runId: string) {
+  if (pollTimer) window.clearInterval(pollTimer);
+  const tick = async () => {
+    try {
+      const response = await api.job(runId);
+      state.runStatus = response.status;
+      state.runError = response.error ?? "";
+      // Мерджим события вместо полной замены. WS уже складывает токены и
+      // agent:activity в реальном времени, а поллинг каждые 2с затирал массив
+      // → мельтешение и «скачки» чата. Дедуп по at|event|payload.
+      const incoming = response.events ?? [];
+      const keyOf = (e: { at: string; event: string; payload?: unknown }) =>
+        `${e.at}|${e.event}|${JSON.stringify(e.payload ?? "")}`;
+      const existing = new Set(state.runEvents.map(keyOf));
+      for (const e of incoming) {
+        if (!existing.has(keyOf(e))) state.runEvents.push(e);
+      }
+      updateCurrentStep(state.runEvents);
+      const runsResponse = await api.runs();
+      state.runs = runsResponse.runs;
+      await nextTick();
+      // Скроллим вниз ТОЛЬКО если пользователь сам не ушёл вверх. Раньше
+      // поллинг дёргал скролл на каждом тике — чат «прыгал» при чтении истории.
+      if (shouldAutoScroll && !userHasScrolled) scrollMessagesToBottom("smooth");
+      if (response.status === "completed" || response.status === "done" || response.status === "failed") {
+        if (pollTimer) window.clearInterval(pollTimer);
+        state.currentStep = '';
+        state.currentStepDetail = '';
+        state.streamingMessage = null;
+        state.busy = false;
+        await openRun(runId);
+        if (state.selectedChatId) await openChat(state.selectedChatId);
+      }
+    } catch (e) { console.error('Poll error:', e); }
+  };
+  void tick();
+  pollTimer = window.setInterval(() => void tick(), 2000);
+}
 
 function updateCurrentStep(events: Array<{ at: string; event: string; payload?: unknown }>) {
   const agentEvents = events.filter(e => e.event === 'agent:activity' && e.payload);

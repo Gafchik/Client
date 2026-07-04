@@ -20,8 +20,15 @@ export class RunsController {
   @Post("runs")
   async startRun(@Body() dto: StartRunDto) {
     const { runId } = await this.runsService.startRun(dto);
-    // Блокируем ответ — ждём завершения выполнения
-    await this.runsService.executeRunSteps(runId);
+    // Запуск прогона В ФОНЕ — НЕ блокируем HTTP-ответ. Раньше тут стоял
+    // `await this.runsService.executeRunSteps(runId)` и фронт висел на запросе
+    // всё время выполнения команды (десятки секунд/минут): WS-события
+    // приходили, но UI их отбрасывал, т.к. ещё не получил runId, а потом всё
+    // вываливалось разом и чат «прыгал». Теперь отвечаем мгновенно — фронт
+    // сразу получает runId, подключается к сокету и показывает прогресс.
+    void this.runsService.executeRunSteps(runId).catch((error) => {
+      this.logger.error(`Background run ${runId} failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
     return { runId };
   }
 

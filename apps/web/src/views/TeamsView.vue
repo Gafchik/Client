@@ -2,7 +2,7 @@
 import { computed, inject, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
-import type { Team, Provider, ModelCatalogItem } from "../types";
+import type { Team, Provider, Project, ModelCatalogItem } from "../types";
 
 const route = useRoute();
 const router = useRouter();
@@ -54,6 +54,16 @@ const modelGroups = computed(() =>
   }, {}),
 );
 
+async function loadModelsForProvider(providerId: string) {
+  // Модели тянутся из modelsUrl КОНКРЕТНОГО провайдера (в БД у каждого свой).
+  // Раньше грузили общий список — и при выборе стороннего провайдера команда
+  // видела модели дефолтного rout.my, а сохранённый multiplier не совпадал с
+  // реальным у модели выбранного провайдера.
+  const modelsRes = await api.models(providerId);
+  models.value = modelsRes.items;
+  return models.value;
+}
+
 async function loadData() {
   if (globalTeams.value.length) {
     teams.value = globalTeams.value;
@@ -63,8 +73,6 @@ async function loadData() {
     teams.value = teamsRes.teams;
     providers.value = providersRes.providers;
   }
-  const modelsRes = await api.models();
-  models.value = modelsRes.items;
 
   const id = route.params.id as string | undefined;
   if (id) {
@@ -73,13 +81,23 @@ async function loadData() {
     selectedTeam.value = teams.value[0];
   }
   if (providers.value[0] && !newTeam.value.providerId) newTeam.value.providerId = providers.value[0].id;
-  if (models.value[0]) {
-    const firstModel = models.value[0].id;
-    const firstMultiplier = models.value[0].multiplier;
-    Object.keys(newTeam.value.agents).forEach(role => {
-      newTeam.value.agents[role].model = firstModel;
-      newTeam.value.agents[role].multiplier = firstMultiplier;
-    });
+
+  // Грузим модели под провайдер выбранной команды (или дефолтного — для формы).
+  const initialProviderId =
+    selectedTeam.value?.providerId ||
+    newTeam.value.providerId ||
+    providers.value[0]?.id ||
+    "";
+  if (initialProviderId) {
+    await loadModelsForProvider(initialProviderId);
+    if (models.value[0]) {
+      const firstModel = models.value[0].id;
+      const firstMultiplier = models.value[0].multiplier;
+      (Object.keys(newTeam.value.agents) as Array<keyof typeof newTeam.value.agents>).forEach(role => {
+        newTeam.value.agents[role].model = firstModel;
+        newTeam.value.agents[role].multiplier = firstMultiplier;
+      });
+    }
   }
 }
 
@@ -151,8 +169,45 @@ async function deleteTeam(id: string) {
   }
 }
 
-watch(() => route.params.id, (id) => {
-  if (id) selectedTeam.value = teams.value.find(t => t.id === id) || null;
+// При переключении команды — подгружаем модели её провайдера, чтобы селект
+// моделей показывал именно её список (а не «чужой» от прошлого провайдера).
+watch(() => route.params.id, async (id) => {
+  if (id) {
+    selectedTeam.value = teams.value.find(t => t.id === id) || null;
+    const pid = selectedTeam.value?.providerId;
+    if (pid) await loadModelsForProvider(pid);
+  }
+});
+
+// При смене провайдера прямо в форме команды — перезагружаем каталог моделей
+// под новый провайдер. Если у текущих агентов модель отсутствует в новом
+// списке, сбрасываем её на первую доступную (и подтягиваем её multiplier).
+watch(() => selectedTeam.value?.providerId, async (pid) => {
+  if (!pid) return;
+  await loadModelsForProvider(pid);
+  if (!selectedTeam.value) return;
+  const first = models.value[0];
+  for (const role of Object.keys(selectedTeam.value.agents)) {
+    const agent = selectedTeam.value.agents[role as keyof typeof selectedTeam.value.agents] as { model: string; multiplier: number };
+    if (!models.value.some(m => m.id === agent.model)) {
+      agent.model = first?.id || "";
+      agent.multiplier = first?.multiplier ?? 1;
+    }
+  }
+});
+
+// Аналогично для формы создания новой команды: сменили провайдер → сменили
+// доступные модели и умолчания для агентов.
+watch(() => newTeam.value.providerId, async (pid) => {
+  if (!pid) return;
+  await loadModelsForProvider(pid);
+  const first = models.value[0];
+  if (first) {
+    Object.keys(newTeam.value.agents).forEach(role => {
+      newTeam.value.agents[role as keyof typeof newTeam.value.agents].model = first.id;
+      newTeam.value.agents[role as keyof typeof newTeam.value.agents].multiplier = first.multiplier;
+    });
+  }
 });
 
 onMounted(loadData);
