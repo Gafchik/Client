@@ -8,6 +8,7 @@ import { createLlmStreamRequest } from '../../shared/llm-client';
 import { TeamsService } from '../teams/teams.service';
 import { ProjectsService } from '../projects/projects.service';
 import { ChatsService } from '../chats/chats.service';
+import { ProvidersService } from '../providers/providers.service';
 import { WsGateway } from '../ws/ws.gateway';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -117,6 +118,8 @@ export class RunsService implements OnModuleInit {
     private readonly chatsService: ChatsService,
     @Inject(WsGateway)
     private readonly wsGateway: WsGateway,
+    @Inject(ProvidersService)
+    private readonly providersService: ProvidersService,
   ) {}
 
   /**
@@ -582,9 +585,12 @@ export class RunsService implements OnModuleInit {
     const chatId = run.chatId ?? '';
     const projectId = project.id ?? '';
     
-    if (!team.provider || !team.provider.apiKey) {
-      throw new Error('Team provider not configured');
+    // Провайдер команды может быть не привязан — тогда берём текущий (активный).
+    const teamProvider = team?.provider ?? await this.providersService.getActive().catch(() => null);
+    if (!teamProvider || !teamProvider.apiKey) {
+      throw new Error('No provider configured — add one in Settings → Providers');
     }
+    team.provider = teamProvider;
 
     const teamConfig = team.config as unknown as TeamConfig;
     const language = teamConfig.language || 'ru';
@@ -1328,11 +1334,11 @@ export class RunsService implements OnModuleInit {
     if (!run) return { success: false, error: `Run ${runId} not found` };
 
     const team = await this.teamsService.getById(run.teamId);
-    if (!team.provider || !team.provider.apiKey) {
-      return { success: false, error: 'Provider not configured' };
+    // Провайдер команды может быть не привязан — тогда берём текущий (активный).
+    const provider = team?.provider ?? await this.providersService.getActive().catch(() => null);
+    if (!provider || !provider.apiKey) {
+      return { success: false, error: 'No provider configured — add one in Settings → Providers' };
     }
-
-    const provider = team.provider;
     const model = agent.model;
     const temperature = agent.temperature ?? 0.2;
 
