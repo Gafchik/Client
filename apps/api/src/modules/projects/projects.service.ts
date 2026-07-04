@@ -195,7 +195,7 @@ export class ProjectsService {
 
   mapLocalPathToContainerPath(localPath: string) {
     const localRoot = path.resolve(this.configService.get<string>("LOCAL_PROJECTS_ROOT", "/Users/evgenii"));
-    const containerRoot = path.resolve(this.configService.get<string>("CONTAINER_PROJECTS_ROOT", "/host-projects"));
+    const containerRoot = path.resolve(this.configService.get<string>("CONTAINER_PROJECTS_ROOT", localRoot));
     const absoluteLocalPath = path.resolve(localPath);
 
     if (!absoluteLocalPath.startsWith(localRoot)) {

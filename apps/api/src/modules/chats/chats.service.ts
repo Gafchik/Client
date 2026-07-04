@@ -219,6 +219,28 @@ export class ChatsService {
       take: 5,
     });
 
+    // Git-контекст: status + diff для оркестратора
+    let gitStatus = "";
+    let gitDiffStat = "";
+    if (project.localPath) {
+      try {
+        const { execSync } = await import("child_process");
+        gitStatus = execSync("git status --short", {
+          cwd: project.localPath,
+          encoding: "utf-8",
+          timeout: 5000,
+        }).trim();
+      } catch { }
+      try {
+        const { execSync } = await import("child_process");
+        gitDiffStat = execSync("git diff --stat", {
+          cwd: project.localPath,
+          encoding: "utf-8",
+          timeout: 5000,
+        }).trim();
+      } catch { }
+    }
+
     // Стриминговый запрос к LLM
     const streamResponse = await createLlmStreamRequest({
       url: `${team.provider.baseUrl.replace(/\/$/, "")}/chat/completions`,
@@ -226,10 +248,11 @@ export class ChatsService {
         "Content-Type": "application/json",
         Authorization: `Bearer ${team.provider.apiKey}`,
       },
-      body: JSON.stringify({
+        body: JSON.stringify({
         model: orchestrator.model,
         temperature: orchestrator.temperature ?? 0.2,
         stream: true,
+        reasoning_effort: process.env.LLM_REASONING_EFFORT ?? 'high',
         messages: [
           {
             role: "system",
@@ -263,6 +286,10 @@ export class ChatsService {
                   role: message.role,
                   content: message.content,
                 })),
+                gitContext: {
+                  status: gitStatus || "(нет изменений или git недоступен)",
+                  diffStat: gitDiffStat || "(нет изменений)",
+                },
                 projectMemory: memoryEntries.map((entry) => ({
                   title: entry.title,
                   summary: entry.summary,
@@ -379,33 +406,28 @@ export class ChatsService {
         'обнови', 'обновить', 'удали файл', 'рефактор', 'рефакторинг',
         'тестируй', 'запусти', 'запустить',
         'create', 'add', 'fix', 'implement', 'write', 'make', 'update',
-        'refactor', 'run', 'execute', 'build', 'deploy'
-      ];
-      // Стоп-фразы: пользователь явно просит БЕЗ правок — никогда не форсим.
-      const stopPhrases = [
-        'не пишите код', 'не пишу код', 'код не пишите', 'код не писать',
-        'только проверить', 'только проверь', 'просто проверить', 'просто проверь',
-        'без правок', 'без изменений', 'ничего не меняй', 'не меняй код',
-        "don't write code", 'no code changes', 'just check', 'read only', 'без изменения кода'
+        'refactor', 'run', 'execute', 'build', 'deploy',
+        // Investigation keywords — команда имеет доступ к файловой системе
+        'проверь', 'проверить', 'посмотри', 'посмотреть', 'посмотрите',
+        'изучи', 'изучить', 'разберись', 'разобраться',
+        'что нового', 'что не закомичено', 'git status', 'git diff',
+        'что изменилось', 'что поменялось',
+        'check', 'inspect', 'investigate', 'look at',
       ];
       const lowerContent = content.toLowerCase();
-      const hasStopPhrase = stopPhrases.some(p => lowerContent.includes(p));
-      const hasActionKeyword = !hasStopPhrase && actionKeywords.some(keyword => lowerContent.includes(keyword));
+      const hasActionKeyword = actionKeywords.some(keyword => lowerContent.includes(keyword));
 
       if (hasActionKeyword) {
         this.logger.log(`Heuristic fallback triggered: user message contains action keywords, forcing execution`);
         shouldExecute = true;
         executionTask = content;
-      } else if (hasStopPhrase) {
-        this.logger.log(`Heuristic fallback skipped: stop phrase detected, keeping shouldExecute=false`);
       }
     }
     
-    // Серверный оверрайд (защита от слабой модели): если в ИСХОДНОМ сообщении
-    // пользователя есть стоп-фраза «код не пишите / только проверить / без правок»,
-    // принудительно выключаем запуск команды — даже если оркестратор вернул
-    // shouldExecute=true. Раньше оркестратор мог «забыть» стоп-фразу в executionTask,
-    // и разработчик переписывал 6 файлов вопреки явной просьбе пользователя.
+    // Серверный оверрайд: если в ИСХОДНОМ сообщении пользователя есть стоп-фраза
+    // «код не пишите / только проверить / без правок», НЕ блокируем shouldExecute,
+    // а добавляем ограничение «только чтение» в executionTask. Раньше это форсило
+    // shouldExecute=false и оркестратор не мог делегировать «посмотри git status».
     const userStopPhrases = [
       'не пишите код', 'не пишу код', 'код не пишите', 'код не писать',
       'только проверить', 'только проверь', 'только проверьте',
@@ -416,9 +438,8 @@ export class ChatsService {
     const userLower = content.toLowerCase();
     const userHasStopPhrase = userStopPhrases.some(p => userLower.includes(p));
     if (userHasStopPhrase && shouldExecute) {
-      this.logger.log(`Server override: stop phrase in user message forces shouldExecute=false`);
-      shouldExecute = false;
-      executionTask = '';
+      this.logger.log(`Server override: stop phrase detected — adding READ-ONLY constraint to executionTask`);
+      executionTask = `[ТОЛЬКО ЧТЕНИЕ — не менять файлы, не коммитить, не создавать новые файлы]\n${executionTask}\n[ОГРАНИЧЕНИЕ: Только чтение/анализ. Запрещено: запись файлов, git commit, git push, создание файлов, удаление файлов.]`;
     }
 
     // Логируем решение оркестратора

@@ -1,10 +1,43 @@
-export const ROLE_ORDER = ["orchestrator", "developer", "tester", "analyst"] as const;
+export const ROLE_ORDER = ["orchestrator", "analyst", "developer", "reviewer", "tester"] as const;
+
+/** Tool kinds that can be requested during a run */
+export type ToolKind = "file_read" | "file_write" | "shell" | "migration" | "search";
+
+/** Per-role tool permissions */
+export interface RoleToolPolicy {
+  allowed: ToolKind[];
+  shellWhitelist?: string[]; // read-only commands allowed for restricted roles
+}
+
+export const ROLE_TOOL_POLICIES: Record<string, RoleToolPolicy> = {
+  orchestrator: {
+    allowed: ["file_read", "file_write", "shell", "migration", "search"],
+  },
+  analyst: {
+    allowed: ["file_read", "search"],
+    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree"],
+  },
+  developer: {
+    allowed: ["file_read", "file_write", "shell", "migration", "search"],
+  },
+  reviewer: {
+    allowed: ["file_read", "search"],
+    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "git diff", "git log", "git show"],
+  },
+  tester: {
+    allowed: ["file_read", "shell", "search"],
+    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "npm test", "npm run test", "npx jest", "npx vitest", "npx playwright test", "git diff", "git log"],
+  },
+};
+
+/** Maximum weighted tokens a single role turn may consume */
+export const DEFAULT_MAX_TOKENS_PER_ROLE = 200_000;
 
 export function createDefaultTeam(name = "Core Team") {
   return {
     id: `team-${Date.now()}`,
     name,
-    description: "Базовая команда: оркестратор -> аналитик -> разработчик -> тестировщик",
+    description: "Базовая команда: оркестратор -> аналитик -> разработчик -> ревьюер -> тестировщик",
     language: "ru",
     budget: {
       dailyWeightedTokens: 50000000,
@@ -71,6 +104,13 @@ export function createDefaultTeam(name = "Core Team") {
         model: "openai/gpt-5.3-codex",
         multiplier: 2,
         temperature: 0.15,
+      },
+      reviewer: {
+        name: "Lex",
+        label: "Ревьюер",
+        model: "deepseek/deepseek-v4-flash",
+        multiplier: 0.5,
+        temperature: 0.1,
       },
       tester: {
         name: "Nova",

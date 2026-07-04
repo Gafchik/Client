@@ -86,7 +86,7 @@ class RunCancelledError extends Error {
 
 
 type RunMode = 'diagnostics' | 'implementation' | 'research';
-type ExecutionRole = 'analyst' | 'developer' | 'tester';
+type ExecutionRole = 'analyst' | 'developer' | 'reviewer' | 'tester';
 
 interface RoleExecutionPlan {
   enabled: boolean;
@@ -614,7 +614,7 @@ export class RunsService implements OnModuleInit {
     const testLabel = testerAgent.label || 'Тестировщик';
 
     const hostProjectsRoot = process.env.LOCAL_PROJECTS_ROOT || '/Users/evgenii';
-    const containerProjectsRoot = process.env.CONTAINER_PROJECTS_ROOT || '/host-projects';
+    const containerProjectsRoot = process.env.CONTAINER_PROJECTS_ROOT || hostProjectsRoot;
     const projectPath = (project.localPath || '').replace(hostProjectsRoot, containerProjectsRoot);
     const projectName = project.name || 'Unknown Project';
 
@@ -918,6 +918,71 @@ export class RunsService implements OnModuleInit {
               }
             }
           }
+        }
+
+        // REVIEWER (code review) — после developer, до tester.
+        // Проверяет стили, потенциальные баги, архитектурные риски.
+        // Может предлагать SEARCH/REPLACE-патчи — они мержатся в codeChanges.
+        let reviewerWorked = false;
+        if (plan.roles.reviewer?.enabled) {
+          if (!developerAgent?.model) {
+            throw new Error('Reviewer role is required by the plan, but developer model is not configured (reused for reviewer)');
+          }
+
+          const reviewerAgentCfg: AgentConfig = {
+            ...developerAgent,
+            name: agents.reviewer?.name || agents.developer?.name || 'Kai',
+            label: agents.reviewer?.label || agents.developer?.label || 'Разработчик',
+          };
+          const rvName = reviewerAgentCfg.name || 'Kai';
+          const rvLabel = reviewerAgentCfg.label || 'Ревьюер';
+
+          await this.broadcastActivity(runId, chatId, 'reviewer', rvName, rvLabel, 'working', this.buildReviewerStatus(plan, runMode));
+
+          const reviewerResult = await this.callAgentStream(
+            runId, chatId, 'reviewer', reviewerAgentCfg, language,
+            this.buildReviewerPrompt(run, codeChanges, project, workspace, projectPath, runMode, plan),
+            (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'reviewer', content: delta, done: false })
+          );
+
+          if (!reviewerResult.success && reviewerResult.rawResponse) {
+            const fixed = this.parseReviewerMarkerFormat(reviewerResult.rawResponse)
+              ?? this.tryFixAgentJson(reviewerResult.rawResponse, 'reviewer');
+            if (fixed) {
+              reviewerResult.success = true;
+              reviewerResult.artifact = fixed;
+            }
+          }
+
+          if (reviewerResult.success && reviewerResult.artifact) {
+            const reviewArtifact = reviewerResult.artifact as Record<string, unknown>;
+            const reviewFiles = Array.isArray((reviewArtifact as any)?.files) ? (reviewArtifact as any).files : [];
+
+            if (reviewFiles.length && runMode === 'implementation' && applyChanges) {
+              await this.broadcastActivity(runId, chatId, 'reviewer', rvName, rvLabel, 'working', `Ревьюер предложил ${reviewFiles.length} исправлений — применяю`);
+              // Мержим патчи ревьюера поверх codeChanges разработчика
+              const byPath = new Map<string, any>();
+              for (const f of (codeChanges as any).files || []) byPath.set(String(f.path), f);
+              for (const f of reviewFiles) byPath.set(String(f.path), f);
+              (codeChanges as any).files = Array.from(byPath.values());
+            }
+
+            // Добавляем findings ревьюера в финальный отчёт (metadata)
+            const findings = Array.isArray((reviewArtifact as any)?.findings) ? (reviewArtifact as any).findings : [];
+            if (findings.length) {
+              (codeChanges as any).reviewFindings = findings;
+            }
+            reviewerWorked = true;
+            await this.broadcastActivity(runId, chatId, 'reviewer', rvName, rvLabel, 'done', this.buildReviewerDoneStatus(plan, runMode, reviewArtifact));
+          } else if (!reviewerResult.success) {
+            // Ревьюер не критичен — логируем ошибку, но не роняем run
+            this.logger.warn(`Reviewer failed for run ${runId}: ${reviewerResult.error}`);
+            await this.broadcastActivity(runId, chatId, 'reviewer', reviewerAgentCfg.name || 'Kai', reviewerAgentCfg.label || 'Ревьюер', 'error', `Ревью не удался: ${reviewerResult.error}`);
+          }
+        } else if (plan.roles.reviewer) {
+          const rvName = agents.reviewer?.name || 'Kai';
+          const rvLabel = agents.reviewer?.label || 'Ревьюер';
+          await this.broadcastActivity(runId, chatId, 'reviewer', rvName, rvLabel, 'done', `Этап пропущен: ${plan.roles.reviewer.reason}`);
         }
 
         // Сохраняем doc-артефакты в project memory с ПОЛНЫМ контентом — чтобы
@@ -1285,6 +1350,7 @@ export class RunsService implements OnModuleInit {
         temperature,
         stream: true,
         max_tokens: agent.maxTokens ?? Number(process.env.AGENT_MAX_TOKENS ?? 8000),
+        reasoning_effort: process.env.LLM_REASONING_EFFORT ?? 'high',
         messages: [
           { role: 'system', content: systemContent },
           { role: 'user', content: prompt },
@@ -1492,6 +1558,10 @@ export class RunsService implements OnModuleInit {
       || /\b(тест|проверь|validate|verify|check)\b/i.test(task)
       || steps.some((step) => /тест|провер|validate|verify|check/i.test(step));
 
+    const defaultReviewerEnabled =
+      runMode === 'implementation'
+      && /\b(ревью|review|проверь код|code review|посмотри код|прочитай код)\b/i.test(task);
+
     const roles: Record<ExecutionRole, RoleExecutionPlan> = {
       analyst: resolveRole(
         'analyst',
@@ -1508,6 +1578,12 @@ export class RunsService implements OnModuleInit {
           : 'Внести точечные изменения по подтверждённому плану, не переписывая лишние файлы.',
         defaultDeveloperEnabled,
         defaultDeveloperEnabled ? 'Нужны реальные изменения в проекте.' : 'Код менять не требуется.',
+      ),
+      reviewer: resolveRole(
+        'reviewer',
+        'Провести code review изменений разработчика: проверить стили, потенциальные баги, архитектурные риски.',
+        defaultReviewerEnabled,
+        defaultReviewerEnabled ? 'Запрошен code review изменений.' : 'Code review не запрошен явно.',
       ),
       tester: resolveRole(
         'tester',
@@ -1600,6 +1676,7 @@ export class RunsService implements OnModuleInit {
   private roleLabel(role: ExecutionRole): string {
     if (role === 'analyst') return 'аналитика';
     if (role === 'developer') return 'разработчика';
+    if (role === 'reviewer') return 'ревьюера';
     return 'тестировщика';
   }
 
@@ -2217,10 +2294,19 @@ export class RunsService implements OnModuleInit {
       const branch = run('git rev-parse --abbrev-ref HEAD');
       const log = run('git log --oneline -n 15 --no-decorate');
       const status = run('git status --short');
+      const diffStat = run('git diff --stat --no-color');
+      const diffStatCached = run('git diff --cached --stat --no-color');
       const parts: string[] = [];
       if (branch) parts.push(`Ветка: ${branch}`);
       if (log) parts.push(`Последние коммиты (git log --oneline -n 15):\n${log}`);
       if (status) parts.push(`Незакоммиченные изменения (git status --short):\n${status || '(рабочее дерево чистое)'}`);
+      if (diffStat) parts.push(`Diff unstaged (git diff --stat):\n${diffStat}`);
+      if (diffStatCached) parts.push(`Diff staged (git diff --cached --stat):\n${diffStatCached}`);
+      // Последние 5 изменённых файлов — показываем агентам, что недавно менялось,
+      // чтобы они понимали «горячие» зоны проекта и не пытались «починить»
+      // уже исправленный файл или наоборот не трогали стабильный код.
+      const recentFiles = run('git diff --name-only HEAD~5..HEAD 2>/dev/null || git diff --name-only HEAD~3..HEAD 2>/dev/null || echo ""');
+      if (recentFiles) parts.push(`Недавно изменённые файлы (последние 5 коммитов):\n${recentFiles}`);
       return parts.length ? parts.join('\n\n') : '';
     } catch {
       return '';
@@ -2229,9 +2315,10 @@ export class RunsService implements OnModuleInit {
 
   /**
    * Строит компактный индекс проекта: список релевантных файлов с размерами
-   * + короткое дерево директорий. Даёт агентам "карту" проекта, чтобы они
-   * не выдумывали пути и не сериализовали всё подряд. Без этого слабые модели
-   * фантазируют структуру и тратят токены на несуществующие файлы.
+   * + короткое дерево директорий + архитектурные метки + зависимости.
+   * Даёт агентам "карту" проекта, чтобы они не выдумывали пути и не
+   * сериализовали всё подряд. Без этого слабые модели фантазируют структуру
+   * и тратят токены на несуществующие файлы.
    */
   private buildProjectIndex(projectPath: string, workspace: any, maxFiles = 50): string {
     try {
@@ -2498,6 +2585,120 @@ PATCH_END
 5. Никаких .md/README/документации — только код.`;
   }
 
+
+  // ──────────────────────────────────────────────────────────────────
+  // REVIEWER helpers
+  // ──────────────────────────────────────────────────────────────────
+
+  private buildReviewerStatus(plan: NormalizedExecutionPlan, runMode: RunMode): string {
+    if (runMode === 'research') return 'Проверяю инженерное мнение разработчика';
+    if (runMode === 'diagnostics') return 'Проверяю диагноз разработчика';
+    return 'Провожу code review изменений разработчика';
+  }
+
+  private buildReviewerDoneStatus(
+    plan: NormalizedExecutionPlan,
+    runMode: RunMode,
+    reviewArtifact: Record<string, unknown>,
+  ): string {
+    const files = Array.isArray((reviewArtifact as any)?.files) ? (reviewArtifact as any).files.length : 0;
+    const findings = Array.isArray((reviewArtifact as any)?.findings) ? (reviewArtifact as any).findings.length : 0;
+    if (runMode === 'research') return findings > 0 ? `Ревью: ${findings} замечание(й)` : 'Ревью инженерного мнения готово';
+    if (runMode === 'diagnostics') return findings > 0 ? `Ревью: ${findings} замечание(й)` : 'Ревью диагноза готово';
+    return files > 0 ? `Ревью: ${files} исправление(й), ${findings} замечание(й)` : findings > 0 ? `Ревью: ${findings} замечание(й)` : 'Ревью завершено, замечаний нет';
+  }
+
+  private buildReviewerPrompt(
+    run: Run,
+    codeChanges: Record<string, unknown>,
+    project: any,
+    workspace: any,
+    projectPath: string,
+    runMode: RunMode,
+    plan: NormalizedExecutionPlan,
+  ): string {
+    const assignment = plan.roles.reviewer?.assignment || 'Провести code review';
+    const filesChanged = Array.isArray((codeChanges as any)?.files) ? (codeChanges as any).files : [];
+    const filesSummary = filesChanged.length
+      ? filesChanged.map((f: any) => `- ${f.path} (${f.action}): ${f.description || '—'}`).join('\n')
+      : 'нет изменений';
+    const modeLine = runMode === 'research'
+      ? 'РЕЖИМ: исследование. Ревьюер проверяет инженерное мнение разработчика на полноту и корректность.'
+      : runMode === 'diagnostics'
+        ? 'РЕЖИМ: диагностика. Ревьюер проверяет, что выводы разработчика по диагнозу корректны.'
+        : 'РЕЖИМ: реализация. Ревьюер проверяет изменения кода на баги, стиль и архитектурные риски.';
+
+    return `Ты — Ревьюер (Code Review). Проведи ревью результатов работы разработчика.
+
+ПРОЕКТ: ${project.name || 'Unknown'}
+ПУТЬ: ${project.localPath || ''}
+ЗАДАЧА: ${run.task}
+${modeLine}
+НАЗНАЧЕНИЕ: ${assignment}
+
+ИЗМЕНЕНИЯ РАЗРАБОТЧИКА (codeChanges):
+${JSON.stringify(codeChanges, null, 2)}
+
+СПИСОК ИЗМЕНЁННЫХ ФАЙЛОВ:
+${filesSummary}
+
+Твоя задача — найти проблемы в изменениях разработчика: баги, нарушения стиля, архитектурные риски, несогласованности. Если проблем нет — верни findings:[], files:[]. Если есть критичные проблемы — верни исправленные патчи (SEARCH/REPLACE) в files[].
+
+ПРАВИЛА (КРИТИЧНО):
+1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON. Никакого markdown, никакого текста вне { }.
+2. В findings[] перечисли конкретные замечания (severity: info|warning|critical).
+3. В files[] верни ИСПРАВЛЕННЫЕ патчи (SEARCH/REPLACE) — только для критичных проблем.
+4. Если всё хорошо — {"summary":"Ревью завершено, замечаний нет.","findings":[],"files":[]}.
+5. Не трогай файлы, которые не менял разработчик.
+6. В research/diagnostics ревьюер только проверяет корректность выводов, НЕ генерирует код.
+
+Схема:
+{"summary":"string","findings":[{"file":"string","severity":"info|warning|critical","message":"string"}],"files":[{"path":"string","action":"update","description":"string","patches":[{"search":"string","replace":"string"}]}]}
+
+ПРИМЕР (есть критичная проблема):
+{"summary":"Найдена критичная проблема: неправильная обработка null.","findings":[{"file":"apps/api/src/modules/chats/chats.service.ts","severity":"critical","message":"Не проверяется chat.chat на null перед обращением к projectId"}],"files":[{"path":"apps/api/src/modules/chats/chats.service.ts","action":"update","description":"Добавить null-check","patches":[{"search":"const projectId = chat.chat.projectId","replace":"const projectId = chat.chat?.projectId ?? ''"}]}]}
+
+ПРИМЕР (всё хорошо):
+{"summary":"Ревью завершено, критичных замечаний нет.","findings":[],"files":[]}
+
+Если вернёшь невалидный JSON — запуск упадёт.`;
+  }
+
+  /**
+   * Парсит маркерный формат ответа ревьюера: SUMMARY + FINDINGS + FILE/PATCH.
+   * Ревьюер использует тот же маркерный формат, что и разработчик, но с
+   * дополнительным блоком FINDINGS.
+   */
+  private parseReviewerMarkerFormat(text: string): Record<string, unknown> | null {
+    try {
+      if (!text || typeof text !== 'string') return null;
+
+      const summaryMatch = text.match(/^[ \t]*SUMMARY:[ \t]*(.+?)$/m);
+      const summary = summaryMatch ? summaryMatch[1].trim() : '';
+
+      // FINDINGS-блок
+      const findingsMatch = text.match(/^[ \t]*FINDINGS:[ \t]*$/m);
+      const findings: Array<{ file: string; severity: string; message: string }> = [];
+      if (findingsMatch) {
+        const afterFindings = text.slice(text.indexOf(findingsMatch[0]) + findingsMatch[0].length);
+        const endIdx = afterFindings.search(/^[ \t]*(FILE:|SUMMARY:|$)/m);
+        const findingsBlock = endIdx >= 0 ? afterFindings.slice(0, endIdx) : afterFindings;
+        for (const line of findingsBlock.split('\n')) {
+          const m = line.match(/^\s*-\s*\[?(info|warning|critical)\]?\s*([^:]+?):\s*(.+)$/i);
+          if (m) findings.push({ file: m[2].trim(), severity: m[1].toLowerCase(), message: m[3].trim() });
+        }
+      }
+
+      if (!/^[ \t]*FILE:/m.test(text)) {
+        return { summary, findings, files: [] };
+      }
+
+      const files = this.parseDeveloperMarkerFormat(text)?.files || [];
+      return { summary, findings, files };
+    } catch {
+      return null;
+    }
+  }
 
   private async buildMemoryContext(projectId: string, task: string): Promise<string> {
     try {

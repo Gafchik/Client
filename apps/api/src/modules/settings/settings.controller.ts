@@ -7,7 +7,7 @@ export class SettingsController {
     return {
       env: {
         LOCAL_PROJECTS_ROOT: process.env.LOCAL_PROJECTS_ROOT || "/Users/evgenii",
-        CONTAINER_PROJECTS_ROOT: process.env.CONTAINER_PROJECTS_ROOT || "/host-projects",
+        CONTAINER_PROJECTS_ROOT: process.env.CONTAINER_PROJECTS_ROOT || process.env.LOCAL_PROJECTS_ROOT || "/Users/evgenii",
       },
     };
   }
