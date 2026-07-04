@@ -621,8 +621,26 @@ export class RunsService implements OnModuleInit {
 
     const hostProjectsRoot = process.env.LOCAL_PROJECTS_ROOT || '/Users/evgenii';
     const containerProjectsRoot = process.env.CONTAINER_PROJECTS_ROOT || hostProjectsRoot;
-    const projectPath = (project.localPath || '').replace(hostProjectsRoot, containerProjectsRoot);
+    // Резолвим абсолютный путь: если в БД лежит относительный (историческая запись),
+    // path.resolve сделает его абсолютным относительно hostProjectsRoot.
+    // Затем подменяем префикс для контейнера, если нужно.
+    const resolvedLocalPath = path.resolve(hostProjectsRoot, project.localPath || '');
+    const projectPath = resolvedLocalPath.replace(hostProjectsRoot, containerProjectsRoot).replace(/\/+$/, '');
     const projectName = project.name || 'Unknown Project';
+
+    // Защита: если projectPath не абсолютный или не существует — роняем с понятной ошибкой,
+    // чтобы агенты не писали файлы в cwd API-процесса (apps/api).
+    if (!path.isAbsolute(projectPath)) {
+      const msg = `projectPath не абсолютный: "${projectPath}". localPath="${project.localPath}", hostProjectsRoot="${hostProjectsRoot}". Проверьте LOCAL_PROJECTS_ROOT в .env и localPath в БД.`;
+      this.logger.error(msg);
+      throw new Error(msg);
+    }
+    if (!fs.existsSync(projectPath)) {
+      const msg = `projectPath не существует: "${projectPath}". Проверьте, что проект примонтирован и путь корректен.`;
+      this.logger.error(msg);
+      throw new Error(msg);
+    }
+    this.logger.log(`Project path resolved: ${projectPath} (localPath=${project.localPath})`);
 
     // Режим прогона: 'diagnostics' (только анализ, БЕЗ правок кода) или
     // 'implementation' (внести изменения). Определяем ДЕТЕРМИНИРОВАННО по
@@ -2411,6 +2429,35 @@ export class RunsService implements OnModuleInit {
     description: string,
     teamConfig: TeamConfig,
   ): Promise<{ success: boolean; output: string; code: number | null; approved: boolean }> {
+    // СЕРВЕРНАЯ БЛОКИРОВКА git-команд записи.
+    // Агенты НИКОГДА не должны коммитить, пушить или добавлять файлы в staging.
+    // Это разрушительные операции — пользователь сам решает, когда коммитить.
+    // Блокируем на уровне сервера, независимо от того, что попросит модель.
+    const normalizedCmd = String(command || '').trim();
+    if (normalizedCmd) {
+      const blockedPatterns = [
+        /\bgit\s+commit\b/i,
+        /\bgit\s+push\b/i,
+        /\bgit\s+add\b/i,
+        /\bgit\s+rm\b/i,
+        /\bgit\s+tag\b/i,
+        /\bgit\s+reset\s+--hard\b/i,
+        /\brm\s+-rf\b/i,
+        /\bsudo\b/i,
+        /\bchmod\s+777\b/i,
+        /\bchown\b/i,
+      ];
+      for (const pattern of blockedPatterns) {
+        if (pattern.test(normalizedCmd)) {
+          const blockMsg = `Blocked destructive command: "${normalizedCmd.slice(0, 200)}". Команды git commit/push/add, а также rm -rf, sudo, chmod 777, chown запрещены на серверном уровне. Используйте только команды чтения (grep, ls, git log, git status, npm test, npm run build и т.д.).`;
+          this.logger.warn(`[run ${runId}] ${blockMsg}`);
+          await this.broadcastActivity(runId, chatId, role, name, label, 'error', blockMsg);
+          await this.appendRunEvent(runId, 'command:blocked', { role, agentName: name, label, command, cwd, reason: 'destructive command blocked', title });
+          return { success: false, output: blockMsg, code: 1, approved: false };
+        }
+      }
+    }
+
     if (teamConfig.run?.requireApprovalForCommands !== false) {
       const approval = await this.requestApproval(runId, chatId, role, name, label, {
         kind: 'command',
@@ -3365,8 +3412,13 @@ SUMMARY: Нет изменений. Диагноз аналитика подтв
 
 ПРОЕКТ: ${project.name || 'Unknown'}
 ПУТЬ: ${project.localPath || ''}
+РАБОЧАЯ ДИРЕКТОРИЯ: ${projectPath}
 ЗАДАЧА: ${run.task}
 ${assignmentLine}
+
+⚠️ Все пути к файлам должны быть ОТНОСИТЕЛЬНЫМИ от рабочей директории ${projectPath}.
+Пример ПРАВИЛЬНОГО пути: apps/web/src/views/WorkspaceView.vue
+Пример НЕПРАВИЛЬНОГО: apps/api/apps/web/... (дублирование префиксов), /Users/evgenii/Desktop/client/apps/... (абсолютный путь)
 
 ТРЕБОВАНИЯ ИЗ ТЗ:
 ${requirements}

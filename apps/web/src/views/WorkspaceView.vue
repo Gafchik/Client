@@ -80,6 +80,7 @@ const state = reactive({
 
 
 const chatDraft = ref("");
+const isSending = ref(false);
 const messagesListRef = ref<HTMLElement | null>(null);
 const composerTextareaRef = ref<HTMLTextAreaElement | null>(null);
 let isMounted = false;
@@ -485,7 +486,48 @@ function confirmDelete(type: 'project' | 'chat', id: string, name: string, onCon
 async function executeDelete() { if (!state.deleteConfirm) return; const { onConfirm } = state.deleteConfirm; state.deleteConfirm = null; try { await onConfirm(); showToast('success', 'Удалено'); } catch (e) { showToast('error', e instanceof Error ? e.message : 'Ошибка удаления'); } }
 async function createChat() { if (!selectedProject.value || !(selectedProject.value.teamId || state.selectedTeamId)) return; state.busy = true; try { const response = await api.saveChat({ projectId: selectedProject.value.id, teamId: selectedProject.value.teamId || state.selectedTeamId, title: `Чат ${state.chats.length + 1}`, summary: "" }); state.chats.unshift(response.chat); state.selectedChatId = response.chat.id; await openChat(response.chat.id); showToast('success', 'Чат создан'); } catch (e) { showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
 async function deleteChat(id: string) { const chat = state.chats.find(c => c.id === id); if (!chat) return; confirmDelete('chat', id, chat.title, async () => { state.busy = true; try { await api.deleteChat(id); state.chats = state.chats.filter(c => c.id !== id); if (state.selectedChatId === id) { const fallback = state.chats[0] || null; state.selectedChatId = fallback?.id || ""; if (fallback) await openChat(fallback.id); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } } showToast('success', 'Чат удалён'); } finally { state.busy = false; } }); }
-async function sendChatMessage() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); state.busy = true; chatDraft.value = ""; try { const response = await api.sendChatMessage(selectedChat.value.id, draft, state.selectedTeamId || undefined); await openChat(selectedChat.value.id); if (response.autoRunId) { state.selectedRunId = response.autoRunId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; clearAgentLogs(); startPolling(response.autoRunId); /* busy stays true: polling resets it when run completes */ } else { state.busy = false; } } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); state.busy = false; } }
+function onComposerKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChatMessage();
+  }
+  // Shift+Enter — стандартное поведение браузера (перенос строки), не трогаем
+  // Escape — убрать фокус (опционально)
+  if (e.key === 'Escape') {
+    composerTextareaRef.value?.blur();
+  }
+}
+async function sendChatMessage() {
+  if (!selectedChat.value || !chatDraft.value.trim() || isSending.value) return;
+  const draft = chatDraft.value.trim();
+  isSending.value = true;
+  state.busy = true;
+  chatDraft.value = "";
+  try {
+    const response = await api.sendChatMessage(selectedChat.value.id, draft, state.selectedTeamId || undefined);
+    await openChat(selectedChat.value.id);
+    if (response.autoRunId) {
+      state.selectedRunId = response.autoRunId;
+      state.runStatus = "queued";
+      state.runEvents = [];
+      state.runError = "";
+      state.report = null;
+      clearAgentLogs();
+      startPolling(response.autoRunId);
+    } else {
+      state.busy = false;
+    }
+  } catch (e) {
+    chatDraft.value = draft;
+    showToast('error', e instanceof Error ? e.message : 'Ошибка');
+    state.busy = false;
+  } finally {
+    isSending.value = false;
+    // Возвращаем фокус в поле ввода
+    await nextTick();
+    composerTextareaRef.value?.focus();
+  }
+}
 async function runTask() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); const project = selectedProject.value; const team = selectedProjectTeam.value; if (!project || !team) return; state.busy = true; chatDraft.value = ""; try { const response = await api.startRun({ chatId: selectedChat.value.id, task: draft, teamId: team.id, teamName: team.name, projectPath: project.localPath || '' }); state.selectedRunId = response.runId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; clearAgentLogs(); startPolling(response.runId); showToast('success', 'Работа запущена'); /* busy stays true until run completes via polling */ } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); state.busy = false; } }
 function startPolling(runId: string) {
   if (pollTimer) window.clearInterval(pollTimer);
@@ -918,8 +960,8 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
       </div>
 
       <footer class="chat-composer">
-        <div class="composer-input"><textarea ref="composerTextareaRef" class="composer-textarea" v-model="chatDraft" rows="1" placeholder="Например: кто в команде, что сейчас в работе, добавь задачу на экспорт CSV" @keydown.enter.exact.shift="sendChatMessage" @keydown.enter.prevent="sendChatMessage"></textarea></div>
-        <div class="composer-actions"><span class="composer-hint">Enter — отправить · Shift+Enter — новая строка</span><button class="composer-send" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button></div>
+        <div class="composer-input"><textarea ref="composerTextareaRef" class="composer-textarea" v-model="chatDraft" rows="1" placeholder="Например: кто в команде, что сейчас в работе, добавь задачу на экспорт CSV" @keydown="onComposerKeydown"></textarea></div>
+        <div class="composer-actions"><span class="composer-hint">Enter — отправить · Shift+Enter — новая строка</span><button class="composer-send" :disabled="isSending || state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button></div>
       </footer>
 
     <!-- Модалка «Дать агенту новую задачу». На паузе — отложится до resume,
