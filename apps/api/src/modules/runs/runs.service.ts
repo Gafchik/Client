@@ -777,15 +777,6 @@ export class RunsService implements OnModuleInit {
             (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'developer', content: delta, done: false })
           );
 
-          if (!developerResult.success && developerResult.rawResponse) {
-            const fixed = this.parseDeveloperMarkerFormat(developerResult.rawResponse)
-              ?? this.tryFixDeveloperJson(developerResult.rawResponse);
-            if (fixed) {
-              developerResult.success = true;
-              developerResult.artifact = fixed;
-            }
-          }
-
           if (!developerResult.success) {
             throw new Error(`Developer failed: ${developerResult.error}`);
           }
@@ -1391,6 +1382,11 @@ export class RunsService implements OnModuleInit {
       let fullContent = '';
       let totalUsage: any = null;
       let finishReason: string | undefined;
+      // Буфер для диагностики: храним сырые SSE-события, чтобы при пустом
+      // ответе понять, что именно вернул провайдер (ошибка, reasoning_content,
+      // нестандартный формат и т.п.).
+      const rawSseEvents: string[] = [];
+      let streamHadError = false;
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
 
@@ -1406,29 +1402,93 @@ export class RunsService implements OnModuleInit {
               if (dataStr === '[DONE]') continue;
               try {
                 const data = JSON.parse(dataStr);
+
+                // Диагностика: сохраняем первые N событий для анализа.
+                if (rawSseEvents.length < 20) {
+                  rawSseEvents.push(dataStr.slice(0, 500));
+                }
+
+                // Провайдер может вернуть ошибку прямо в SSE-стриме
+                // (например {"error":{"message":"..."}}). Раньше это молча
+                // проглатывалось — fullContent оставалась пустой, и мы не
+                // знали почему. Теперь логируем.
+                if (data.error) {
+                  const errMsg = typeof data.error === 'string'
+                    ? data.error
+                    : data.error.message || JSON.stringify(data.error);
+                  this.logger.warn(`Agent ${stepName} SSE error event: ${errMsg}`);
+                  streamHadError = true;
+                }
+
                 const choice = data.choices?.[0];
-                const delta = choice?.delta?.content;
+                // Поддержка reasoning-моделей (o1, o3, DeepSeek-R1 и т.п.):
+                // они отдают контент в reasoning_content, а не в content.
+                const delta = choice?.delta?.content
+                  ?? choice?.delta?.reasoning_content;
                 if (delta) {
                   fullContent += delta;
                   onToken(delta);
                 }
                 if (choice?.finish_reason) finishReason = choice.finish_reason;
                 if (data.usage) totalUsage = data.usage;
-              } catch { }
+              } catch {
+                // Логируем нестандартные SSE-строки для диагностики.
+                const snippet = line.slice(0, 200);
+                if (rawSseEvents.length < 20) {
+                  rawSseEvents.push(`[unparsed] ${snippet}`);
+                }
+              }
             }
           }
         }
+      } else {
+        this.logger.warn(`Agent ${stepName}: response.body is null (no reader) for run ${runId}`);
       }
 
       // Финальный токен
       onToken('');
 
+      // Диагностика пустого ответа: логируем сырые SSE-события, чтобы понять
+      // что именно вернул провайдер. Без этого при пустом fullContent мы
+      // видим только "Empty or invalid response" и не можем отладить.
+      if (!fullContent) {
+        this.logger.warn(
+          `Agent ${stepName} returned empty content for run ${runId}. ` +
+          `SSE events captured (${rawSseEvents.length}): ${rawSseEvents.join(' | ').slice(0, 2000)}` +
+          (streamHadError ? ' [stream contained error events]' : '') +
+          (finishReason ? ` [finish_reason=${finishReason}]` : ' [no finish_reason]') +
+          (reader ? '' : ' [no reader — response.body was null]'),
+        );
+      }
+
       if (finishReason === 'length') {
         this.logger.warn(`Agent ${stepName} truncated by max_tokens (finish_reason=length) for run ${runId}; JSON may be incomplete. Consider raising AGENT_MAX_TOKENS or splitting the task.`);
       }
 
-      // Парсим JSON ответ
-      const parseResult = parseJsonSafely(fullContent);
+      // Парсим ответ агента. Для developer-шага ПРИОРИТЕТ — маркерный формат
+      // (SUMMARY:/FILE:/PATCH_START/...), JSON только как fallback. Для остальных
+      // шагов — сначала JSON, потом маркерный (если applicable).
+      let parseResult: ParseJsonResult = { success: false, error: 'not attempted', rawResponse: fullContent };
+
+      if (stepName === 'developer') {
+        // 1) Маркерный формат (основной для developer)
+        const markerResult = this.parseDeveloperMarkerFormat(fullContent);
+        if (markerResult) {
+          parseResult = { success: true, data: markerResult, rawResponse: fullContent };
+        } else {
+          // 2) JSON fallback (на случай если модель вернула JSON)
+          parseResult = parseJsonSafely(fullContent);
+          // 3) Ещё одна попытка — tryFixDeveloperJson
+          if (!parseResult.success && fullContent) {
+            const fixed = this.tryFixDeveloperJson(fullContent);
+            if (fixed) {
+              parseResult = { success: true, data: fixed, rawResponse: fullContent };
+            }
+          }
+        }
+      } else {
+        parseResult = parseJsonSafely(fullContent);
+      }
       
       // Дамп ответа агента на диск — чисто отладочный, по умолчанию выключен.
       // Эти artifacts/<role>.json никто не читает: рантайм и контроллер
@@ -1450,7 +1510,7 @@ export class RunsService implements OnModuleInit {
         fs.writeFileSync(artifactPath, JSON.stringify(artifactContent, null, 2), 'utf-8');
       }
 
-
+      
       if (!parseResult.success) {
         this.logger.error(`Failed to parse JSON for run ${runId}, step ${stepName}: ${parseResult.error}`);
         this.logger.error(`Raw response (first 1000 chars): ${fullContent.slice(0, 1000)}`);

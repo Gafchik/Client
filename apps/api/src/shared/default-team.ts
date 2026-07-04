@@ -101,8 +101,8 @@ export function createDefaultTeam(name = "Core Team") {
       developer: {
         name: "Kai",
         label: "Разработчик",
-        model: "openai/gpt-5.3-codex",
-        multiplier: 2,
+        model: "openai/gpt-5.4-mini",
+        multiplier: 0.8,
         temperature: 0.15,
       },
       reviewer: {
