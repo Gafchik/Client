@@ -84,10 +84,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(chat),
     }),
-  sendChatMessage: (chatId: string, content: string) =>
+  sendChatMessage: (chatId: string, content: string, teamId?: string) =>
     request<{ chat: Chat; message: ChatMessage; autoRunId?: string | null }>(`/chats/${chatId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, teamId }),
     }),
   deleteChat: (id: string) =>
     request<{ ok: boolean }>(`/chats/${id}`, {

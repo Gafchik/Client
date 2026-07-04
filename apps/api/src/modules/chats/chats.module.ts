@@ -10,12 +10,14 @@ import { ChatsController } from "./chats.controller.js";
 import { ChatsService } from "./chats.service.js";
 import { RunsModule } from "../runs/runs.module.js";
 import { TeamsModule } from "../teams/teams.module.js";
+import { ProvidersModule } from "../providers/providers.module.js";
 import { WsModule } from "../ws/ws.module.js";
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([ChatEntity, MessageEntity, ProjectEntity, ProjectMemoryEntryEntity, TeamEntity, RunEntity]),
     TeamsModule,
+    ProvidersModule,
     forwardRef(() => RunsModule),
     WsModule,
   ],

@@ -12,6 +12,7 @@ import { TeamsService } from "../teams/teams.service.js";
 import { parseJsonSafely, safeJsonParse } from "../../shared/json.js";
 import { createLlmStreamRequest } from "../../shared/llm-client.js";
 import { RunsService } from "../runs/runs.service.js";
+import { ProvidersService } from "../providers/providers.service.js";
 import { WsGateway } from "../ws/ws.gateway.js";
 import * as fs from "fs";
 import * as path from "path";
@@ -39,6 +40,8 @@ export class ChatsService {
     private readonly runsService: RunsService,
     @Inject(WsGateway)
     private readonly wsGateway: WsGateway,
+    @Inject(ProvidersService)
+    private readonly providersService: ProvidersService,
   ) {}
 
   async list(projectId?: string) {
@@ -190,15 +193,17 @@ export class ChatsService {
     return { ok: true };
   }
 
-  async sendMessageToOrchestrator(chatId: string, content: string) {
+  async sendMessageToOrchestrator(chatId: string, content: string, overrideTeamId?: string) {
     const { chat, messages } = await this.getById(chatId);
     const project = await this.projectsRepository.findOneBy({ id: chat.projectId });
     if (!project) throw new Error("Project not found");
-    const resolvedTeamId = project.teamId || chat.teamId;
+    const resolvedTeamId = overrideTeamId || project.teamId || chat.teamId;
     if (!resolvedTeamId) throw new Error("Project team is not configured");
     const team = await this.teamsService.getById(resolvedTeamId);
-    if (!team.provider) throw new Error("Team provider is not configured");
-    if (!team.provider.apiKey) throw new Error("Provider API key is missing");
+    // Провайдер команды может быть не привязан — тогда берём текущий (активный).
+    const provider = team?.provider ?? await this.providersService.getActive().catch(() => null);
+    if (!provider) throw new Error("No provider configured — add one in Settings → Providers");
+    if (!provider.apiKey) throw new Error("Provider API key is missing");
     if (chat.teamId !== team.id) {
       chat.teamId = team.id;
       await this.chatsRepository.save(chat);
@@ -243,10 +248,10 @@ export class ChatsService {
 
     // Стриминговый запрос к LLM
     const streamResponse = await createLlmStreamRequest({
-      url: `${team.provider.baseUrl.replace(/\/$/, "")}/chat/completions`,
+      url: `${provider.baseUrl.replace(/\/$/, "")}/chat/completions`,
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${team.provider.apiKey}`,
+        Authorization: `Bearer ${provider.apiKey}`,
       },
         body: JSON.stringify({
         model: orchestrator.model,
@@ -307,7 +312,7 @@ export class ChatsService {
         ],
       }),
       logger: this.logger,
-      requestKey: `${team.provider.id}:${orchestrator.model}`,
+      requestKey: `${provider.id}:${orchestrator.model}`,
       onRetry: ({ attempt, maxAttempts, delayMs, status }) => {
         const seconds = Math.max(1, Math.round(delayMs / 1000));
         this.wsGateway.broadcastTokenStream(chat.id, {

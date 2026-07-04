@@ -19,7 +19,7 @@ const providers = ref<Provider[]>([]);
 const selectedProvider = ref<Provider | null>(null);
 const busy = ref(false);
 const showCreateForm = ref(false);
-const newProvider = ref({ name: "", baseUrl: "https://api.rout.my/v1", apiKey: "", modelsUrl: "https://api.rout.my/v1/models", isCurrent: false });
+const newProvider = ref({ name: "", baseUrl: "https://api.rout.my/v1", apiKey: "", modelsUrl: "https://api.rout.my/v1/models" });
 
 async function loadData() {
   if (globalProviders.value.length) {
@@ -42,7 +42,7 @@ async function createProvider() {
     const res = await api.saveProvider(newProvider.value);
     providers.value.unshift(res.provider);
     selectedProvider.value = res.provider;
-    newProvider.value = { name: "", baseUrl: "https://api.rout.my/v1", apiKey: "", modelsUrl: "https://api.rout.my/v1/models", isCurrent: providers.value.length === 1 };
+    newProvider.value = { name: "", baseUrl: "https://api.rout.my/v1", apiKey: "", modelsUrl: "https://api.rout.my/v1/models" };
     showCreateForm.value = false;
     router.push(`/providers/${res.provider.id}`);
   } catch (e) {
@@ -111,7 +111,6 @@ onMounted(loadData);
           <div class="form-group"><label>Base URL</label><input class="form-input" v-model="newProvider.baseUrl" placeholder="https://api.example.com/v1" /></div>
           <div class="form-group"><label>API Key</label><input class="form-input" type="password" v-model="newProvider.apiKey" placeholder="Вставь API ключ" /></div>
           <div class="form-group"><label>Models URL</label><input class="form-input" v-model="newProvider.modelsUrl" placeholder="https://api.example.com/v1/models" /></div>
-          <div class="form-group"><label class="checkbox-row"><input type="checkbox" v-model="newProvider.isCurrent" /><span>Current provider</span></label></div>
           <div class="form-actions">
             <button class="btn btn-primary" @click="createProvider" :disabled="busy || !newProvider.name.trim()">Создать</button>
             <button class="btn btn-ghost" @click="showCreateForm = false">Отмена</button>
@@ -131,13 +130,15 @@ onMounted(loadData);
         <div class="card">
           <header class="detail-header">
             <h3>{{ selectedProvider.name }}</h3>
-            <button class="btn btn-primary" @click="saveProvider" :disabled="busy">Сохранить</button>
+            <div class="detail-header-actions">
+              <button class="btn btn-primary" @click="saveProvider" :disabled="busy">Сохранить</button>
+              <button class="btn btn-danger" @click="deleteProvider(selectedProvider.id)" :disabled="busy">Удалить</button>
+            </div>
           </header>
           <div class="form-group"><label>Имя</label><input class="form-input" v-model="selectedProvider.name" /></div>
           <div class="form-group"><label>Base URL</label><input class="form-input" v-model="selectedProvider.baseUrl" /></div>
           <div class="form-group"><label>API Key</label><input class="form-input" type="password" :placeholder="selectedProvider.hasApiKey ? selectedProvider.apiKeyMasked || 'Ключ уже сохранён' : 'Вставь API ключ'" v-model="selectedProvider.apiKey" /></div>
           <div class="form-group"><label>Models URL</label><input class="form-input" v-model="selectedProvider.modelsUrl" /></div>
-          <div class="form-group"><label class="checkbox-row" style="display:flex;align-items:center;gap:10px"><input type="checkbox" v-model="selectedProvider.isCurrent" /><span>Current provider</span></label></div>
         </div>
       </section>
 
@@ -163,6 +164,10 @@ onMounted(loadData);
 .form-actions { display:flex; gap:8px; margin-top:8px; }
 .card { padding:20px; border-radius:var(--radius); background:var(--panel); border:1px solid var(--line); }
 .detail-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
+.detail-header-actions { display:flex; gap:8px; }
+.btn-danger { background:#ef4444; border-color:#ef4444; color:#fff; }
+.btn-danger:hover:not(:disabled) { background:#dc2626; border-color:#dc2626; }
+.btn-danger:disabled { opacity:.5; cursor:not-allowed; }
 .checkbox-row { display:flex; align-items:center; gap:10px; font-size:14px; color:var(--text); cursor:pointer; }
 .empty-state { color:var(--muted); text-align:center; padding:40px; }
 </style>

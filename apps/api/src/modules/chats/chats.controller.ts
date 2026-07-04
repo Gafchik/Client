@@ -26,7 +26,7 @@ export class ChatsController {
 
   @Post(":id/messages")
   async sendMessage(@Param("id") id: string, @Body() body: SendChatMessageDto) {
-    return this.chatsService.sendMessageToOrchestrator(id, body.content);
+    return this.chatsService.sendMessageToOrchestrator(id, body.content, body.teamId);
   }
 
   @Delete(":id")
