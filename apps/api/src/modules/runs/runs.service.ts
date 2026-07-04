@@ -2300,6 +2300,13 @@ export class RunsService implements OnModuleInit {
       }
 
       if (fileChange.action === 'create' || fileChange.action === 'update') {
+        // Защита: если модель вернула ACTION: create для существующего файла —
+        // принудительно конвертируем в update. Без этого developer перезаписывает
+        // весь файл CONTENT_START/CONTENT_END, теряя существующий код.
+        if (fileChange.action === 'create' && fs.existsSync(fullPath)) {
+          this.logger.warn(`applyFileChange: action=create for existing file ${relPath}, forcing to update`);
+          fileChange.action = 'update';
+        }
         // Патч-режим: применяем точечные SEARCH/REPLACE к существующему файлу.
         // Это критично для legacy-спагетти: не нужно переписывать весь файл целиком,
         // экономим токены и не теряем существующую логику.
