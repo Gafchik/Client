@@ -1380,6 +1380,7 @@ export class RunsService implements OnModuleInit {
       });
 
       let fullContent = '';
+      let reasoningContent = '';  // reasoning-модели (o1, o3, gpt-5.x) отдают "мышление" отдельно
       let totalUsage: any = null;
       let finishReason: string | undefined;
       // Буфер для диагностики: храним сырые SSE-события, чтобы при пустом
@@ -1421,13 +1422,18 @@ export class RunsService implements OnModuleInit {
                 }
 
                 const choice = data.choices?.[0];
-                // Поддержка reasoning-моделей (o1, o3, DeepSeek-R1 и т.п.):
+                // Поддержка reasoning-моделей (o1, o3, gpt-5.x, DeepSeek-R1 и т.п.):
                 // они отдают контент в reasoning_content, а не в content.
-                const delta = choice?.delta?.content
-                  ?? choice?.delta?.reasoning_content;
-                if (delta) {
-                  fullContent += delta;
-                  onToken(delta);
+                // ВАЖНО: используем || вместо ??, т.к. content может быть ""
+                // (пустая строка — не null/undefined), и ?? не пропустит к reasoning_content.
+                const contentDelta = choice?.delta?.content;
+                const reasoningDelta = choice?.delta?.reasoning_content;
+                if (contentDelta) {
+                  fullContent += contentDelta;
+                  onToken(contentDelta);
+                } else if (reasoningDelta) {
+                  reasoningContent += reasoningDelta;
+                  onToken(reasoningDelta);
                 }
                 if (choice?.finish_reason) finishReason = choice.finish_reason;
                 if (data.usage) totalUsage = data.usage;
@@ -1447,6 +1453,15 @@ export class RunsService implements OnModuleInit {
 
       // Финальный токен
       onToken('');
+
+      // Fallback для reasoning-моделей: если content был пустой (модель отдала
+      // всё через reasoning_content, как gpt-5-mini при некоторых промптах),
+      // берём reasoningContent как основной ответ. Без этого developer-шаг
+      // падал с "Empty or invalid response" — модель "думала", но "не отвечала".
+      if (!fullContent && reasoningContent) {
+        this.logger.log(`Agent ${stepName}: content was empty, using reasoningContent (${reasoningContent.length} chars) for run ${runId}`);
+        fullContent = reasoningContent;
+      }
 
       // Диагностика пустого ответа: логируем сырые SSE-события, чтобы понять
       // что именно вернул провайдер. Без этого при пустом fullContent мы
