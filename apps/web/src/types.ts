@@ -73,6 +73,8 @@ export interface ProjectMemoryEntry {
   tags: string[];
   relatedFiles: string[];
   sourceRunId?: string | null;
+  sourceChatId?: string | null;
+  relevanceScore?: number | null;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -129,6 +131,20 @@ export interface RunItem {
   error?: string;
   events?: Array<{ at: string; event: string; payload?: unknown }>;
   finalReport?: unknown;
+}
+
+export interface RunApproval {
+  id: string;
+  kind: "command";
+  role: string;
+  title: string;
+  description: string;
+  command: string;
+  cwd?: string;
+  status: "pending" | "approved" | "rejected";
+  createdAt: string;
+  resolvedAt?: string | null;
+  reason?: string | null;
 }
 
 export interface ChatStats {

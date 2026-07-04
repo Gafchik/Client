@@ -44,6 +44,8 @@ export function createDefaultTeam(name = "Core Team") {
       maxReviewRounds: 1,
       applyChanges: true,
       artifactDir: ".agent-team",
+      requireApprovalForCommands: true,
+      requireApprovalForFileWrites: false,
     },
     testing: {
       commands: [],

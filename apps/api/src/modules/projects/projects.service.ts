@@ -61,6 +61,52 @@ export class ProjectsService {
     });
   }
 
+  async searchMemory(projectId: string, query: string, limit = 6) {
+    await this.getById(projectId);
+    const normalizedQuery = String(query || "").trim().toLowerCase();
+    if (!normalizedQuery) {
+      return this.projectMemoryRepository.find({
+        where: { projectId, isActive: true },
+        order: { updatedAt: "DESC" },
+        take: limit,
+      });
+    }
+
+    const entries = await this.projectMemoryRepository.find({
+      where: { projectId, isActive: true },
+      order: { updatedAt: "DESC" },
+      take: Math.max(limit * 4, 20),
+    });
+
+    const keywords = normalizedQuery
+      .split(/[\s,.;:!?()[\]{}"']+/)
+      .map((item) => item.trim())
+      .filter((item) => item.length > 2);
+
+    const scoreEntry = (entry: ProjectMemoryEntryEntity) => {
+      const haystack = [
+        entry.title,
+        entry.summary,
+        entry.details,
+        ...(entry.tags || []),
+        ...(entry.relatedFiles || []),
+      ].join(" \n ").toLowerCase();
+      let score = entry.relevanceScore || 0;
+      for (const keyword of keywords) {
+        if (haystack.includes(keyword)) score += 2;
+      }
+      if (haystack.includes(normalizedQuery)) score += 4;
+      return score;
+    };
+
+    return entries
+      .map((entry) => ({ entry, score: scoreEntry(entry) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score || new Date(b.entry.updatedAt).getTime() - new Date(a.entry.updatedAt).getTime())
+      .slice(0, limit)
+      .map(({ entry }) => entry);
+  }
+
   async saveMemory(input: SaveProjectMemoryDto) {
     const project = await this.projectsRepository.findOneBy({ id: input.projectId });
     if (!project) throw new Error("projectId is invalid");
@@ -78,6 +124,8 @@ export class ProjectsService {
         ? input.relatedFiles.map((file) => String(file).trim()).filter(Boolean)
         : existing?.relatedFiles || [],
       sourceRunId: input.sourceRunId ?? existing?.sourceRunId ?? null,
+      sourceChatId: input.sourceChatId ?? existing?.sourceChatId ?? null,
+      relevanceScore: typeof input.relevanceScore === "number" ? input.relevanceScore : existing?.relevanceScore ?? 0.5,
       isActive: true,
       createdAt: existing?.createdAt || new Date(),
       updatedAt: new Date(),

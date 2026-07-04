@@ -1,4 +1,4 @@
-import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunItem, Team } from "./types";
+import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunApproval, RunItem, Team } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
 
@@ -107,4 +107,9 @@ export const api = {
       error?: string;
       events: Array<{ at: string; event: string; payload?: unknown }>;
     }>(`/jobs/${id}`),
+  resolveRunApproval: (runId: string, approvalId: string, approved: boolean, reason?: string) =>
+    request<{ ok: boolean; reason?: string }>(`/runs/${runId}/approvals/${approvalId}`, {
+      method: "POST",
+      body: JSON.stringify({ approved, reason }),
+    }),
 };

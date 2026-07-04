@@ -4,11 +4,13 @@ import { Repository } from "typeorm";
 import { ChatEntity } from "../../persistence/chat.entity.js";
 import { MessageEntity } from "../../persistence/message.entity.js";
 import { ProjectEntity } from "../../persistence/project.entity.js";
+import { ProjectMemoryEntryEntity } from "../../persistence/project-memory.entity.js";
 import { TeamEntity } from "../../persistence/team.entity.js";
 import { RunEntity } from "../../persistence/run.entity.js";
 import { SaveChatDto } from "./dto/save-chat.dto.js";
 import { TeamsService } from "../teams/teams.service.js";
 import { parseJsonSafely, safeJsonParse } from "../../shared/json.js";
+import { createLlmStreamRequest } from "../../shared/llm-client.js";
 import { RunsService } from "../runs/runs.service.js";
 import { WsGateway } from "../ws/ws.gateway.js";
 import * as fs from "fs";
@@ -25,6 +27,8 @@ export class ChatsService {
     private readonly messagesRepository: Repository<MessageEntity>,
     @InjectRepository(ProjectEntity)
     private readonly projectsRepository: Repository<ProjectEntity>,
+    @InjectRepository(ProjectMemoryEntryEntity)
+    private readonly projectMemoryRepository: Repository<ProjectMemoryEntryEntity>,
     @InjectRepository(TeamEntity)
     private readonly teamsRepository: Repository<TeamEntity>,
     @InjectRepository(RunEntity)
@@ -207,10 +211,15 @@ export class ChatsService {
     }
 
     const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code);
+    const memoryEntries = await this.projectMemoryRepository.find({
+      where: { projectId: project.id, isActive: true },
+      order: { updatedAt: "DESC" },
+      take: 5,
+    });
 
     // Стриминговый запрос к LLM
-    const streamResponse = await fetch(`${team.provider.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
+    const streamResponse = await createLlmStreamRequest({
+      url: `${team.provider.baseUrl.replace(/\/$/, "")}/chat/completions`,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${team.provider.apiKey}`,
@@ -252,6 +261,14 @@ export class ChatsService {
                   role: message.role,
                   content: message.content,
                 })),
+                projectMemory: memoryEntries.map((entry) => ({
+                  title: entry.title,
+                  summary: entry.summary,
+                  details: entry.details,
+                  kind: entry.kind,
+                  tags: entry.tags,
+                  relatedFiles: entry.relatedFiles,
+                })),
                 userMessage: content,
               },
               null,
@@ -260,11 +277,19 @@ export class ChatsService {
           },
         ],
       }),
+      logger: this.logger,
+      requestKey: `${team.provider.id}:${orchestrator.model}`,
+      onRetry: ({ attempt, maxAttempts, delayMs, status }) => {
+        const seconds = Math.max(1, Math.round(delayMs / 1000));
+        this.wsGateway.broadcastTokenStream(chat.id, {
+          role: "orchestrator",
+          content: status === 429
+            ? `\n[жду лимит провайдера ${seconds}с, повтор ${attempt}/${maxAttempts}]`
+            : `\n[временная ошибка провайдера, повтор через ${seconds}с ${attempt}/${maxAttempts}]`,
+          done: false,
+        });
+      },
     });
-
-    if (!streamResponse.ok) {
-      throw new Error(`API request failed (${streamResponse.status}): ${await streamResponse.text()}`);
-    }
 
     // Читаем стрим и отправляем токены через WebSocket
     let fullContent = "";
@@ -490,7 +515,8 @@ export class ChatsService {
             if (report?.testResult) {
               finalMessage += `\n\n🧪 Тесты: ${report.testResult === 'passed' ? '✅ Пройдены' : '❌ Провалены'}`;
             }
-            if (report?.nextSteps?.length) {
+            const shouldShowNextSteps = /(?:следующ|next steps|что дальше|what next|дальше|roadmap|план действий|action items)/i.test(String(content || ""));
+            if (shouldShowNextSteps && report?.nextSteps?.length) {
               finalMessage += `\n\n📋 Следующие шаги:\n${report.nextSteps.map((s: string) => `  • ${s}`).join('\n')}`;
             }
 

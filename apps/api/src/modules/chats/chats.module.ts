@@ -3,6 +3,7 @@ import { TypeOrmModule } from "@nestjs/typeorm";
 import { ChatEntity } from "../../persistence/chat.entity.js";
 import { MessageEntity } from "../../persistence/message.entity.js";
 import { ProjectEntity } from "../../persistence/project.entity.js";
+import { ProjectMemoryEntryEntity } from "../../persistence/project-memory.entity.js";
 import { RunEntity } from "../../persistence/run.entity.js";
 import { TeamEntity } from "../../persistence/team.entity.js";
 import { ChatsController } from "./chats.controller.js";
@@ -13,7 +14,7 @@ import { WsModule } from "../ws/ws.module.js";
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([ChatEntity, MessageEntity, ProjectEntity, TeamEntity, RunEntity]),
+    TypeOrmModule.forFeature([ChatEntity, MessageEntity, ProjectEntity, ProjectMemoryEntryEntity, TeamEntity, RunEntity]),
     TeamsModule,
     forwardRef(() => RunsModule),
     WsModule,

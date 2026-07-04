@@ -14,6 +14,8 @@ export interface TeamConfig {
     maxReviewRounds: number;
     applyChanges: boolean;
     artifactDir: string;
+    requireApprovalForCommands?: boolean;
+    requireApprovalForFileWrites?: boolean;
   };
   testing: {
     commands: string[];

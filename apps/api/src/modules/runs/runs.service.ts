@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { Run } from '../../persistence/run.entity';
 import { StartRunDto } from './dto/start-run.dto';
 import { parseJsonSafely, ParseJsonResult } from '../../shared/json';
+import { createLlmStreamRequest } from '../../shared/llm-client';
 import { TeamsService } from '../teams/teams.service';
 import { ProjectsService } from '../projects/projects.service';
 import { ChatsService } from '../chats/chats.service';
@@ -39,13 +40,46 @@ interface TeamConfig {
   language: string;
   agents: Record<string, AgentConfig>;
   workspace: { maxFiles: number; maxCharsPerFile: number; includeExtensions: string[]; ignoreDirs: string[] };
-  run: { maxReviewRounds: number; applyChanges: boolean };
+  run: { maxReviewRounds: number; applyChanges: boolean; requireApprovalForCommands?: boolean; requireApprovalForFileWrites?: boolean };
+  testing?: { commands?: string[] };
 }
 
 interface TestResult {
   passed: boolean;
+  summary?: string;
   tests?: Array<{ name: string; command: string; success: boolean; output: string }>;
   errors?: string[];
+}
+
+interface ApprovalRequest {
+  id: string;
+  kind: 'command';
+  role: ExecutionRole;
+  title: string;
+  description: string;
+  command: string;
+  cwd?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: string;
+  resolvedAt?: string | null;
+  reason?: string | null;
+}
+
+type RunMode = 'diagnostics' | 'implementation' | 'research';
+type ExecutionRole = 'analyst' | 'developer' | 'tester';
+
+interface RoleExecutionPlan {
+  enabled: boolean;
+  assignment: string;
+  reason: string;
+}
+
+interface NormalizedExecutionPlan {
+  message: string;
+  executionTask: string;
+  plan: string[];
+  roles: Record<ExecutionRole, RoleExecutionPlan>;
+  files?: Array<{ path?: string; action?: string; description?: string; reason?: string }>;
 }
 
 @Injectable()
@@ -178,6 +212,31 @@ export class RunsService implements OnModuleInit {
     };
   }
 
+  async resolveApproval(runId: string, approvalId: string, approved: boolean, reason?: string) {
+    const run = await this.runRepo.findOne({ where: { id: runId } });
+    if (!run) throw new Error('Run not found');
+    const events = Array.isArray(run.events) ? [...run.events] : [];
+    let updated = false;
+    for (const entry of events) {
+      if (entry.event !== 'approval:requested' || !entry.payload || typeof entry.payload !== 'object') continue;
+      const payload = entry.payload as ApprovalRequest;
+      if (payload.id !== approvalId || payload.status !== 'pending') continue;
+      payload.status = approved ? 'approved' : 'rejected';
+      payload.reason = reason ?? null;
+      payload.resolvedAt = new Date().toISOString();
+      updated = true;
+    }
+    if (!updated) {
+      return { ok: false, reason: 'Approval request not found or already resolved' };
+    }
+    run.events = events;
+    if (run.status === 'waiting_approval') {
+      run.status = 'running';
+    }
+    await this.runRepo.save(run);
+    return { ok: true };
+  }
+
   /**
    * Сохраняет событие в run.events (для поллинга) — обязательно,
    * иначе фронт через api.job() не увидит прогресс агентов.
@@ -195,9 +254,62 @@ export class RunsService implements OnModuleInit {
     }
   }
 
+  private getPendingApprovals(run: Run | null): ApprovalRequest[] {
+    if (!run || !Array.isArray(run.events)) return [];
+    return run.events
+      .filter((entry) => entry.event === 'approval:requested' && entry.payload && typeof entry.payload === 'object')
+      .map((entry) => entry.payload as ApprovalRequest)
+      .filter((approval) => approval.status === 'pending');
+  }
+
+  private async requestApproval(
+    runId: string,
+    chatId: string,
+    role: ExecutionRole,
+    name: string,
+    label: string,
+    input: Omit<ApprovalRequest, 'id' | 'status' | 'createdAt'>,
+  ): Promise<{ approved: boolean; approvalId: string }> {
+    const approval: ApprovalRequest = {
+      ...input,
+      id: `approval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+    await this.appendRunEvent(runId, 'approval:requested', approval);
+    await this.broadcastActivity(runId, chatId, role, name, label, 'working', `Жду разрешение на действие: ${approval.title}`);
+    await this.runRepo.update(runId, { status: 'waiting_approval' });
+
+    const started = Date.now();
+    while (Date.now() - started < 30 * 60 * 1000) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const run = await this.runRepo.findOne({ where: { id: runId } });
+      const pending = this.getPendingApprovals(run);
+      const current = Array.isArray(run?.events)
+        ? run?.events
+            .filter((entry) => entry.event === 'approval:requested' && entry.payload && typeof entry.payload === 'object')
+            .map((entry) => entry.payload as ApprovalRequest)
+            .find((item) => item.id === approval.id)
+        : undefined;
+      if (!current) break;
+      if (current.status === 'approved') {
+        await this.broadcastActivity(runId, chatId, role, name, label, 'done', `Разрешение получено: ${approval.title}`);
+        return { approved: true, approvalId: approval.id };
+      }
+      if (current.status === 'rejected') {
+        await this.broadcastActivity(runId, chatId, role, name, label, 'error', `Действие отклонено: ${approval.title}`);
+        return { approved: false, approvalId: approval.id };
+      }
+      if (!pending.some((item) => item.id === approval.id)) break;
+    }
+
+    await this.broadcastActivity(runId, chatId, role, name, label, 'error', `Истекло ожидание разрешения: ${approval.title}`);
+    return { approved: false, approvalId: approval.id };
+  }
+
   /**
-   * Основная оркестрация: orchestrator -> analyst -> developer -> tester -> analyst(memory) -> orchestrator
-   * Всё стримится в чат через WebSocket
+   * Основная оркестрация. Оркестратор сначала строит план, после чего рантайм
+   * сам решает, каких агентов реально подключать для конкретной задачи.
    */
   async executeRunSteps(runId: string): Promise<void> {
     const MAX_RETRIES = 3;
@@ -246,15 +358,17 @@ export class RunsService implements OnModuleInit {
     const language = teamConfig.language || 'ru';
     const agents = teamConfig.agents || {};
     const workspace = teamConfig.workspace || { maxFiles: 12, maxCharsPerFile: 12000, includeExtensions: ['.ts', '.tsx', '.js', '.jsx', '.json', '.md', '.css', '.html', '.py', '.php', '.vue'], ignoreDirs: ['.git', 'node_modules', 'dist', 'build'] };
+    const testingCommands = Array.isArray(teamConfig.testing?.commands)
+      ? teamConfig.testing?.commands.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
 
     const orchestratorAgent = agents.orchestrator || agents.pm;
     const analystAgent = agents.analyst;
     const developerAgent = agents.developer;
     const testerAgent = agents.tester;
-    const reviewerAgent = agents.reviewer;
 
-    if (!orchestratorAgent?.model || !analystAgent?.model || !developerAgent?.model || !testerAgent?.model) {
-      throw new Error('Not all agents have models configured');
+    if (!orchestratorAgent?.model) {
+      throw new Error('Orchestrator model is not configured');
     }
 
     // Имена агентов
@@ -280,6 +394,7 @@ export class RunsService implements OnModuleInit {
     // пользователь явно просил только проверить".
     const runMode = this.detectRunMode(run.task);
     this.logger.log(`Run ${runId} mode: ${runMode} (task="${run.task.slice(0, 80)}")`);
+    const memoryContext = await this.buildMemoryContext(projectId, run.task);
 
     // Цикл ретраев (максимум 3 попытки)
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -330,7 +445,8 @@ export class RunsService implements OnModuleInit {
           throw new Error(`Orchestrator failed: ${orchestratorResult.error}`);
         }
 
-        let plan = orchestratorResult.artifact || {};
+        const rawPlan = (orchestratorResult.artifact || {}) as Record<string, unknown>;
+        const plan = this.normalizeExecutionPlan(rawPlan, run.task, runMode, teamConfig);
         const executionTask = (plan as any).executionTask || run.task;
 
         // ВАЖНО: НЕ останавливаем конвейер на shouldExecute=false.
@@ -343,77 +459,121 @@ export class RunsService implements OnModuleInit {
         // Теперь конвейер идёт до конца: аналитик исследует код, разработчик
         // по ТЗ «не писать код» вернёт SUMMARY: Нет изменений, тестер
         // подтвердит, финальный отчёт суммирует результат.
-        await this.broadcastActivity(runId, chatId, 'orchestrator', orchName, orchLabel, 'done', 'План готов, передаю аналитику');
-
-
-        // 2. ANALYST
-        await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'working', 'Изучаю задачу, пишу техническое задание');
-
-        const analystResult = await this.callAgentStream(
-          runId, chatId, 'analyst', analystAgent, language,
-          this.buildAnalystPrompt(run, plan, project, chat.messages, projectPath, workspace, runMode),
-          (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'analyst', content: delta, done: false })
+        await this.broadcastActivity(
+          runId,
+          chatId,
+          'orchestrator',
+          orchName,
+          orchLabel,
+          'done',
+          this.describeExecutionPlan(plan),
         );
 
-        if (!analystResult.success && analystResult.rawResponse) {
-          const fixed = this.tryFixAgentJson(analystResult.rawResponse, 'analyst');
-          if (fixed) {
-            analystResult.success = true;
-            analystResult.artifact = fixed;
+        let spec: Record<string, unknown> = this.buildFallbackSpecFromPlan(plan, runMode);
+        let analystWorked = false;
+        if (plan.roles.analyst.enabled) {
+          if (!analystAgent?.model) {
+            throw new Error('Analyst role is required by the plan, but its model is not configured');
           }
-        }
 
-        if (!analystResult.success) {
-          throw new Error(`Analyst failed: ${analystResult.error}`);
-        }
+          await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'working', this.buildAnalystStatus(plan, runMode));
 
-        await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'done', 'ТЗ готово, передаю разработчику');
+          const analystResult = await this.callAgentStream(
+            runId, chatId, 'analyst', analystAgent, language,
+            this.buildAnalystPrompt(run, plan, project, chat.messages, projectPath, workspace, runMode, memoryContext),
+            (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'analyst', content: delta, done: false })
+          );
 
-        const spec = analystResult.artifact || {};
-        await this.saveProjectMemory(projectId, chatId, spec, language);
-
-        // 3. DEVELOPER
-        // В diagnostic-режиме разработчик НЕ трогает код. Раньше здесь хардкод
-        // «Начинаю реализацию по ТЗ» + «Код написан» вещался ВСЕГДА — даже когда
-        // пользователь явно просил «код не пишите». В чате горело «Код написан»,
-        // хотя код не менялся. Это ломало доверие («агенты врут/тупые»).
-        await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', runMode === 'diagnostics' ? 'Изучаю выводы аналитика' : 'Начинаю реализацию по ТЗ');
-
-        const devSpec = {
-          files: (spec as any).files || [],
-          requirements: (spec as any).requirements || [],
-          feature: (spec as any).feature || '',
-          description: (spec as any).description || '',
-        };
-
-        const developerResult = await this.callAgentStream(
-          runId, chatId, 'developer', developerAgent, language,
-          this.buildDeveloperPrompt(run, devSpec, project, workspace, projectPath, runMode),
-          (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'developer', content: delta, done: false })
-        );
-
-        if (!developerResult.success && developerResult.rawResponse) {
-          // Слабые модели часто ломают JSON, когда пишут код в "content"
-          // (неэкранированные переносы и кавычки). Маркерный формат решает это
-          // кардинально — код между маркерами не требует экранирования.
-          // ВАЖНО: маркерный формат проверяем ПЕРВЫМ — он приоритетнее для
-          // разработчика. Иначе tryFixAgentJson может случайно распарсить
-          // кусок кода {...} из маркерного ответа как JSON и вернуть мусор.
-          const fixed = this.parseDeveloperMarkerFormat(developerResult.rawResponse)
-            ?? this.tryFixDeveloperJson(developerResult.rawResponse);
-          if (fixed) {
-            developerResult.success = true;
-            developerResult.artifact = fixed;
+          if (!analystResult.success && analystResult.rawResponse) {
+            const fixed = this.tryFixAgentJson(analystResult.rawResponse, 'analyst');
+            if (fixed) {
+              analystResult.success = true;
+              analystResult.artifact = fixed;
+            }
           }
+
+          if (!analystResult.success) {
+            throw new Error(`Analyst failed: ${analystResult.error}`);
+          }
+
+          spec = (analystResult.artifact || {}) as Record<string, unknown>;
+          analystWorked = true;
+          await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'done', this.buildAnalystDoneStatus(plan, runMode));
+          await this.saveProjectMemory(projectId, chatId, spec, language, runMode, runId);
+        } else {
+          await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'done', `Этап пропущен: ${plan.roles.analyst.reason}`);
         }
 
-        if (!developerResult.success) {
-          throw new Error(`Developer failed: ${developerResult.error}`);
+        let codeChanges: Record<string, unknown> = { files: [], summary: 'Нет изменений' };
+        let developerWorked = false;
+        if (plan.roles.developer.enabled) {
+          if (!developerAgent?.model) {
+            throw new Error('Developer role is required by the plan, but its model is not configured');
+          }
+
+          await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', this.buildDeveloperStatus(plan, runMode));
+
+          const devSpec = {
+            files: (spec as any).files || [],
+            requirements: (spec as any).requirements || [],
+            feature: (spec as any).feature || '',
+            description: (spec as any).description || '',
+            diagnosis: (spec as any).diagnosis || [],
+            assignment: plan.roles.developer.assignment,
+          };
+
+          const developerResult = await this.callAgentStream(
+            runId, chatId, 'developer', developerAgent, language,
+            this.buildDeveloperPrompt(run, devSpec, project, workspace, projectPath, runMode),
+            (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'developer', content: delta, done: false })
+          );
+
+          if (!developerResult.success && developerResult.rawResponse) {
+            const fixed = this.parseDeveloperMarkerFormat(developerResult.rawResponse)
+              ?? this.tryFixDeveloperJson(developerResult.rawResponse);
+            if (fixed) {
+              developerResult.success = true;
+              developerResult.artifact = fixed;
+            }
+          }
+
+          if (!developerResult.success) {
+            throw new Error(`Developer failed: ${developerResult.error}`);
+          }
+
+          codeChanges = (developerResult.artifact || {}) as Record<string, unknown>;
+          const requestedCommands = this.parseAgentCommandRequests(developerResult.rawResponse || '');
+          const executedDeveloperCommands: Array<{ command: string; success: boolean; output: string; code: number | null }> = [];
+          for (const request of requestedCommands) {
+            const cwd = request.cwd
+              ? path.join(projectPath, this.relPathWithinProject(projectPath, request.cwd) || '')
+              : projectPath;
+            const result = await this.executeCommandWithApproval(
+              runId,
+              chatId,
+              'developer',
+              devName,
+              devLabel,
+              request.command,
+              cwd,
+              `Команда разработчика: ${request.command}`,
+              request.reason || 'Разработчик запросил выполнение команды',
+              teamConfig,
+            );
+            executedDeveloperCommands.push({
+              command: request.command,
+              success: result.success,
+              output: result.output.slice(0, 4000),
+              code: result.code,
+            });
+          }
+          (codeChanges as any).executedCommands = executedDeveloperCommands;
+          developerWorked = true;
+          await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'done', this.buildDeveloperDoneStatus(plan, runMode, codeChanges));
+        } else {
+          await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'done', `Этап пропущен: ${plan.roles.developer.reason}`);
         }
 
-        await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'done', runMode === 'diagnostics' ? 'Диагноз подтверждён, код не трогал' : 'Код написан');
-
-        const codeChanges = developerResult.artifact || {};
         const files = (codeChanges as any).files;
         let applyChanges = teamConfig.run?.applyChanges !== false; // по умолчанию true
         // ЖЁСТКАЯ защита режима диагностики: даже если разработчик ослушался и
@@ -466,46 +626,130 @@ export class RunsService implements OnModuleInit {
           }
         }
 
-        // 4. TESTER
-        await this.broadcastActivity(runId, chatId, 'tester', testName, testLabel, 'working', runMode === 'diagnostics' ? 'Проверяю выводы аналитика' : 'Запускаю тесты');
-
-        const testerResult = await this.callAgentStream(
-          runId, chatId, 'tester', testerAgent, language,
-          this.buildTesterPrompt(run, codeChanges, project),
-          (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'tester', content: delta, done: false })
-        );
-
-        if (!testerResult.success && testerResult.rawResponse) {
-          const fixed = this.tryFixAgentJson(testerResult.rawResponse, 'tester');
-          if (fixed) {
-            testerResult.success = true;
-            testerResult.artifact = fixed;
-          }
-        }
-
-        if (!testerResult.success) {
-          throw new Error(`Tester failed: ${testerResult.error}`);
-        }
-
-        const testResults: TestResult = (testerResult.artifact as unknown as TestResult) || { passed: true, tests: [] };
-        await this.broadcastActivity(runId, chatId, 'tester', testName, testLabel, testResults.passed ? 'done' : 'error', testResults.passed ? 'Тесты пройдены' : `Тесты упали: ${(testResults.errors || []).join(', ') || 'unknown'}`);
-
-        // 5. ANALYST - память
-        await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'working', 'Обновляю документацию проекта');
-
-        const memoryUpdate = {
+        const memoryUpdate: {
+          [key: string]: unknown;
+          lastRun: {
+            task: string;
+            status: 'success' | 'failed';
+            testResults: TestResult;
+            codeChanges: string[];
+            executedCommands?: string[];
+            timestamp: string;
+          };
+        } = {
           ...spec,
           lastRun: {
+            task: run.task,
+            status: 'success',
+            testResults: { passed: true, tests: [], errors: [] },
+            codeChanges: files?.map((f: any) => f.path) || [],
+            executedCommands: [],
+            timestamp: new Date().toISOString(),
+          },
+        };
+
+        let testResults: TestResult = {
+          passed: true,
+          summary: '',
+          tests: [],
+          errors: [],
+        };
+        if (plan.roles.tester.enabled) {
+          if (!testerAgent?.model) {
+            throw new Error('Tester role is required by the plan, but its model is not configured');
+          }
+
+          await this.broadcastActivity(runId, chatId, 'tester', testName, testLabel, 'working', this.buildTesterStatus(plan, runMode));
+
+          const testerResult = await this.callAgentStream(
+            runId, chatId, 'tester', testerAgent, language,
+            this.buildTesterPrompt(run, codeChanges, project, plan, runMode, testingCommands),
+            (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'tester', content: delta, done: false })
+          );
+
+          if (!testerResult.success && testerResult.rawResponse) {
+            const fixed = this.tryFixAgentJson(testerResult.rawResponse, 'tester');
+            if (fixed) {
+              testerResult.success = true;
+              testerResult.artifact = fixed;
+            }
+          }
+
+          if (!testerResult.success) {
+            throw new Error(`Tester failed: ${testerResult.error}`);
+          }
+
+          testResults = (testerResult.artifact as unknown as TestResult) || testResults;
+          const requestedTests = Array.isArray(testResults.tests) ? testResults.tests : [];
+          const executedTests: Array<{ name: string; command: string; success: boolean; output: string }> = [];
+          if (runMode === 'implementation' && testingCommands.length) {
+            for (const test of requestedTests) {
+              if (!test?.command || !testingCommands.includes(test.command)) continue;
+              const result = await this.executeCommandWithApproval(
+                runId,
+                chatId,
+                'tester',
+                testName,
+                testLabel,
+                test.command,
+                projectPath,
+                `Тестовая команда: ${test.command}`,
+                test.output || `Тестировщик хочет выполнить ${test.command}`,
+                teamConfig,
+              );
+              executedTests.push({
+                name: test.name || test.command,
+                command: test.command,
+                success: result.success,
+                output: result.output.slice(0, 4000),
+              });
+            }
+          }
+          if (executedTests.length) {
+            testResults.tests = executedTests;
+            testResults.passed = executedTests.every((item) => item.success) && testResults.passed !== false;
+            if (!testResults.summary) {
+              testResults.summary = executedTests.every((item) => item.success)
+                ? 'Реальные команды проверки выполнены успешно.'
+                : 'Часть реальных команд проверки завершилась с ошибкой.';
+            }
+            if (!testResults.passed) {
+              testResults.errors = [
+                ...(testResults.errors || []),
+                ...executedTests.filter((item) => !item.success).map((item) => `Команда ${item.command} завершилась с ошибкой`),
+              ];
+            }
+          }
+          await this.broadcastActivity(
+            runId,
+            chatId,
+            'tester',
+            testName,
+            testLabel,
+            testResults.passed ? 'done' : 'error',
+            testResults.passed ? this.buildTesterDoneStatus(plan, runMode) : `Тесты упали: ${(testResults.errors || []).join(', ') || 'unknown'}`,
+          );
+        } else {
+          await this.broadcastActivity(runId, chatId, 'tester', testName, testLabel, 'done', `Этап пропущен: ${plan.roles.tester.reason}`);
+        }
+
+        if (analystWorked || developerWorked || plan.roles.tester.enabled) {
+          await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'working', 'Обновляю память проекта');
+
+          memoryUpdate.lastRun = {
             task: run.task,
             status: testResults.passed ? 'success' : 'failed',
             testResults,
             codeChanges: files?.map((f: any) => f.path) || [],
+            executedCommands: Array.isArray((testResults as any)?.tests)
+              ? (testResults as any).tests.map((item: any) => item.command).filter(Boolean)
+              : [],
             timestamp: new Date().toISOString(),
-          },
-        };
-        await this.saveProjectMemory(projectId, chatId, memoryUpdate, language);
+          };
+          await this.saveProjectMemory(projectId, chatId, memoryUpdate, language, runMode, runId);
 
-        await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'done', 'Документация обновлена');
+          await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'done', 'Память проекта обновлена');
+        }
 
         // 6. ORCHESTRATOR - финальный отчет
         await this.broadcastActivity(runId, chatId, 'orchestrator', orchName, orchLabel, 'working', 'Формирую итоговый отчет');
@@ -525,7 +769,9 @@ export class RunsService implements OnModuleInit {
         }
 
         if (!finalReport.success) {
-          throw new Error(`Final report failed: ${finalReport.error}`);
+          this.logger.warn(`Final report JSON failed for run ${runId}; falling back to synthesized report: ${finalReport.error}`);
+          finalReport.success = true;
+          finalReport.artifact = this.buildFallbackFinalReport(run, runMode, spec, codeChanges, testResults, finalReport.rawResponse);
         }
 
         await this.broadcastActivity(runId, chatId, 'orchestrator', orchName, orchLabel, 'done', 'Работа завершена');
@@ -535,16 +781,14 @@ export class RunsService implements OnModuleInit {
         if (run) {
           run.status = testResults.passed ? 'completed' : 'failed';
           run.finishedAt = new Date();
-          const finalArtifact: Record<string, unknown> =
-            (finalReport.artifact as Record<string, unknown>) || { summary: finalReport.rawResponse };
-          // Гарантируем, что в finalReport сохранён diagnosis аналитика —
-          // чтобы chats.service мог собрать итоговый ответ пользователю даже
-          // если LLM-финалка перепечатала план вместо результата (баг
-          // "финальный ответ = дубль планировочного сообщения").
-          if (runMode === 'diagnostics' && Array.isArray((spec as any)?.diagnosis) && !Array.isArray((finalArtifact as any).diagnosis)) {
-            (finalArtifact as any).diagnosis = (spec as any).diagnosis;
-          }
-          if (runMode === 'diagnostics') (finalArtifact as any).mode = 'diagnostics';
+          const finalArtifact = this.normalizeFinalReportArtifact(
+            ((finalReport.artifact as Record<string, unknown>) || { summary: finalReport.rawResponse }),
+            run,
+            runMode,
+            spec,
+            codeChanges,
+            testResults,
+          );
           run.finalReport = finalArtifact;
           await this.runRepo.save(run);
         }
@@ -650,27 +894,41 @@ export class RunsService implements OnModuleInit {
         ? `You are ${agent.name ?? agent.label ?? stepName}. Respond in ${language}. Use the MARKER format exactly as instructed in the task (SUMMARY:, FILE:, ACTION:, DESCRIPTION:, CONTENT_START/CONTENT_END, PATCH_START/SEARCH:/REPLACE:/PATCH_END). Do NOT wrap the answer in JSON. Do NOT use markdown code fences. Write code between markers AS-IS, without escaping quotes or newlines.`
         : `You are ${agent.name ?? agent.label ?? stepName}. Respond in ${language}. Return ONLY valid JSON. No markdown, no code fences, no text before or after the JSON object.`;
 
-      const response = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-        method: 'POST',
+      const requestBody = JSON.stringify({
+        model,
+        temperature,
+        stream: true,
+        max_tokens: agent.maxTokens ?? Number(process.env.AGENT_MAX_TOKENS ?? 8000),
+        messages: [
+          { role: 'system', content: systemContent },
+          { role: 'user', content: prompt },
+        ],
+      });
+
+      const response = await createLlmStreamRequest({
+        url: `${provider.baseUrl.replace(/\/$/, '')}/chat/completions`,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${provider.apiKey}`,
         },
-        body: JSON.stringify({
-          model,
-          temperature,
-          stream: true,
-          max_tokens: agent.maxTokens ?? Number(process.env.AGENT_MAX_TOKENS ?? 8000),
-          messages: [
-            { role: 'system', content: systemContent },
-            { role: 'user', content: prompt },
-          ],
-        }),
+        body: requestBody,
+        logger: this.logger,
+        requestKey: `${provider.id}:${model}`,
+        onRetry: async ({ attempt, maxAttempts, delayMs, reason, status }) => {
+          const waitSec = Math.max(1, Math.round(delayMs / 1000));
+          await this.broadcastActivity(
+            runId,
+            chatId,
+            stepName,
+            agent.name ?? stepName,
+            agent.label ?? stepName,
+            'working',
+            status === 429
+              ? `Уперся в rate limit, жду ${waitSec}с и повторяю (${attempt}/${maxAttempts})`
+              : `Временная ошибка провайдера (${reason}), повторю через ${waitSec}с (${attempt}/${maxAttempts})`,
+          );
+        },
       });
-
-      if (!response.ok) {
-        throw new Error(`API request failed (${response.status}): ${await response.text()}`);
-      }
 
       let fullContent = '';
       let totalUsage: any = null;
@@ -770,11 +1028,264 @@ export class RunsService implements OnModuleInit {
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
-        if (parsed.plan && parsed.assignments) {
+        if (parsed.plan && (parsed.assignments || parsed.roles)) {
           return parsed;
         }
       }
     } catch { }
+    return null;
+  }
+
+  private normalizeExecutionPlan(
+    rawPlan: Record<string, unknown>,
+    task: string,
+    runMode: RunMode,
+    teamConfig: TeamConfig,
+  ): NormalizedExecutionPlan {
+    const rawAssignments = (rawPlan.assignments && typeof rawPlan.assignments === 'object')
+      ? (rawPlan.assignments as Record<string, unknown>)
+      : {};
+    const rawRoles = (rawPlan.roles && typeof rawPlan.roles === 'object')
+      ? (rawPlan.roles as Record<string, unknown>)
+      : {};
+    const steps = Array.isArray(rawPlan.plan)
+      ? rawPlan.plan.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+
+    const testingCommands = Array.isArray(teamConfig.testing?.commands)
+      ? teamConfig.testing?.commands.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    const explicitRoleRequest = this.detectExplicitRoleRequest(task);
+    const wantsVerificationPass = /\b(подтверд|подтвержд|верифиц|перепроверь|вторая проверка|second opinion|double-check|validate|verify)\b/i.test(task);
+    const wantsOnlyOpinion = /\b(мнение|opinion|что думаешь|what do you think|оцени|evaluate|compare)\b/i.test(task);
+
+    const resolveRole = (
+      role: ExecutionRole,
+      fallbackAssignment: string,
+      fallbackEnabled: boolean,
+      fallbackReason: string,
+    ): RoleExecutionPlan => {
+      const rolePayload = rawRoles[role];
+      const assignment = String(rawAssignments[role] ?? fallbackAssignment).trim() || fallbackAssignment;
+
+      if (rolePayload && typeof rolePayload === 'object') {
+        const payload = rolePayload as Record<string, unknown>;
+        const enabled = typeof payload.enabled === 'boolean' ? payload.enabled : fallbackEnabled;
+        return {
+          enabled,
+          assignment: String(payload.assignment ?? assignment).trim() || assignment,
+          reason: String(payload.reason ?? fallbackReason).trim() || fallbackReason,
+        };
+      }
+
+      return {
+        enabled: fallbackEnabled,
+        assignment,
+        reason: fallbackReason,
+      };
+    };
+
+    const isResearch = runMode === 'research';
+    const isDiagnostics = runMode === 'diagnostics';
+    const defaultAnalystEnabled =
+      isDiagnostics
+      || isResearch
+      || /\b(исслед|проанализ|разбер|найд|root cause|investigat|analy[sz]e|diagnos)/i.test(task)
+      || steps.some((step) => /анализ|диагноз|исслед|research|spec|design/i.test(step));
+    const defaultDeveloperEnabled =
+      runMode === 'implementation'
+      && !/\b(документ|описан|список|summary|plan only)\b/i.test(task);
+    const defaultTesterEnabled =
+      (defaultDeveloperEnabled && testingCommands.length > 0)
+      || /\b(тест|проверь|validate|verify|check)\b/i.test(task)
+      || steps.some((step) => /тест|провер|validate|verify|check/i.test(step));
+
+    const roles: Record<ExecutionRole, RoleExecutionPlan> = {
+      analyst: resolveRole(
+        'analyst',
+        isDiagnostics || isResearch
+          ? 'Изучить код, локализовать причину и дать конкретный диагноз по реальным файлам.'
+          : 'Разобрать задачу по коду и подготовить точечное ТЗ только по нужным изменениям.',
+        defaultAnalystEnabled,
+        defaultAnalystEnabled ? 'Нужен анализ кода и формализация решения.' : 'Задача достаточно определена, отдельный анализ не обязателен.',
+      ),
+      developer: resolveRole(
+        'developer',
+        isDiagnostics
+          ? 'НЕ вносить правок в код. Только подтвердить выводы аналитика. Вернуть SUMMARY: Нет изменений.'
+          : 'Внести точечные изменения по подтверждённому плану, не переписывая лишние файлы.',
+        defaultDeveloperEnabled,
+        defaultDeveloperEnabled ? 'Нужны реальные изменения в проекте.' : 'Код менять не требуется.',
+      ),
+      tester: resolveRole(
+        'tester',
+        isDiagnostics
+          ? 'Проверить состоятельность диагноза и подтвердить, что он объясняет наблюдаемое поведение.'
+          : testingCommands.length
+              ? `Проверить изменения и опереться на команды: ${testingCommands.join(', ')}`
+              : 'Проверить изменения статически и отметить риски.',
+        defaultTesterEnabled,
+        defaultTesterEnabled ? 'Нужна верификация результата.' : 'Отдельная проверка сейчас не добавит сигнала.',
+      ),
+    };
+
+    if (isDiagnostics) {
+      roles.developer.enabled = explicitRoleRequest === 'developer' || wantsVerificationPass;
+      roles.developer.assignment = roles.developer.enabled
+        ? 'НЕ вносить правок в код. Только подтвердить выводы аналитика. Вернуть SUMMARY: Нет изменений.'
+        : '';
+      roles.developer.reason = roles.developer.enabled
+        ? 'Пользователь явно просит инженерную сверку без правок.'
+        : 'Диагностика по умолчанию ограничена аналитиком; разработчик не нужен без прямого запроса на сверку.';
+      roles.tester.enabled = explicitRoleRequest === 'tester' || wantsVerificationPass;
+      roles.tester.assignment = roles.tester.enabled
+        ? 'Проверить состоятельность диагноза и подтвердить, что он объясняет наблюдаемое поведение.'
+        : '';
+      roles.tester.reason = roles.tester.enabled
+        ? 'Пользователь явно просит дополнительную верификацию диагноза.'
+        : 'Отдельная верификация не нужна, пока пользователь прямо её не просил.';
+    }
+
+    if (isResearch) {
+      const allowDeveloperOpinion = explicitRoleRequest === 'developer';
+      const allowTesterOpinion = explicitRoleRequest === 'tester';
+      const allowAnalystOpinion = explicitRoleRequest === 'analyst' || !explicitRoleRequest;
+      roles.analyst.enabled = allowAnalystOpinion;
+      roles.analyst.assignment = allowAnalystOpinion
+        ? (wantsOnlyOpinion
+            ? 'Изучить код и дать мнение строго по запросу, без новых задач и без правок.'
+            : 'Изучить код и дать точный ответ строго по запросу, без новых задач и без правок.')
+        : '';
+      roles.analyst.reason = allowAnalystOpinion
+        ? 'Исследовательская задача по умолчанию решается аналитиком.'
+        : 'Пользователь попросил мнение другой роли.';
+      roles.developer.enabled = allowDeveloperOpinion;
+      roles.developer.assignment = allowDeveloperOpinion
+        ? 'Изучить код и дать инженерное мнение строго по запросу. Никаких правок, файлов и дополнительных задач.'
+        : '';
+      roles.developer.reason = allowDeveloperOpinion
+        ? 'Пользователь явно попросил мнение разработчика.'
+        : 'Это исследовательская задача: разработчик не нужен без явной просьбы о его мнении.';
+      roles.tester.enabled = allowTesterOpinion;
+      roles.tester.assignment = allowTesterOpinion
+        ? 'Изучить код и дать мнение тестировщика строго по запросу. Никаких правок, файлов и дополнительных задач.'
+        : '';
+      roles.tester.reason = allowTesterOpinion
+        ? 'Пользователь явно попросил мнение тестировщика.'
+        : 'Это исследовательская задача: тестировщик не нужен без явной просьбы о его мнении.';
+    }
+
+    if (!roles.analyst.enabled && !roles.developer.enabled && !roles.tester.enabled) {
+      roles.analyst.enabled = true;
+      roles.analyst.reason = 'Хотя бы один агент должен проверить задачу на содержательность.';
+    }
+
+    const normalizedFiles = Array.isArray(rawPlan.files)
+      ? rawPlan.files.filter((item): item is { path?: string; action?: string; description?: string; reason?: string } => !!item && typeof item === 'object')
+      : undefined;
+
+    return {
+      message: String(rawPlan.message ?? '').trim() || 'План работы сформирован.',
+      executionTask: String(rawPlan.executionTask ?? task).trim() || task,
+      plan: steps,
+      roles,
+      files: normalizedFiles,
+    };
+  }
+
+  private describeExecutionPlan(plan: NormalizedExecutionPlan): string {
+    const activeRoles = (Object.entries(plan.roles) as Array<[ExecutionRole, RoleExecutionPlan]>)
+      .filter(([, rolePlan]) => rolePlan.enabled)
+      .map(([role]) => this.roleLabel(role));
+
+    if (!activeRoles.length) {
+      return 'План готов, но активных ролей не выбрано.';
+    }
+
+    return `План готов. Подключаю: ${activeRoles.join(', ')}.`;
+  }
+
+  private roleLabel(role: ExecutionRole): string {
+    if (role === 'analyst') return 'аналитика';
+    if (role === 'developer') return 'разработчика';
+    return 'тестировщика';
+  }
+
+  private buildFallbackSpecFromPlan(
+    plan: NormalizedExecutionPlan,
+    runMode: RunMode,
+  ): Record<string, unknown> {
+    if (runMode === 'diagnostics' || runMode === 'research') {
+      return {
+        feature: plan.executionTask,
+        description: plan.message,
+        diagnosis: [],
+        rootCause: '',
+        recommendations: [],
+        risks: [],
+      };
+    }
+
+    return {
+      feature: plan.executionTask,
+      description: plan.message,
+      requirements: plan.plan,
+      files: Array.isArray(plan.files) ? plan.files : [],
+      acceptanceCriteria: [],
+      risks: [],
+    };
+  }
+
+  private buildAnalystStatus(plan: NormalizedExecutionPlan, runMode: RunMode): string {
+    if (runMode === 'research') return 'Изучаю код и готовлю ответ строго по запросу без лишних действий';
+    if (runMode === 'diagnostics') return 'Изучаю код и собираю точный диагноз';
+    return plan.roles.developer.enabled ? 'Изучаю код и готовлю точечное ТЗ' : 'Изучаю код и формирую краткий разбор задачи';
+  }
+
+  private buildAnalystDoneStatus(plan: NormalizedExecutionPlan, runMode: RunMode): string {
+    if (runMode === 'research') return 'Исследование готово';
+    if (runMode === 'diagnostics') return 'Диагноз готов';
+    return plan.roles.developer.enabled ? 'ТЗ готово' : 'Разбор задачи готов';
+  }
+
+  private buildDeveloperStatus(plan: NormalizedExecutionPlan, runMode: RunMode): string {
+    if (runMode === 'research') return 'Готовлю инженерное мнение без правок кода';
+    if (runMode === 'diagnostics') return 'Сверяю выводы аналитика без правок кода';
+    if (!plan.roles.analyst.enabled) return 'Выполняю задачу напрямую по плану оркестратора';
+    return 'Начинаю реализацию по подтверждённому ТЗ';
+  }
+
+  private buildDeveloperDoneStatus(
+    plan: NormalizedExecutionPlan,
+    runMode: RunMode,
+    codeChanges: Record<string, unknown>,
+  ): string {
+    if (runMode === 'research') return 'Инженерное мнение готово';
+    if (runMode === 'diagnostics') return 'Диагноз подтверждён, код не трогал';
+    const files = Array.isArray((codeChanges as any)?.files) ? (codeChanges as any).files.length : 0;
+    return files > 0 ? `Подготовил изменения по ${files} файл(ам)` : 'Проверил задачу, правки не понадобились';
+  }
+
+  private buildTesterStatus(plan: NormalizedExecutionPlan, runMode: RunMode): string {
+    if (runMode === 'research') return 'Готовлю мнение тестировщика без запуска тестов';
+    if (runMode === 'diagnostics') return 'Проверяю состоятельность диагноза';
+    if (plan.roles.developer.enabled) return 'Проверяю изменения и риски';
+    return 'Проверяю решение оркестратора без правок кода';
+  }
+
+  private buildTesterDoneStatus(plan: NormalizedExecutionPlan, runMode: RunMode): string {
+    if (runMode === 'research') return 'Мнение тестировщика готово';
+    if (runMode === 'diagnostics') return 'Диагноз подтверждён';
+    if (plan.roles.developer.enabled) return 'Проверка завершена';
+    return 'Сверка завершена';
+  }
+
+  private detectExplicitRoleRequest(task: string): ExecutionRole | null {
+    const t = String(task || '').toLowerCase();
+    if (!t.trim()) return null;
+    if (/\b(мнение аналитика|спроси аналитика|аналитик считает|analyst opinion|ask the analyst)\b/i.test(t)) return 'analyst';
+    if (/\b(мнение разработчика|спроси разработчика|разработчик считает|developer opinion|ask the developer|engineering opinion)\b/i.test(t)) return 'developer';
+    if (/\b(мнение тестировщика|спроси тестировщика|тестировщик считает|tester opinion|qa opinion|ask the tester|ask qa)\b/i.test(t)) return 'tester';
     return null;
   }
 
@@ -1021,6 +1532,23 @@ export class RunsService implements OnModuleInit {
     return parts.join('');
   }
 
+  private parseAgentCommandRequests(text: string): Array<{ command: string; cwd?: string; reason?: string }> {
+    const normalized = String(text || '').replace(/\r\n/g, '\n');
+    const commands: Array<{ command: string; cwd?: string; reason?: string }> = [];
+    const regex = /COMMAND:\s*(.+?)(?:\nCWD:\s*(.+?))?(?:\nREASON:\s*(.+?))?(?=\nCOMMAND:|\nFILE:|\nSUMMARY:|$)/gms;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(normalized)) !== null) {
+      const command = String(match[1] || '').trim();
+      if (!command) continue;
+      commands.push({
+        command,
+        cwd: String(match[2] || '').trim() || undefined,
+        reason: String(match[3] || '').trim() || undefined,
+      });
+    }
+    return commands;
+  }
+
   private ensureArtifactDir(runId: string): void {
     const dir = path.join(process.cwd(), 'runs', runId, 'artifacts');
     if (!fs.existsSync(dir)) {
@@ -1187,6 +1715,50 @@ export class RunsService implements OnModuleInit {
     }
   }
 
+  private async executeCommandWithApproval(
+    runId: string,
+    chatId: string,
+    role: ExecutionRole,
+    name: string,
+    label: string,
+    command: string,
+    cwd: string,
+    title: string,
+    description: string,
+    teamConfig: TeamConfig,
+  ): Promise<{ success: boolean; output: string; code: number | null; approved: boolean }> {
+    if (teamConfig.run?.requireApprovalForCommands !== false) {
+      const approval = await this.requestApproval(runId, chatId, role, name, label, {
+        kind: 'command',
+        role,
+        title,
+        description,
+        command,
+        cwd,
+      });
+      if (!approval.approved) {
+        return { success: false, output: 'Command was not approved', code: null, approved: false };
+      }
+    }
+
+    await this.appendRunEvent(runId, 'command:started', { role, agentName: name, label, command, cwd, title });
+    try {
+      const output = execSync(command, {
+        cwd,
+        encoding: 'utf-8',
+        timeout: 120000,
+        maxBuffer: 1024 * 1024 * 4,
+      }).toString();
+      await this.appendRunEvent(runId, 'command:finished', { role, agentName: name, label, command, cwd, success: true, code: 0, output: output.slice(0, 4000) });
+      return { success: true, output, code: 0, approved: true };
+    } catch (error: any) {
+      const output = String(error?.stdout || error?.stderr || error?.message || 'Command failed');
+      const code = typeof error?.status === 'number' ? error.status : 1;
+      await this.appendRunEvent(runId, 'command:finished', { role, agentName: name, label, command, cwd, success: false, code, output: output.slice(0, 4000) });
+      return { success: false, output, code, approved: true };
+    }
+  }
+
   /**
    * Защита от засорения репозитория документацией. Аналитик ведёт доку
    * проекта в БД (project memory через saveProjectMemory), а НЕ файлами
@@ -1340,26 +1912,97 @@ export class RunsService implements OnModuleInit {
     }
   }
 
-  private async saveProjectMemory(projectId: string, chatId: string, memory: any, language: string): Promise<void> {
+  private async buildMemoryContext(projectId: string, task: string): Promise<string> {
     try {
-      // Аналитик ведёт осмысленную документацию проекта (не JSON-свалку).
-      // memory — это spec (ТЗ) на шаге 2 либо memoryUpdate (spec + lastRun) на шаге 5.
+      const entries = await this.projectsService.searchMemory(projectId, task, 6);
+      if (!entries.length) return '';
+      return entries.map((entry, index) => {
+        const files = Array.isArray(entry.relatedFiles) && entry.relatedFiles.length
+          ? `\nФайлы: ${entry.relatedFiles.join(', ')}`
+          : '';
+        const tags = Array.isArray(entry.tags) && entry.tags.length
+          ? `\nТеги: ${entry.tags.join(', ')}`
+          : '';
+        return [
+          `#${index + 1}. ${entry.title}`,
+          `Сводка: ${entry.summary}`,
+          entry.details ? `Детали:\n${entry.details}` : '',
+          files,
+          tags,
+        ].filter(Boolean).join('\n');
+      }).join('\n\n');
+    } catch (error) {
+      this.logger.warn(`Failed to build memory context: ${error instanceof Error ? error.message : String(error)}`);
+      return '';
+    }
+  }
+
+  private inferMemoryKind(memory: any, runMode?: RunMode): string {
+    if (runMode === 'research') return 'research';
+    if (runMode === 'diagnostics') return 'diagnostic';
+    if (Array.isArray(memory?.requirements) && memory.requirements.length) return 'implementation';
+    return 'feature';
+  }
+
+  private buildMemoryTags(memory: any, runMode?: RunMode): string[] {
+    const tags = new Set<string>(['auto-generated', 'run', this.inferMemoryKind(memory, runMode)]);
+    if (Array.isArray(memory?.tags)) {
+      for (const tag of memory.tags) {
+        const normalized = String(tag || '').trim().toLowerCase();
+        if (normalized) tags.add(normalized);
+      }
+    }
+    if (runMode === 'research') tags.add('analysis');
+    if (runMode === 'diagnostics') tags.add('root-cause');
+    if (memory?.feature) {
+      for (const token of String(memory.feature).toLowerCase().split(/[\s,.;:!?()[\]{}"']+/).filter((item: string) => item.length > 3).slice(0, 6)) {
+        tags.add(token);
+      }
+    }
+    return Array.from(tags);
+  }
+
+  private async saveProjectMemory(projectId: string, chatId: string, memory: any, language: string, runMode?: RunMode, sourceRunId?: string): Promise<void> {
+    try {
       const feature = memory.feature || memory.lastRun?.task || 'Выполнение задачи';
-      const summaryText = String(memory.summary || memory.description || feature).slice(0, 1000);
+      const summaryText = String(
+        memory.summary
+        || memory.opinion
+        || memory.rootCause
+        || memory.description
+        || feature,
+      ).slice(0, 1000);
 
       const detailLines: string[] = [];
       if (memory.description) detailLines.push(`Описание: ${memory.description}`);
+      if (memory.opinion) detailLines.push(`Мнение: ${memory.opinion}`);
       if (Array.isArray(memory.requirements) && memory.requirements.length) {
         detailLines.push(`Требования: ${(memory.requirements as string[]).join('; ')}`);
       }
       if (Array.isArray(memory.acceptanceCriteria) && memory.acceptanceCriteria.length) {
         detailLines.push(`Критерии приёмки: ${(memory.acceptanceCriteria as string[]).join('; ')}`);
       }
+      if (Array.isArray(memory.evidence) && memory.evidence.length) {
+        detailLines.push(`Доказательства:\n${memory.evidence.map((item: any) => `- ${item.file || '?'}${item.location ? ` (${item.location})` : ''}: ${item.note || ''}`).join('\n')}`);
+      }
+      if (Array.isArray(memory.diagnosis) && memory.diagnosis.length) {
+        detailLines.push(`Диагноз:\n${memory.diagnosis.map((item: any) => `- ${item.file || '?'}${item.location ? ` (${item.location})` : ''}: ${item.issue || item}`).join('\n')}`);
+      }
+      if (memory.rootCause) detailLines.push(`Главная причина: ${memory.rootCause}`);
+      if (Array.isArray(memory.recommendations) && memory.recommendations.length) {
+        detailLines.push(`Рекомендации: ${(memory.recommendations as string[]).join('; ')}`);
+      }
+      if (Array.isArray(memory.risks) && memory.risks.length) {
+        detailLines.push(`Риски: ${(memory.risks as string[]).join('; ')}`);
+      }
       if (memory.lastRun) {
         const status = memory.lastRun.status === 'success' ? 'успешно' : 'с ошибкой';
         detailLines.push(`Последний запуск: ${status} — ${memory.lastRun.task}`);
         if (memory.lastRun.testResults) {
           detailLines.push(`Тесты: ${memory.lastRun.testResults.passed ? 'пройдены' : 'провалены'}`);
+        }
+        if (Array.isArray(memory.lastRun.executedCommands) && memory.lastRun.executedCommands.length) {
+          detailLines.push(`Команды: ${memory.lastRun.executedCommands.join('; ')}`);
         }
       }
       const detailsText = detailLines.join('\n') || `Language: ${language}`;
@@ -1375,17 +2018,19 @@ export class RunsService implements OnModuleInit {
         title: `Документация: ${String(feature).slice(0, 180)}`,
         summary: summaryText,
         details: detailsText,
-        kind: 'feature',
-        tags: ['auto-generated', 'run'],
+        kind: this.inferMemoryKind(memory, runMode),
+        tags: this.buildMemoryTags(memory, runMode),
         relatedFiles,
-        sourceRunId: null,
+        sourceRunId: sourceRunId ?? null,
+        sourceChatId: chatId,
+        relevanceScore: runMode === 'research' ? 0.95 : runMode === 'diagnostics' ? 0.9 : 0.75,
       } as any);
     } catch (error) {
       this.logger.warn(`Failed to save project memory: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private buildOrchestratorPrompt(run: Run, messages: any[], project: any, teamConfig: TeamConfig, projectPath: string, runMode: 'diagnostics' | 'implementation'): string {
+  private buildOrchestratorPrompt(run: Run, messages: any[], project: any, teamConfig: TeamConfig, projectPath: string, runMode: RunMode): string {
     const recentMessages = messages?.slice(-10).map(m => `${m.role}: ${m.content}`).join('\n') || 'Нет истории';
     const index = projectPath ? this.buildProjectIndex(projectPath, teamConfig.workspace, 50) : '';
     const gitContext = projectPath ? this.getGitContext(projectPath) : '';
@@ -1393,12 +2038,11 @@ export class RunsService implements OnModuleInit {
     // модели как ФАКТ (не вопрос) — она не должна «решать» заново. Раньше
     // слабая модель на этом шаге игнорила «код не пишите» и всё равно ставила
     // разрабу задачу кодить. Теперь режим зафиксирован в промпте явно.
-    const modeLine = runMode === 'diagnostics'
-      ? `РЕЖИМ: ДИАГНОСТИКА (только анализ, БЕЗ правок кода). Пользователь явно просил проверить/найти причину, НЕ писать код. Разработчик НЕ должен трогать файлы.`
-      : `РЕЖИМ: РЕАЛИЗАЦИЯ (внести точечные правки в код).`;
-    const devAssignment = runMode === 'diagnostics'
-      ? 'НЕ вносить правок в код. Только подтвердить выводы аналитика. Вернуть SUMMARY: Нет изменений.'
-      : 'Внести точечные правки по ТЗ аналитика.';
+    const modeLine = runMode === 'research'
+      ? `РЕЖИМ: ИССЛЕДОВАНИЕ / МНЕНИЕ. Нужно только изучить, проанализировать или дать мнение по запросу. НИКАКИХ новых задач, НИКАКОГО расширения объёма, НИКАКИХ правок кода, если пользователь явно этого не просил.`
+      : runMode === 'diagnostics'
+        ? `РЕЖИМ: ДИАГНОСТИКА (только анализ, БЕЗ правок кода). Пользователь явно просил проверить/найти причину, НЕ писать код. Разработчик НЕ должен трогать файлы.`
+        : `РЕЖИМ: РЕАЛИЗАЦИЯ (внести точечные правки в код).`;
     return `Ты — Оркестратор. Проанализируй задачу и создай план работы для команды.
 
 ПРОЕКТ: ${project.name || 'Unknown'}
@@ -1417,18 +2061,20 @@ ${recentMessages}
 
 ПРАВИЛА (КРИТИЧНО):
 1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON-ОБЪЕКТ. Никакого markdown, никаких \`\`\`json блоков, никакого текста до или после { }.
-2. Запуск УЖЕ идёт — команда всегда работает. ВСЕГДА заполняй assignments для аналитика, разработчика и тестера.
-3. РЕЖИМ уже задан выше — НЕ меняй его. В assignments.developer пишИ ровно: "${devAssignment}"
+2. Запуск УЖЕ идёт — но зови ТОЛЬКО тех, кто реально нужен. Не включай роль ради ритуала.
+3. РЕЖИМ уже задан выше — НЕ меняй его. В диагностике разработчик может быть только verifier без правок. В research-режиме нельзя самовольно включать разработчика или тестировщика.
 4. НЕ выдумывай пути файлов — используй только КАРТУ ПРОЕКТА выше.
+5. Если отдельный этап не нужен, явно отключи его через roles.<role>.enabled=false и кратко объясни why в reason.
+6. НЕЛЬЗЯ расширять задачу. Отвечай только на прямой запрос пользователя. Не придумывай дополнительные подзадачи, проверки, рефакторы, улучшения или “следующие логичные шаги”, если их не просили.
 
 Схема ответа:
-{"message":"string - что ты понял и что сделает команда","teamSummary":["string"],"shouldExecute":true,"executionTask":"string - краткая задача для команды","plan":["string - шаги"],"assignments":{"analyst":"string","developer":"string","tester":"string"}}
+{"message":"string - что ты понял и что сделает команда","teamSummary":["string"],"shouldExecute":true,"executionTask":"string - краткая задача для команды","plan":["string - шаги"],"roles":{"analyst":{"enabled":true,"assignment":"string","reason":"string"},"developer":{"enabled":true,"assignment":"string","reason":"string"},"tester":{"enabled":true,"assignment":"string","reason":"string"}},"files":[{"path":"string","action":"create|update","description":"string","reason":"string"}]}
 
 ПРИМЕР (ДИАГНОСТИКА):
-{"message":"Понял. Назначу аналитика для поиска причины.","teamSummary":["Alex: координирует","Mira: исследует код"],"shouldExecute":true,"executionTask":"Найти причину X, код не менять","plan":["Анализ кода","Подтверждение причины"],"assignments":{"analyst":"Изучить код и найти причину","developer":"НЕ вносить правок в код. Только подтвердить выводы аналитика. Вернуть SUMMARY: Нет изменений.","tester":"Проверить логику вывода"}}
+{"message":"Нужно локализовать причину и подтвердить её без правок.","teamSummary":["Alex: координирует","Mira: исследует код"],"shouldExecute":true,"executionTask":"Найти причину X, код не менять","plan":["Разобрать код","Проверить диагноз"],"roles":{"analyst":{"enabled":true,"assignment":"Изучить код и найти причину.","reason":"Без анализа нельзя назвать точную причину."},"developer":{"enabled":true,"assignment":"НЕ вносить правок в код. Только подтвердить выводы аналитика. Вернуть SUMMARY: Нет изменений.","reason":"Нужна техническая сверка без изменений файлов."},"tester":{"enabled":true,"assignment":"Проверить, что диагноз объясняет поведение.","reason":"Нужна независимая верификация вывода."}},"files":[{"path":"apps/api/src/modules/chats/chats.service.ts","action":"update","description":"Проверить участок с формированием payload","reason":"Вероятное место проблемы"}]}
 
 ПРИМЕР (РЕАЛИЗАЦИЯ):
-{"message":"Понял. Назначу аналитика и разработчика.","teamSummary":["Alex: координирует","Mira: пишет ТЗ"],"shouldExecute":true,"executionTask":"Исправить баг X в модуле Y","plan":["Анализ","Реализация","Тесты"],"assignments":{"analyst":"Найти причину в коде","developer":"Внести точечные правки по ТЗ аналитика.","tester":"Проверить"}}
+{"message":"Нужно быстро внести точечную правку и проверить её.","teamSummary":["Alex: координирует","Kai: меняет код"],"shouldExecute":true,"executionTask":"Исправить баг X в модуле Y","plan":["Подтвердить место правки","Изменить код","Проверить результат"],"roles":{"analyst":{"enabled":false,"assignment":"","reason":"Задача уже локализована в конкретном модуле."},"developer":{"enabled":true,"assignment":"Внести точечные правки по задаче.","reason":"Нужны реальные изменения в коде."},"tester":{"enabled":true,"assignment":"Проверить изменение статически и по тестовым командам.","reason":"Нужно подтвердить, что правка не ломает поведение."}},"files":[{"path":"apps/api/src/modules/runs/runs.service.ts","action":"update","description":"Исправить логику выбора ролей","reason":"Главная точка поведения"}]}
 
 Если вернёшь невалидный JSON — весь запуск упадёт.`;
   }
@@ -1442,9 +2088,19 @@ ${recentMessages}
    * Определяем по ключевым словам, а НЕ по решению LLM — слабые модели часто
    * игнорят «код не пишите» на planning-шаге и всё равно дают разрабу кодить.
    */
-  private detectRunMode(task: string): 'diagnostics' | 'implementation' {
+  private detectRunMode(task: string): RunMode {
     const t = String(task || '').toLowerCase();
     if (!t.trim()) return 'implementation';
+    const researchKeywords = [
+      'изучи', 'изучи', 'изучить', 'изучите',
+      'ресерч', 'research',
+      'проанализируй', 'проанализировать', 'анализни',
+      'разбери', 'разобрать', 'посмотри',
+      'дай мнение', 'нужно мнение', 'спроси мнение', 'мнение аналитика', 'мнение разработчика', 'мнение команды',
+      'что думаешь', 'what do you think', 'opinion', 'review idea',
+      'оцени идею', 'оцени подход', 'сравни варианты', 'compare options',
+    ];
+    const hasResearch = researchKeywords.some((k) => t.includes(k));
     const diagKeywords = [
       'код не пиш', 'не пишите код', 'не писать код', 'без кода', 'только провер',
       'просто провер', 'проверь почему', 'проверьте почему', 'почему так',
@@ -1455,17 +2111,23 @@ ${recentMessages}
       'just check', 'only check', 'why does', 'root cause',
     ];
     const hasDiag = diagKeywords.some((k) => t.includes(k));
+    // Research-паттерны приоритетнее общей фразы "только анализ": если
+    // пользователь просит изучить/дать мнение/сделать ресерч, не надо
+    // превращать это в диагностику с verifier-этапом разработчика.
+    if (hasResearch) return 'research';
     if (hasDiag) return 'diagnostics';
     // Если задача сформулирована как вопрос («почему», «зачем», «как работает»)
     // и НЕ содержит глаголов изменения — тоже диагностика.
     const isQuestion = /\b(почему|зачем|как (работает|устроен)|отчего|due to|why)\b/.test(t);
+    const isResearchQuestion = /\b(что думаешь|какое мнение|как лучше|какой вариант|стоит ли|what do you think|which option)\b/.test(t);
     const implVerbs = ['создай', 'создать', 'добавь', 'добавить', 'исправь', 'исправить', 'реализуй', 'реализовать', 'напиши', 'написать', 'сделай', 'сделать', 'обнови', 'обновить', 'удали', 'удалить', 'рефактор', 'create', 'add', 'fix', 'implement', 'write', 'make', 'update', 'delete', 'refactor'];
     const hasImpl = implVerbs.some((k) => t.includes(k));
+    if (isResearchQuestion && !hasImpl) return 'research';
     if (isQuestion && !hasImpl) return 'diagnostics';
     return 'implementation';
   }
 
-  private buildAnalystPrompt(run: Run, plan: any, project: any, messages: any[], projectPath: string, workspace: any, runMode: 'diagnostics' | 'implementation'): string {
+  private buildAnalystPrompt(run: Run, plan: NormalizedExecutionPlan, project: any, messages: any[], projectPath: string, workspace: any, runMode: RunMode, memoryContext = ''): string {
     const index = projectPath ? this.buildProjectIndex(projectPath, workspace, 80) : '';
     const gitContext = projectPath ? this.getGitContext(projectPath) : '';
     // Подгружаем содержимое файлов, упомянутых оркестратором в плане (если он
@@ -1473,7 +2135,7 @@ ${recentMessages}
     // фантазировал. Ограничиваем по размеру.
     let fileContext = '';
     try {
-      const hinted = Array.isArray((plan as any)?.files) ? (plan as any).files : [];
+      const hinted = Array.isArray(plan.files) ? plan.files : [];
       const seen = new Set<string>();
       for (const t of hinted) {
         const p = (t as any)?.path;
@@ -1488,6 +2150,34 @@ ${recentMessages}
     // увидит файлы и начнёт их править (баг «разраб пишет код, хотя просили
     // только проверить»). Вместо этого аналитик возвращает diagnosis[] —
     // конкретные выводы: файл, функция, механизм проблемы.
+    if (runMode === 'research') {
+      return `Ты — Аналитик. РЕЖИМ: ИССЛЕДОВАНИЕ / МНЕНИЕ. Твоя задача — ответить СТРОГО на тот вопрос, который поставил пользователь. Никаких дополнительных задач, улучшений, проверок, рефакторов или скрытых рекомендаций сверх запроса.
+
+ПРОЕКТ: ${project.name || 'Unknown'}
+ПУТЬ: ${project.localPath || ''}
+ЗАДАЧА: ${run.task}
+ПЛАН ОРКЕСТРАТОРА: ${JSON.stringify(plan, null, 2)}
+НАЗНАЧЕНИЕ ДЛЯ ТЕБЯ: ${plan.roles.analyst.assignment}
+
+КАРТА ПРОЕКТА:
+${index}
+${gitContext ? `\nGIT-КОНТЕКСТ:\n${gitContext}` : ''}
+${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД:\n${fileContext}` : ''}
+${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД (используй это как готовую документацию и не дублируй заново без причины):\n${memoryContext}` : ''}
+
+ПРАВИЛА (КРИТИЧНО):
+1. Отвечай ТОЛЬКО на прямой запрос пользователя.
+2. Не предлагай делать новые задачи, если пользователь об этом не просил.
+3. Не расширяй область анализа за пределы вопроса.
+4. Не возвращай files, patches, implementation plan или code changes.
+5. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON.
+
+Схема:
+{"feature":"string","description":"string - прямой ответ по сути запроса","opinion":"string - мнение или вывод по запросу","evidence":[{"file":"string","location":"string","note":"string"}],"risks":["string"],"recommendations":["string - только если прямо следуют из запроса, без новых задач"]}
+
+Если вернёшь невалидный JSON — запуск упадёт.`;
+    }
+
     if (runMode === 'diagnostics') {
       return `Ты — Аналитик. Проведи ДИАГНОСТИКУ кода проекта и найди причину. РЕЖИМ: только анализ, БЕЗ правок кода.
 
@@ -1495,11 +2185,13 @@ ${recentMessages}
 ПУТЬ: ${project.localPath || ''}
 ЗАДАЧА: ${run.task}
 ПЛАН ОРКЕСТРАТОРА: ${JSON.stringify(plan, null, 2)}
+НАЗНАЧЕНИЕ ДЛЯ ТЕБЯ: ${plan.roles.analyst.assignment}
 
 КАРТА ПРОЕКТА:
 ${index}
 ${gitContext ? `\nGIT-КОНТЕКСТ (актуальный, серверный — НЕ создавай файлы для git log/diff, он уже здесь):\n${gitContext}` : ''}
 ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на него, не придумывай структуру):\n${fileContext}` : ''}
+${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД:\n${memoryContext}` : ''}
 
 Твоя задача — изучить РЕАЛЬНЫЙ код и найти ТОЧНУЮ причину описанной проблемы. Укажи конкретные файлы, функции и механизм, который вызывает эффект. НЕ предлагай писать/менять код — только диагноз.
 
@@ -1524,11 +2216,13 @@ ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на нег
 ПУТЬ: ${project.localPath || ''}
 ЗАДАЧА: ${run.task}
 ПЛАН ОРКЕСТРАТОРА: ${JSON.stringify(plan, null, 2)}
+НАЗНАЧЕНИЕ ДЛЯ ТЕБЯ: ${plan.roles.analyst.assignment}
 
 КАРТА ПРОЕКТА:
 ${index}
 ${gitContext ? `\nGIT-КОНТЕКСТ (актуальный, серверный — НЕ создавай файлы для git log/diff, он уже здесь):\n${gitContext}` : ''}
 ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на него, не придумывай структуру):\n${fileContext}` : ''}
+${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД:\n${memoryContext}` : ''}
 
 Твоя задача — точно описать ЧТО менять и ГДЕ, указывая только РЕАЛЬНЫЕ пути из карты выше. НЕ пиши сам код — это работа разработчика. Будь конкретен: файл, функция, что изменить.
 
@@ -1547,10 +2241,31 @@ ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на нег
 Если вернёшь невалидный JSON — запуск упадёт.`;
   }
 
-  private buildDeveloperPrompt(run: Run, spec: any, project: any, workspace: any, projectPath: string, runMode: 'diagnostics' | 'implementation'): string {
+  private buildDeveloperPrompt(run: Run, spec: any, project: any, workspace: any, projectPath: string, runMode: RunMode): string {
     const ignoreDirs = Array.isArray(workspace.ignoreDirs) ? workspace.ignoreDirs.join(', ') : '';
     const filesList = (spec.files || []).map((f: any) => `- ${f.path}: ${f.action} — ${f.description}`).join('\n') || 'нет файлов';
     const requirements = (spec.requirements || []).map((r: any) => `- ${r}`).join('\n') || 'нет требований';
+    const assignmentLine = spec.assignment ? `\nНАЗНАЧЕНИЕ ОРКЕСТРАТОРА:\n${spec.assignment}\n` : '';
+
+    if (runMode === 'research') {
+      return `Ты — Разработчик. РЕЖИМ: ИССЛЕДОВАНИЕ / МНЕНИЕ. Пользователь просит инженерную оценку, а НЕ правки кода.
+
+ПРОЕКТ: ${project.name || 'Unknown'}
+ЗАДАЧА: ${run.task}
+${assignmentLine}
+
+Твоя задача — изучить релевантный код и дать краткое инженерное мнение строго по вопросу пользователя. Никаких изменений файлов, патчей, планов реализации и новых задач.
+
+ОТВЕТ (строго так, одной строкой):
+
+SUMMARY: <краткое инженерное мнение по запросу пользователя>
+
+ПРАВИЛА:
+1. Никаких FILE:, PATCH_START, CONTENT_START и JSON.
+2. Не придумывай follow-up задачи.
+3. Не пиши про "нужно сделать" или "я бы ещё добавил", если пользователь этого не просил.
+4. Верни только строку SUMMARY:.`;
+    }
 
     // В режиме диагностики разработчик НЕ должен трогать код. Возвращаем
     // короткий промпт, который заставляет его ответить «Нет изменений».
@@ -1564,6 +2279,7 @@ ${fileContext ? `\nСУЩЕСТВУЮЩИЙ КОД (опирайся на нег
 
 ПРОЕКТ: ${project.name || 'Unknown'}
 ЗАДАЧА: ${run.task}
+${assignmentLine}
 
 ВЫВОДЫ АНАЛИТИКА (диагноз):
 ${diagnosisText || '(аналитик не дал диагноз)'}
@@ -1601,6 +2317,7 @@ SUMMARY: Нет изменений. Диагноз аналитика подтв
 ПРОЕКТ: ${project.name || 'Unknown'}
 ПУТЬ: ${project.localPath || ''}
 ЗАДАЧА: ${run.task}
+${assignmentLine}
 
 ТРЕБОВАНИЯ ИЗ ТЗ:
 ${requirements}
@@ -1614,6 +2331,10 @@ ${existingFiles ? `\nСУЩЕСТВУЮЩИЙ КОД ФАЙЛОВ:\n${existingFi
 ФОРМАТ ОТВЕТА (строго так):
 
 SUMMARY: краткая сводка что сделано
+
+COMMAND: npm test
+CWD: apps/api
+REASON: Нужно прогнать локальные тесты модуля после правок
 
 FILE: путь/к/файлу
 ACTION: create
@@ -1643,9 +2364,10 @@ DESCRIPTION: что сделано
 4. Между маркерами пиши код КАК ЕСТЬ — реальные переносы строк и обычные кавычки, без \\n и без экранирования.
 5. Если изменений не требуется — верни только SUMMARY: Нет изменений (без блоков FILE).
 6. Маркеры FILE:, ACTION:, DESCRIPTION:, SUMMARY: — каждый с новой строки, без пробелов перед двоеточием.
-7. НЕ создавай .md/README/документационные файлы. Документацию проекта ведёт Аналитик в памяти проекта (БД), а не в репозитории. Создавай только КОД. Если в ТЗ есть .md — пропусти его.
-8. НЕ создавай мусорные/временные/логовые/текстовые файлы: git_log_output.txt, scratch.txt, output_*.txt, *.log, *.tmp, *.out и подобные. git-контекст УЖЕ в промпте (сервер выполняет git log/status сам). Если нужно сохранить вывод — используй SUMMARY, а не файл. Все .txt/.log/.tmp пути будут отклонены.
-9. Пиши пути ОТНОСИТЕЛЬНО корня проекта (например src/domain/dog/aggregates/Dog.ts), БЕЗ ведущего /host-projects/... и БЕЗ абсолютных путей. Абсолютные пути будут нормализованы.
+7. Если для работы нужна консольная команда, добавь блок COMMAND/CWD/REASON. Не выдумывай результат команды, сервер выполнит её отдельно после подтверждения пользователя.
+8. НЕ создавай .md/README/документационные файлы. Документацию проекта ведёт Аналитик в памяти проекта (БД), а не в репозитории. Создавай только КОД. Если в ТЗ есть .md — пропусти его.
+9. НЕ создавай мусорные/временные/логовые/текстовые файлы: git_log_output.txt, scratch.txt, output_*.txt, *.log, *.tmp, *.out и подобные. git-контекст УЖЕ в промпте (сервер выполняет git log/status сам). Если нужно сохранить вывод — используй SUMMARY, а не файл. Все .txt/.log/.tmp пути будут отклонены.
+10. Пиши пути ОТНОСИТЕЛЬНО корня проекта (например src/domain/dog/aggregates/Dog.ts), БЕЗ ведущего /host-projects/... и БЕЗ абсолютных путей. Абсолютные пути будут нормализованы.
 
 ПРИМЕР полного ответа:
 
@@ -1665,32 +2387,50 @@ PATCH_END
 Лимиты: макс ${workspace.maxFiles} файлов, до ${workspace.maxCharsPerFile} символов на файл.`;
   }
 
-  private buildTesterPrompt(run: Run, codeChanges: any, project: any): string {
-    return `Ты — Тестировщик. Проверь изменения кода разработчика на корректность (статический анализ логики).
+  private buildTesterPrompt(
+    run: Run,
+    codeChanges: any,
+    project: any,
+    plan: NormalizedExecutionPlan,
+    runMode: RunMode,
+    testingCommands: string[],
+  ): string {
+    const modeLine = runMode === 'research'
+      ? 'РЕЖИМ: исследование. Дай мнение тестировщика по вопросу пользователя без запуска тестов и без новых задач.'
+      : runMode === 'diagnostics'
+        ? 'РЕЖИМ: диагностика. Кода могло не быть вовсе — твоя задача подтвердить или опровергнуть сам диагноз.'
+        : 'РЕЖИМ: реализация. Оцени изменения кода и риски.'
+    ;
+    return `Ты — Тестировщик. Проверь результат работы команды на корректность и предложи, какие реальные команды нужно выполнить.
 
 ПРОЕКТ: ${project.name || 'Unknown'}
 ПУТЬ: ${project.localPath || ''}
+${modeLine}
+НАЗНАЧЕНИЕ ОРКЕСТРАТОРА: ${plan.roles.tester.assignment}
 ИЗМЕНЕНИЯ: ${JSON.stringify(codeChanges, null, 2)}
+КОМАНДЫ ПРОВЕРКИ: ${testingCommands.length ? testingCommands.join(', ') : 'не заданы'}
 
-Твоя задача — оценить, решает ли код задачу и нет ли явных ошибок. НЕ запускай реальные команды — дай статическую оценку.
+Твоя задача — понять, решает ли результат задачу, и предложить краткий набор реальных проверок. Команды выполняет сервер, не ты.
 
 ПРАВИЛА (КРИТИЧНО):
 1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON. Никакого markdown, никакого текста вне { }.
-2. Если изменений нет или они выглядят корректно — passed:true.
+2. Если изменений нет, но диагностический вывод выглядит убедительно — тоже passed:true.
+3. В research-режиме дай краткое мнение в поле "summary" и не придумывай дополнительные проверки, если их не просили.
+4. В tests.command используй только команды из списка КОМАНДЫ ПРОВЕРКИ выше. Если список пуст, tests должен быть [].
 
 Схема:
-{"passed":boolean,"tests":[{"name":"string","command":"string","success":boolean,"output":"string"}],"errors":["string"]}
+{"passed":boolean,"summary":"string","tests":[{"name":"string","command":"string","success":true,"output":"string - что именно эта команда должна проверить"}],"errors":["string"]}
 
 ПРИМЕР (всё ок):
-{"passed":true,"tests":[{"name":"Логика payload","command":"static-review","success":true,"output":"Payload содержит только id и title"}],"errors":[]}
+{"passed":true,"summary":"Изменение выглядит целевым.","tests":[{"name":"API unit tests","command":"npm run test -w apps/api","success":true,"output":"Проверит, что API не сломался после правки"}],"errors":[]}
 
 ПРИМЕР (есть ошибка):
-{"passed":false,"tests":[{"name":"Логика payload","command":"static-review","success":false,"output":"Сериализация истории осталась"}],"errors":["Поле messages всё ещё передаётся"]}
+{"passed":false,"summary":"Нужна дополнительная проверка edge cases.","tests":[{"name":"Web build","command":"npm run build -w apps/web","success":true,"output":"Проверит, что сборка фронта остаётся валидной"}],"errors":["Есть риск регрессии в отображении"]} 
 
-Если тестов нет — верни {"passed":true,"tests":[],"errors":[]}.`;
+Если тестов нет — верни {"passed":true,"summary":"","tests":[],"errors":[]}.`;
   }
 
-  private buildFinalReportPrompt(run: Run, plan: any, spec: any, codeChanges: any, testResults: any, memoryUpdate: any, runMode: 'diagnostics' | 'implementation'): string {
+  private buildFinalReportPrompt(run: Run, plan: any, spec: any, codeChanges: any, testResults: any, memoryUpdate: any, runMode: RunMode): string {
     // Усиливаем промпт финалки: работа УЖЕ выполнена, нужно ИТОГ, а не
     // перепечатка плана. Раньше слабая модель возвращала {message:"Понял
     // задачу, назначу..."} — то есть перепечатывала planning-сообщение, и
@@ -1701,9 +2441,11 @@ PATCH_END
       ? (spec as any).diagnosis.map((d: any) => `- ${d.file} / ${d.location || '?'}: ${d.issue || ''}${d.evidence ? ` (доказательство: ${d.evidence})` : ''}`).join('\n')
       : '';
     const rootCause = (spec as any)?.rootCause ? `\nГЛАВНАЯ ПРИЧИНА: ${(spec as any).rootCause}` : '';
-    const modeDirective = runMode === 'diagnostics'
-      ? `Это ДИАГНОСТИЧЕСКАЯ задача. Код НЕ изменялся (так и задумано). Итоговый отчёт — это ДИАГНОЗ: причину, конкретные файлы/функции, механизм проблемы и рекомендации.`
-      : `Это задача на реализацию. Код уже изменён разработчиком и проверен тестером. Итоговый отчёт — что реально сделано.`;
+    const modeDirective = runMode === 'research'
+      ? `Это ИССЛЕДОВАТЕЛЬСКАЯ задача. Нужно дать только ответ по существу исходного вопроса пользователя. НЕЛЬЗЯ расширять задачу, придумывать новые поручения или описывать несделанные работы.`
+      : runMode === 'diagnostics'
+        ? `Это ДИАГНОСТИЧЕСКАЯ задача. Код НЕ изменялся (так и задумано). Итоговый отчёт — это ДИАГНОЗ: причину, конкретные файлы/функции, механизм проблемы и рекомендации.`
+        : `Это задача на реализацию. Код уже изменён разработчиком и проверен тестером. Итоговый отчёт — что реально сделано.`;
 
     return `Ты — Оркестратор. Работа команды УЖЕ завершена. Напиши ИТОГОВЫЙ ОТЧЁТ пользователю — РЕЗУЛЬТАТ, а НЕ повтор плана.
 
@@ -1717,9 +2459,10 @@ ${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на э
 
 КРИТИЧНО:
 1. "message" — это ОТВЕТ ПОЛЬЗОВАТЕЛЮ на его вопрос/задачу. НЕ начинай с "Понял задачу" или "Назначу". Не повторяй план. Работа уже сделана.
-2. В режиме ДИАГНОСТИКИ в "message" изложи конкретную причину проблемы (файлы, функции, механизм) и рекомендации — это и есть ответ, который ждёт пользователь.
-3. В режиме РЕАЛИЗАЦИИ в "message" кратко напиши, что реально изменено и результат тестов.
-4. ВЕРНИ ТОЛЬКО валидный JSON, без markdown и текста вне { }.
+2. В режиме ИССЛЕДОВАНИЯ в "message" дай только прямой ответ/мнение/анализ по запросу пользователя. Без расширения задачи. Без "ещё стоит сделать". Без новых поручений команде.
+3. В режиме ДИАГНОСТИКИ в "message" изложи конкретную причину проблемы (файлы, функции, механизм) и рекомендации — это и есть ответ, который ждёт пользователь.
+4. В режиме РЕАЛИЗАЦИИ в "message" кратко напиши, что реально изменено и результат тестов.
+5. ВЕРНИ ТОЛЬКО валидный JSON, без markdown и текста вне { }.
 
 Схема:
 {
@@ -1729,6 +2472,92 @@ ${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на э
   "testResult": "passed|failed",
   "diagnosis": ["string - пункты диагноза, только для диагностического режима"],
   "nextSteps": ["string"]
-}`;
+}
+
+ДОПОЛНИТЕЛЬНО:
+- Если пользователь НЕ просил следующие шаги, "nextSteps" верни как [].
+- В research/diagnostics не придумывай новые поручения команде.
+- Если сомневаешься в JSON, верни минимальный валидный объект по схеме выше.`;
+  }
+
+  private shouldIncludeNextSteps(task: string): boolean {
+    const t = String(task || '').toLowerCase();
+    if (!t.trim()) return false;
+    return /\b(следующ|next steps|что дальше|what next|дальше|roadmap|план действий|action items)\b/i.test(t);
+  }
+
+  private buildFallbackFinalReport(
+    run: Run,
+    runMode: RunMode,
+    spec: Record<string, unknown>,
+    codeChanges: Record<string, unknown>,
+    testResults: TestResult,
+    rawResponse?: string,
+  ): Record<string, unknown> {
+    const filesChanged = Array.isArray((codeChanges as any)?.files)
+      ? (codeChanges as any).files.map((file: any) => String(file?.path || '').trim()).filter(Boolean)
+      : [];
+    const testResult = testResults?.passed === false ? 'failed' : 'passed';
+    const cleanedMessage = String(rawResponse || '').replace(/```[\s\S]*?```/g, '').trim();
+    const fallbackMessage = runMode === 'research'
+      ? String((spec as any)?.opinion || (spec as any)?.description || (codeChanges as any)?.summary || (testResults as any)?.summary || 'Исследование завершено.')
+      : runMode === 'diagnostics'
+        ? String((spec as any)?.rootCause || (spec as any)?.description || 'Диагностика завершена.')
+        : String(cleanedMessage || (codeChanges as any)?.summary || 'Работа завершена.');
+    const artifact: Record<string, unknown> = {
+      mode: runMode,
+      message: cleanedMessage || fallbackMessage,
+      summary: String((spec as any)?.description || (codeChanges as any)?.summary || (testResults as any)?.summary || fallbackMessage),
+      filesChanged,
+      testResult,
+      nextSteps: this.shouldIncludeNextSteps(run.task) ? [] : [],
+    };
+    if (runMode === 'diagnostics') {
+      artifact.diagnosis = Array.isArray((spec as any)?.diagnosis) ? (spec as any).diagnosis : [];
+      artifact.rootCause = (spec as any)?.rootCause || '';
+      artifact.recommendations = Array.isArray((spec as any)?.recommendations) ? (spec as any).recommendations : [];
+    }
+    return artifact;
+  }
+
+  private normalizeFinalReportArtifact(
+    artifact: Record<string, unknown>,
+    run: Run,
+    runMode: RunMode,
+    spec: Record<string, unknown>,
+    codeChanges: Record<string, unknown>,
+    testResults: TestResult,
+  ): Record<string, unknown> {
+    const normalized = { ...artifact } as Record<string, unknown>;
+    normalized.mode = runMode;
+    if (!normalized.message || !String(normalized.message).trim()) {
+      normalized.message = this.buildFallbackFinalReport(run, runMode, spec, codeChanges, testResults).message;
+    }
+    if (!normalized.summary || !String(normalized.summary).trim()) {
+      normalized.summary = String((spec as any)?.description || (codeChanges as any)?.summary || (testResults as any)?.summary || normalized.message || '');
+    }
+    if (!Array.isArray(normalized.filesChanged)) {
+      normalized.filesChanged = Array.isArray((codeChanges as any)?.files)
+        ? (codeChanges as any).files.map((file: any) => String(file?.path || '').trim()).filter(Boolean)
+        : [];
+    }
+    normalized.testResult = testResults?.passed === false ? 'failed' : 'passed';
+    if (!this.shouldIncludeNextSteps(run.task)) {
+      normalized.nextSteps = [];
+    } else if (!Array.isArray(normalized.nextSteps)) {
+      normalized.nextSteps = [];
+    }
+    if (runMode === 'diagnostics') {
+      if (!Array.isArray((normalized as any).diagnosis)) {
+        normalized.diagnosis = Array.isArray((spec as any)?.diagnosis) ? (spec as any).diagnosis : [];
+      }
+      if (!(normalized as any).rootCause) {
+        normalized.rootCause = (spec as any)?.rootCause || '';
+      }
+      if (!Array.isArray((normalized as any).recommendations)) {
+        normalized.recommendations = Array.isArray((spec as any)?.recommendations) ? (spec as any).recommendations : [];
+      }
+    }
+    return normalized;
   }
 }

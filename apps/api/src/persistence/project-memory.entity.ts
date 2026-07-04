@@ -34,6 +34,12 @@ export class ProjectMemoryEntryEntity {
   @Column("varchar", { nullable: true })
   sourceRunId!: string | null;
 
+  @Column("varchar", { nullable: true })
+  sourceChatId!: string | null;
+
+  @Column("float", { default: 0.5 })
+  relevanceScore!: number;
+
   @Column("boolean", { default: true })
   isActive!: boolean;
 

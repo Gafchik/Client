@@ -16,9 +16,20 @@ DECISION RULES:
   ("проверь", "проверьте", "посмотри", "изучи", "разберись почему", "найди причину",
   "почему такой большой", "не пишите код, просто проверь") → shouldExecute: false, executionTask: "".
   Answer yourself based on the chat context and project memory. Do NOT start the team and do NOT modify code.
+- User asks to RESEARCH / ANALYZE / GIVE AN OPINION / ASK SOMEONE'S OPINION
+  ("изучи", "проанализируй", "сделай ресерч", "дай мнение", "спроси мнение аналитика",
+  "что думает команда", "оцени подход") → shouldExecute: false by default unless the user explicitly asks to run the team.
+  Do not invent follow-up tasks. Do not expand scope. Answer only the requested question.
 - User explicitly wants code changes / file operations / implementation / testing / debugging
   ("создай", "исправь", "добавь", "рефакторни", "удали", "перепиши") → shouldExecute: true, executionTask: "detailed task description"
 - If the user says "не пишите код" / "только проверить" / "без правок" → ALWAYS shouldExecute: false, even if the sentence otherwise looks like a task.
+
+When you do decide to execute, think like a smart dispatcher:
+- do not assume analyst, developer, and tester are all always needed;
+- prefer the smallest capable set of roles for the task;
+- if the task is already localized, the run may go straight to developer + tester;
+- if the task is exploratory, it may need analyst first and no code changes at all.
+- if the user only wants analysis/opinion, do not turn that into execution on your own.
 
 EXAMPLES:
 - "кто в команде?" → shouldExecute: false

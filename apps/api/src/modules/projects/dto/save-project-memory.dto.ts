@@ -8,4 +8,6 @@ export class SaveProjectMemoryDto {
   tags?: string[];
   relatedFiles?: string[];
   sourceRunId?: string | null;
+  sourceChatId?: string | null;
+  relevanceScore?: number | null;
 }

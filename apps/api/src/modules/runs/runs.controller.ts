@@ -32,6 +32,16 @@ export class RunsController {
     return { runId };
   }
 
+  @Post("runs/:id/approvals/:approvalId")
+  async resolveApproval(
+    @Param("id") id: string,
+    @Param("approvalId") approvalId: string,
+    @Body() body: { approved?: boolean; reason?: string },
+  ) {
+    const approved = body?.approved !== false;
+    return this.runsService.resolveApproval(id, approvalId, approved, body?.reason);
+  }
+
   @Get("runs/:id")
   async getRun(@Param("id") id: string) {
     const run = await this.runsService.getById(id);
