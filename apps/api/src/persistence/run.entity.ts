@@ -76,7 +76,24 @@ export class RunEntity {
 
   @Column("int", { default: 0 })
   retryCount!: number;
+
+  /**
+   * Новая задача, которую пользователь дал агенту через «заменить задачу»,
+   * пока текущая была на паузе/в работе. Когда run.resume() поднимает прогон,
+   * executeRunSteps подхватывает это поле как актуальный task/originalMessage.
+   * nullable — у обычных runs его нет.
+   */
+  @Column("text", { nullable: true })
+  pendingTask!: string | null;
+
+  /**
+   * Причина отмены/паузы, записанная пользователем (для отображения в чате
+   * и в итоговом статусе run). nullable.
+   */
+  @Column("text", { nullable: true })
+  cancelReason!: string | null;
 }
+
 
 // Алиас для обратной совместимости
 export { RunEntity as Run };

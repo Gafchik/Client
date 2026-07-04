@@ -68,7 +68,16 @@ const state = reactive({
   toasts: [] as Array<{ id: number; type: 'success' | 'error' | 'info'; message: string }>,
   deleteConfirm: null as null | { type: 'project' | 'chat'; id: string; name: string; onConfirm: () => Promise<void> },
   streamingMessage: null as null | { id: string; content: string; role: string; isRunExecution: boolean },
+  // Управление агентом и запросами разрешений.
+  agentControlBusy: false,
+  // Текст комментария «как сделать надо» для каждого ожидающего разрешения.
+  approvalDrafts: {} as Record<string, string>,
+  showReplaceTask: false,
+  replaceTaskText: "",
+  replaceTaskBusy: false,
+  confirmStop: false,
 });
+
 
 const chatDraft = ref("");
 const messagesListRef = ref<HTMLElement | null>(null);
@@ -124,6 +133,35 @@ const pendingApprovals = computed(() => {
   }
   return approvals;
 });
+
+// Активный прогон — тот, что сейчас крутится агентами (running) или стоит на
+// паузе (paused) и ждёт resume. Раньше «стоп/продолжить» были невозможны:
+// прогон запускался в фоне и пользователь мог только ждать. Теперь по этому
+// computed мы показываем панель управления агентом.
+const activeRun = computed<RunItem | null>(() => {
+  if (!state.selectedRunId) return null;
+  const run = state.runs.find((r) => r.id === state.selectedRunId);
+  if (!run) return null;
+  if (["queued", "running", "paused", "awaiting_approval"].includes(run.status)) return run;
+  return null;
+});
+const isRunActive = computed(() => activeRun.value?.status === "running" || activeRun.value?.status === "queued");
+const isRunPaused = computed(() => activeRun.value?.status === "paused");
+const isRunAwaiting = computed(() => activeRun.value?.status === "awaiting_approval" || pendingApprovals.value.length > 0);
+
+// Человекочитаемый бейдж статуса агента для панели управления.
+const runStatusLabel = computed(() => {
+  const s = activeRun.value?.status || state.runStatus;
+  if (s === "running") return "Работает";
+  if (s === "queued") return "В очереди";
+  if (s === "paused") return "На паузе";
+  if (s === "awaiting_approval") return "Ждёт разрешения";
+  if (s === "completed" || s === "done") return "Завершено";
+  if (s === "failed") return "Ошибка";
+  if (s === "cancelled") return "Остановлено";
+  return s || "—";
+});
+
 
 const displayedMessages = computed(() => {
   return state.messages;
@@ -503,22 +541,144 @@ function onUserScroll() {
   userHasScrolled = !atBottom;
 }
 function copyMessage(text: string) { if (!text) return; navigator.clipboard.writeText(text).then(() => showToast('success', 'Скопировано')).catch(() => showToast('error', 'Не удалось скопировать')); }
-async function resolveApproval(approval: RunApproval, approved: boolean) {
+// Запрос разрешения от агента. Три варианта ответа вместо старых «да/нет»:
+//   approve       — разрешаю действие (с необязательным комментарием);
+//   reject_skip   — нет, пропустить шаг, но работу продолжить;
+//   reject_cancel — отмена работы целиком (прогон завершится как cancelled).
+// Плюс поле комментария «как сделать надо» — оно уйдёт агенту как reason.
+async function resolveApproval(approval: RunApproval, resolution: "approve" | "reject_skip" | "reject_cancel") {
   if (!state.selectedRunId || state.resolvingApprovalId) return;
   state.resolvingApprovalId = approval.id;
+  const reason = (state.approvalDrafts[approval.id] || "").trim();
+  const approved = resolution === "approve";
   try {
-    const response = await api.resolveRunApproval(state.selectedRunId, approval.id, approved);
+    const response = await api.resolveRunApproval(state.selectedRunId, approval.id, approved, reason, resolution);
     if (!response.ok) throw new Error(response.reason || "Не удалось обработать разрешение");
-    showToast('success', approved ? 'Разрешение выдано' : 'Действие отклонено');
+    // Очищаем черновик комментария для этого запроса.
+    delete state.approvalDrafts[approval.id];
+    if (resolution === "reject_cancel") {
+      showToast('info', 'Работа отменена');
+      // Поллинг сам подхватит завершение; на всякий случай снимаем busy.
+      state.busy = false;
+    } else if (resolution === "approve") {
+      showToast('success', reason ? 'Разрешение выдано с указанием' : 'Разрешение выдано');
+    } else {
+      showToast('success', 'Шаг пропущен, работа продолжается');
+    }
     const job = await api.job(state.selectedRunId);
     state.runStatus = job.status;
     state.runEvents = job.events ?? [];
+    const runsResponse = await api.runs();
+    state.runs = runsResponse.runs;
   } catch (e) {
     showToast('error', e instanceof Error ? e.message : 'Ошибка подтверждения');
   } finally {
     state.resolvingApprovalId = "";
   }
 }
+
+// ---- Управление агентом: стоп / пауза / продолжить / новая задача ----------
+// Раньше запущенный прогон нельзя было ни остановить, ни поставить на паузу —
+// пользователь был заперт до завершения. Теперь эти функции дают полный
+// контроль, как в привычных AI-агентах (Cursor/Cline и т.п.).
+function approvalDraft(approvalId: string): string {
+  return state.approvalDrafts[approvalId] || "";
+}
+function setApprovalDraft(approvalId: string, value: string) {
+  state.approvalDrafts[approvalId] = value;
+}
+async function refreshRunStatus(runId: string) {
+  try {
+    const job = await api.job(runId);
+    state.runStatus = job.status;
+    state.runError = job.error ?? "";
+    const incoming = job.events ?? [];
+    const keyOf = (e: { at: string; event: string; payload?: unknown }) => `${e.at}|${e.event}|${JSON.stringify(e.payload ?? "")}`;
+    const existing = new Set(state.runEvents.map(keyOf));
+    for (const e of incoming) if (!existing.has(keyOf(e))) state.runEvents.push(e);
+    const runsResponse = await api.runs();
+    state.runs = runsResponse.runs;
+  } catch (e) {
+    console.error('refreshRunStatus error:', e);
+  }
+}
+async function cancelAgent() {
+  if (!state.selectedRunId || state.agentControlBusy) return;
+  state.agentControlBusy = true;
+  state.confirmStop = false;
+  try {
+    const response = await api.cancelRun(state.selectedRunId);
+    if (!response.ok) throw new Error(response.reason || "Не удалось остановить работу");
+    showToast('info', 'Работа остановлена');
+    await refreshRunStatus(state.selectedRunId);
+    state.busy = false;
+  } catch (e) {
+    showToast('error', e instanceof Error ? e.message : 'Ошибка остановки');
+  } finally {
+    state.agentControlBusy = false;
+  }
+}
+async function pauseAgent() {
+  if (!state.selectedRunId || state.agentControlBusy) return;
+  state.agentControlBusy = true;
+  try {
+    const response = await api.pauseRun(state.selectedRunId);
+    if (!response.ok) throw new Error(response.reason || "Не удалось поставить на паузу");
+    showToast('info', 'Работа на паузе');
+    await refreshRunStatus(state.selectedRunId);
+  } catch (e) {
+    showToast('error', e instanceof Error ? e.message : 'Ошибка паузы');
+  } finally {
+    state.agentControlBusy = false;
+  }
+}
+async function resumeAgent() {
+  if (!state.selectedRunId || state.agentControlBusy) return;
+  state.agentControlBusy = true;
+  try {
+    const response = await api.resumeRun(state.selectedRunId);
+    if (!response.ok) throw new Error(response.reason || "Не удалось продолжить работу");
+    showToast('success', 'Работа продолжена');
+    state.busy = true;
+    await refreshRunStatus(state.selectedRunId);
+    // Поднимаем поллинг заново, чтобы следить за продолженным прогоном.
+    startPolling(state.selectedRunId);
+  } catch (e) {
+    showToast('error', e instanceof Error ? e.message : 'Ошибка возобновления');
+  } finally {
+    state.agentControlBusy = false;
+  }
+}
+function openReplaceTask() {
+  state.replaceTaskText = "";
+  state.showReplaceTask = true;
+}
+async function submitReplaceTask() {
+  if (!state.selectedRunId || state.replaceTaskBusy) return;
+  const task = state.replaceTaskText.trim();
+  if (!task) return;
+  state.replaceTaskBusy = true;
+  try {
+    const response = await api.replaceTask(state.selectedRunId, task);
+    if (!response.ok) throw new Error(response.reason || "Не удалось сменить задачу");
+    state.showReplaceTask = false;
+    if (response.action === "queued_for_resume") {
+      showToast('info', 'Задача записана — нажмите «Продолжить», чтобы агент взялся за неё');
+    } else if (response.action === "redirected") {
+      showToast('success', 'Агент переключился на новую задачу');
+      state.busy = true;
+      startPolling(state.selectedRunId);
+    } else {
+      showToast('info', 'Задача передана агенту');
+    }
+    await refreshRunStatus(state.selectedRunId);
+  } catch (e) {
+    showToast('error', e instanceof Error ? e.message : 'Ошибка смены задачи');
+  } finally {
+    state.replaceTaskBusy = false;
+  }
+}
+
 function reportText(): string { if (!state.report) return "Пока нет отчёта."; const r = state.report as any; return [`Task: ${r.task || "-"}`, `Project: ${r.projectPath || "-"}`, r.summary ? `Summary: ${r.summary}` : "", r.testResult ? `Test result: ${r.testResult}` : "", Array.isArray(r.filesChanged) && r.filesChanged.length ? `Files: ${r.filesChanged.join(", ")}` : "", r.usageSummary ? `Tokens: actual ${r.usageSummary.totalActualTokens}, weighted ${r.usageSummary.totalWeightedTokens}` : ""].filter(Boolean).join("\n"); }
 
 function connectWebSocket() { if (ws) { ws.disconnect(); ws = null; } import('socket.io-client').then(({ io }) => { const wsUrl = window.location.origin; try { ws = io(wsUrl, { path: '/ws/socket.io', transports: ['websocket', 'polling'], autoConnect: true }); ws.on('connect', () => { if (state.selectedChatId) ws.emit("join:chat", { chatId: state.selectedChatId }); if (state.selectedProjectId) ws.emit("join:project", { projectId: state.selectedProjectId }); }); ws.on('token:stream', (msg: any) => { handleWsMessage({ event: "token:stream", data: msg }); }); ws.on('run:event', (msg: any) => { handleWsMessage({ event: "run:event", data: msg }); }); ws.on('agent:activity', (msg: any) => { handleWsMessage({ event: "agent:activity", data: msg }); }); ws.on('disconnect', () => { wsReconnectTimer = window.setTimeout(connectWebSocket, 3000); }); ws.on('connect_error', () => {}); } catch { ws = null; } }).catch(() => { ws = null; }); }
@@ -657,26 +817,71 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
         </div>
       </div>
 
+      <!-- Панель управления агентом: стоп / пауза / продолжить / новая задача.
+           Появляется только когда есть активный прогон. Раньше пользователь
+           был заперт до конца работы — теперь контролирует процесс. -->
+      <div v-if="activeRun" class="agent-control-bar" :class="activeRun.status">
+        <div class="agent-control-status">
+          <span class="agent-control-dot" :class="activeRun.status"></span>
+          <span class="agent-control-label">{{ runStatusLabel }}</span>
+          <span v-if="isRunPaused && activeRun.pendingTask" class="agent-control-hint">Есть новая задача — нажмите «Продолжить»</span>
+        </div>
+        <div class="agent-control-actions">
+          <button v-if="isRunActive" class="btn btn-ghost btn-sm" :disabled="state.agentControlBusy" @click="pauseAgent">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Пауза
+          </button>
+          <button v-if="isRunPaused" class="btn btn-primary btn-sm" :disabled="state.agentControlBusy" @click="resumeAgent">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>Продолжить
+          </button>
+          <button class="btn btn-ghost btn-sm" :disabled="state.agentControlBusy" @click="openReplaceTask">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>Новая задача
+          </button>
+          <button class="btn btn-danger btn-sm" :disabled="state.agentControlBusy" @click="cancelAgent">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>Стоп
+          </button>
+        </div>
+      </div>
+
       <div v-if="pendingApprovals.length" class="approval-stack">
         <div v-for="approval in pendingApprovals" :key="approval.id" class="approval-card">
           <div class="approval-card-header">
             <div>
               <div class="approval-card-title">{{ approval.title }}</div>
-              <div class="approval-card-subtitle">{{ approval.role }} хочет выполнить действие</div>
+              <div class="approval-card-subtitle">
+                {{ approval.role }} хочет {{ approval.kind === 'migration' ? 'применить миграцию' : 'выполнить команду' }}
+              </div>
             </div>
-            <span class="approval-badge">Ждёт разрешения</span>
+            <span class="approval-badge">{{ approval.kind === 'migration' ? 'Миграция' : 'Команда' }} · Ждёт разрешения</span>
           </div>
           <div class="approval-card-body">
+            <!-- Подробное описание зачем нужно действие. Раньше агент кидал
+                 сырую команду без объяснений — пользователь не понимал, что
+                 approves. Теперь всегда есть описание + зачем. -->
             <p class="approval-description">{{ approval.description }}</p>
-            <pre class="approval-command"><code>{{ approval.command }}</code></pre>
-            <div v-if="approval.cwd" class="approval-cwd">Папка: {{ approval.cwd }}</div>
+            <div v-if="approval.kind === 'migration'" class="approval-meta">
+              <div class="approval-meta-row"><span class="approval-meta-key">Миграция:</span><code>{{ approval.migrationId || approval.migrationName }}</code></div>
+              <div v-if="approval.migrationName" class="approval-meta-row"><span class="approval-meta-key">Название:</span><span>{{ approval.migrationName }}</span></div>
+              <p v-if="approval.migrationDescription" class="approval-meta-desc">{{ approval.migrationDescription }}</p>
+            </div>
+            <div v-else class="approval-meta">
+              <div class="approval-meta-row"><span class="approval-meta-key">Команда:</span><code class="approval-command-code">{{ approval.command }}</code></div>
+              <p class="approval-why">{{ approval.description }}</p>
+              <div v-if="approval.cwd" class="approval-cwd">Папка: {{ approval.cwd }}</div>
+            </div>
+          </div>
+          <!-- Поле «как сделать надо» — уйдёт агенту как reason. -->
+          <div class="approval-comment">
+            <textarea class="approval-comment-input" :value="approvalDraft(approval.id)" @input="setApprovalDraft(approval.id, ($event.target as HTMLTextAreaElement).value)" rows="2" placeholder="Подсказка агенту, как сделать правильно (необязательно)…"></textarea>
           </div>
           <div class="approval-actions">
-            <button class="btn btn-ghost" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, false)">
-              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Отклонить" }}
+            <button class="btn btn-danger" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, 'reject_cancel')">
+              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Отменить работу" }}
             </button>
-            <button class="btn btn-primary" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, true)">
-              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Разрешить" }}
+            <button class="btn btn-ghost" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, 'reject_skip')">
+              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Нет, пропустить" }}
+            </button>
+            <button class="btn btn-primary" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, 'approve')">
+              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Да, разрешаю" }}
             </button>
           </div>
         </div>
@@ -686,6 +891,26 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
         <div class="composer-input"><textarea ref="composerTextareaRef" class="composer-textarea" v-model="chatDraft" rows="1" placeholder="Например: кто в команде, что сейчас в работе, добавь задачу на экспорт CSV" @keydown.enter.exact.shift="sendChatMessage" @keydown.enter.prevent="sendChatMessage"></textarea></div>
         <div class="composer-actions"><span class="composer-hint">Enter — отправить · Shift+Enter — новая строка</span><button class="composer-send" :disabled="state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button></div>
       </footer>
+
+    <!-- Модалка «Дать агенту новую задачу». На паузе — отложится до resume,
+         в активном состоянии — перенаправит агента. -->
+    <div v-if="state.showReplaceTask" class="modal-overlay" @click.self="state.showReplaceTask = false">
+      <div class="modal">
+        <div class="modal-header"><h3 class="modal-title">Новая задача агенту</h3></div>
+        <div class="modal-body">
+          <p class="replace-task-hint" v-if="isRunPaused">Агент на паузе — задача запишется и запустится после нажатия «Продолжить».</p>
+          <p class="replace-task-hint" v-else>Агент работает — будет перенаправлен на новую задачу.</p>
+          <textarea class="replace-task-textarea" v-model="state.replaceTaskText" rows="4" placeholder="Опишите, что должен сделать агент…" :disabled="state.replaceTaskBusy"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" :disabled="state.replaceTaskBusy" @click="state.showReplaceTask = false">Отмена</button>
+          <button class="btn btn-primary" :disabled="state.replaceTaskBusy || !state.replaceTaskText.trim()" @click="submitReplaceTask">
+            {{ state.replaceTaskBusy ? "Отправляю..." : "Поставить задачу" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     </main>
 
     <div v-if="state.deleteConfirm" class="modal-overlay" @click.self="state.deleteConfirm = null">
@@ -783,8 +1008,44 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .approval-description { margin:0 0 10px; font-size:13px; color:var(--text); line-height:1.5; }
 .approval-command { margin:0; padding:12px; border-radius:10px; background:rgba(0,0,0,.24); border:1px solid rgba(255,255,255,.08); overflow:auto; font-size:12px; }
 .approval-cwd { margin-top:8px; font-size:12px; color:var(--muted); font-family:var(--font-mono); }
-.approval-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:12px; }
+.approval-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:12px; flex-wrap:wrap; }
+
+/* Мета запроса разрешения: какая миграция/команда + зачем. */
+.approval-meta { display:flex; flex-direction:column; gap:8px; padding:10px 12px; border-radius:10px; background:rgba(0,0,0,.18); border:1px solid rgba(255,255,255,.06); margin-bottom:10px; }
+.approval-meta-row { display:flex; align-items:baseline; gap:8px; font-size:12px; color:var(--muted); flex-wrap:wrap; }
+.approval-meta-key { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+.approval-meta-row code, .approval-command-code { font-family:var(--font-mono); font-size:12px; color:var(--text); background:rgba(255,255,255,.06); padding:2px 6px; border-radius:6px; word-break:break-all; }
+.approval-meta-desc { margin:0; font-size:12px; color:var(--text); line-height:1.5; }
+.approval-why { margin:0; font-size:12px; color:var(--muted); line-height:1.5; font-style:italic; }
+.approval-comment { margin-top:10px; }
+.approval-comment-input { width:100%; min-height:44px; max-height:120px; padding:10px 12px; border-radius:10px; border:1px solid rgba(245,158,11,.22); background:rgba(0,0,0,.18); color:var(--text); font:inherit; font-size:13px; resize:vertical; line-height:1.5; }
+.approval-comment-input:focus { outline:none; border-color:#f59e0b; }
+.approval-comment-input::placeholder { color:var(--muted); }
+
+/* Панель управления агентом: статус + кнопки Стоп/Пауза/Продолжить/Новая задача. */
+.agent-control-bar { display:flex; align-items:center; justify-content:space-between; gap:12px; max-width:980px; margin:0 auto 8px; width:100%; padding:8px 14px; border-radius:12px; border:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
+.agent-control-bar.running, .agent-control-bar.queued { border-color:rgba(245,158,11,.32); background:rgba(245,158,11,.06); }
+.agent-control-bar.paused { border-color:rgba(99,102,241,.32); background:rgba(99,102,241,.06); }
+.agent-control-bar.awaiting_approval { border-color:rgba(245,158,11,.32); background:rgba(245,158,11,.06); }
+.agent-control-status { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text); flex-wrap:wrap; }
+.agent-control-dot { width:9px; height:9px; border-radius:50%; background:#6b7280; flex-shrink:0; }
+.agent-control-dot.running, .agent-control-dot.queued, .agent-control-dot.awaiting_approval { background:#f59e0b; animation:pulse 1.5s infinite; }
+.agent-control-dot.paused { background:#6366f1; }
+.agent-control-label { font-weight:600; }
+.agent-control-hint { font-size:12px; color:var(--muted); }
+.agent-control-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.agent-control-actions .btn { display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:6px 10px; }
+.agent-control-actions .btn svg { width:14px; height:14px; }
+.btn-danger { background:#ef4444; border-color:#ef4444; color:#fff; }
+.btn-danger:hover:not(:disabled) { background:#dc2626; border-color:#dc2626; }
+.btn-danger:disabled { opacity:.5; cursor:not-allowed; }
+
+/* Модалка «Новая задача агенту». */
+.replace-task-hint { margin:0 0 12px; font-size:13px; color:var(--muted); }
+.replace-task-textarea { width:100%; min-width:420px; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--text); font:inherit; font-size:14px; line-height:1.5; resize:vertical; }
+.replace-task-textarea:focus { outline:none; border-color:var(--accent); }
 .composer-input { flex:1; }
+
 .composer-textarea { width:100%; min-height:56px; max-height:220px; padding:14px 16px; border-radius:16px; border:1px solid var(--line); background:rgba(255,255,255,.02); color:var(--text); font:inherit; resize:none; line-height:1.5; overflow:auto; }
 .composer-textarea:focus { outline:none; border-color:var(--accent); }
 .composer-actions { display:flex; align-items:center; justify-content:space-between; margin-top:8px; }

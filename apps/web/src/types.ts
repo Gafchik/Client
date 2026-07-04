@@ -131,21 +131,30 @@ export interface RunItem {
   error?: string;
   events?: Array<{ at: string; event: string; payload?: unknown }>;
   finalReport?: unknown;
+  // Управление агентом: пауза/возобновление/перенаправление задачи.
+  pendingTask?: string | null;
+  cancelReason?: string | null;
+  pausedAt?: string | null;
 }
 
 export interface RunApproval {
   id: string;
-  kind: "command";
+  kind: "command" | "migration";
   role: string;
   title: string;
   description: string;
-  command: string;
+  command?: string;
   cwd?: string;
+  // Для миграций: какая миграция и что делает.
+  migrationId?: string;
+  migrationName?: string;
+  migrationDescription?: string;
   status: "pending" | "approved" | "rejected";
   createdAt: string;
   resolvedAt?: string | null;
   reason?: string | null;
 }
+
 
 export interface ChatStats {
   requestCount: number;

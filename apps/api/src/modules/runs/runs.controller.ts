@@ -35,11 +35,38 @@ export class RunsController {
   async resolveApproval(
     @Param("id") id: string,
     @Param("approvalId") approvalId: string,
-    @Body() body: { approved?: boolean; reason?: string },
+    @Body() body: { approved?: boolean; reason?: string; resolution?: "approve" | "reject_skip" | "reject_cancel" },
   ) {
     const approved = body?.approved !== false;
-    return this.runsService.resolveApproval(id, approvalId, approved, body?.reason);
+    return this.runsService.resolveApproval(id, approvalId, approved, body?.reason, body?.resolution);
   }
+
+  // Остановить работу агента (cancel). Текущая попытка выйдет на ближайшей
+  // проверке между этапами и пометки failed не будет.
+  @Post("runs/:id/cancel")
+  async cancelRun(@Param("id") id: string, @Body() body: { reason?: string }) {
+    return this.runsService.cancelRun(id, body?.reason);
+  }
+
+  // Поставить работу на паузу. Resume поднимет прогон заново.
+  @Post("runs/:id/pause")
+  async pauseRun(@Param("id") id: string, @Body() body: { reason?: string }) {
+    return this.runsService.pauseRun(id, body?.reason);
+  }
+
+  // Продолжить работу после паузы (подхватит pendingTask, если задали новую).
+  @Post("runs/:id/resume")
+  async resumeRun(@Param("id") id: string) {
+    return this.runsService.resumeRun(id);
+  }
+
+  // Дать агенту новую задачу. На паузе — отложится до resume; в активном
+  // состоянии — перенаправит (пауза → resume с новой задачей).
+  @Post("runs/:id/replace-task")
+  async replaceTask(@Param("id") id: string, @Body() body: { task?: string }) {
+    return this.runsService.replaceTask(id, String(body?.task ?? "").trim());
+  }
+
 
   @Get("runs/:id")
   async getRun(@Param("id") id: string) {

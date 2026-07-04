@@ -107,9 +107,39 @@ export const api = {
       error?: string;
       events: Array<{ at: string; event: string; payload?: unknown }>;
     }>(`/jobs/${id}`),
-  resolveRunApproval: (runId: string, approvalId: string, approved: boolean, reason?: string) =>
-    request<{ ok: boolean; reason?: string }>(`/runs/${runId}/approvals/${approvalId}`, {
+  resolveRunApproval: (
+    runId: string,
+    approvalId: string,
+    approved: boolean,
+    reason?: string,
+    resolution?: "approve" | "reject_skip" | "reject_cancel",
+  ) =>
+    request<{ ok: boolean; reason?: string; cancelled?: boolean }>(`/runs/${runId}/approvals/${approvalId}`, {
       method: "POST",
-      body: JSON.stringify({ approved, reason }),
+      body: JSON.stringify({ approved, reason, resolution }),
     }),
+  // Управление агентом: остановить / пауза / продолжить / новая задача.
+  cancelRun: (runId: string, reason?: string) =>
+    request<{ ok: boolean; reason?: string }>(`/runs/${runId}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
+  pauseRun: (runId: string, reason?: string) =>
+    request<{ ok: boolean; reason?: string }>(`/runs/${runId}/pause`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
+  resumeRun: (runId: string) =>
+    request<{ ok: boolean; started: boolean; reason?: string }>(`/runs/${runId}/resume`, {
+      method: "POST",
+    }),
+  replaceTask: (runId: string, task: string) =>
+    request<{ ok: boolean; action: "queued_for_resume" | "redirected" | "unavailable"; reason?: string }>(
+      `/runs/${runId}/replace-task`,
+      {
+        method: "POST",
+        body: JSON.stringify({ task }),
+      },
+    ),
 };
+

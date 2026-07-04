@@ -53,17 +53,37 @@ interface TestResult {
 
 interface ApprovalRequest {
   id: string;
-  kind: 'command';
+  /** Вид действия: команда шелла, миграция БД, запись файла. */
+  kind: 'command' | 'migration' | 'file_write';
   role: ExecutionRole;
+  /** Короткий заголовок — что именно собирается сделать агент. */
   title: string;
+  /** Что делает действие — развёрнутое описание одним абзацем. */
   description: string;
+  /** Зачем это нужно — rationale, какую цель преследует агент. */
+  rationale?: string;
+  /** Уровень риска для подсветки в UI. */
+  riskLevel?: 'safe' | 'moderate' | 'risky';
+  /** Категория для иконки/группировки в UI. */
+  category?: string;
   command: string;
   cwd?: string;
   status: 'pending' | 'approved' | 'rejected';
+  /** Что выбрал пользователь: approve / reject_skip (пропустить, продолжить) / reject_cancel (отменить всю работу). */
+  resolution?: 'approve' | 'reject_skip' | 'reject_cancel' | null;
   createdAt: string;
   resolvedAt?: string | null;
   reason?: string | null;
 }
+
+/** Специальная ошибка — пользователь отменил работу. Ловится в цикле ретраев, чистый выход без retry. */
+class RunCancelledError extends Error {
+  constructor(message = 'Run cancelled by user') {
+    super(message);
+    this.name = 'RunCancelledError';
+  }
+}
+
 
 type RunMode = 'diagnostics' | 'implementation' | 'research';
 type ExecutionRole = 'analyst' | 'developer' | 'tester';
@@ -219,11 +239,28 @@ export class RunsService implements OnModuleInit {
     };
   }
 
-  async resolveApproval(runId: string, approvalId: string, approved: boolean, reason?: string) {
+  /**
+   * Обработка ответа пользователя на запрос разрешения.
+   * resolution:
+   *  - 'approve'      — да, разрешаю (status='approved', run возвращается в running).
+   *  - 'reject_skip'  — нет, пропустить это действие и продолжить работу (status='rejected',
+   *    run возвращается в running — агент получит «не одобрено» и пойдёт дальше).
+   *  - 'reject_cancel'— нет, отменить всю работу (status='rejected', run → cancelled,
+   *    executeRunSteps увидит статус cancelled и выйдет из цикла).
+   * reason — текст пользователя «как сделать надо» (опционально).
+   */
+  async resolveApproval(
+    runId: string,
+    approvalId: string,
+    approved: boolean,
+    reason?: string,
+    resolution?: 'approve' | 'reject_skip' | 'reject_cancel',
+  ) {
     const run = await this.runRepo.findOne({ where: { id: runId } });
     if (!run) throw new Error('Run not found');
     const events = Array.isArray(run.events) ? [...run.events] : [];
     let updated = false;
+    let chosen: ApprovalRequest | null = null;
     for (const entry of events) {
       if (entry.event !== 'approval:requested' || !entry.payload || typeof entry.payload !== 'object') continue;
       const payload = entry.payload as ApprovalRequest;
@@ -231,18 +268,180 @@ export class RunsService implements OnModuleInit {
       payload.status = approved ? 'approved' : 'rejected';
       payload.reason = reason ?? null;
       payload.resolvedAt = new Date().toISOString();
+      payload.resolution = resolution ?? (approved ? 'approve' : 'reject_skip');
       updated = true;
+      chosen = payload;
     }
     if (!updated) {
       return { ok: false, reason: 'Approval request not found or already resolved' };
     }
     run.events = events;
+
+    // Если пользователь выбрал «отменить всю работу» — помечаем run cancelled.
+    // executeRunSteps крутится в requestApproval / между этапами и увидит это.
+    if (chosen?.resolution === 'reject_cancel') {
+      run.status = 'cancelled';
+      run.finishedAt = new Date();
+      run.cancelReason = reason ?? 'Пользователь отменил работу в запросе разрешения';
+      await this.runRepo.save(run);
+      try {
+        if (run.chatId) {
+          await this.broadcastActivity(
+            runId, run.chatId, 'orchestrator', 'Alex', 'Оркестратор', 'error',
+            reason ? `Работа отменена пользователем: ${reason}` : 'Работа отменена пользователем',
+          );
+        }
+      } catch { /* ignore */ }
+      return { ok: true, cancelled: true };
+    }
+
     if (run.status === 'waiting_approval') {
       run.status = 'running';
     }
     await this.runRepo.save(run);
     return { ok: true };
   }
+
+  /**
+   * Остановить работу агента (cancel). Текущая попытка executeRunSteps увидит
+   * status='cancelled' на ближайшей проверке между этапами и выйдет. Если run
+   * сейчас ждёт разрешения — тоже выйдет (requestApproval увидит cancelled).
+   */
+  async cancelRun(runId: string, reason?: string): Promise<{ ok: boolean; reason?: string }> {
+    const run = await this.runRepo.findOne({ where: { id: runId } });
+    if (!run) return { ok: false };
+    const terminal = ['completed', 'failed', 'cancelled'];
+    if (terminal.includes(run.status)) {
+      return { ok: false, reason: `Run already ${run.status}` };
+    }
+    run.status = 'cancelled';
+    run.finishedAt = new Date();
+    run.cancelReason = reason ?? 'Остановлено пользователем';
+    await this.runRepo.save(run);
+    if (run.chatId) {
+      try {
+        await this.broadcastActivity(
+          runId, run.chatId, 'orchestrator', 'Alex', 'Оркестратор', 'error',
+          reason ? `Останавливаю работу: ${reason}` : 'Останавливаю работу по запросу пользователя',
+        );
+      } catch { /* ignore */ }
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Поставить работу на паузу. executeRunSteps увидит status='paused' на
+   * ближайшей проверке и выйдет из цикла (без пометки failed). Resume поднимет
+   * прогон заново.
+   */
+  async pauseRun(runId: string, reason?: string): Promise<{ ok: boolean; reason?: string }> {
+    const run = await this.runRepo.findOne({ where: { id: runId } });
+    if (!run) return { ok: false };
+    const active = ['running', 'queued', 'waiting_approval'];
+    if (!active.includes(run.status)) {
+      return { ok: false, reason: `Run is ${run.status}, cannot pause` };
+    }
+    run.status = 'paused';
+    run.cancelReason = reason ?? null;
+    await this.runRepo.save(run);
+    if (run.chatId) {
+      try {
+        await this.broadcastActivity(
+          runId, run.chatId, 'orchestrator', 'Alex', 'Оркестратор', 'working',
+          reason ? `Ставлю работу на паузу: ${reason}` : 'Работа поставлена на паузу',
+        );
+      } catch { /* ignore */ }
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Продолжить работу после паузы. Просто перезапускаем executeRunSteps — он
+   * подхватит контекст заново (attempt продолжится по retryCount). Если есть
+   * pendingTask (пользователь дал новую задачу) — используем её как task/originalMessage.
+   */
+  async resumeRun(runId: string): Promise<{ ok: boolean; started: boolean; reason?: string }> {
+    const run = await this.runRepo.findOne({ where: { id: runId } });
+    if (!run) return { ok: false, started: false };
+    if (run.status !== 'paused') {
+      return { ok: false, started: false, reason: `Run is ${run.status}, not paused` };
+    }
+    // Если пользователь дал новую задачу — подменяем task/originalMessage.
+    if (run.pendingTask && String(run.pendingTask).trim()) {
+      run.task = String(run.pendingTask).trim();
+      run.originalMessage = String(run.pendingTask).trim();
+      run.pendingTask = null;
+    }
+    run.status = 'queued';
+    run.cancelReason = null;
+    await this.runRepo.save(run);
+    if (run.chatId) {
+      try {
+        await this.broadcastActivity(
+          runId, run.chatId, 'orchestrator', 'Alex', 'Оркестратор', 'working',
+          'Продолжаю работу',
+        );
+      } catch { /* ignore */ }
+    }
+    // Запуск в фоне.
+    void this.executeRunSteps(runId).catch((error) => {
+      this.logger.error(`Resume run ${runId} failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    return { ok: true, started: true };
+  }
+
+  /**
+   * Дать агенту новую задачу. Если run сейчас на паузе — кладём в pendingTask,
+   * resume подхватит. Если run активен (running/queued/waiting) — сначала
+   * ставим паузу, затем кладём pendingTask и сразу resume (по сути «перенаправить»).
+   * Если run уже завершён — возвращаем ok:false, фронт тогда должен начать
+   * новый чат/run.
+   */
+  async replaceTask(
+    runId: string,
+    newTask: string,
+  ): Promise<{ ok: boolean; action: 'queued_for_resume' | 'redirected' | 'unavailable'; reason?: string }> {
+    const run = await this.runRepo.findOne({ where: { id: runId } });
+    if (!run) return { ok: false, action: 'unavailable', reason: 'Прогон не найден' };
+    const task = String(newTask || '').trim();
+    if (!task) return { ok: false, action: 'unavailable', reason: 'Пустая задача' };
+
+    const terminal = ['completed', 'failed', 'cancelled'];
+    if (terminal.includes(run.status)) {
+      return { ok: false, action: 'unavailable', reason: `Прогон уже завершён (${run.status})` };
+    }
+
+    if (run.status === 'paused') {
+      run.pendingTask = task;
+      await this.runRepo.save(run);
+      if (run.chatId) {
+        try {
+          await this.broadcastActivity(
+            runId, run.chatId, 'orchestrator', 'Alex', 'Оркестратор', 'working',
+            `Принял новую задачу. Возобновите работу, чтобы агент начал её.`,
+          );
+        } catch { /* ignore */ }
+      }
+      return { ok: true, action: 'queued_for_resume' };
+    }
+
+    // Активный run — ставим паузу, кладём задачу, тут же resume.
+    run.status = 'paused';
+    run.pendingTask = task;
+    await this.runRepo.save(run);
+    if (run.chatId) {
+      try {
+        await this.broadcastActivity(
+          runId, run.chatId, 'orchestrator', 'Alex', 'Оркестратор', 'working',
+          'Перенаправляю на новую задачу…',
+        );
+      } catch { /* ignore */ }
+    }
+    // resume перечитает run, подхватит pendingTask и запустит executeRunSteps.
+    await this.resumeRun(runId);
+    return { ok: true, action: 'redirected' };
+  }
+
 
   /**
    * Сохраняет событие в run.events (для поллинга) — обязательно,
@@ -268,6 +467,25 @@ export class RunsService implements OnModuleInit {
       .map((entry) => entry.payload as ApprovalRequest)
       .filter((approval) => approval.status === 'pending');
   }
+
+  /**
+   * Проверяет, был ли run остановлен/приостановлен пользователем во время
+   * работы. executeRunSteps вызывает её между этапами (оркестратор→аналитик→
+   * разработчик→тестер→финалка) и при выходе из ожидания разрешения. Если run
+   * отменён/на паузе — выбрасываем RunCancelledError, который ловится в цикле
+   * ретраев как «чистый выход, без retry и без пометки failed».
+   */
+  private async assertRunContinuable(runId: string, context = 'step'): Promise<void> {
+    const run = await this.runRepo.findOne({ where: { id: runId } });
+    if (!run) throw new RunCancelledError(`Run ${runId} not found (${context})`);
+    if (run.status === 'cancelled') {
+      throw new RunCancelledError(run.cancelReason || `Run cancelled (${context})`);
+    }
+    if (run.status === 'paused') {
+      throw new RunCancelledError(`Run paused by user (${context})`);
+    }
+  }
+
 
   private async requestApproval(
     runId: string,
@@ -307,8 +525,15 @@ export class RunsService implements OnModuleInit {
         await this.broadcastActivity(runId, chatId, role, name, label, 'error', `Действие отклонено: ${approval.title}`);
         return { approved: false, approvalId: approval.id };
       }
+      // Пользователь остановил/приостановил работу, пока мы ждали разрешения —
+      // выходим из ожидания. По reject_cancel approval уже помечен rejected и
+      // мы вышли выше; сюда попадаем при cancelRun/pauseRun без resolveApproval.
+      if (run?.status === 'cancelled' || run?.status === 'paused') {
+        return { approved: false, approvalId: approval.id };
+      }
       if (!pending.some((item) => item.id === approval.id)) break;
     }
+
 
     await this.broadcastActivity(runId, chatId, role, name, label, 'error', `Истекло ожидание разрешения: ${approval.title}`);
     return { approved: false, approvalId: approval.id };
@@ -482,7 +707,12 @@ export class RunsService implements OnModuleInit {
           this.describeExecutionPlan(plan),
         );
 
+        // Проверка: не остановил/приостановил ли пользователь работу, пока
+        // оркестратор строил план. Если да — выходим чисто (RunCancelledError).
+        await this.assertRunContinuable(runId, 'after-orchestrator');
+
         let spec: Record<string, unknown> = this.buildFallbackSpecFromPlan(plan, runMode);
+
         let analystWorked = false;
         if (plan.roles.analyst.enabled) {
           if (!analystAgent?.model) {
@@ -934,6 +1164,23 @@ export class RunsService implements OnModuleInit {
         break;
 
       } catch (error) {
+        // Пользователь остановил/приостановил работу между этапами — это НЕ
+        // ошибка и НЕ повод для retry. status уже выставлен cancelRun/pauseRun
+        // (cancelled/paused). Просто выходим из цикла ретраев без пометки failed.
+        if (error instanceof RunCancelledError) {
+          this.logger.log(`Run ${runId} stopped by user at attempt ${attempt}: ${error.message}`);
+          success = true; // считаем «чистым выходом», чтобы не идти в финальный фейл-блок
+          // Статус уже cancelled/paused — перечитываем и фиксируем finishedAt
+          // только если cancelled (paused оставляем без finishedAt, чтобы resume
+          // мог поднять).
+          run = await this.runRepo.findOne({ where: { id: runId } });
+          if (run && run.status === 'cancelled' && !run.finishedAt) {
+            run.finishedAt = new Date();
+            await this.runRepo.save(run);
+          }
+          break;
+        }
+
         lastError = error instanceof Error ? error.message : String(error);
         this.logger.error(`Run ${runId} attempt ${attempt}/${MAX_RETRIES} failed: ${lastError}`);
         
@@ -965,6 +1212,7 @@ export class RunsService implements OnModuleInit {
         // Небольшая пауза перед следующей попыткой
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
+
     }
     } catch (contextError) {
       // Блок загрузки контекста (chat/project/team/provider/agents) упал ВНЕ
@@ -1110,20 +1358,26 @@ export class RunsService implements OnModuleInit {
       // Парсим JSON ответ
       const parseResult = parseJsonSafely(fullContent);
       
-      // Сохраняем артефакт
-      const artifactPath = this.getArtifactPath(runId, stepName);
-      this.ensureArtifactDir(runId);
-      const artifactContent = {
-        role: stepName,
-        prompt,
-        rawResponse: fullContent,
-        parsed: parseResult.success ? parseResult.data : null,
-        parseError: parseResult.error,
-        timestamp: new Date().toISOString(),
-        model,
-        usage: totalUsage,
-      };
-      fs.writeFileSync(artifactPath, JSON.stringify(artifactContent, null, 2), 'utf-8');
+      // Дамп ответа агента на диск — чисто отладочный, по умолчанию выключен.
+      // Эти artifacts/<role>.json никто не читает: рантайм и контроллер
+      // ходят только в runs/<id>/final-report.json. Чтобы не плодить мусор
+      // (и не коммитить его в репо), дамп пишем только при SAVE_AGENT_ARTIFACTS=1.
+      if (process.env.SAVE_AGENT_ARTIFACTS === '1') {
+        const artifactPath = this.getArtifactPath(runId, stepName);
+        this.ensureArtifactDir(runId);
+        const artifactContent = {
+          role: stepName,
+          prompt,
+          rawResponse: fullContent,
+          parsed: parseResult.success ? parseResult.data : null,
+          parseError: parseResult.error,
+          timestamp: new Date().toISOString(),
+          model,
+          usage: totalUsage,
+        };
+        fs.writeFileSync(artifactPath, JSON.stringify(artifactContent, null, 2), 'utf-8');
+      }
+
 
       if (!parseResult.success) {
         this.logger.error(`Failed to parse JSON for run ${runId}, step ${stepName}: ${parseResult.error}`);

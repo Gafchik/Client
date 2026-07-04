@@ -7,3 +7,9 @@ workspace/*
 !workspace/.gitkeep
 .env
 .idea
+
+# Дампы ответов агентов и финальные отчёты ранов — рантаймные, на машине.
+# runs/<id>/artifacts/*.json пишется только при SAVE_AGENT_ARTIFACTS=1.
+# final-report.json пишется всегда, но тоже локальный — в репо не нужен.
+apps/api/runs
+
