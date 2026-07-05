@@ -13,6 +13,12 @@ import { WsGateway } from '../ws/ws.gateway';
 import * as fs from 'fs';
 import * as path from 'path';
 import { execSync } from 'node:child_process';
+import {
+  stripMirroredProjectPrefixes,
+  normalizePathByProjectSuffix,
+  relPathWithinProject,
+  cleanupPathsInTask,
+} from '../../shared/path-utils.js';
 
 interface LlmResponse {
   content: string;
@@ -638,6 +644,16 @@ export class RunsService implements OnModuleInit {
       run.projectPath = project.localPath;
       run.projectId = project.id;
       await this.runRepo.save(run);
+    }
+
+    // Финальная очистка run.task от дублированных путей (apps/api/apps/web/... → apps/web/...)
+    if (run.task && project.localPath) {
+      const cleanedTask = cleanupPathsInTask(project.localPath, run.task, fs.existsSync);
+      if (cleanedTask !== run.task) {
+        this.logger.warn(`[${runId}] Cleaned duplicate path in run.task: "${run.task.slice(0, 80)}..." → "${cleanedTask.slice(0, 80)}..."`);
+        run.task = cleanedTask;
+        await this.runRepo.save(run);
+      }
     }
 
     // Защита: если projectPath не абсолютный или не существует — роняем с понятной ошибкой,
@@ -2257,6 +2273,9 @@ export class RunsService implements OnModuleInit {
   }
 
   private ensureArtifactDir(runId: string): void {
+    // Артефакты API-процесса (диагностические дампы агентов) НЕ относятся к
+    // проекту пользователя — храним в рабочей директории API-процесса.
+    // process.cwd() в production = apps/api, это безопасно.
     const dir = path.join(process.cwd(), 'runs', runId, 'artifacts');
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -2314,105 +2333,11 @@ export class RunsService implements OnModuleInit {
   }
 
   /**
-   * Приводит путь из ТЗ разработчика к относительному виду внутри проекта.
-   * Слабые модели регулярно пишут АБСОЛЮТНЫЕ пути вида
-   *   /host-projects/<project>/src/...
-   * или даже полные host-пути. path.join(projectPath, absPath) с абсолютным
-   * вторым аргументом ВЫБРАСЫВАЕТ projectPath и пишет файл чёрт знает где
-   * (иногда — в чужой проект). Здесь нормализуем: обрезаем projectPath /
-   * префикс host-projects/<projBase>/ и всегда работаем по относительному
-   * пути внутри проекта. Фикс бага, когда правки «уезжали» из проекта.
+   * Делегат к общей библиотеке path-utils.
+   * Все агенты используют единую логику нормализации путей.
    */
   private relPathWithinProject(projectPath: string, relOrAbs: string): string {
-    let p = String(relOrAbs || '').trim();
-    if (!p) return '';
-    const normProject = path.resolve(projectPath).replace(/\/+$/, '');
-    const projBase = path.basename(normProject);
-    // Windows-слеши на всякий случай.
-    p = p.replace(/\\/g, '/').trim();
-    // Если путь абсолютный и лежит внутри проекта — берём относительную часть.
-    try {
-      const abs = path.resolve(p);
-      if (abs === normProject) return '';
-      if (abs.startsWith(normProject + '/')) {
-        return path.relative(normProject, abs);
-      }
-    } catch { }
-    // Обрезаем ведущие слеши (модель пишет /src/... вместо src/...).
-    p = p.replace(/^\/+/, '');
-    // Срезаем возможный префикс "host-projects/<projBase>/" если модель
-    // писала контейнерный путь без ведущего слеша.
-    if (projBase) {
-      const hostPrefix = `host-projects/${projBase}/`;
-      if (p.startsWith(hostPrefix)) p = p.slice(hostPrefix.length);
-      else if (p === `host-projects/${projBase}`) p = '';
-      else if (p.startsWith(`${projBase}/`)) p = p.slice(`${projBase}/`.length);
-      else if (p === projBase) p = '';
-    }
-    p = this.stripMirroredProjectPrefixes(normProject, p);
-    // Защита от выхода за пределы проекта (../).
-    p = p.replace(/^(\.\.\/)+/, '');
-    return this.normalizePathByProjectSuffix(normProject, p);
-  }
-
-  private stripMirroredProjectPrefixes(projectPath: string, relPath: string): string {
-    let current = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
-    if (!current) return '';
-    const projectSegments = path.resolve(projectPath).replace(/\\/g, '/').split('/').filter(Boolean);
-    const suffixPrefixes: string[] = [];
-    const base = projectSegments[projectSegments.length - 1];
-    const parent = projectSegments[projectSegments.length - 2];
-    const grandParent = projectSegments[projectSegments.length - 3];
-    const commonWorkspaceDirs = new Set(['apps', 'packages', 'services', 'libs']);
-
-    if (base) suffixPrefixes.push(`${base}/`);
-    if (parent && base && commonWorkspaceDirs.has(parent)) {
-      suffixPrefixes.push(`${parent}/${base}/`);
-    }
-    if (grandParent && parent && base && commonWorkspaceDirs.has(grandParent)) {
-      suffixPrefixes.push(`${grandParent}/${parent}/${base}/`);
-    }
-
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const prefix of suffixPrefixes) {
-        if (current.startsWith(prefix)) {
-          current = current.slice(prefix.length);
-          changed = true;
-        }
-      }
-    }
-    return current;
-  }
-
-  private normalizePathByProjectSuffix(projectPath: string, relPath: string): string {
-    const normalized = this.stripMirroredProjectPrefixes(
-      projectPath,
-      String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim(),
-    );
-    if (!normalized) return '';
-    const segments = normalized.split('/').filter(Boolean);
-    const hasMirroredRepoPrefix =
-      segments.length >= 3 &&
-      segments[0] === 'apps' &&
-      segments[1] === 'api' &&
-      segments[2] === 'apps';
-    const directFile = path.join(projectPath, normalized);
-    const directDir = path.join(projectPath, path.dirname(normalized));
-    if (!hasMirroredRepoPrefix && (fs.existsSync(directFile) || fs.existsSync(directDir))) {
-      return normalized;
-    }
-
-    for (let i = 1; i < segments.length; i += 1) {
-      const suffix = segments.slice(i).join('/');
-      const fileCandidate = path.join(projectPath, suffix);
-      const dirCandidate = path.join(projectPath, path.dirname(suffix));
-      if (fs.existsSync(fileCandidate) || fs.existsSync(dirCandidate)) {
-        return suffix;
-      }
-    }
-    return normalized;
+    return relPathWithinProject(projectPath, relOrAbs, fs.existsSync.bind(fs));
   }
 
   private async applyFileChange(

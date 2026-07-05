@@ -16,6 +16,10 @@ import { ProvidersService } from "../providers/providers.service.js";
 import { WsGateway } from "../ws/ws.gateway.js";
 import * as fs from "fs";
 import * as path from "path";
+import {
+  cleanupPathsInTask,
+  relPathWithinProject,
+} from "../../shared/path-utils.js";
 
 @Injectable()
 export class ChatsService {
@@ -450,7 +454,16 @@ export class ChatsService {
       executionTask = `[ТОЛЬКО ЧТЕНИЕ — не менять файлы, не коммитить, не создавать новые файлы]\n${executionTask}\n[ОГРАНИЧЕНИЕ: Только чтение/анализ. Запрещено: запись файлов, git commit, git push, создание файлов, удаление файлов.]`;
     }
 
-    executionTask = this.normalizeExecutionTaskFromUserIntent(content, executionTask);
+    executionTask = this.normalizeExecutionTaskFromUserIntent(content, executionTask, project.localPath || "");
+
+    // Очищаем дублированные пути в executionTask (баг "apps/api/apps/web/...")
+    if (project.localPath) {
+      const cleanedBefore = executionTask;
+      executionTask = cleanupPathsInTask(project.localPath, executionTask, fs.existsSync);
+      if (cleanedBefore !== executionTask) {
+        this.logger.log(`Cleaned up duplicate paths in executionTask for project ${project.localPath}`);
+      }
+    }
 
     // Логируем решение оркестратора
     this.logger.log(`Orchestrator decision: shouldExecute=${shouldExecute}, executionTask="${executionTask}"`);
@@ -708,10 +721,18 @@ Output schema: {"message":"string","teamSummary":["string"],"shouldExecute":bool
     return imperativeScore >= 4 || /команды:\s|последний запуск:\s|тесты:\s/i.test(text);
   }
 
-  private normalizeExecutionTaskFromUserIntent(userMessage: string, executionTask: string): string {
+  private normalizeExecutionTaskFromUserIntent(userMessage: string, executionTask: string, projectPath: string): string {
     const original = String(userMessage || "").trim();
-    const task = String(executionTask || "").trim();
+    let task = String(executionTask || "").trim();
     if (!original || !task) return task;
+
+    // Очищаем дублированные пути (apps/api/apps/web/... → apps/web/...)
+    if (projectPath) {
+      const existsFn = (p: string) => {
+        try { return fs.existsSync(p); } catch { return false; }
+      };
+      task = cleanupPathsInTask(projectPath, task, existsFn);
+    }
 
     const lowerOriginal = original.toLowerCase();
     const lowerTask = task.toLowerCase();
