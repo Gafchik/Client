@@ -2357,13 +2357,18 @@ export class RunsService implements OnModuleInit {
   private normalizePathByProjectSuffix(projectPath: string, relPath: string): string {
     const normalized = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
     if (!normalized) return '';
+    const segments = normalized.split('/').filter(Boolean);
+    const hasMirroredRepoPrefix =
+      segments.length >= 3 &&
+      segments[0] === 'apps' &&
+      segments[1] === 'api' &&
+      segments[2] === 'apps';
     const directFile = path.join(projectPath, normalized);
     const directDir = path.join(projectPath, path.dirname(normalized));
-    if (fs.existsSync(directFile) || fs.existsSync(directDir)) {
+    if (!hasMirroredRepoPrefix && (fs.existsSync(directFile) || fs.existsSync(directDir))) {
       return normalized;
     }
 
-    const segments = normalized.split('/').filter(Boolean);
     for (let i = 1; i < segments.length; i += 1) {
       const suffix = segments.slice(i).join('/');
       const fileCandidate = path.join(projectPath, suffix);
@@ -3048,6 +3053,17 @@ ${filesSummary}
   private async saveProjectMemory(projectId: string, chatId: string, memory: any, language: string, runMode?: RunMode, sourceRunId?: string): Promise<void> {
     try {
       const feature = memory.feature || memory.lastRun?.task || 'Выполнение задачи';
+      const relatedFiles: string[] = this.normalizeMemoryRelatedFiles(
+        Array.isArray(memory.lastRun?.codeChanges)
+          ? memory.lastRun.codeChanges
+          : Array.isArray(memory.files)
+            ? (memory.files as Array<{ path?: string }>).map((f) => f.path).filter(Boolean)
+            : [],
+      );
+      const hasSuspiciousPaths = relatedFiles.some((file) => /^apps\/api\/apps\//.test(file));
+      const effectiveRunMode: RunMode | undefined = hasSuspiciousPaths && runMode === 'implementation'
+        ? 'diagnostics'
+        : runMode;
       const summaryText = String(
         memory.summary
         || memory.opinion
@@ -3090,27 +3106,33 @@ ${filesSummary}
       }
       const detailsText = detailLines.join('\n') || `Language: ${language}`;
 
-      const relatedFiles: string[] = Array.isArray(memory.lastRun?.codeChanges)
-        ? memory.lastRun.codeChanges
-        : Array.isArray(memory.files)
-          ? (memory.files as Array<{ path?: string }>).map((f) => f.path).filter(Boolean)
-          : [];
-
       await this.projectsService.saveMemory({
         projectId,
         title: `Документация: ${String(feature).slice(0, 180)}`,
         summary: summaryText,
         details: detailsText,
-        kind: this.inferMemoryKind(memory, runMode),
-        tags: this.buildMemoryTags(memory, runMode),
+        kind: this.inferMemoryKind(memory, effectiveRunMode),
+        tags: this.buildMemoryTags(memory, effectiveRunMode),
         relatedFiles,
         sourceRunId: sourceRunId ?? null,
         sourceChatId: chatId,
-        relevanceScore: runMode === 'research' ? 0.95 : runMode === 'diagnostics' ? 0.9 : 0.75,
+        relevanceScore: effectiveRunMode === 'research' ? 0.95 : effectiveRunMode === 'diagnostics' ? 0.9 : hasSuspiciousPaths ? 0.2 : 0.75,
       } as any);
     } catch (error) {
       this.logger.warn(`Failed to save project memory: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private normalizeMemoryRelatedFiles(rawFiles: unknown[]): string[] {
+    if (!Array.isArray(rawFiles)) return [];
+    const out: string[] = [];
+    for (const raw of rawFiles) {
+      const value = String(raw || '').replace(/\\/g, '/').trim();
+      if (!value) continue;
+      if (/^apps\/api\/apps\//.test(value)) continue;
+      out.push(value);
+    }
+    return out;
   }
 
   private buildOrchestratorPrompt(run: Run, messages: any[], project: any, teamConfig: TeamConfig, projectPath: string, runMode: RunMode): string {
