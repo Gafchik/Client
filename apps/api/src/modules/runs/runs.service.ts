@@ -2349,13 +2349,48 @@ export class RunsService implements OnModuleInit {
       else if (p.startsWith(`${projBase}/`)) p = p.slice(`${projBase}/`.length);
       else if (p === projBase) p = '';
     }
+    p = this.stripMirroredProjectPrefixes(normProject, p);
     // Защита от выхода за пределы проекта (../).
     p = p.replace(/^(\.\.\/)+/, '');
     return this.normalizePathByProjectSuffix(normProject, p);
   }
 
+  private stripMirroredProjectPrefixes(projectPath: string, relPath: string): string {
+    let current = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+    if (!current) return '';
+    const projectSegments = path.resolve(projectPath).replace(/\\/g, '/').split('/').filter(Boolean);
+    const suffixPrefixes: string[] = [];
+    const base = projectSegments[projectSegments.length - 1];
+    const parent = projectSegments[projectSegments.length - 2];
+    const grandParent = projectSegments[projectSegments.length - 3];
+    const commonWorkspaceDirs = new Set(['apps', 'packages', 'services', 'libs']);
+
+    if (base) suffixPrefixes.push(`${base}/`);
+    if (parent && base && commonWorkspaceDirs.has(parent)) {
+      suffixPrefixes.push(`${parent}/${base}/`);
+    }
+    if (grandParent && parent && base && commonWorkspaceDirs.has(grandParent)) {
+      suffixPrefixes.push(`${grandParent}/${parent}/${base}/`);
+    }
+
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const prefix of suffixPrefixes) {
+        if (current.startsWith(prefix)) {
+          current = current.slice(prefix.length);
+          changed = true;
+        }
+      }
+    }
+    return current;
+  }
+
   private normalizePathByProjectSuffix(projectPath: string, relPath: string): string {
-    const normalized = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+    const normalized = this.stripMirroredProjectPrefixes(
+      projectPath,
+      String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim(),
+    );
     if (!normalized) return '';
     const segments = normalized.split('/').filter(Boolean);
     const hasMirroredRepoPrefix =
