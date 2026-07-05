@@ -84,10 +84,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(chat),
     }),
-  sendChatMessage: (chatId: string, content: string, teamId?: string) =>
+  sendChatMessage: (chatId: string, content: string, teamId?: string, projectId?: string) =>
     request<{ chat: Chat; message: ChatMessage; autoRunId?: string | null }>(`/chats/${chatId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content, teamId }),
+      body: JSON.stringify({ content, teamId, projectId }),
     }),
   deleteChat: (id: string) =>
     request<{ ok: boolean }>(`/chats/${id}`, {
@@ -95,7 +95,7 @@ export const api = {
     }),
   runs: () => request<{ runs: RunItem[] }>("/runs"),
   runById: (id: string) => request<{ run: RunItem; report: unknown }>(`/runs/${id}`),
-  startRun: (payload: { chatId: string; task: string; teamId: string; teamName: string; projectPath: string }) =>
+  startRun: (payload: { chatId: string; projectId: string; task: string; teamId: string; teamName: string; projectPath: string }) =>
     request<{ runId: string }>("/runs", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -142,4 +142,3 @@ export const api = {
       },
     ),
 };
-

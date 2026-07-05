@@ -179,6 +179,7 @@ export class RunsService implements OnModuleInit {
     const run = this.runRepo.create({
       id: crypto.randomUUID(),
       chatId: dto.chatId,
+      projectId: dto.projectId,
       task: dto.task,
       // Сохраняем ИСХОДНОЕ сообщение пользователя. detectRunMode ниже использует
       // его в приоритете перед run.task (= executionTask оркестратора), который
@@ -579,7 +580,14 @@ export class RunsService implements OnModuleInit {
     if (!run.chatId) throw new Error('Run has no chatId');
     const chat = await this.chatsService.getById(run.chatId);
     const projectIdFromChat = chat.chat?.projectId ?? '';
-    const project = await this.projectsService.getById(run.projectId ?? projectIdFromChat ?? '');
+    const resolvedProjectId = run.projectId ?? projectIdFromChat ?? '';
+    if (!resolvedProjectId) {
+      throw new Error(`Run ${runId} has no projectId and chat ${run.chatId} has no projectId`);
+    }
+    if (run.projectId && projectIdFromChat && run.projectId !== projectIdFromChat) {
+      throw new Error(`Run ${runId} points to project ${run.projectId}, but chat ${run.chatId} belongs to ${projectIdFromChat}`);
+    }
+    const project = await this.projectsService.getById(resolvedProjectId);
     const team = await this.teamsService.getById(run.teamId);
     
     const chatId = run.chatId ?? '';
@@ -621,12 +629,16 @@ export class RunsService implements OnModuleInit {
 
     const hostProjectsRoot = process.env.LOCAL_PROJECTS_ROOT || '/Users/evgenii';
     const containerProjectsRoot = process.env.CONTAINER_PROJECTS_ROOT || hostProjectsRoot;
-    // Резолвим абсолютный путь: если в БД лежит относительный (историческая запись),
-    // path.resolve сделает его абсолютным относительно hostProjectsRoot.
-    // Затем подменяем префикс для контейнера, если нужно.
-    const resolvedLocalPath = path.resolve(hostProjectsRoot, project.localPath || '');
+    const resolvedLocalPath = path.isAbsolute(project.localPath || '')
+      ? path.resolve(project.localPath || '')
+      : path.resolve(hostProjectsRoot, project.localPath || '');
     const projectPath = resolvedLocalPath.replace(hostProjectsRoot, containerProjectsRoot).replace(/\/+$/, '');
     const projectName = project.name || 'Unknown Project';
+    if (run.projectPath !== project.localPath || run.projectId !== project.id) {
+      run.projectPath = project.localPath;
+      run.projectId = project.id;
+      await this.runRepo.save(run);
+    }
 
     // Защита: если projectPath не абсолютный или не существует — роняем с понятной ошибкой,
     // чтобы агенты не писали файлы в cwd API-процесса (apps/api).
@@ -2339,7 +2351,28 @@ export class RunsService implements OnModuleInit {
     }
     // Защита от выхода за пределы проекта (../).
     p = p.replace(/^(\.\.\/)+/, '');
-    return p;
+    return this.normalizePathByProjectSuffix(normProject, p);
+  }
+
+  private normalizePathByProjectSuffix(projectPath: string, relPath: string): string {
+    const normalized = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim();
+    if (!normalized) return '';
+    const directFile = path.join(projectPath, normalized);
+    const directDir = path.join(projectPath, path.dirname(normalized));
+    if (fs.existsSync(directFile) || fs.existsSync(directDir)) {
+      return normalized;
+    }
+
+    const segments = normalized.split('/').filter(Boolean);
+    for (let i = 1; i < segments.length; i += 1) {
+      const suffix = segments.slice(i).join('/');
+      const fileCandidate = path.join(projectPath, suffix);
+      const dirCandidate = path.join(projectPath, path.dirname(suffix));
+      if (fs.existsSync(fileCandidate) || fs.existsSync(dirCandidate)) {
+        return suffix;
+      }
+    }
+    return normalized;
   }
 
   private async applyFileChange(
@@ -3097,9 +3130,8 @@ ${filesSummary}
 
 ⚠️ РАБОЧАЯ ДИРЕКТОРИЯ: ${projectPath}
 Все пути к файлам должны быть ОТНОСИТЕЛЬНЫМИ от этой директории.
-Примеры ПРАВИЛЬНЫХ путей: apps/web/src/views/WorkspaceView.vue, src/main.ts, package.json
-Примеры НЕПРАВИЛЬНЫХ: /Users/evgenii/Desktop/client/apps/..., apps/api/apps/web/... (дублирование префиксов)
-ЗАПРЕЩЕНО: абсолютные пути, дублирование сегментов (типа apps/api/apps/...), любые префиксы перед путём.
+Используй только реальные пути из КАРТЫ ПРОЕКТА ниже.
+ЗАПРЕЩЕНО: абсолютные пути, дублирование сегментов, префиксы чужого репозитория или текущего раннера.
 Корень проекта = ${projectPath}, все пути начинаются от него.
 
 ПРОЕКТ: ${project.name || 'Unknown'}
@@ -3417,8 +3449,8 @@ SUMMARY: Нет изменений. Диагноз аналитика подтв
 ${assignmentLine}
 
 ⚠️ Все пути к файлам должны быть ОТНОСИТЕЛЬНЫМИ от рабочей директории ${projectPath}.
-Пример ПРАВИЛЬНОГО пути: apps/web/src/views/WorkspaceView.vue
-Пример НЕПРАВИЛЬНОГО: apps/api/apps/web/... (дублирование префиксов), /Users/evgenii/Desktop/client/apps/... (абсолютный путь)
+Используй только реальные пути из ФАЙЛЫ ИЗ ТЗ и КАРТЫ ПРОЕКТА.
+ЗАПРЕЩЕНО: абсолютные пути, дублирование сегментов, префиксы чужого репозитория или текущего раннера.
 
 ТРЕБОВАНИЯ ИЗ ТЗ:
 ${requirements}
@@ -3434,7 +3466,7 @@ ${existingFiles ? `\nСУЩЕСТВУЮЩИЙ КОД ФАЙЛОВ:\n${existingFi
 SUMMARY: краткая сводка что сделано
 
 COMMAND: npm test
-CWD: apps/api
+CWD: .
 REASON: Нужно прогнать локальные тесты модуля после правок
 
 FILE: путь/к/файлу

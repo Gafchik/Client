@@ -500,11 +500,18 @@ function onComposerKeydown(e: KeyboardEvent) {
 async function sendChatMessage() {
   if (!selectedChat.value || !chatDraft.value.trim() || isSending.value) return;
   const draft = chatDraft.value.trim();
+  const project = selectedProject.value;
+  if (!project) return;
   isSending.value = true;
   state.busy = true;
   chatDraft.value = "";
   try {
-    const response = await api.sendChatMessage(selectedChat.value.id, draft, state.selectedTeamId || undefined);
+    const response = await api.sendChatMessage(
+      selectedChat.value.id,
+      draft,
+      state.selectedTeamId || undefined,
+      project.id,
+    );
     await openChat(selectedChat.value.id);
     if (response.autoRunId) {
       state.selectedRunId = response.autoRunId;
@@ -528,7 +535,7 @@ async function sendChatMessage() {
     composerTextareaRef.value?.focus();
   }
 }
-async function runTask() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); const project = selectedProject.value; const team = selectedProjectTeam.value; if (!project || !team) return; state.busy = true; chatDraft.value = ""; try { const response = await api.startRun({ chatId: selectedChat.value.id, task: draft, teamId: team.id, teamName: team.name, projectPath: project.localPath || '' }); state.selectedRunId = response.runId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; clearAgentLogs(); startPolling(response.runId); showToast('success', 'Работа запущена'); /* busy stays true until run completes via polling */ } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); state.busy = false; } }
+async function runTask() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); const project = selectedProject.value; const team = selectedProjectTeam.value; if (!project || !team) return; state.busy = true; chatDraft.value = ""; try { const response = await api.startRun({ chatId: selectedChat.value.id, projectId: project.id, task: draft, teamId: team.id, teamName: team.name, projectPath: project.localPath || '' }); state.selectedRunId = response.runId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; clearAgentLogs(); startPolling(response.runId); showToast('success', 'Работа запущена'); /* busy stays true until run completes via polling */ } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); state.busy = false; } }
 function startPolling(runId: string) {
   if (pollTimer) window.clearInterval(pollTimer);
   const tick = async () => {

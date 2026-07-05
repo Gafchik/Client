@@ -1,5 +1,6 @@
 export class StartRunDto {
   chatId!: string;
+  projectId!: string;
   task!: string;
   /**
    * Исходное сообщение пользователя (как он написал в чат). Нужно для

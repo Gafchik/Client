@@ -193,8 +193,11 @@ export class ChatsService {
     return { ok: true };
   }
 
-  async sendMessageToOrchestrator(chatId: string, content: string, overrideTeamId?: string) {
+  async sendMessageToOrchestrator(chatId: string, content: string, overrideTeamId?: string, overrideProjectId?: string) {
     const { chat, messages } = await this.getById(chatId);
+    if (overrideProjectId && overrideProjectId !== chat.projectId) {
+      throw new Error(`Chat ${chat.id} belongs to project ${chat.projectId}, but request tried to run on ${overrideProjectId}`);
+    }
     const project = await this.projectsRepository.findOneBy({ id: chat.projectId });
     if (!project) throw new Error("Project not found");
     const resolvedTeamId = overrideTeamId || project.teamId || chat.teamId;
@@ -458,6 +461,7 @@ export class ChatsService {
     if (shouldExecute && executionTask) {
       const run = await this.runsService.startRun({
         chatId: chat.id,
+        projectId: project.id,
         task: executionTask,
         // ИСХОДНОЕ сообщение пользователя нужно runs.service для детерминированного
         // detectRunMode: executionTask оркестратора часто теряет стоп-фразу «код не
