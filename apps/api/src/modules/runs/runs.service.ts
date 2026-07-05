@@ -3002,7 +3002,9 @@ ${filesSummary}
 
   private async buildMemoryContext(projectId: string, task: string): Promise<string> {
     try {
-      const entries = await this.projectsService.searchMemory(projectId, task, 6);
+      const entries = (await this.projectsService.searchMemory(projectId, task, 10))
+        .filter((entry: any) => !this.isPrescriptiveMemoryEntry(entry))
+        .slice(0, 6);
       if (!entries.length) return '';
       return entries.map((entry, index) => {
         const files = Array.isArray(entry.relatedFiles) && entry.relatedFiles.length
@@ -3023,6 +3025,43 @@ ${filesSummary}
       this.logger.warn(`Failed to build memory context: ${error instanceof Error ? error.message : String(error)}`);
       return '';
     }
+  }
+
+  private isPrescriptiveMemoryEntry(entry: any): boolean {
+    const kind = String(entry?.kind || '').toLowerCase();
+    const summary = String(entry?.summary || '');
+    const details = String(entry?.details || '');
+    const title = String(entry?.title || '');
+    const text = `${title}\n${summary}\n${details}`.toLowerCase();
+
+    if (!text.trim()) return false;
+    if (kind !== 'implementation' && kind !== 'feature') return false;
+
+    const imperativeScore = [
+      'добавь ',
+      'добавить ',
+      'создай ',
+      'создать ',
+      'внеси ',
+      'внести ',
+      'убедись ',
+      'нужно ',
+      'проверь, есть ли',
+      'если чего-то не хватает',
+      'шаг 1',
+      'шаг 2',
+      'кнопка отправки',
+      'const issending',
+      'computed issenddisabled',
+      'keydown',
+      'aria-label',
+      'tailwind',
+      'npm run dev',
+    ].reduce((score, token) => score + (text.includes(token) ? 1 : 0), 0);
+
+    const hasCommandDump = /команды:\s|последний запуск:\s|тесты:\s/i.test(details);
+    const looksLikeRecipe = imperativeScore >= 4 || hasCommandDump;
+    return looksLikeRecipe;
   }
 
   private inferMemoryKind(memory: any, runMode?: RunMode): string {
@@ -3177,6 +3216,8 @@ ${recentMessages}
 4. НЕ выдумывай пути файлов — используй только КАРТУ ПРОЕКТА выше.
 5. Если отдельный этап не нужен, явно отключи его через roles.<role>.enabled=false и кратко объясни why в reason.
 6. НЕЛЬЗЯ расширять задачу. Отвечай только на прямой запрос пользователя. Не придумывай дополнительные подзадачи, проверки, рефакторы, улучшения или “следующие логичные шаги”, если их не просили.
+7. Для implementation НЕ превращай executionTask в микро-ТЗ с выдуманными именами функций, переменных, CSS-классов или готовыми кусками кода, если ты не видел их в реальном файле. Формулируй по наблюдаемому поведению и реальным путям файлов.
+8. Если пользователь уже указал экран/URL/файл и желаемое поведение, executionTask должен быть коротким и предметным: цель, реальный файл/модуль, ограничения по области. Не расписывай пошагово "добавь const X" или "создай функцию Y", если это не подтверждено кодом.
 
 Схема ответа:
 {"message":"string - что ты понял и что сделает команда","teamSummary":["string"],"shouldExecute":true,"executionTask":"string - краткая задача для команды","plan":["string - шаги"],"roles":{"analyst":{"enabled":true,"assignment":"string","reason":"string"},"developer":{"enabled":true,"assignment":"string","reason":"string"},"tester":{"enabled":true,"assignment":"string","reason":"string"}},"files":[{"path":"string","action":"create|update","description":"string","reason":"string"}]}
@@ -3353,6 +3394,7 @@ ${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД:\n${memoryContext}` :
 2. В files.path указывай ТОЛЬКО пути, которые есть в КАРТЕ ПРОЕКТА. Не выдумывай файлы.
 3. Для существующих файлов ставь action:"update" (разработчик сделает патч), для новых — action:"create".
 4. НЕ добавляй в files[] документацию, README, файлы .md/.mdx/.rst, файлы из docs/. Документацию проекта ты ВЕДЁШЬ В ПАМЯТИ ПРОЕКТА (БД) — полями description/requirements/acceptanceCriteria, а НЕ файлами в репозитории. В files[] только КОД. Если хочешь зафиксировать архитектурное решение — опиши его в description/requirements, не создавай .md.
+5. Описывай изменения СЕМАНТИЧЕСКИ по текущему коду. Если нужное поведение уже реализовано под другими именами (другая функция, другой computed, другой обработчик), не требуй переименования только ради совпадения со словами пользователя.
 
 Схема:
 {"feature":"string","description":"string","requirements":["string"],"api":{"endpoints":["string"]},"dataModels":["string"],"files":[{"path":"string - реальный путь","action":"create|update","description":"string - что менять","reason":"string - зачем"}],"acceptanceCriteria":["string"],"risks":["string"]}
@@ -3525,6 +3567,8 @@ DESCRIPTION: что сделано
 10. НЕ создавай мусорные/временные/логовые/текстовые файлы: git_log_output.txt, scratch.txt, output_*.txt, *.log, *.tmp, *.out и подобные. git-контекст УЖЕ в промпте (сервер выполняет git log/status сам). Если нужно сохранить вывод — используй SUMMARY, а не файл. Все .txt/.log/.tmp пути будут отклонены.
 11. Пиши пути ОТНОСИТЕЛЬНО корня проекта (например src/domain/dog/aggregates/Dog.ts), БЕЗ ведущего /host-projects/... и БЕЗ абсолютных путей. Абсолютные пути будут нормализованы.
 12. САМОПРОВЕРКА ПЕРЕД ОТДАЧЕЙ (КРИТИЧНО): прежде чем вернуть ответ, мысленно перепрочитай КАЖДЫЙ свой SEARCH-блок и сверь с СУЩЕСТВУЮЩИМ КОДОМ выше. SEARCH должен быть БУКВАЛЬНОЙ копией фрагмента текущего файла (те же отступы, переносы, кавычки). Если SEARCH не совпадает с реальным кодом символ-в-символ — патч будет отклонён сервером. Проверь также: не сломал ли REPLACE импорты/синтаксис, нет ли дублей, согласованы ли call-сайты, если меняешь сигнатуру/экспорт. Если хоть один SEARCH вызывает сомнение — перепиши его по реальному коду. Сервер всё равно перепроверит каждый SEARCH по текущему файлу и вернёт тебе рассинхрон на исправление, но лучше сделать верно с первого раза.
+13. Выполняй задачу по СМЫСЛУ, а не по буквальному совпадению имён из ТЗ/памяти. Если поведение уже есть под другими именами или в другой локальной структуре файла, не переписывай код ради косметического совпадения.
+14. Если после чтения текущего файла видишь, что требуемое поведение уже реализовано и правки не нужны, верни только SUMMARY: Нет изменений.
 
 ПРИМЕР полного ответа:
 

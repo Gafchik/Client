@@ -221,11 +221,11 @@ export class ChatsService {
     }
 
     const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code, project.localPath || "");
-    const memoryEntries = await this.projectMemoryRepository.find({
+    const memoryEntries = (await this.projectMemoryRepository.find({
       where: { projectId: project.id, isActive: true },
       order: { updatedAt: "DESC" },
       take: 5,
-    });
+    })).filter((entry) => !this.isPrescriptiveMemoryEntry(entry));
 
     // Git-контекст: status + diff для оркестратора
     let gitStatus = "";
@@ -450,6 +450,8 @@ export class ChatsService {
       executionTask = `[ТОЛЬКО ЧТЕНИЕ — не менять файлы, не коммитить, не создавать новые файлы]\n${executionTask}\n[ОГРАНИЧЕНИЕ: Только чтение/анализ. Запрещено: запись файлов, git commit, git push, создание файлов, удаление файлов.]`;
     }
 
+    executionTask = this.normalizeExecutionTaskFromUserIntent(content, executionTask);
+
     // Логируем решение оркестратора
     this.logger.log(`Orchestrator decision: shouldExecute=${shouldExecute}, executionTask="${executionTask}"`);
     
@@ -673,5 +675,74 @@ Output schema: {"message":"string","teamSummary":["string"],"shouldExecute":bool
       .replace(/{{teamLanguage}}/g, languageLabel)
       .replace(/{{teamLanguageCode}}/g, languageCode)
       .replace(/{{workingDirectory}}/g, workingDirectory);
+  }
+
+  private isPrescriptiveMemoryEntry(entry: any): boolean {
+    const kind = String(entry?.kind || "").toLowerCase();
+    if (kind !== "implementation" && kind !== "feature") return false;
+
+    const text = [
+      entry?.title,
+      entry?.summary,
+      entry?.details,
+    ].filter(Boolean).join("\n").toLowerCase();
+    if (!text.trim()) return false;
+
+    const imperativeScore = [
+      "шаг 1",
+      "шаг 2",
+      "если чего-то не хватает",
+      "добавь ",
+      "добавить ",
+      "создай ",
+      "создать ",
+      "computed ",
+      "const issending",
+      "aria-label",
+      "keydown",
+      "npm run dev",
+      "кнопка отправки",
+      "после textarea",
+    ].reduce((score, token) => score + (text.includes(token) ? 1 : 0), 0);
+
+    return imperativeScore >= 4 || /команды:\s|последний запуск:\s|тесты:\s/i.test(text);
+  }
+
+  private normalizeExecutionTaskFromUserIntent(userMessage: string, executionTask: string): string {
+    const original = String(userMessage || "").trim();
+    const task = String(executionTask || "").trim();
+    if (!original || !task) return task;
+
+    const lowerOriginal = original.toLowerCase();
+    const lowerTask = task.toLowerCase();
+    const isReadOnly = task.includes("[ТОЛЬКО ЧТЕНИЕ");
+    const looksLikeOverprescribedPlan =
+      /шаг 1|шаг 2|если чего-то не хватает|добавь const|computed |aria-label|tailwind|после textarea|event\.key === 'enter'/i.test(task)
+      || task.length > 1400;
+
+    const implementationHints = [
+      "исправь", "исправить", "добавь", "добавить", "сделай", "сделать",
+      "переделать", "реализуй", "реализовать", "перепиши", "создай", "создать",
+      "refactor", "fix", "add", "implement", "make",
+    ];
+    const looksImplementation = implementationHints.some((hint) => lowerOriginal.includes(hint));
+    if (isReadOnly || !looksImplementation || !looksLikeOverprescribedPlan) return task;
+
+    const pathMatches = Array.from(task.matchAll(/\b(?:[a-z0-9_-]+\/)+[a-z0-9_.-]+\b/gi))
+      .map((match) => match[0])
+      .filter((value, index, arr) => arr.indexOf(value) === index);
+    const fileLines = pathMatches.length
+      ? `Файлы:\n- ${pathMatches.join("\n- ")}\n`
+      : "";
+
+    return [
+      `Задача: ${original}`,
+      fileLines.trimEnd(),
+      "Подход:",
+      "- Сначала прочитай текущую реализацию и определи, что уже есть.",
+      "- Если нужное поведение уже реализовано корректно под другими именами или в другой структуре файла, не переписывай код ради совпадения названий.",
+      "- Внеси только недостающие точечные изменения в реальные файлы проекта.",
+      "Ограничения: Не выходить за пределы указанных файлов без необходимости. Не создавать новые файлы и не менять store/API/WebSocket без явной причины.",
+    ].filter(Boolean).join("\n");
   }
 }
