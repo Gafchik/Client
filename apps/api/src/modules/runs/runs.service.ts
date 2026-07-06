@@ -965,6 +965,8 @@ export class RunsService implements OnModuleInit {
         if (isDiagnostics) {
           applyChanges = false;
         }
+        const appliedFilePaths: string[] = [];
+        const failedFileChanges: Array<{ path: string; error: string }> = [];
         if (files && Array.isArray(files) && files.length) {
           if (isDiagnostics) {
             // В диагностике молча игнорируем любые правки — не портим проект
@@ -1006,13 +1008,17 @@ export class RunsService implements OnModuleInit {
               // Раньше throw здесь срывал все 3 попытки, и чат падал в «Ошибка».
               const res = await this.applyFileChange(projectPath, fileChange, applyChanges);
               if (res.ok) {
+                appliedFilePaths.push(String(fileChange.path || '').trim());
                 await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'working', `${verb} файл: ${fileChange.path} (${fileChange.action})`);
               } else {
+                failedFileChanges.push({ path: String(fileChange.path || '').trim(), error: String(res.error || 'unknown') });
                 await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'error', `Не удалось применить ${fileChange.path}: ${res.error}`);
               }
             }
           }
         }
+        (codeChanges as any).appliedFiles = appliedFilePaths;
+        (codeChanges as any).failedFiles = failedFileChanges;
 
         // REVIEWER (code review) — после developer, до tester.
         // Проверяет стили, потенциальные баги, архитектурные риски.
@@ -1267,7 +1273,7 @@ export class RunsService implements OnModuleInit {
             task: run.task,
             status: testResults.passed ? 'success' : 'failed',
             testResults,
-            codeChanges: files?.map((f: any) => f.path) || [],
+            codeChanges: appliedFilePaths,
             executedCommands: Array.isArray((testResults as any)?.tests)
               ? (testResults as any).tests.map((item: any) => item.command).filter(Boolean)
               : [],
@@ -3825,16 +3831,21 @@ ${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на э
     testResults: TestResult,
     rawResponse?: string,
   ): Record<string, unknown> {
-    const filesChanged = Array.isArray((codeChanges as any)?.files)
-      ? (codeChanges as any).files.map((file: any) => String(file?.path || '').trim()).filter(Boolean)
+    const filesChanged = Array.isArray((codeChanges as any)?.appliedFiles)
+      ? (codeChanges as any).appliedFiles.map((file: any) => String(file || '').trim()).filter(Boolean)
       : [];
-    const testResult = testResults?.passed === false ? 'failed' : 'passed';
+    const failedFiles = Array.isArray((codeChanges as any)?.failedFiles)
+      ? (codeChanges as any).failedFiles as Array<{ path?: string; error?: string }>
+      : [];
+    const testResult = testResults?.passed === false || failedFiles.length > 0 ? 'failed' : 'passed';
     const cleanedMessage = String(rawResponse || '').replace(/```[\s\S]*?```/g, '').trim();
     const fallbackMessage = runMode === 'research'
       ? String((spec as any)?.opinion || (spec as any)?.description || (codeChanges as any)?.summary || (testResults as any)?.summary || 'Исследование завершено.')
       : runMode === 'diagnostics'
         ? String((spec as any)?.rootCause || (spec as any)?.description || 'Диагностика завершена.')
-        : String(cleanedMessage || (codeChanges as any)?.summary || 'Работа завершена.');
+        : failedFiles.length > 0
+          ? `Изменения не были применены. Ошибки: ${failedFiles.map((item) => `${item.path}: ${item.error}`).join('; ')}`
+          : String(cleanedMessage || (codeChanges as any)?.summary || 'Работа завершена.');
     const artifact: Record<string, unknown> = {
       mode: runMode,
       message: cleanedMessage || fallbackMessage,
@@ -3868,11 +3879,23 @@ ${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на э
       normalized.summary = String((spec as any)?.description || (codeChanges as any)?.summary || (testResults as any)?.summary || normalized.message || '');
     }
     if (!Array.isArray(normalized.filesChanged)) {
-      normalized.filesChanged = Array.isArray((codeChanges as any)?.files)
-        ? (codeChanges as any).files.map((file: any) => String(file?.path || '').trim()).filter(Boolean)
+      normalized.filesChanged = Array.isArray((codeChanges as any)?.appliedFiles)
+        ? (codeChanges as any).appliedFiles.map((file: any) => String(file || '').trim()).filter(Boolean)
         : [];
     }
-    normalized.testResult = testResults?.passed === false ? 'failed' : 'passed';
+    const failedFiles = Array.isArray((codeChanges as any)?.failedFiles)
+      ? (codeChanges as any).failedFiles as Array<{ path?: string; error?: string }>
+      : [];
+    normalized.testResult = testResults?.passed === false || failedFiles.length > 0 ? 'failed' : 'passed';
+    if (failedFiles.length > 0) {
+      normalized.filesChanged = Array.isArray(normalized.filesChanged) ? normalized.filesChanged : [];
+      if (!normalized.message || /задача выполнена|реализовано|изменена обработка/i.test(String(normalized.message))) {
+        normalized.message = `Изменения не были применены. ${failedFiles.map((item) => `${item.path}: ${item.error}`).join('; ')}`;
+      }
+      if (!normalized.summary || /задача выполнена|реализовано/i.test(String(normalized.summary))) {
+        normalized.summary = `Изменения не применились: ${failedFiles.map((item) => item.path).filter(Boolean).join(', ')}`;
+      }
+    }
     if (!this.shouldIncludeNextSteps(run.task)) {
       normalized.nextSteps = [];
     } else if (!Array.isArray(normalized.nextSteps)) {
