@@ -18,6 +18,8 @@ import {
   normalizePathByProjectSuffix,
   relPathWithinProject,
   cleanupPathsInTask,
+  hasSuspiciousMirroredPath,
+  isUrlLikePath,
 } from '../../shared/path-utils.js';
 
 interface LlmResponse {
@@ -902,9 +904,25 @@ export class RunsService implements OnModuleInit {
 
           const executedDeveloperCommands: Array<{ command: string; success: boolean; output: string; code: number | null }> = [];
           for (const request of requestedCommands) {
-            const cwd = request.cwd
-              ? path.join(projectPath, this.relPathWithinProject(projectPath, request.cwd) || '')
-              : projectPath;
+            const relCwd = request.cwd ? this.relPathWithinProject(projectPath, request.cwd) : '';
+            const cwd = relCwd ? path.join(projectPath, relCwd) : projectPath;
+            const suspiciousNestedCwd =
+              !!relCwd &&
+              /^(apps|packages|services|libs)\/[^/]+$/i.test(relCwd) &&
+              Array.isArray((codeChanges as any).files) &&
+              ((codeChanges as any).files as Array<any>).some((file) => {
+                const p = String(file?.path || '').replace(/\\/g, '/');
+                return p.startsWith('apps/web/') || p.endsWith('.vue');
+              });
+            if (suspiciousNestedCwd) {
+              executedDeveloperCommands.push({
+                command: request.command,
+                success: false,
+                code: null,
+                output: `Blocked suspicious developer CWD "${request.cwd}". Для этой задачи команды должны запускаться из корня выбранного проекта.`,
+              });
+              continue;
+            }
             const result = await this.executeCommandWithApproval(
               runId,
               chatId,
@@ -2346,8 +2364,14 @@ export class RunsService implements OnModuleInit {
     applyChanges = true,
   ): Promise<{ ok: boolean; error?: string }> {
     try {
+      if (isUrlLikePath(fileChange.path) || hasSuspiciousMirroredPath(fileChange.path)) {
+        return { ok: false, error: `Подозрительный путь от агента: ${fileChange.path}` };
+      }
       const relPath = this.relPathWithinProject(projectPath, fileChange.path);
       if (!relPath) return { ok: true };
+      if (hasSuspiciousMirroredPath(relPath)) {
+        return { ok: false, error: `Подозрительный нормализованный путь: ${relPath}` };
+      }
       const fullPath = path.join(projectPath, relPath);
 
       // dry-run: НЕ трогаем диск. Только логируем намерение. Так команда с

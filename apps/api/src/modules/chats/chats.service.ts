@@ -18,7 +18,7 @@ import * as fs from "fs";
 import * as path from "path";
 import {
   cleanupPathsInTask,
-  relPathWithinProject,
+  isUrlLikePath,
 } from "../../shared/path-utils.js";
 
 @Injectable()
@@ -758,6 +758,7 @@ Output schema: {"message":"string","teamSummary":["string"],"shouldExecute":bool
 
     const pathMatches = Array.from(task.matchAll(/\b(?:[a-z0-9_-]+\/)+[a-z0-9_.-]+\b/gi))
       .map((match) => match[0])
+      .filter((value) => !isUrlLikePath(value))
       .filter((value, index, arr) => arr.indexOf(value) === index);
     const fileLines = pathMatches.length
       ? `Файлы:\n- ${pathMatches.join("\n- ")}\n`

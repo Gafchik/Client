@@ -37,6 +37,21 @@ export function stripMirroredProjectPrefixes(projectPath: string, relPath: strin
   return current;
 }
 
+export function isUrlLikePath(value: string): boolean {
+  const v = String(value || '').trim();
+  if (!v) return false;
+  if (/^https?:\/\//i.test(v)) return true;
+  if (/^(localhost|127\.0\.0\.1)(:\d+)?\//i.test(v)) return true;
+  if (/^\d{2,5}\/[a-z0-9_.-]/i.test(v)) return true;
+  return false;
+}
+
+export function hasSuspiciousMirroredPath(value: string): boolean {
+  const normalized = String(value || '').replace(/\\/g, '/');
+  if (!normalized) return false;
+  return /(apps\/api\/){2,}|(apps\/web\/){2,}|apps\/api\/apps\/web\/|apps\/api\/apps\/api\//.test(normalized);
+}
+
 /**
  * Убирает зеркальный префикс типа "apps/api/apps/..." → "..."
  * и проверяет существование файла на диске для выбора правильного варианта.
@@ -46,6 +61,7 @@ export function normalizePathByProjectSuffix(
   relPath: string,
   fsExistsSync: (p: string) => boolean = () => false,
 ): string {
+  if (isUrlLikePath(relPath)) return '';
   const normalized = stripMirroredProjectPrefixes(
     projectPath,
     String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '').trim(),
@@ -97,6 +113,7 @@ export function relPathWithinProject(
 ): string {
   let p = String(relOrAbs || '').trim();
   if (!p) return '';
+  if (isUrlLikePath(p)) return '';
   const normProject = path.resolve(projectPath).replace(/\/+$/, '');
   const projBase = path.basename(normProject);
   // Windows-слеши на всякий случай.
@@ -137,15 +154,15 @@ export function cleanupPathsInTask(
   fsExistsSync: (p: string) => boolean = () => false,
 ): string {
   if (!taskText || !projectPath) return taskText || '';
+  let result = String(taskText);
+  result = result.replace(/(^|\n)\s*-\s*(?:https?:\/\/|localhost:|127\.0\.0\.1:|\d{2,5}\/)[^\n]*/gi, '$1');
 
   // Ищем подозрительные пути с дублированным префиксом: "apps/api/apps/web/..."
   // (модель пишет путь от корня монорепы, повторяя структуру проекта)
   const duplicatePrefixRegex = /\b((?:apps|packages|services|libs)\/[a-zA-Z0-9_-]+\/(?:apps|packages|services|libs)\/[^\s,;:]+)/g;
-
-  let result = taskText;
   const replaced = new Set<string>();
 
-  for (const match of taskText.matchAll(duplicatePrefixRegex)) {
+  for (const match of result.matchAll(duplicatePrefixRegex)) {
     const original = match[0];
     if (replaced.has(original)) continue;
 
@@ -161,7 +178,7 @@ export function cleanupPathsInTask(
 
   for (const match of result.matchAll(genericPathRegex)) {
     const original = match[0];
-    if (/^https?:\/\//i.test(original)) continue;
+    if (isUrlLikePath(original)) continue;
     if (replaced.has(original)) continue;
 
     const cleaned = relPathWithinProject(projectPath, original, fsExistsSync);
