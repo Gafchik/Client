@@ -139,10 +139,11 @@ export interface RunItem {
 
 export interface RunApproval {
   id: string;
-  kind: "command" | "migration";
+  kind: "command" | "migration" | "clarification";
   role: string;
   title: string;
   description: string;
+  questions?: string[];
   command?: string;
   cwd?: string;
   // Для миграций: какая миграция и что делает.
@@ -153,6 +154,7 @@ export interface RunApproval {
   createdAt: string;
   resolvedAt?: string | null;
   reason?: string | null;
+  resolution?: "approve" | "reject_skip" | "reject_cancel" | null;
 }
 
 

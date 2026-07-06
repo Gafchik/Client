@@ -6,7 +6,7 @@ import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMe
 
 type StreamItem = {
   id: string;
-  type: 'user' | 'assistant' | 'system' | 'agent-status' | 'run-summary' | 'token-summary';
+  type: 'user' | 'assistant' | 'system' | 'agent-status' | 'agent-brief' | 'run-summary' | 'token-summary';
   role?: string;
   name?: string;
   label?: string;
@@ -144,6 +144,8 @@ const pendingApprovals = computed(() => {
   }
   return approvals;
 });
+const pendingClarifications = computed(() => pendingApprovals.value.filter((item) => item.kind === "clarification"));
+const pendingActionApprovals = computed(() => pendingApprovals.value.filter((item) => item.kind !== "clarification"));
 
 // Активный прогон — тот, что сейчас крутится агентами (running) или стоит на
 // паузе (paused) и ждёт resume. Раньше «стоп/продолжить» были невозможны:
@@ -153,12 +155,12 @@ const activeRun = computed<RunItem | null>(() => {
   if (!state.selectedRunId) return null;
   const run = state.runs.find((r) => r.id === state.selectedRunId);
   if (!run) return null;
-  if (["queued", "running", "paused", "awaiting_approval"].includes(run.status)) return run;
+  if (["queued", "running", "paused", "awaiting_approval", "waiting_approval"].includes(run.status)) return run;
   return null;
 });
 const isRunActive = computed(() => activeRun.value?.status === "running" || activeRun.value?.status === "queued");
 const isRunPaused = computed(() => activeRun.value?.status === "paused");
-const isRunAwaiting = computed(() => activeRun.value?.status === "awaiting_approval" || pendingApprovals.value.length > 0);
+const isRunAwaiting = computed(() => activeRun.value?.status === "awaiting_approval" || activeRun.value?.status === "waiting_approval" || pendingApprovals.value.length > 0);
 
 // Человекочитаемый бейдж статуса агента для панели управления.
 const runStatusLabel = computed(() => {
@@ -166,7 +168,7 @@ const runStatusLabel = computed(() => {
   if (s === "running") return "Работает";
   if (s === "queued") return "В очереди";
   if (s === "paused") return "На паузе";
-  if (s === "awaiting_approval") return "Ждёт разрешения";
+  if (s === "awaiting_approval" || s === "waiting_approval") return "Ждёт ответа";
   if (s === "completed" || s === "done") return "Завершено";
   if (s === "failed") return "Ошибка";
   if (s === "cancelled") return "Остановлено";
@@ -205,6 +207,21 @@ const unifiedChatStream = computed(() => {
           meta: msg.meta 
         });
       }
+    } else if (msg.meta?.type === 'agent-brief') {
+      const usage = msg.meta?.usage;
+      const meta = msg.meta as any;
+      stream.push({
+        id: msg.id,
+        type: 'agent-brief',
+        role: usage?.role || meta.agentRole || 'assistant',
+        agentRole: meta.agentRole,
+        name: meta.agentName || usage?.name || 'Alex',
+        label: meta.agentLabel || usage?.label || 'Оркестратор',
+        content: String(msg.content ?? ''),
+        createdAt: msg.createdAt,
+        meta: msg.meta,
+        status: meta.status,
+      });
     } else {
       const orchPayload = msg.meta?.orchestratorPayload;
       const usage = msg.meta?.usage;
@@ -361,7 +378,7 @@ const AGENT_DISPLAY: Record<string, { name: string; letter: string; cls: string;
   orchestrator: { name: 'Alex (Оркестратор)', letter: 'A', cls: 'orchestrator', placeholder: 'Анализирую задачу и планирую работу команды…' },
   analyst: { name: 'Mira (Аналитик)', letter: 'M', cls: 'analyst', placeholder: 'Изучаю код и составляю техническое задание…' },
   developer: { name: 'Kai (Разработчик)', letter: 'K', cls: 'developer', placeholder: 'Пишу код и применяю изменения…' },
-  tester: { name: 'Nova (Тестировщик)', letter: 'N', cls: 'tester', placeholder: 'Проверяю изменения…' },
+  tester: { name: 'Nova (Верификатор)', letter: 'N', cls: 'tester', placeholder: 'Проверяю изменения…' },
 };
 function agentDisplay(role: string) { return AGENT_DISPLAY[role] || AGENT_DISPLAY.orchestrator; }
 
@@ -412,10 +429,10 @@ const streamingDisplayContent = computed(() => {
   return text || agentDisplay(state.streamingMessage.role).placeholder;
 });
 
-function formatActivityEntry(entry: { at: string; event: string; payload?: unknown }) { const actor = eventActor(entry.payload); if (entry.event === "agent:activity") return `${actor.agentName} (${actor.label}): ${actor.detail}`; if (entry.event === "agent:retry") return `${actor.agentName} (${actor.label}): ответ не распарсился, автоповтор ${actor.attempt || "?"}/3`; if (entry.event === "agent:retry-success") return `${actor.agentName} (${actor.label}): прислал валидный JSON, выполнение продолжено`; if (entry.event === "agent:note") return `${actor.agentName} (${actor.label}): ${actor.detail}`; if (entry.event === "agent:done") return `${actor.agentName} (${actor.label}): завершил этап`; if (entry.event === "agent:skipped") return `${actor.agentName} (${actor.label}): сейчас не задействован`; if (entry.event === "developer:empty-operations") return `${actor.agentName} (${actor.label}): не вернул правки, получает повторную задачу`; if (entry.event === "run:blocked") return `${actor.agentName} (${actor.label}): прогон остановлен, нет реальных правок`; if (entry.event === "file:processing") { const p = entry.payload as { path?: string; action?: string }; return `Разработчик: ${p?.action === "create" ? "создаёт" : "обновляет"} файл ${p?.path || "-"}`; } if (entry.event === "file:applied") { const p = entry.payload as { path?: string; action?: string }; return `Разработчик: ${p?.action === "create" ? "создал" : "обновил"} файл ${p?.path || "-"}`; } if (entry.event === "file:skipped") { const p = entry.payload as { path?: string; reason?: string }; return `Разработчик: пропустил файл ${p?.path || "-"} (${p?.reason || "без причины"})`; } if (entry.event === "files:applied") return "Разработчик применил изменения к файлам"; if (entry.event === "test:started") { const p = entry.payload as { command?: string }; return `Тестировщик: запускает "${p?.command || ""}"`; } if (entry.event === "test:finished") { const p = entry.payload as { command?: string; success?: boolean; code?: number }; return `Тестировщик: ${p?.success ? "успешно завершил" : "завершил с ошибкой"} "${p?.command || ""}" (code ${p.code ?? "-"})`; } if (entry.event === "tests:done") return "Тестировщик завершил проверку"; if (entry.event === "tests:skipped") return "Проверка тестировщиком была пропущена"; return `Событие: ${entry.event}`; }
-function avatarColor(role: string): string { const colors: Record<string, string> = { orchestrator: '#6366f1', pm: '#6366f1', analyst: '#10b981', researcher: '#10b981', developer: '#f59e0b', coder: '#f59e0b', tester: '#ef4444', system: '#6b7280', user: '#3b82f6' }; return colors[role] || colors.system; }
+function formatActivityEntry(entry: { at: string; event: string; payload?: unknown }) { const actor = eventActor(entry.payload); if (entry.event === "agent:activity") return `${actor.agentName} (${actor.label}): ${actor.detail}`; if (entry.event === "agent:retry") return `${actor.agentName} (${actor.label}): ответ не распарсился, автоповтор ${actor.attempt || "?"}/3`; if (entry.event === "agent:retry-success") return `${actor.agentName} (${actor.label}): прислал валидный JSON, выполнение продолжено`; if (entry.event === "agent:note") return `${actor.agentName} (${actor.label}): ${actor.detail}`; if (entry.event === "agent:done") return `${actor.agentName} (${actor.label}): завершил этап`; if (entry.event === "agent:skipped") return `${actor.agentName} (${actor.label}): сейчас не задействован`; if (entry.event === "developer:empty-operations") return `${actor.agentName} (${actor.label}): не вернул правки, получает повторную задачу`; if (entry.event === "run:blocked") return `${actor.agentName} (${actor.label}): прогон остановлен, нет реальных правок`; if (entry.event === "file:processing") { const p = entry.payload as { path?: string; action?: string }; return `Разработчик: ${p?.action === "create" ? "создаёт" : "обновляет"} файл ${p?.path || "-"}`; } if (entry.event === "file:applied") { const p = entry.payload as { path?: string; action?: string }; return `Разработчик: ${p?.action === "create" ? "создал" : "обновил"} файл ${p?.path || "-"}`; } if (entry.event === "file:skipped") { const p = entry.payload as { path?: string; reason?: string }; return `Разработчик: пропустил файл ${p?.path || "-"} (${p?.reason || "без причины"})`; } if (entry.event === "files:applied") return "Разработчик применил изменения к файлам"; if (entry.event === "test:started") { const p = entry.payload as { command?: string }; return `Верификатор: запускает "${p?.command || ""}"`; } if (entry.event === "test:finished") { const p = entry.payload as { command?: string; success?: boolean; code?: number }; return `Верификатор: ${p?.success ? "успешно завершил" : "завершил с ошибкой"} "${p?.command || ""}" (code ${p.code ?? "-"})`; } if (entry.event === "tests:done") return "Верификатор завершил проверку"; if (entry.event === "tests:skipped") return "Проверка верификатором была пропущена"; return `Событие: ${entry.event}`; }
+function avatarColor(role: string): string { const colors: Record<string, string> = { orchestrator: '#6366f1', pm: '#6366f1', analyst: '#10b981', researcher: '#10b981', developer: '#f59e0b', coder: '#f59e0b', tester: '#ef4444', reviewer: '#8b5cf6', system: '#6b7280', user: '#3b82f6' }; return colors[role] || colors.system; }
 function agentInitial(item: any): string { const name = item.name || item.label || '?'; return name.charAt(0).toUpperCase(); }
-function messageName(item: any): string { if (item.type === 'user') return 'Вы'; if (item.type === 'assistant' || item.type === 'run-summary') return `${item.name || 'Alex'} (${item.label || 'Оркестратор'})`; if (item.type === 'agent-status') return `${item.name || 'Agent'} (${item.label || item.agentRole})`; if (item.type === 'system') return 'Система'; if (item.type === 'token-summary') return 'Токены'; return 'Неизвестно'; }
+function messageName(item: any): string { if (item.type === 'user') return 'Вы'; if (item.type === 'assistant' || item.type === 'agent-brief' || item.type === 'run-summary') return `${item.name || 'Alex'} (${item.label || 'Оркестратор'})`; if (item.type === 'agent-status') return `${item.name || 'Agent'} (${item.label || item.agentRole})`; if (item.type === 'system') return 'Система'; if (item.type === 'token-summary') return 'Токены'; return 'Неизвестно'; }
 function formatMessageContent(item: any): string {
   if (!item.content) return '';
   const content = String(item.content).replace(/\\n/g, '\n');
@@ -478,7 +495,7 @@ async function loadInitialData() {
 }
 
 async function refreshChats(projectId?: string, preferredChatId?: string) { if (!projectId) { state.chats = []; state.selectedChatId = ""; state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; return; } const response = await api.chats(projectId); state.chats = response.chats; const targetChatId = (preferredChatId && state.chats.some(c => c.id === preferredChatId)) ? preferredChatId : state.chats[0]?.id || ""; state.selectedChatId = targetChatId; if (state.selectedChatId) await openChat(state.selectedChatId); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } }
-async function openChat(id: string) { state.selectedChatId = id; isLoadingChat = true; const response = await api.chatById(id); state.messages = response.messages; state.chatRuns = response.runs; state.chatStats = response.stats; state.runEvents = []; state.runError = ""; state.report = null; state.runStatus = ""; clearAgentLogs(); await nextTick(); isLoadingChat = false; shouldAutoScroll = true; userHasScrolled = false; scheduleScrollToBottom("auto"); }
+async function openChat(id: string) { state.selectedChatId = id; isLoadingChat = true; const response = await api.chatById(id); state.messages = response.messages; state.chatRuns = response.runs; state.chatStats = response.stats; const persistedActiveRun = response.runs.find((run) => ["queued", "running", "paused", "awaiting_approval", "waiting_approval"].includes(run.status)); if (persistedActiveRun) { state.selectedRunId = persistedActiveRun.id; await openRun(persistedActiveRun.id); if (["queued", "running", "awaiting_approval", "waiting_approval"].includes(persistedActiveRun.status)) startPolling(persistedActiveRun.id); } else { state.runEvents = []; state.runError = ""; state.report = null; state.runStatus = ""; } clearAgentLogs(); await nextTick(); isLoadingChat = false; shouldAutoScroll = true; userHasScrolled = false; scheduleScrollToBottom("auto"); }
 async function openRun(id: string) { state.selectedRunId = id; const response = await api.runById(id); state.report = response.report; state.runStatus = response.run.status; state.runEvents = response.run.events ?? []; state.runError = response.run.error ?? ""; }
 
 function showToast(type: 'success' | 'error' | 'info', message: string) { const id = ++toastId; state.toasts.push({ id, type, message }); setTimeout(() => { const idx = state.toasts.findIndex(t => t.id === id); if (idx !== -1) state.toasts.splice(idx, 1); }, 4000); }
@@ -618,21 +635,36 @@ function copyMessage(text: string) { if (!text) return; navigator.clipboard.writ
 async function resolveApproval(approval: RunApproval, resolution: "approve" | "reject_skip" | "reject_cancel") {
   if (!state.selectedRunId || state.resolvingApprovalId) return;
   state.resolvingApprovalId = approval.id;
-  const reason = (state.approvalDrafts[approval.id] || "").trim();
-  const approved = resolution === "approve";
+  let reason = (state.approvalDrafts[approval.id] || "").trim();
+  let effectiveResolution = resolution;
+  let approved = resolution === "approve";
+  if (approval.kind === "clarification") {
+    if (!reason || reason === "+") {
+      approved = true;
+      effectiveResolution = "approve";
+      reason = "";
+    } else if (reason === "-") {
+      approved = false;
+      effectiveResolution = "reject_skip";
+      reason = "";
+    } else {
+      approved = true;
+      effectiveResolution = "approve";
+    }
+  }
   try {
-    const response = await api.resolveRunApproval(state.selectedRunId, approval.id, approved, reason, resolution);
+    const response = await api.resolveRunApproval(state.selectedRunId, approval.id, approved, reason, effectiveResolution);
     if (!response.ok) throw new Error(response.reason || "Не удалось обработать разрешение");
     // Очищаем черновик комментария для этого запроса.
     delete state.approvalDrafts[approval.id];
-    if (resolution === "reject_cancel") {
+    if (effectiveResolution === "reject_cancel") {
       showToast('info', 'Работа отменена');
       // Поллинг сам подхватит завершение; на всякий случай снимаем busy.
       state.busy = false;
-    } else if (resolution === "approve") {
-      showToast('success', reason ? 'Разрешение выдано с указанием' : 'Разрешение выдано');
+    } else if (effectiveResolution === "approve") {
+      showToast('success', approval.kind === "clarification" ? (reason ? 'Ответ отправлен' : 'Подтверждено без уточнений') : (reason ? 'Разрешение выдано с указанием' : 'Разрешение выдано'));
     } else {
-      showToast('success', 'Шаг пропущен, работа продолжается');
+      showToast('success', approval.kind === "clarification" ? 'Уточнение отклонено, работа продолжится без него' : 'Шаг пропущен, работа продолжается');
     }
     const job = await api.job(state.selectedRunId);
     state.runStatus = job.status;
@@ -921,8 +953,43 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
         </div>
       </div>
 
-      <div v-if="pendingApprovals.length" class="approval-stack">
-        <div v-for="approval in pendingApprovals" :key="approval.id" class="approval-card">
+      <div v-if="pendingClarifications.length" class="approval-stack">
+        <div v-for="approval in pendingClarifications" :key="approval.id" class="approval-card clarification-card">
+          <div class="approval-card-header">
+            <div>
+              <div class="approval-card-title">{{ approval.title }}</div>
+              <div class="approval-card-subtitle">{{ approval.role }} ждёт ответ пользователя, чтобы продолжить работу</div>
+            </div>
+            <span class="approval-badge">Уточнение · Ждёт ответа</span>
+          </div>
+          <div class="approval-card-body">
+            <p class="approval-description">{{ approval.description }}</p>
+            <div class="approval-meta">
+              <div v-for="(question, index) in approval.questions || []" :key="`${approval.id}-q-${index}`" class="clarification-question">
+                <span class="clarification-index">{{ index + 1 }}.</span>
+                <span>{{ question }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="approval-comment">
+            <textarea class="approval-comment-input" :value="approvalDraft(approval.id)" @input="setApprovalDraft(approval.id, ($event.target as HTMLTextAreaElement).value)" rows="3" placeholder="Ответ пользователю. Пусто или «+» = да, «-» = нет…"></textarea>
+          </div>
+          <div class="approval-actions">
+            <button class="btn btn-danger" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, 'reject_cancel')">
+              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Отменить работу" }}
+            </button>
+            <button class="btn btn-ghost" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, 'reject_skip')">
+              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Нет" }}
+            </button>
+            <button class="btn btn-primary" :disabled="state.resolvingApprovalId === approval.id" @click="resolveApproval(approval, 'approve')">
+              {{ state.resolvingApprovalId === approval.id ? "Обрабатываю..." : "Ответить" }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="pendingActionApprovals.length" class="approval-stack">
+        <div v-for="approval in pendingActionApprovals" :key="approval.id" class="approval-card">
           <div class="approval-card-header">
             <div>
               <div class="approval-card-title">{{ approval.title }}</div>
@@ -1080,6 +1147,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .chat-composer { padding:16px 20px; border-top:1px solid var(--line); background:var(--panel); }
 .approval-stack { max-width:980px; margin:0 auto 12px; display:flex; flex-direction:column; gap:10px; width:100%; }
 .approval-card { border:1px solid rgba(245, 158, 11, 0.28); background:rgba(245, 158, 11, 0.08); border-radius:12px; padding:14px; }
+.clarification-card { border-color: rgba(99, 102, 241, 0.28); background: rgba(99, 102, 241, 0.08); }
 .approval-card-header { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:10px; }
 .approval-card-title { font-size:14px; font-weight:600; color:var(--text); }
 .approval-card-subtitle { font-size:12px; color:var(--muted); margin-top:4px; }
@@ -1100,15 +1168,17 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .approval-comment-input { width:100%; min-height:44px; max-height:120px; padding:10px 12px; border-radius:10px; border:1px solid rgba(245,158,11,.22); background:rgba(0,0,0,.18); color:var(--text); font:inherit; font-size:13px; resize:vertical; line-height:1.5; }
 .approval-comment-input:focus { outline:none; border-color:#f59e0b; }
 .approval-comment-input::placeholder { color:var(--muted); }
+.clarification-question { display:flex; gap:8px; align-items:flex-start; font-size:13px; color:var(--text); line-height:1.5; }
+.clarification-index { color:var(--muted); min-width:18px; }
 
 /* Панель управления агентом: статус + кнопки Стоп/Пауза/Продолжить/Новая задача. */
 .agent-control-bar { display:flex; align-items:center; justify-content:space-between; gap:12px; max-width:980px; margin:0 auto 8px; width:100%; padding:8px 14px; border-radius:12px; border:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
 .agent-control-bar.running, .agent-control-bar.queued { border-color:rgba(245,158,11,.32); background:rgba(245,158,11,.06); }
 .agent-control-bar.paused { border-color:rgba(99,102,241,.32); background:rgba(99,102,241,.06); }
-.agent-control-bar.awaiting_approval { border-color:rgba(245,158,11,.32); background:rgba(245,158,11,.06); }
+.agent-control-bar.awaiting_approval, .agent-control-bar.waiting_approval { border-color:rgba(245,158,11,.32); background:rgba(245,158,11,.06); }
 .agent-control-status { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text); flex-wrap:wrap; }
 .agent-control-dot { width:9px; height:9px; border-radius:50%; background:#6b7280; flex-shrink:0; }
-.agent-control-dot.running, .agent-control-dot.queued, .agent-control-dot.awaiting_approval { background:#f59e0b; animation:pulse 1.5s infinite; }
+.agent-control-dot.running, .agent-control-dot.queued, .agent-control-dot.awaiting_approval, .agent-control-dot.waiting_approval { background:#f59e0b; animation:pulse 1.5s infinite; }
 .agent-control-dot.paused { background:#6366f1; }
 .agent-control-label { font-weight:600; }
 .agent-control-hint { font-size:12px; color:var(--muted); }

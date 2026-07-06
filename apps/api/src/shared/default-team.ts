@@ -1,4 +1,4 @@
-export const ROLE_ORDER = ["orchestrator", "analyst", "developer", "reviewer", "tester"] as const;
+export const ROLE_ORDER = ["orchestrator", "analyst", "developer", "tester", "reviewer"] as const;
 
 /** Tool kinds that can be requested during a run */
 export type ToolKind = "file_read" | "file_write" | "shell" | "migration" | "search";
@@ -11,22 +11,23 @@ export interface RoleToolPolicy {
 
 export const ROLE_TOOL_POLICIES: Record<string, RoleToolPolicy> = {
   orchestrator: {
-    allowed: ["file_read", "file_write", "shell", "migration", "search"],
+    allowed: ["file_read", "search"],
+    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree"],
   },
   analyst: {
     allowed: ["file_read", "search"],
-    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree"],
+    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "rg"],
   },
   developer: {
     allowed: ["file_read", "file_write", "shell", "migration", "search"],
   },
-  reviewer: {
-    allowed: ["file_read", "search"],
-    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "git diff", "git log", "git show"],
-  },
   tester: {
     allowed: ["file_read", "shell", "search"],
-    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "npm test", "npm run test", "npx jest", "npx vitest", "npx playwright test", "git diff", "git log"],
+    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "rg", "npm test", "npm run test", "npx jest", "npx vitest", "npx playwright test", "git diff", "git log"],
+  },
+  reviewer: {
+    allowed: ["file_read", "search"],
+    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "rg", "git diff", "git log", "git show"],
   },
 };
 
@@ -37,7 +38,7 @@ export function createDefaultTeam(name = "Core Team") {
   return {
     id: `team-${Date.now()}`,
     name,
-    description: "Базовая команда: оркестратор -> аналитик -> разработчик -> ревьюер -> тестировщик",
+    description: "Дисциплинированная команда для сложного кода: оркестратор маршрутизирует, аналитик сжимает контекст, разработчик меняет только реальный код, верификатор проверяет фактами и возвращает баг назад.",
     language: "ru",
     budget: {
       dailyWeightedTokens: 50000000,
@@ -87,34 +88,34 @@ export function createDefaultTeam(name = "Core Team") {
       orchestrator: {
         name: "Alex",
         label: "Оркестратор",
-        model: "openai/gpt-5.4-mini",
-        multiplier: 0.8,
-        temperature: 0.2,
+        model: "deepseek/deepseek-v3.2",
+        multiplier: 0.5,
+        temperature: 0.05,
       },
       analyst: {
         name: "Mira",
-        label: "Бизнес-аналитик",
+        label: "Аналитик",
         model: "deepseek/deepseek-v4-pro",
         multiplier: 0.7,
-        temperature: 0.2,
+        temperature: 0.1,
       },
       developer: {
         name: "Kai",
         label: "Разработчик",
-        model: "openai/gpt-5.4-mini",
-        multiplier: 0.8,
-        temperature: 0.15,
-      },
-      reviewer: {
-        name: "Lex",
-        label: "Ревьюер",
-        model: "deepseek/deepseek-v4-flash",
-        multiplier: 0.5,
-        temperature: 0.1,
+        model: "deepseek/deepseek-v4-pro",
+        multiplier: 0.7,
+        temperature: 0.05,
       },
       tester: {
         name: "Nova",
-        label: "Тестировщик",
+        label: "Верификатор",
+        model: "deepseek/deepseek-v4-flash",
+        multiplier: 0.5,
+        temperature: 0.05,
+      },
+      reviewer: {
+        name: "Lex",
+        label: "Критик",
         model: "deepseek/deepseek-v4-flash",
         multiplier: 0.5,
         temperature: 0.1,
