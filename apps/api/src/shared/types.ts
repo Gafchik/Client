@@ -1,3 +1,5 @@
+export type ExecutionRole = 'pm' | 'developer' | 'reviewer' | 'tester';
+
 export interface TeamConfig {
   language: string;
   budget: {

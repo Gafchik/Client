@@ -3,7 +3,7 @@ import type { ChatMessage } from "../types";
 // ---- Метаданные агентов для отрисовки аватаров/имен --------------------------
 export const AGENT_DISPLAY: Record<string, { name: string; letter: string; cls: string; placeholder: string }> = {
   orchestrator: { name: "Alex (Оркестратор)", letter: "A", cls: "orchestrator", placeholder: "Анализирую задачу и планирую работу команды…" },
-  analyst: { name: "Mira (Аналитик)", letter: "M", cls: "analyst", placeholder: "Изучаю код и составляю техническое задание…" },
+  pm: { name: "Mira (PM)", letter: "M", cls: "pm", placeholder: "Изучаю код и составляю техническое задание…" },
   developer: { name: "Kai (Разработчик)", letter: "K", cls: "developer", placeholder: "Пишу код и применяю изменения…" },
   tester: { name: "Nova (Тестировщик)", letter: "N", cls: "tester", placeholder: "Проверяю изменения…" },
 };
@@ -16,7 +16,6 @@ export function avatarColor(role: string): string {
   const colors: Record<string, string> = {
     orchestrator: "#6366f1",
     pm: "#6366f1",
-    analyst: "#10b981",
     researcher: "#10b981",
     developer: "#f59e0b",
     coder: "#f59e0b",
@@ -72,7 +71,7 @@ export function extractReadableText(role: string, raw: string): string {
   if (role === "orchestrator") {
     return extractJsonField(raw, "message") || "";
   }
-  if (role === "analyst") {
+  if (role === "pm") {
     return extractJsonField(raw, "description") || extractJsonField(raw, "feature") || "";
   }
   if (role === "tester") {

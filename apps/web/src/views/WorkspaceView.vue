@@ -114,7 +114,7 @@ const EMPTY_AGENTS = {
   orchestrator: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 },
   developer: { name: "", label: "", model: "", multiplier: 1, temperature: 0.15 },
   tester: { name: "", label: "", model: "", multiplier: 1, temperature: 0.1 },
-  analyst: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 },
+  pm: { name: "", label: "", model: "", multiplier: 1, temperature: 0.2 },
 };
 function emptyTeam(): Team {
   return {
@@ -410,7 +410,7 @@ function canShowAgentMeta(item: StreamItem): boolean {
 // в привычных AI-чатах.
 const AGENT_DISPLAY: Record<string, { name: string; letter: string; cls: string; placeholder: string }> = {
   orchestrator: { name: 'Alex (Оркестратор)', letter: 'A', cls: 'orchestrator', placeholder: 'Анализирую задачу и планирую работу команды…' },
-  analyst: { name: 'Mira (Аналитик)', letter: 'M', cls: 'analyst', placeholder: 'Изучаю код и составляю техническое задание…' },
+  pm: { name: 'Mira (PM)', letter: 'M', cls: 'pm', placeholder: 'Изучаю код и составляю техническое задание…' },
   developer: { name: 'Kai (Разработчик)', letter: 'K', cls: 'developer', placeholder: 'Пишу код и применяю изменения…' },
   tester: { name: 'Nova (Верификатор)', letter: 'N', cls: 'tester', placeholder: 'Проверяю изменения…' },
 };
@@ -444,7 +444,7 @@ function extractReadableText(role: string, raw: string): string {
   if (role === 'orchestrator') {
     return extractJsonField(raw, 'message') || '';
   }
-  if (role === 'analyst') {
+  if (role === 'pm') {
     return extractJsonField(raw, 'description') || extractJsonField(raw, 'feature') || '';
   }
   if (role === 'tester') {
@@ -835,7 +835,7 @@ function handleWsMessage(msg: any) {
   if (msg.event === "token:stream") { 
     const { role, content, done, usage } = msg.data; 
     // Only show streaming for conversation mode (orchestrator), not for run execution agents
-    const isRunExecution = state.runStatus === 'running' && ['orchestrator', 'analyst', 'developer', 'tester'].includes(role);
+    const isRunExecution = state.runStatus === 'running' && ['orchestrator', 'pm', 'developer', 'tester'].includes(role);
     if (done) { 
       state.streamingMessage = null; 
       // If this was a conversation response (not run execution), the final message will be loaded via openChat
@@ -1215,7 +1215,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .message-avatar.orchestrator { background:#6366f1; }
 .message-avatar.developer { background:#f59e0b; }
 .message-avatar.tester { background:#ef4444; }
-.message-avatar.analyst { background:#10b981; }
+.message-avatar.pm { background:#10b981; }
 .message-avatar.system { background:#6b7280; }
 .message-avatar.user { background:#3b82f6; }
 .message-bubble { flex:1; min-width:0; max-width:min(760px, calc(100% - 56px)); padding:14px 16px 12px; border-radius:18px; border:1px solid var(--line); background:rgba(255,255,255,.02); box-shadow:0 1px 0 rgba(255,255,255,.02) inset; }
