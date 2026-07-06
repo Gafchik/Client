@@ -804,6 +804,18 @@ export class RunsService implements OnModuleInit {
           spec = (analystResult.artifact || {}) as Record<string, unknown>;
           analystWorked = true;
           await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'done', this.buildAnalystDoneStatus(plan, runMode));
+          // Сохраняем ТЗ аналитика как сообщение в чат, чтобы оно персистило
+          // и не исчезало при перезагрузке страницы.
+          const analystRawText = String(analystResult.rawResponse || '').trim();
+          if (analystRawText) {
+            await this.chatsService.addMessage(chatId, 'assistant', analystRawText, {
+              type: 'agent-brief',
+              role: 'analyst',
+              name: anName,
+              label: anLabel,
+              runId,
+            } as Record<string, unknown>);
+          }
           await this.saveProjectMemory(projectId, chatId, spec, language, runMode, runId);
         } else {
           await this.broadcastActivity(runId, chatId, 'analyst', anName, anLabel, 'done', `Этап пропущен: ${plan.roles.analyst.reason}`);
