@@ -2933,12 +2933,13 @@ PATCH_END
       if (!projectPath || !fs.existsSync(projectPath)) {
         return 'Проект недоступен для индексации (путь не существует).';
       }
-      const ignoreDirs = new Set(Array.isArray(workspace?.ignoreDirs) ? workspace.ignoreDirs : ['.git', 'node_modules', 'dist', 'build']);
+      const ignoreDirs = new Set(Array.isArray(workspace?.ignoreDirs) ? workspace.ignoreDirs : ['.git', 'node_modules', 'dist', 'build', 'vendor', 'bower_components', '__pycache__', '.venv', 'venv', '.env']);
+      const deepIgnoreDirs = new Set(['node_modules', 'vendor', 'bower_components', '__pycache__', '.venv', 'venv', '.env']);
       const includeExts = Array.isArray(workspace?.includeExtensions) && workspace.includeExtensions.length
         ? new Set(workspace.includeExtensions)
         : null;
 
-      const collected: Array<{ rel: string; size: number }> = [];
+      const collected: Array<{ abs: string; rel: string; size: number }> = [];
       const walk = (absDir: string, relDir: string, depth: number) => {
         if (collected.length >= maxFiles || depth > 6) return;
         let entries: fs.Dirent[];
@@ -2954,15 +2955,18 @@ PATCH_END
           const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
           if (entry.isDirectory()) {
             if (ignoreDirs.has(entry.name)) continue;
+            if (deepIgnoreDirs.has(entry.name)) continue;
             walk(path.join(absDir, entry.name), rel, depth + 1);
           } else {
             if (includeExts) {
               const ext = path.extname(entry.name).toLowerCase();
               if (ext && !includeExts.has(ext)) continue;
             }
+            // Пропускаем файлы, лежащие внутри deep-директорий (на случай если ignoreDirs не сработал)
+            if (rel.split('/').some(seg => deepIgnoreDirs.has(seg))) continue;
             try {
               const stat = fs.statSync(path.join(absDir, entry.name));
-              collected.push({ rel, size: stat.size });
+              collected.push({ abs: path.join(absDir, entry.name), rel, size: stat.size });
             } catch { }
             if (collected.length >= maxFiles) break;
           }
@@ -2970,15 +2974,144 @@ PATCH_END
       };
       walk(projectPath, '', 0);
 
-      if (!collected.length) return 'В проекте нет файлов по выбранным расширениям.';
-      const lines = collected.map(f => {
-        const kb = f.size > 1024 ? `${(f.size / 1024).toFixed(1)}KB` : `${f.size}B`;
-        return `${f.rel}  (${kb})`;
-      });
-      return `Найдено ${collected.length} файлов (показаны первые ${maxFiles}):\n${lines.join('\n')}`;
+      // Зависимости из манифестов
+      const deps = this.readDependencyManifests(projectPath);
+
+      if (!collected.length && !deps) return 'В проекте нет файлов по выбранным расширениям.';
+      const lines: string[] = [];
+      if (collected.length) {
+        lines.push(`Найдено ${collected.length} файлов (показаны первые ${maxFiles}):`);
+        for (const f of collected) {
+          const kb = f.size > 1024 ? `${(f.size / 1024).toFixed(1)}KB` : `${f.size}B`;
+          lines.push(`${f.abs}  (${kb})`);
+        }
+      }
+      if (deps) {
+        lines.push('');
+        lines.push(deps);
+      }
+      return lines.join('\n');
     } catch (error) {
       return `Не удалось проиндексировать проект: ${error instanceof Error ? error.message : String(error)}`;
     }
+  }
+
+  /**
+   * Читает манифесты зависимостей (package.json, composer.json, go.mod, Cargo.toml, pom.xml и т.п.)
+   * и извлекает список ключевых зависимостей, чтобы агенты понимали стек проекта.
+   */
+  private readDependencyManifests(projectPath: string): string | null {
+    const manifests: Array<{ file: string; parse: (raw: string) => Record<string, string> | null }> = [
+      {
+        file: 'package.json',
+        parse: (raw) => {
+          try {
+            const pkg = JSON.parse(raw) as any;
+            const deps: Record<string, string> = {};
+            for (const field of ['dependencies', 'devDependencies', 'peerDependencies']) {
+              if (pkg[field] && typeof pkg[field] === 'object') Object.assign(deps, pkg[field]);
+            }
+            return Object.keys(deps).length ? deps : null;
+          } catch { return null; }
+        },
+      },
+      {
+        file: 'composer.json',
+        parse: (raw) => {
+          try {
+            const pkg = JSON.parse(raw) as any;
+            const deps: Record<string, string> = {};
+            if (pkg.require && typeof pkg.require === 'object') Object.assign(deps, pkg.require);
+            if (pkg['require-dev'] && typeof pkg['require-dev'] === 'object') Object.assign(deps, pkg['require-dev']);
+            return Object.keys(deps).length ? deps : null;
+          } catch { return null; }
+        },
+      },
+      {
+        file: 'go.mod',
+        parse: (raw) => {
+          const deps: Record<string, string> = {};
+          for (const line of raw.split('\n')) {
+            const m = line.match(/^\s*require\s+(\S+)\s+(\S+)/);
+            if (m) deps[m[1]] = m[2];
+            // Также строки в блоке require (...)
+            const inline = line.match(/^\t(\S+)\s+(\S+)/);
+            if (inline) deps[inline[1]] = inline[2];
+          }
+          return Object.keys(deps).length ? deps : null;
+        },
+      },
+      {
+        file: 'requirements.txt',
+        parse: (raw) => {
+          const deps: Record<string, string> = {};
+          for (const line of raw.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('-')) continue;
+            const m = trimmed.match(/^([^=<>!~]+)([<>=!~]=.*)?$/);
+            if (m) deps[m[1].trim()] = (m[2] || '').trim();
+          }
+          return Object.keys(deps).length ? deps : null;
+        },
+      },
+      {
+        file: 'Gemfile',
+        parse: (raw) => {
+          const deps: Record<string, string> = {};
+          const rgx = /gem\s+['"]([^'"]+)['"]\s*,?\s*(['"]([^'"]*)['"])?/g;
+          let m: RegExpExecArray | null;
+          while ((m = rgx.exec(raw)) !== null) {
+            deps[m[1]] = m[3] || '';
+          }
+          return Object.keys(deps).length ? deps : null;
+        },
+      },
+      {
+        file: 'Cargo.toml',
+        parse: (raw) => {
+          const deps: Record<string, string> = {};
+          let inDeps = false;
+          for (const line of raw.split('\n')) {
+            if (/^\s*\[.*\]/.test(line)) {
+              inDeps = /^\s*\[dependencies\]/.test(line);
+              continue;
+            }
+            if (!inDeps) continue;
+            const m = line.match(/^\s*(\S+)\s*=\s*(.+)/);
+            if (m) deps[m[1]] = m[2].trim().replace(/^"|"$/g, '').replace(/^'|'$/g, '');
+          }
+          return Object.keys(deps).length ? deps : null;
+        },
+      },
+      {
+        file: 'pom.xml',
+        parse: (raw) => {
+          const deps: Record<string, string> = {};
+          const rgx = /<dependency>\s*<groupId>([^<]+)<\/groupId>\s*<artifactId>([^<]+)<\/artifactId>\s*<version>([^<]+)<\/version>/g;
+          let m: RegExpExecArray | null;
+          while ((m = rgx.exec(raw)) !== null) {
+            deps[`${m[1]}:${m[2]}`] = m[3];
+          }
+          return Object.keys(deps).length ? deps : null;
+        },
+      },
+    ];
+
+    const results: string[] = [];
+    for (const { file, parse } of manifests) {
+      const fullPath = path.join(projectPath, file);
+      try {
+        if (!fs.existsSync(fullPath)) continue;
+        const raw = fs.readFileSync(fullPath, 'utf-8');
+        const deps = parse(raw);
+        if (deps) {
+          const entries = Object.entries(deps).slice(0, 30);
+          const lines = entries.map(([name, version]) => `${name}${version ? `@${version}` : ''}`);
+          results.push(`Зависимости из ${file}:\n${lines.join('\n')}`);
+        }
+      } catch { /* skip */ }
+    }
+    return results.length ? results.join('\n\n') : null;
   }
 
   /**
@@ -2989,7 +3122,7 @@ PATCH_END
    */
   private readFileForContext(projectPath: string, relPath: string, maxChars = 8000): string {
     try {
-      const fullPath = path.join(projectPath, relPath);
+      const fullPath = path.isAbsolute(relPath) ? relPath : path.join(projectPath, relPath);
       if (!fs.existsSync(fullPath)) return '';
       const raw = fs.readFileSync(fullPath, 'utf-8');
       if (raw.length <= maxChars) return raw;
@@ -3017,7 +3150,8 @@ PATCH_END
   ): string {
     try {
       if (!projectPath || !fs.existsSync(projectPath)) return '';
-      const ignoreDirs = new Set(Array.isArray(workspace?.ignoreDirs) ? workspace.ignoreDirs : ['.git', 'node_modules', 'dist', 'build']);
+      const ignoreDirs = new Set(Array.isArray(workspace?.ignoreDirs) ? workspace.ignoreDirs : ['.git', 'node_modules', 'dist', 'build', 'vendor', 'bower_components', '__pycache__', '.venv', 'venv', '.env']);
+      const deepIgnoreDirs = new Set(['node_modules', 'vendor', 'bower_components', '__pycache__', '.venv', 'venv', '.env']);
       const includeExts = Array.isArray(workspace?.includeExtensions) && workspace.includeExtensions.length
         ? new Set(workspace.includeExtensions)
         : null;
@@ -3033,7 +3167,7 @@ PATCH_END
         .filter(w => w.length >= 4 && !stop.has(w));
       const wordSet = new Set(words);
 
-      const collected: Array<{ rel: string; size: number; score: number }> = [];
+      const collected: Array<{ abs: string; rel: string; size: number; score: number }> = [];
       const walk = (absDir: string, relDir: string, depth: number) => {
         if (depth > 6) return;
         let entries: fs.Dirent[];
@@ -3048,12 +3182,15 @@ PATCH_END
           const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
           if (entry.isDirectory()) {
             if (ignoreDirs.has(entry.name)) continue;
+            if (deepIgnoreDirs.has(entry.name)) continue;
             walk(path.join(absDir, entry.name), rel, depth + 1);
           } else {
             if (includeExts) {
               const ext = path.extname(entry.name).toLowerCase();
               if (ext && !includeExts.has(ext)) continue;
             }
+            // Пропускаем файлы внутри deep-директорий
+            if (rel.split('/').some(seg => deepIgnoreDirs.has(seg))) continue;
             try {
               const stat = fs.statSync(path.join(absDir, entry.name));
               if (stat.size > 200000) continue; // пропускаем огромные файлы (минификации, лок-файлы и т.п.)
@@ -3068,7 +3205,7 @@ PATCH_END
               if (/(service|controller|entity|module|gateway|store|model|aggregate|view)\./i.test(lower)) score += 1;
               // Штраф за размер — предпочитаем читаемые файлы.
               score -= Math.min(2, Math.floor(stat.size / 30000));
-              if (score > 0) collected.push({ rel, size: stat.size, score });
+              if (score > 0) collected.push({ abs: path.join(absDir, entry.name), rel, size: stat.size, score });
             } catch { }
           }
         }
@@ -3081,8 +3218,8 @@ PATCH_END
 
       let out = '';
       for (const f of top) {
-        const body = this.readFileForContext(projectPath, f.rel, maxCharsPerFile);
-        if (body) out += `\n--- ${f.rel} (текущее содержимое) ---\n${body}\n`;
+        const body = this.readFileForContext(projectPath, f.abs, maxCharsPerFile);
+        if (body) out += `\n--- ${f.abs} (текущее содержимое) ---\n${body}\n`;
       }
       return out.trim();
     } catch {
@@ -3630,10 +3767,10 @@ ${filesSummary}
     return `Ты — Оркестратор. Проанализируй задачу и создай план работы для команды.
  
 ⚠️ РАБОЧАЯ ДИРЕКТОРИЯ: ${projectPath}
-Это КОРЕНЬ ПРОЕКТА. Все пути к файлам должны быть ОТНОСИТЕЛЬНЫМИ от этой директории.
-В КАРТЕ ПРОЕКТА ниже пути УЖЕ относительные от ${projectPath} — используй их КАК ЕСТЬ, не добавляй префиксов.
-КРИТИЧНО: НЕ добавляй к путям "${projectPath}" или любой другой префикс. Бери пути ТОЧНО как в КАРТЕ ПРОЕКТА.
-ЗАПРЕЩЕНО: абсолютные пути, дублирование сегментов (типа apps/web/apps/web/...), префиксы чужого репозитория или текущего раннера.
+Это КОРЕНЬ ПРОЕКТА. Все пути к файлам должны быть АБСОЛЮТНЫМИ — начинаться с "${projectPath}".
+В КАРТЕ ПРОЕКТА ниже пути УЖЕ абсолютные (начинаются с "${projectPath}") — используй их КАК ЕСТЬ, не обрезай.
+КРИТИЧНО: НЕ обрезай "${projectPath}" и не заменяй на относительные. Бери пути ТОЧНО как в КАРТЕ ПРОЕКТА.
+ЗАПРЕЩЕНО: относительные пути (типа apps/web/...), дублирование сегментов, префиксы чужого репозитория или текущего раннера.
  
 ПРОЕКТ: ${project.name || 'Unknown'}
 ЗАДАЧА: ${run.task}
@@ -3657,7 +3794,7 @@ ${recentMessages}
 6. НЕЛЬЗЯ расширять задачу. Отвечай только на прямой запрос пользователя. Не придумывай дополнительные подзадачи, проверки, рефакторы, улучшения или "следующие логичные шаги", если их не просили.
 7. Для implementation НЕ превращай executionTask в микро-ТЗ с выдуманными именами функций, переменных, CSS-классов или готовыми кусками кода, если ты не видел их в реальном файле. Формулируй по наблюдаемому поведению и реальным путям файлов.
 8. Если пользователь уже указал экран/URL/файл и желаемое поведение, executionTask должен быть коротким и предметным: цель, реальный файл/модуль, ограничения по области. Не расписывай пошагово "добавь const X" или "создай функцию Y", если это не подтверждено кодом.
-9. ПУТИ В JSON-ОТВЕТЕ: бери пути ТОЧНО как в КАРТЕ ПРОЕКТА выше (например "apps/web/src/views/WorkspaceView.vue"). НЕ добавляй "${projectPath}" как префикс (не делай "apps/web/apps/web/src/..."). НЕ добавляй абсолютные пути (не делай "/Users/..."). Просто скопируй путь из карты.
+9. ПУТИ В JSON-ОТВЕТЕ: бери пути ТОЧНО как в КАРТЕ ПРОЕКТА выше. Так как в карте все пути УЖЕ абсолютные — просто копируй их. НЕ обрезай "${projectPath}" и не добавляй дублирующих сегментов.
  
 Схема ответа:
 {"message":"string - что ты понял и что сделает команда","teamSummary":["string"],"shouldExecute":true,"executionTask":"string - краткая задача для команды","plan":["string - шаги"],"roles":{"analyst":{"enabled":true,"assignment":"string","reason":"string"},"developer":{"enabled":true,"assignment":"string","reason":"string"},"tester":{"enabled":true,"assignment":"string","reason":"string"}},"files":[{"path":"string","action":"create|update","description":"string","reason":"string"}]}
@@ -4143,9 +4280,9 @@ SUMMARY: Нет изменений. Диагноз аналитика подтв
 ЗАДАЧА: ${run.task}
 ${assignmentLine}
 
-⚠️ Все пути к файлам должны быть ОТНОСИТЕЛЬНЫМИ от рабочей директории ${projectPath}.
-Используй только реальные пути из ФАЙЛЫ ИЗ ТЗ и КАРТЫ ПРОЕКТА.
-ЗАПРЕЩЕНО: абсолютные пути, дублирование сегментов, префиксы чужого репозитория или текущего раннера.
+⚠️ Все пути к файлам должны быть АБСОЛЮТНЫМИ — начинаться с "${projectPath}".
+Используй только реальные абсолютные пути из ФАЙЛЫ ИЗ ТЗ и КАРТЫ ПРОЕКТА.
+ЗАПРЕЩЕНО: относительные пути (типа apps/web/...), дублирование сегментов, префиксы чужого репозитория или текущего раннера.
 
 ТРЕБОВАНИЯ ИЗ ТЗ:
 ${requirements}
@@ -4197,7 +4334,7 @@ DESCRIPTION: что сделано
 8. Если для работы нужна консольная команда, добавь блок COMMAND/CWD/REASON. Не выдумывай результат команды, сервер выполнит её отдельно после подтверждения пользователя.
 9. НЕ создавай .md/README/документационные файлы. Документацию проекта ведёт Аналитик в памяти проекта (БД), а не в репозитории. Создавай только КОД. Если в ТЗ есть .md — пропусти его.
 10. НЕ создавай мусорные/временные/логовые/текстовые файлы: git_log_output.txt, scratch.txt, output_*.txt, *.log, *.tmp, *.out и подобные. git-контекст УЖЕ в промпте (сервер выполняет git log/status сам). Если нужно сохранить вывод — используй SUMMARY, а не файл. Все .txt/.log/.tmp пути будут отклонены.
-11. Пиши пути ОТНОСИТЕЛЬНО корня проекта (например src/domain/dog/aggregates/Dog.ts), БЕЗ ведущего /host-projects/... и БЕЗ абсолютных путей. Абсолютные пути будут нормализованы.
+11. Используй АБСОЛЮТНЫЕ пути — начинающиеся с "${projectPath}". Относительные пути (apps/web/...) будут отвергнуты.
 12. САМОПРОВЕРКА ПЕРЕД ОТДАЧЕЙ (КРИТИЧНО): прежде чем вернуть ответ, мысленно перепрочитай КАЖДЫЙ свой SEARCH-блок и сверь с СУЩЕСТВУЮЩИМ КОДОМ выше. SEARCH должен быть БУКВАЛЬНОЙ копией фрагмента текущего файла (те же отступы, переносы, кавычки). Если SEARCH не совпадает с реальным кодом символ-в-символ — патч будет отклонён сервером. Проверь также: не сломал ли REPLACE импорты/синтаксис, нет ли дублей, согласованы ли call-сайты, если меняешь сигнатуру/экспорт. Если хоть один SEARCH вызывает сомнение — перепиши его по реальному коду. Сервер всё равно перепроверит каждый SEARCH по текущему файлу и вернёт тебе рассинхрон на исправление, но лучше сделать верно с первого раза.
 13. Выполняй задачу по СМЫСЛУ, а не по буквальному совпадению имён из ТЗ/памяти. Если поведение уже есть под другими именами или в другой локальной структуре файла, не переписывай код ради косметического совпадения.
 14. Если после чтения текущего файла видишь, что требуемое поведение уже реализовано и правки не нужны, верни только SUMMARY: Нет изменений.
