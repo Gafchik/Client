@@ -819,6 +819,29 @@ export class RunsService implements OnModuleInit {
             assignment: plan.roles.developer.assignment,
           };
 
+          try {
+            if (Array.isArray(devSpec.files)) {
+              devSpec.files = devSpec.files
+                .map((file: any) => {
+                  const originalPath = String(file?.path || '').trim();
+                  if (!originalPath || isUrlLikePath(originalPath) || hasSuspiciousMirroredPath(originalPath)) {
+                    return null;
+                  }
+                  const relPath = this.relPathWithinProject(projectPath, originalPath);
+                  if (!relPath || hasSuspiciousMirroredPath(relPath)) return null;
+                  const fullPath = path.join(projectPath, relPath);
+                  const parentPath = path.join(projectPath, path.dirname(relPath));
+                  const action = String(file?.action || '').trim().toLowerCase();
+                  const exists = fs.existsSync(fullPath) || fs.existsSync(parentPath);
+                  if (!exists && action !== 'create') return null;
+                  return { ...file, path: relPath };
+                })
+                .filter(Boolean);
+            }
+          } catch (sanitizeError) {
+            this.logger.warn(`Failed to sanitize developer file list: ${sanitizeError instanceof Error ? sanitizeError.message : String(sanitizeError)}`);
+          }
+
           const developerResult = await this.callAgentStream(
             runId, chatId, 'developer', developerAgent, language,
             this.buildDeveloperPrompt(run, devSpec, project, workspace, projectPath, runMode, memoryContext),
@@ -2009,7 +2032,11 @@ export class RunsService implements OnModuleInit {
   ): string {
     if (runMode === 'research') return 'Инженерное мнение готово';
     if (runMode === 'diagnostics') return 'Диагноз подтверждён, код не трогал';
-    const files = Array.isArray((codeChanges as any)?.files) ? (codeChanges as any).files.length : 0;
+    const files = Array.isArray((codeChanges as any)?.appliedFiles)
+      ? (codeChanges as any).appliedFiles.length
+      : Array.isArray((codeChanges as any)?.files)
+        ? (codeChanges as any).files.length
+        : 0;
     return files > 0 ? `Подготовил изменения по ${files} файл(ам)` : 'Проверил задачу, правки не понадобились';
   }
 
@@ -2908,7 +2935,11 @@ PATCH_END
     plan: NormalizedExecutionPlan,
   ): string {
     const assignment = plan.roles.reviewer?.assignment || 'Провести code review';
-    const filesChanged = Array.isArray((codeChanges as any)?.files) ? (codeChanges as any).files : [];
+    const filesChanged = Array.isArray((codeChanges as any)?.appliedFiles)
+      ? (codeChanges as any).appliedFiles.map((file: any) => ({ path: String(file || '').trim(), action: 'applied', description: 'Файл успешно изменён' }))
+      : Array.isArray((codeChanges as any)?.files)
+        ? (codeChanges as any).files
+        : [];
     const filesSummary = filesChanged.length
       ? filesChanged.map((f: any) => `- ${f.path} (${f.action}): ${f.description || '—'}`).join('\n')
       : 'нет изменений';
@@ -3672,6 +3703,12 @@ PATCH_END
     testingCommands: string[],
     projectPath: string,
   ): string {
+    const appliedFiles = Array.isArray((codeChanges as any)?.appliedFiles)
+      ? (codeChanges as any).appliedFiles.map((file: any) => String(file || '').trim()).filter(Boolean)
+      : [];
+    const failedFiles = Array.isArray((codeChanges as any)?.failedFiles)
+      ? (codeChanges as any).failedFiles
+      : [];
     const modeLine = runMode === 'research'
       ? 'РЕЖИМ: исследование. Дай мнение тестировщика по вопросу пользователя без запуска тестов и без новых задач.'
       : runMode === 'diagnostics'
@@ -3685,6 +3722,8 @@ PATCH_END
 ${modeLine}
 НАЗНАЧЕНИЕ ОРКЕСТРАТОРА: ${plan.roles.tester.assignment}
 ИЗМЕНЕНИЯ: ${JSON.stringify(codeChanges, null, 2)}
+РЕАЛЬНО ПРИМЕНЁННЫЕ ФАЙЛЫ: ${appliedFiles.length ? appliedFiles.join(', ') : 'нет'}
+ОШИБКИ ПРИ ПРИМЕНЕНИИ: ${failedFiles.length ? JSON.stringify(failedFiles) : 'нет'}
 КОМАНДЫ ПРОВЕРКИ: ${testingCommands.length ? testingCommands.join(', ') : 'не заданы'}
 
 Твоя задача — понять, решает ли результат задачу, и предложить краткий набор реальных проверок. Команды выполняет сервер, не ты.
@@ -3871,6 +3910,9 @@ ${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на э
     testResults: TestResult,
   ): Record<string, unknown> {
     const normalized = { ...artifact } as Record<string, unknown>;
+    const appliedFiles = Array.isArray((codeChanges as any)?.appliedFiles)
+      ? (codeChanges as any).appliedFiles.map((file: any) => String(file || '').trim()).filter(Boolean)
+      : [];
     normalized.mode = runMode;
     if (!normalized.message || !String(normalized.message).trim()) {
       normalized.message = this.buildFallbackFinalReport(run, runMode, spec, codeChanges, testResults).message;
@@ -3878,17 +3920,13 @@ ${diagnosisText ? `\nДИАГНОЗ АНАЛИТИКА (опирайся на э
     if (!normalized.summary || !String(normalized.summary).trim()) {
       normalized.summary = String((spec as any)?.description || (codeChanges as any)?.summary || (testResults as any)?.summary || normalized.message || '');
     }
-    if (!Array.isArray(normalized.filesChanged)) {
-      normalized.filesChanged = Array.isArray((codeChanges as any)?.appliedFiles)
-        ? (codeChanges as any).appliedFiles.map((file: any) => String(file || '').trim()).filter(Boolean)
-        : [];
-    }
+    normalized.filesChanged = appliedFiles;
     const failedFiles = Array.isArray((codeChanges as any)?.failedFiles)
       ? (codeChanges as any).failedFiles as Array<{ path?: string; error?: string }>
       : [];
     normalized.testResult = testResults?.passed === false || failedFiles.length > 0 ? 'failed' : 'passed';
     if (failedFiles.length > 0) {
-      normalized.filesChanged = Array.isArray(normalized.filesChanged) ? normalized.filesChanged : [];
+      normalized.filesChanged = appliedFiles;
       if (!normalized.message || /задача выполнена|реализовано|изменена обработка/i.test(String(normalized.message))) {
         normalized.message = `Изменения не были применены. ${failedFiles.map((item) => `${item.path}: ${item.error}`).join('; ')}`;
       }

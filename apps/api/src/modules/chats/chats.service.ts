@@ -732,12 +732,12 @@ Output schema: {"message":"string","teamSummary":["string"],"shouldExecute":bool
     const original = String(userMessage || "").trim();
     let task = String(executionTask || "").trim();
     if (!original || !task) return task;
+    const existsFn = (p: string) => {
+      try { return fs.existsSync(p); } catch { return false; }
+    };
 
     // Очищаем дублированные пути (apps/api/apps/web/... → apps/web/...)
     if (projectPath) {
-      const existsFn = (p: string) => {
-        try { return fs.existsSync(p); } catch { return false; }
-      };
       task = cleanupPathsInTask(projectPath, task, existsFn);
     }
 
@@ -759,6 +759,17 @@ Output schema: {"message":"string","teamSummary":["string"],"shouldExecute":bool
     const pathMatches = Array.from(task.matchAll(/\b(?:[a-z0-9_-]+\/)+[a-z0-9_.-]+\b/gi))
       .map((match) => match[0])
       .filter((value) => !isUrlLikePath(value))
+      .map((value) => {
+        if (!projectPath) return value;
+        const cleaned = cleanupPathsInTask(projectPath, value, existsFn).trim();
+        return cleaned || value;
+      })
+      .filter((value) => {
+        if (!projectPath || !value) return !!value;
+        const fullPath = path.join(projectPath, value);
+        const parentPath = path.join(projectPath, path.dirname(value));
+        return existsFn(fullPath) || existsFn(parentPath);
+      })
       .filter((value, index, arr) => arr.indexOf(value) === index);
     const fileLines = pathMatches.length
       ? `Файлы:\n- ${pathMatches.join("\n- ")}\n`
