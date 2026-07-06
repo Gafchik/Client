@@ -16,6 +16,7 @@ import { ProvidersService } from "../providers/providers.service.js";
 import { WsGateway } from "../ws/ws.gateway.js";
 import * as fs from "fs";
 import * as path from "path";
+import crypto from "node:crypto";
 import {
   cleanupPathsInTask,
   isUrlLikePath,
@@ -24,6 +25,10 @@ import {
 @Injectable()
 export class ChatsService {
   private readonly logger = new Logger(ChatsService.name);
+
+  private createMessageId(): string {
+    return `msg-${crypto.randomUUID()}`;
+  }
 
   constructor(
     @InjectRepository(ChatEntity)
@@ -163,7 +168,7 @@ export class ChatsService {
     if (!chat) throw new NotFoundException("Chat not found");
 
     const message = this.messagesRepository.create({
-      id: `msg-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      id: this.createMessageId(),
       chatId,
       role,
       content,
@@ -514,6 +519,20 @@ export class ChatsService {
         autoRunId,
         orchestratorPayload,
       });
+
+      if (orchestratorPayload?.executionTask) {
+        await this.addMessage(chat.id, "assistant", `ТЗ оркестратора:\n${String(orchestratorPayload.executionTask).trim()}`, {
+          type: "agent-brief",
+          requestId,
+          autoRunId,
+          agentRole: "orchestrator",
+          agentName: orchestrator.name || "Alex",
+          agentLabel: orchestrator.label || "Оркестратор",
+          executionTask: orchestratorPayload.executionTask,
+          teamSummary: Array.isArray(orchestratorPayload?.teamSummary) ? orchestratorPayload.teamSummary : [],
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       this.logger.log(`Saved initial assistant message to chat ${chat.id}: ${assistantMessage.id}`);
 

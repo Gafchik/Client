@@ -2,6 +2,7 @@ import { forwardRef, Inject, Injectable, Logger, OnModuleInit } from '@nestjs/co
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Run } from '../../persistence/run.entity';
+import { MessageEntity } from '../../persistence/message.entity';
 import { StartRunDto } from './dto/start-run.dto';
 import { parseJsonSafely, ParseJsonResult } from '../../shared/json';
 import { createLlmStreamRequest } from '../../shared/llm-client';
@@ -58,6 +59,11 @@ interface TestResult {
   summary?: string;
   tests?: Array<{ name: string; command: string; success: boolean; output: string }>;
   errors?: string[];
+}
+
+interface ReworkDecision {
+  shouldRework: boolean;
+  reason: string;
 }
 
 interface ApprovalRequest {
@@ -128,6 +134,8 @@ export class RunsService implements OnModuleInit {
     private readonly wsGateway: WsGateway,
     @Inject(ProvidersService)
     private readonly providersService: ProvidersService,
+    @InjectRepository(MessageEntity)
+    private readonly messagesRepo: Repository<MessageEntity>,
   ) {}
 
   /**
@@ -824,7 +832,7 @@ export class RunsService implements OnModuleInit {
               devSpec.files = devSpec.files
                 .map((file: any) => {
                   const originalPath = String(file?.path || '').trim();
-                  if (!originalPath || isUrlLikePath(originalPath) || hasSuspiciousMirroredPath(originalPath)) {
+                  if (!originalPath || isUrlLikePath(originalPath)) {
                     return null;
                   }
                   const relPath = this.relPathWithinProject(projectPath, originalPath);
@@ -1284,6 +1292,52 @@ export class RunsService implements OnModuleInit {
             testResults.passed ? 'done' : 'error',
             testResults.passed ? this.buildTesterDoneStatus(plan, runMode) : `Тесты упали: ${(testResults.errors || []).join(', ') || 'unknown'}`,
           );
+
+          const testerRework = this.decideTesterRework(runMode, testResults, codeChanges);
+          if (testerRework.shouldRework && developerAgent?.model) {
+            await this.broadcastActivity(
+              runId,
+              chatId,
+              'tester',
+              testName,
+              testLabel,
+              'working',
+              `Нашёл баги, возвращаю задачу разработчику: ${testerRework.reason}`,
+            );
+            const reworkPrompt = this.buildDeveloperReworkPrompt(run, project, projectPath, codeChanges, testResults);
+            const reworkResult = await this.callAgentStream(
+              runId,
+              chatId,
+              'developer',
+              developerAgent,
+              language,
+              reworkPrompt,
+              (delta) => this.wsGateway.broadcastTokenStream(chatId, { role: 'developer', content: delta, done: false }),
+            );
+
+            if (reworkResult.success) {
+              const reworkChanges = (reworkResult.artifact || {}) as Record<string, unknown>;
+              const reworkFiles = Array.isArray((reworkChanges as any)?.files) ? (reworkChanges as any).files : [];
+              if (reworkFiles.length && teamConfig.run?.applyChanges !== false) {
+                for (const fileChange of reworkFiles as Array<{ path: string; action: string; content?: string; description?: string; patches?: Array<{ search: string; replace: string }> }>) {
+                  const res = await this.applyFileChange(projectPath, fileChange, true);
+                  if (res.ok) {
+                    const relPath = this.relPathWithinProject(projectPath, fileChange.path);
+                    if (relPath) appliedFilePaths.push(relPath);
+                  } else {
+                    failedFileChanges.push({ path: fileChange.path, error: res.error || 'Неизвестная ошибка применения правки' });
+                  }
+                }
+                (codeChanges as any).appliedFiles = appliedFilePaths;
+                (codeChanges as any).failedFiles = failedFileChanges;
+                await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'done', 'Исправил замечания тестировщика');
+              } else {
+                await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'done', 'Разработчик не вернул дополнительных правок после замечаний тестировщика');
+              }
+            } else {
+              await this.broadcastActivity(runId, chatId, 'developer', devName, devLabel, 'error', `Не удалось вернуть задачу разработчику: ${reworkResult.error || 'unknown'}`);
+            }
+          }
 
         } else {
           await this.broadcastActivity(runId, chatId, 'tester', testName, testLabel, 'done', `Этап пропущен: ${plan.roles.tester.reason}`);
@@ -2369,12 +2423,13 @@ export class RunsService implements OnModuleInit {
     // 3) Also save as a chat message for persistence and history
     try {
       await this.chatsService.addMessage(chatId, 'assistant', message, {
-        type: 'agent-status',
+        type: (status === 'working' && (role === 'orchestrator' || role === 'analyst')) ? 'agent-brief' : 'agent-status',
         runId,
         agentRole: role,
         agentName: name,
         agentLabel: label,
         status,
+        content: message,
         timestamp: new Date().toISOString(),
       });
       this.logger.log(`Saved agent activity to chat: ${role} - ${message}`);
@@ -2389,6 +2444,115 @@ export class RunsService implements OnModuleInit {
    */
   private relPathWithinProject(projectPath: string, relOrAbs: string): string {
     return relPathWithinProject(projectPath, relOrAbs, fs.existsSync.bind(fs));
+  }
+
+  private buildShellErrorSummary(output: string): string {
+    return String(output || '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 6)
+      .join(' | ')
+      .slice(0, 700);
+  }
+
+  private shouldRetryWithShell(command: string): boolean {
+    const normalized = String(command || '').trim();
+    if (!normalized) return false;
+    if (/[;&]/.test(normalized)) return false;
+    if (/[|><$`]/.test(normalized)) return false;
+    if (!/["']/.test(normalized)) return false;
+    return /\s/.test(normalized);
+  }
+
+  private summarizeTesterIssues(testResults: TestResult): string[] {
+    const problems: string[] = [];
+    if (Array.isArray(testResults.errors)) {
+      for (const error of testResults.errors) {
+        const text = String(error || '').trim();
+        if (text) problems.push(text);
+      }
+    }
+    if (Array.isArray(testResults.tests)) {
+      for (const test of testResults.tests) {
+        if (test?.success) continue;
+        const label = String(test?.name || test?.command || 'Команда тестировщика').trim();
+        const output = this.buildShellErrorSummary(String(test?.output || ''));
+        problems.push(`${label}: ${output || 'команда завершилась с ошибкой'}`);
+      }
+    }
+    return problems.slice(0, 6);
+  }
+
+  private decideTesterRework(runMode: RunMode, testResults: TestResult, codeChanges: Record<string, unknown>): ReworkDecision {
+    if (runMode !== 'implementation') {
+      return { shouldRework: false, reason: 'Не implementation-режим.' };
+    }
+    if (testResults.passed !== false) {
+      return { shouldRework: false, reason: 'Тестер не нашёл блокирующих проблем.' };
+    }
+    const appliedFiles = Array.isArray((codeChanges as any)?.appliedFiles)
+      ? (codeChanges as any).appliedFiles.filter(Boolean)
+      : [];
+    if (!appliedFiles.length) {
+      return { shouldRework: false, reason: 'Нет реально применённых файлов.' };
+    }
+    const issues = this.summarizeTesterIssues(testResults);
+    if (!issues.length) {
+      return { shouldRework: false, reason: 'Нет конкретных замечаний тестера.' };
+    }
+    return { shouldRework: true, reason: issues.join('\n') };
+  }
+
+  private buildDeveloperReworkPrompt(
+    run: Run,
+    project: any,
+    projectPath: string,
+    codeChanges: Record<string, unknown>,
+    testResults: TestResult,
+  ): string {
+    const appliedFiles = Array.isArray((codeChanges as any)?.appliedFiles)
+      ? (codeChanges as any).appliedFiles.map((file: any) => String(file || '').trim()).filter(Boolean)
+      : [];
+    const issues = this.summarizeTesterIssues(testResults);
+    const existingFiles = appliedFiles
+      .map((file: string) => {
+        const body = this.readFileForContext(projectPath, file, 12000);
+        return body ? `\n===== ${file} (ТЕКУЩЕЕ СОДЕРЖИМОЕ) =====\n${body}\n` : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+
+    return `Ты — Разработчик. После твоих правок тестировщик нашёл проблемы. Нужно исправить именно их.
+
+ПРОЕКТ: ${project.name || 'Unknown'}
+РАБОЧАЯ ДИРЕКТОРИЯ: ${projectPath}
+ИСХОДНАЯ ЗАДАЧА: ${run.task}
+
+РЕАЛЬНО ИЗМЕНЁННЫЕ ФАЙЛЫ:
+${appliedFiles.length ? appliedFiles.map((file: string) => `- ${file}`).join('\n') : '- нет'}
+
+ЗАМЕЧАНИЯ ТЕСТИРОВЩИКА:
+${issues.length ? issues.map((item) => `- ${item}`).join('\n') : '- нет'}
+
+ТЕКУЩИЙ КОД:
+${existingFiles || '(код файлов недоступен)'}
+
+Верни ответ только в маркерном формате:
+
+SUMMARY: кратко что исправил
+
+FILE: путь/к/файлу
+ACTION: update
+DESCRIPTION: что исправлено
+PATCH_START
+SEARCH:
+<точный фрагмент текущего кода>
+REPLACE:
+<исправленный фрагмент>
+PATCH_END
+
+Если правки не нужны — верни только SUMMARY: Нет изменений.`;
   }
 
   private async applyFileChange(
@@ -2534,12 +2698,32 @@ export class RunsService implements OnModuleInit {
         encoding: 'utf-8',
         timeout: 120000,
         maxBuffer: 1024 * 1024 * 4,
+        shell: '/bin/zsh',
       }).toString();
       await this.appendRunEvent(runId, 'command:finished', { role, agentName: name, label, command, cwd, success: true, code: 0, output: output.slice(0, 4000) });
       return { success: true, output, code: 0, approved: true };
     } catch (error: any) {
       const output = String(error?.stdout || error?.stderr || error?.message || 'Command failed');
       const code = typeof error?.status === 'number' ? error.status : 1;
+      if (this.shouldRetryWithShell(command)) {
+        try {
+          const escaped = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+          const retried = execSync(`/bin/zsh -lc "${escaped}"`, {
+            cwd,
+            encoding: 'utf-8',
+            timeout: 120000,
+            maxBuffer: 1024 * 1024 * 4,
+            shell: '/bin/zsh',
+          }).toString();
+          await this.appendRunEvent(runId, 'command:finished', { role, agentName: name, label, command, cwd, success: true, code: 0, output: retried.slice(0, 4000), retriedWithShell: true });
+          return { success: true, output: retried, code: 0, approved: true };
+        } catch (retryError: any) {
+          const retryOutput = String(retryError?.stdout || retryError?.stderr || retryError?.message || output || 'Command failed');
+          const retryCode = typeof retryError?.status === 'number' ? retryError.status : code;
+          await this.appendRunEvent(runId, 'command:finished', { role, agentName: name, label, command, cwd, success: false, code: retryCode, output: retryOutput.slice(0, 4000), retriedWithShell: true });
+          return { success: false, output: retryOutput, code: retryCode, approved: true };
+        }
+      }
       await this.appendRunEvent(runId, 'command:finished', { role, agentName: name, label, command, cwd, success: false, code, output: output.slice(0, 4000) });
       return { success: false, output, code, approved: true };
     }

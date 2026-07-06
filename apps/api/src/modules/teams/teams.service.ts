@@ -23,10 +23,10 @@ export class TeamsService implements OnModuleInit {
     const count = await this.teamsRepository.count();
     if (count === 0) {
       const seed = createDefaultTeam();
-      const provider = await this.providersService.getActive();
+      const provider = await this.providersService.getActive().catch(() => null);
       await this.save({
         ...seed,
-        providerId: provider.id,
+        providerId: provider?.id ?? null,
       });
     }
   }
@@ -56,12 +56,12 @@ export class TeamsService implements OnModuleInit {
   async save(input: SaveTeamDto) {
     const fallback = createDefaultTeam(input.name || "New Team");
     const now = new Date();
-    const defaultProvider = await this.providersService.getActive();
+    const defaultProvider = await this.providersService.getActive().catch(() => null);
     const provider =
       input.providerId === null
         ? null
         : await this.providersRepository.findOneBy({
-            id: input.providerId || defaultProvider.id,
+            id: input.providerId || defaultProvider?.id || "",
           });
 
     const normalizedLanguage = typeof input.language === "string" ? input.language.trim().toLowerCase() : "";

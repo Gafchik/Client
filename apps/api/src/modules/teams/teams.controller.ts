@@ -6,6 +6,13 @@ import { SaveTeamDto } from "./dto/save-team.dto.js";
 export class TeamsController {
   constructor(@Inject(TeamsService) private readonly teamsService: TeamsService) {}
 
+  private normalizeConfig(config: unknown): Record<string, unknown> {
+    if (!config || typeof config !== "object" || Array.isArray(config)) {
+      return {};
+    }
+    return config as Record<string, unknown>;
+  }
+
   @Get()
   async listTeams() {
     const teams = await this.teamsService.list();
@@ -15,7 +22,7 @@ export class TeamsController {
         name: team.name,
         description: team.description,
         providerId: team.providerId,
-        ...team.config,
+        ...this.normalizeConfig(team.config),
         createdAt: team.createdAt,
         updatedAt: team.updatedAt,
       })),
@@ -31,7 +38,7 @@ export class TeamsController {
         name: savedTeam.name,
         description: savedTeam.description,
         providerId: savedTeam.providerId,
-        ...(savedTeam.config as Record<string, unknown>),
+        ...this.normalizeConfig(savedTeam.config),
         createdAt: savedTeam.createdAt,
         updatedAt: savedTeam.updatedAt,
       },
