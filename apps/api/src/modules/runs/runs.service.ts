@@ -3325,12 +3325,25 @@ ${filesSummary}
         const tags = Array.isArray(entry.tags) && entry.tags.length
           ? `\nТеги: ${entry.tags.join(', ')}`
           : '';
+        const graph = entry.graph && typeof entry.graph === 'object' ? entry.graph as Record<string, any> : null;
+        const coverage = graph?.coverage && typeof graph.coverage === 'object'
+          ? `\nПокрытие знаний: ${Object.entries(graph.coverage).map(([key, value]) => `${key}=${value}%`).join(', ')}`
+          : '';
+        const unknowns = Array.isArray(graph?.unknowns) && graph.unknowns.length
+          ? `\nНеизвестно: ${graph.unknowns.slice(0, 6).join('; ')}`
+          : '';
+        const entityIndex = Array.isArray(graph?.entityIndex) && graph.entityIndex.length
+          ? `\nИндекс сущностей:\n${graph.entityIndex.slice(0, 12).map((item: any) => `- ${item.name || item.id || '?'} [${item.kind || '?'}] @ ${item.location || item.path || 'unknown'}`).join('\n')}`
+          : '';
         return [
           `#${index + 1}. ${entry.title}`,
           `Сводка: ${entry.summary}`,
           entry.details ? `Детали:\n${entry.details}` : '',
           files,
           tags,
+          coverage,
+          unknowns,
+          entityIndex,
         ].filter(Boolean).join('\n');
       }).join('\n\n');
     } catch (error) {
@@ -3377,6 +3390,7 @@ ${filesSummary}
   }
 
   private inferMemoryKind(memory: any, runMode?: RunMode): string {
+    if (memory?.knowledgeGraph && typeof memory.knowledgeGraph === 'object') return 'knowledge-graph';
     if (runMode === 'research') return 'research';
     if (runMode === 'diagnostics') return 'diagnostic';
     if (Array.isArray(memory?.requirements) && memory.requirements.length) return 'implementation';
@@ -3393,12 +3407,70 @@ ${filesSummary}
     }
     if (runMode === 'research') tags.add('analysis');
     if (runMode === 'diagnostics') tags.add('root-cause');
+    if (memory?.knowledgeGraph && typeof memory.knowledgeGraph === 'object') tags.add('graph');
     if (memory?.feature) {
       for (const token of String(memory.feature).toLowerCase().split(/[\s,.;:!?()[\]{}"']+/).filter((item: string) => item.length > 3).slice(0, 6)) {
         tags.add(token);
       }
     }
     return Array.from(tags);
+  }
+
+  private buildKnowledgeGraph(memory: any, relatedFiles: string[], runMode?: RunMode): Record<string, unknown> {
+    const graph = memory?.knowledgeGraph && typeof memory.knowledgeGraph === 'object'
+      ? { ...(memory.knowledgeGraph as Record<string, unknown>) }
+      : {};
+    const featureName = String(memory?.feature || memory?.lastRun?.task || 'Неизвестная сущность');
+    const entityIndex = Array.isArray((graph as any).entityIndex) ? [ ...(graph as any).entityIndex ] : [];
+    const existingIndexKeys = new Set(entityIndex.map((item: any) => `${item?.kind || ''}:${item?.name || item?.id || ''}:${item?.path || item?.location || ''}`));
+    for (const file of relatedFiles) {
+      const key = `file:${file}:${file}`;
+      if (!existingIndexKeys.has(key)) {
+        entityIndex.push({
+          id: `file:${file}`,
+          kind: 'file',
+          name: file.split('/').pop() || file,
+          path: file,
+          location: file,
+          feature: featureName,
+        });
+      }
+    }
+
+    const unknowns = Array.isArray((graph as any).unknowns)
+      ? (graph as any).unknowns.map((item: any) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const coverage = (graph as any).coverage && typeof (graph as any).coverage === 'object'
+      ? (graph as any).coverage
+      : {
+          backend: runMode === 'implementation' ? 60 : 40,
+          frontend: runMode === 'implementation' ? 60 : 40,
+          infrastructure: 20,
+          config: 30,
+          tests: 25,
+          scripts: 20,
+          docs: 20,
+        };
+
+    return {
+      version: 1,
+      feature: featureName,
+      domains: (graph as any).domains || ['backend', 'frontend', 'infrastructure', 'config', 'tests', 'scripts', 'docs'],
+      modules: Array.isArray((graph as any).modules) ? (graph as any).modules : [],
+      files: Array.isArray((graph as any).files) ? (graph as any).files : [],
+      entities: Array.isArray((graph as any).entities) ? (graph as any).entities : [],
+      relations: Array.isArray((graph as any).relations) ? (graph as any).relations : [],
+      features: Array.isArray((graph as any).features) ? (graph as any).features : [],
+      apiMap: Array.isArray((graph as any).apiMap) ? (graph as any).apiMap : [],
+      dataModels: Array.isArray((graph as any).dataModels) ? (graph as any).dataModels : [],
+      frontendMap: Array.isArray((graph as any).frontendMap) ? (graph as any).frontendMap : [],
+      dataFlows: Array.isArray((graph as any).dataFlows) ? (graph as any).dataFlows : [],
+      adrs: Array.isArray((graph as any).adrs) ? (graph as any).adrs : [],
+      entityIndex,
+      coverage,
+      unknowns,
+      updatedFromRunMode: runMode || 'unknown',
+    };
   }
 
   private async saveProjectMemory(projectId: string, chatId: string, memory: any, language: string, runMode?: RunMode, sourceRunId?: string): Promise<void> {
@@ -3422,17 +3494,26 @@ ${filesSummary}
         || memory.description
         || feature,
       ).slice(0, 1000);
+      const knowledgeGraph = this.buildKnowledgeGraph(memory, relatedFiles, effectiveRunMode);
 
-      // Если аналитик заполнил документацию (implementation-режим), сохраняем
-      // структурированно в details + обогащаем summary.
       const doc = memory.documentation && typeof memory.documentation === 'object' ? memory.documentation : null;
 
       const detailLines: string[] = [];
       if (memory.description) detailLines.push(`Описание: ${memory.description}`);
       if (memory.opinion) detailLines.push(`Мнение: ${memory.opinion}`);
+      detailLines.push(`--- KNOWLEDGE GRAPH ---`);
+      if (Array.isArray((knowledgeGraph as any).entityIndex) && (knowledgeGraph as any).entityIndex.length) {
+        detailLines.push(`Индекс сущностей:\n${(knowledgeGraph as any).entityIndex.slice(0, 20).map((item: any) => `- ${item.name || item.id || '?'} [${item.kind || '?'}] @ ${item.location || item.path || 'unknown'}`).join('\n')}`);
+      }
+      if ((knowledgeGraph as any).coverage) {
+        detailLines.push(`Покрытие знаний: ${Object.entries((knowledgeGraph as any).coverage).map(([key, value]) => `${key}=${value}%`).join(', ')}`);
+      }
+      if (Array.isArray((knowledgeGraph as any).unknowns) && (knowledgeGraph as any).unknowns.length) {
+        detailLines.push(`Неизвестные участки: ${(knowledgeGraph as any).unknowns.join('; ')}`);
+      }
 
-      // Структурированная документация проекта от аналитика — приоритетный источник знаний.
-      // Сохраняем все поля, чтобы следующие run'ы видели архитектуру и не галлюцинировали.
+      // Backward-compatible fallback: если старый аналитик ещё вернул documentation,
+      // вплетаем полезное в human-readable details, но источником истины уже считаем graph.
       if (doc) {
         if (typeof doc.overview === 'string' && doc.overview.trim()) {
           detailLines.push(`--- ОБЗОР ПРОЕКТА ---\n${doc.overview.trim()}`);
@@ -3492,15 +3573,29 @@ ${filesSummary}
 
       await this.projectsService.saveMemory({
         projectId,
-        title: `Документация: ${String(feature).slice(0, 180)}`,
+        title: `Knowledge Graph: ${String(feature).slice(0, 180)}`,
         summary: summaryText,
         details: detailsText,
+        graph: knowledgeGraph,
         kind: this.inferMemoryKind(memory, effectiveRunMode),
         tags: this.buildMemoryTags(memory, effectiveRunMode),
         relatedFiles,
         sourceRunId: sourceRunId ?? null,
         sourceChatId: chatId,
         relevanceScore: effectiveRunMode === 'research' ? 0.95 : effectiveRunMode === 'diagnostics' ? 0.9 : hasSuspiciousPaths ? 0.2 : 0.75,
+      } as any);
+      await this.projectsService.upsertKnowledgeGraphIndex({
+        projectId,
+        title: "Knowledge Graph Index",
+        summary: summaryText,
+        details: detailsText,
+        graph: knowledgeGraph,
+        kind: "knowledge-graph-index",
+        tags: this.buildMemoryTags(memory, effectiveRunMode),
+        relatedFiles,
+        sourceRunId: sourceRunId ?? null,
+        sourceChatId: chatId,
+        relevanceScore: 1,
       } as any);
     } catch (error) {
       this.logger.warn(`Failed to save project memory: ${error instanceof Error ? error.message : String(error)}`);
@@ -3718,7 +3813,7 @@ ${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД:\n${memoryContext}` :
 Если вернёшь невалидный JSON — запуск упадёт.`;
     }
 
-      return `Ты — Аналитик. Напиши КОРОТКОЕ ТЗ для разработчика и обнови документацию проекта в БД, опираясь на РЕАЛЬНЫЙ код проекта.
+    return `Ты — Аналитик. Напиши КОРОТКОЕ ТЗ для разработчика и обнови KNOWLEDGE GRAPH проекта в БД, опираясь на РЕАЛЬНЫЙ код проекта.
 
 ПРОЕКТ: ${project.name || 'Unknown'}
 РАБОЧАЯ ДИРЕКТОРИЯ: ${projectPath}
@@ -3734,7 +3829,7 @@ ${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД (существующ
 
 У ТЕБЯ ДВЕ ЗАДАЧИ:
 1. Написать короткое и точное ТЗ для разработчика: только что менять, где менять и какие ограничения соблюдать.
-2. Обновить документацию проекта в поле "documentation" — это память в БД, а не файл в репозитории. Пиши компактно, полезно и без воды. Эта документация нужна, чтобы следующие слабые модели не тратили токены на повторное изучение.
+2. Обновить knowledge graph проекта в поле "knowledgeGraph" — это живая память в БД, а не файл в репозитории. Ты строишь не текстовую документацию, а цифровую модель проекта: сущности, связи, фичи, API, data flow, coverage, unknowns.
 
 ПРАВИЛА (КРИТИЧНО):
 1. ВЕРНИ ТОЛЬКО ОДИН ВАЛИДНЫЙ JSON. Никакого markdown, никакого текста вне { }.
@@ -3742,9 +3837,11 @@ ${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД (существующ
 3. Для существующих файлов ставь action:"update" (разработчик сделает патч), для новых — action:"create".
 4. НЕ добавляй в files[] документацию, README, файлы .md/.mdx/.rst, файлы из docs/. Документация живёт в БД (поле documentation), а НЕ в файлах репозитория.
 5. Описывай изменения СЕМАНТИЧЕСКИ по текущему коду. Если нужное поведение уже реализовано под другими именами, не требуй переименования ради совпадения со словами пользователя.
-6. ПОЛЕ "documentation" ЗАПОЛНЯЙ ВСЕГДА, но компактно. Фокус: затронутые модули, реальные зависимости, поток данных, наблюдённые паттерны.
-7. Если в ПАМЯТИ ПРОЕКТА уже есть documentation по этим же файлам — ДОПОЛНИ и УТОЧНИ её, а не переписывай всё заново. Не дублируй одно и то же разными словами.
-8. В documentation.codePatterns опиши реальные соглашения кода, которые помогут разработчику действовать в стиле проекта.
+6. ПОЛЕ "knowledgeGraph" ЗАПОЛНЯЙ ВСЕГДА. Любая новая информация должна быть связана с уже известными сущностями.
+7. Если информации в коде нет — явно пиши "Неизвестно" и добавляй это в unknowns.
+8. Для каждого затронутого файла строй file passport: назначение, тип, ответственность, public methods, used classes, used by, related entities, related features.
+9. Укажи coverage по модулям: backend, frontend, infrastructure, config, tests, scripts, docs — в процентах 0..100.
+10. Не пиши художественные обзоры. Пиши структурированные факты и связи.
 
 Схема:
 {
@@ -3763,20 +3860,151 @@ ${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД (существующ
   ],
   "acceptanceCriteria": ["string — как проверить что сделано правильно"],
   "risks": ["string — возможные проблемы"],
-  "documentation": {
-    "overview": "string — общее описание проекта/модуля (стек, назначение, ключевые фичи)",
-    "architecture": "string — архитектурный обзор (слои, модули, как они связаны)",
-    "components": [
+  "knowledgeGraph": {
+    "domains": ["Backend", "Frontend", "Infrastructure", "Config", "Tests", "Scripts", "Docs"],
+    "modules": [
       {
-        "name": "string — имя компонента/модуля/сервиса",
-        "path": "string — путь к файлу/папке",
-        "responsibility": "string — за что отвечает",
-        "dependencies": ["string — от чего зависит"],
-        "publicApi": ["string — экспортируемые функции/методы/компоненты"]
+        "id": "string",
+        "name": "string",
+        "domain": "string",
+        "description": "string",
+        "paths": ["string"],
+        "dependencies": ["string"],
+        "usedBy": ["string"],
+        "coverage": 0
       }
     ],
-    "dataFlow": "string — как данные проходят через систему (от запроса до ответа)",
-    "codePatterns": "string — принятые паттерны и соглашения в коде (стиль имён, структура, библиотеки)"
+    "files": [
+      {
+        "path": "string",
+        "purpose": "string",
+        "type": "Controller|Service|Repository|Model|Component|Store|Composable|Config|Script|Test|Unknown",
+        "responsibility": "string",
+        "publicMethods": ["string"],
+        "usedClasses": ["string"],
+        "usedBy": ["string"],
+        "relatedEntities": ["string"],
+        "relatedFeatures": ["string"]
+      }
+    ],
+    "entities": [
+      {
+        "id": "string",
+        "kind": "Controller|Service|Repository|Model|Component|Store|API|Feature|ADR|Route|Script|Unknown",
+        "name": "string",
+        "location": "string",
+        "purpose": "string",
+        "dependsOn": ["string"],
+        "usedBy": ["string"],
+        "featureIds": ["string"]
+      }
+    ],
+    "relations": [
+      {
+        "from": "string",
+        "to": "string",
+        "type": "calls|uses|imports|renders|stores|exposes|validates|persists|tests|configures|unknown",
+        "reason": "string"
+      }
+    ],
+    "features": [
+      {
+        "id": "string",
+        "name": "string",
+        "description": "string",
+        "purpose": "string",
+        "backendFiles": ["string"],
+        "frontendFiles": ["string"],
+        "api": ["string"],
+        "models": ["string"],
+        "accessRules": ["string"],
+        "events": ["string"],
+        "queues": ["string"],
+        "businessRules": ["string"],
+        "tests": ["string"]
+      }
+    ],
+    "apiMap": [
+      {
+        "method": "GET|POST|PUT|PATCH|DELETE|Unknown",
+        "url": "string",
+        "controller": "string",
+        "service": "string",
+        "request": "string",
+        "response": "string",
+        "validation": "string",
+        "authorization": "string",
+        "models": ["string"],
+        "featureIds": ["string"]
+      }
+    ],
+    "dataModels": [
+      {
+        "name": "string",
+        "location": "string",
+        "fields": ["string"],
+        "relations": ["string"],
+        "readBy": ["string"],
+        "writtenBy": ["string"],
+        "createdBy": ["string"],
+        "deletedBy": ["string"],
+        "services": ["string"],
+        "api": ["string"]
+      }
+    ],
+    "frontendMap": [
+      {
+        "route": "string",
+        "page": "string",
+        "components": ["string"],
+        "composables": ["string"],
+        "stores": ["string"],
+        "api": ["string"],
+        "dependencies": ["string"]
+      }
+    ],
+    "dataFlows": [
+      {
+        "name": "string",
+        "trigger": "string",
+        "steps": ["string"],
+        "models": ["string"],
+        "api": ["string"]
+      }
+    ],
+    "adrs": [
+      {
+        "id": "string",
+        "title": "string",
+        "decision": "string",
+        "reason": "string",
+        "advantages": ["string"],
+        "limitations": ["string"],
+        "relatedFiles": ["string"]
+      }
+    ],
+    "entityIndex": [
+      {
+        "id": "string",
+        "name": "string",
+        "kind": "string",
+        "location": "string",
+        "feature": "string",
+        "uses": ["string"],
+        "usedBy": ["string"],
+        "impacts": ["string"]
+      }
+    ],
+    "coverage": {
+      "backend": 0,
+      "frontend": 0,
+      "infrastructure": 0,
+      "config": 0,
+      "tests": 0,
+      "scripts": 0,
+      "docs": 0
+    },
+    "unknowns": ["string"]
   }
 }
 
@@ -3787,14 +4015,21 @@ ${memoryContext ? `\nПАМЯТЬ ПРОЕКТА ИЗ БД (существующ
   "requirements": ["Кнопка отправки disabled пока нет текста", "Enter отправляет", "Shift+Enter — перенос строки"],
   "files": [{"path": "apps/web/src/views/WorkspaceView.vue", "action": "update", "description": "Добавить кнопку отправки после textarea, привязать @keydown.enter", "reason": "Сейчас только textarea без кнопки"}],
   "acceptanceCriteria": ["Enter отправляет сообщение", "Shift+Enter делает перенос", "Пустой ввод не отправляется"],
-  "documentation": {
-    "overview": "Фронтенд на Vue 3 + TypeScript, чат в WorkspaceView.vue",
-    "architecture": "Компоненты вьюх лежат в src/views/, API-клиент в src/api.ts, роутер в src/router.ts",
-    "components": [
-      {"name": "WorkspaceView", "path": "apps/web/src/views/WorkspaceView.vue", "responsibility": "Основной интерфейс чата с оркестратором", "dependencies": ["api.ts", "router.ts", "ws"], "publicApi": ["textarea ввода", "список сообщений", "селектор команды"]}
-    ],
-    "dataFlow": "Пользователь вводит текст → POST /chats/:id/messages → оркестратор → стрим ответа через WebSocket → отображение в чате",
-    "codePatterns": "Vue 3 Composition API с <script setup>, Pinia не используется, API через fetch в api.ts"
+  "knowledgeGraph": {
+    "domains": ["Frontend", "Backend"],
+    "modules": [{"id":"workspace-ui","name":"Workspace UI","domain":"Frontend","description":"Чат и контроль run-ов","paths":["apps/web/src/views/WorkspaceView.vue"],"dependencies":["api-client"],"usedBy":[],"coverage":85}],
+    "files": [{"path":"apps/web/src/views/WorkspaceView.vue","purpose":"Отображает чат, run events и approvals","type":"Component","responsibility":"UI рабочего пространства","publicMethods":["sendChatMessage","resolveApproval"],"usedClasses":["api"],"usedBy":["router"],"relatedEntities":["WorkspaceView"],"relatedFeatures":["chat-workspace"]}],
+    "entities": [{"id":"component:WorkspaceView","kind":"Component","name":"WorkspaceView","location":"apps/web/src/views/WorkspaceView.vue","purpose":"Основная страница чата","dependsOn":["api:chat"],"usedBy":["route:/workspace"],"featureIds":["feature:chat-workspace"]}],
+    "relations": [{"from":"component:WorkspaceView","to":"api:chat","type":"uses","reason":"отправляет сообщения и читает run state"}],
+    "features": [{"id":"feature:chat-workspace","name":"Workspace chat","description":"Рабочий чат с агентами","purpose":"Вести задачи и видеть процесс","backendFiles":["apps/api/src/modules/chats/chats.service.ts"],"frontendFiles":["apps/web/src/views/WorkspaceView.vue"],"api":["POST /chats/:id/messages"],"models":["RunEntity"],"accessRules":["Неизвестно"],"events":["ws token stream"],"queues":[],"businessRules":["Сообщение пользователя может запускать run"],"tests":["Неизвестно"]}],
+    "apiMap": [{"method":"POST","url":"/chats/:id/messages","controller":"ChatsController","service":"ChatsService","request":"chatId + content","response":"assistant message + autoRunId","validation":"Неизвестно","authorization":"Неизвестно","models":["ChatEntity","RunEntity"],"featureIds":["feature:chat-workspace"]}],
+    "dataModels": [{"name":"RunEntity","location":"apps/api/src/persistence/run.entity.ts","fields":["id","task","status","events"],"relations":["chatId -> ChatEntity"],"readBy":["RunsService"],"writtenBy":["RunsService"],"createdBy":["RunsService.startRun"],"deletedBy":["Неизвестно"],"services":["RunsService"],"api":["/runs","/jobs/:id"]}],
+    "frontendMap": [{"route":"/workspace","page":"WorkspaceView","components":["WorkspaceView"],"composables":[],"stores":[],"api":["/chats/:id/messages","/runs/:id"],"dependencies":["api.ts"]}],
+    "dataFlows": [{"name":"Send chat message","trigger":"Пользователь нажал Enter","steps":["WorkspaceView -> api.sendChatMessage","ChatsService -> orchestrator","RunsService -> agents","WebSocket -> WorkspaceView"],"models":["ChatEntity","RunEntity"],"api":["POST /chats/:id/messages"]}],
+    "adrs": [],
+    "entityIndex": [{"id":"component:WorkspaceView","name":"WorkspaceView","kind":"Component","location":"apps/web/src/views/WorkspaceView.vue","feature":"chat-workspace","uses":["api:chat"],"usedBy":["route:/workspace"],"impacts":["chat UX","run control"]}],
+    "coverage": {"backend":60,"frontend":85,"infrastructure":10,"config":20,"tests":10,"scripts":5,"docs":10},
+    "unknowns": ["Authorization rules not found in provided code","Tests coverage for workspace flow not confirmed"]
   }
 }
 

@@ -318,6 +318,7 @@ export class ChatsService {
                   title: entry.title,
                   summary: entry.summary,
                   details: entry.details,
+                  graph: entry.graph,
                   kind: entry.kind,
                   tags: entry.tags,
                   relatedFiles: entry.relatedFiles,

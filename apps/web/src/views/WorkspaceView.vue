@@ -29,6 +29,8 @@ type MessageBlock = {
   inlineParts?: InlinePart[];
 };
 
+type KnowledgeGraphRecord = Record<string, any>;
+
 const router = useRouter();
 const route = useRoute();
 
@@ -173,6 +175,38 @@ const runStatusLabel = computed(() => {
   if (s === "failed") return "Ошибка";
   if (s === "cancelled") return "Остановлено";
   return s || "—";
+});
+
+const knowledgeGraphIndexEntry = computed<ProjectMemoryEntry | null>(() => {
+  return state.projectMemory.find((entry) => entry.kind === "knowledge-graph-index" || entry.tags?.includes("source-of-truth")) ?? null;
+});
+
+const knowledgeGraph = computed<KnowledgeGraphRecord | null>(() => {
+  const graph = knowledgeGraphIndexEntry.value?.graph;
+  return graph && typeof graph === "object" ? graph as KnowledgeGraphRecord : null;
+});
+
+const graphCoverageEntries = computed(() => {
+  const coverage = knowledgeGraph.value?.coverage;
+  if (!coverage || typeof coverage !== "object") return [];
+  return Object.entries(coverage)
+    .map(([key, value]) => ({ key, value: Number(value) || 0 }))
+    .sort((a, b) => b.value - a.value);
+});
+
+const graphUnknowns = computed(() => {
+  const unknowns = knowledgeGraph.value?.unknowns;
+  return Array.isArray(unknowns) ? unknowns.map((item) => String(item || "").trim()).filter(Boolean) : [];
+});
+
+const graphFeatures = computed(() => {
+  const features = knowledgeGraph.value?.features;
+  return Array.isArray(features) ? features.slice(0, 8) : [];
+});
+
+const graphEntityIndex = computed(() => {
+  const entityIndex = knowledgeGraph.value?.entityIndex;
+  return Array.isArray(entityIndex) ? entityIndex.slice(0, 14) : [];
 });
 
 
@@ -494,7 +528,21 @@ async function loadInitialData() {
   }
 }
 
-async function refreshChats(projectId?: string, preferredChatId?: string) { if (!projectId) { state.chats = []; state.selectedChatId = ""; state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; return; } const response = await api.chats(projectId); state.chats = response.chats; const targetChatId = (preferredChatId && state.chats.some(c => c.id === preferredChatId)) ? preferredChatId : state.chats[0]?.id || ""; state.selectedChatId = targetChatId; if (state.selectedChatId) await openChat(state.selectedChatId); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } }
+async function refreshProjectMemory(projectId?: string) {
+  if (!projectId) {
+    state.projectMemory = [];
+    return;
+  }
+  try {
+    const response = await api.projectMemory(projectId);
+    state.projectMemory = response.entries;
+  } catch (e) {
+    console.error("Failed to load project memory:", e);
+    state.projectMemory = [];
+  }
+}
+
+async function refreshChats(projectId?: string, preferredChatId?: string) { if (!projectId) { state.chats = []; state.selectedChatId = ""; state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; state.projectMemory = []; return; } await refreshProjectMemory(projectId); const response = await api.chats(projectId); state.chats = response.chats; const targetChatId = (preferredChatId && state.chats.some(c => c.id === preferredChatId)) ? preferredChatId : state.chats[0]?.id || ""; state.selectedChatId = targetChatId; if (state.selectedChatId) await openChat(state.selectedChatId); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } }
 async function openChat(id: string) { state.selectedChatId = id; isLoadingChat = true; const response = await api.chatById(id); state.messages = response.messages; state.chatRuns = response.runs; state.chatStats = response.stats; const persistedActiveRun = response.runs.find((run) => ["queued", "running", "paused", "awaiting_approval", "waiting_approval"].includes(run.status)); if (persistedActiveRun) { state.selectedRunId = persistedActiveRun.id; await openRun(persistedActiveRun.id); if (["queued", "running", "awaiting_approval", "waiting_approval"].includes(persistedActiveRun.status)) startPolling(persistedActiveRun.id); } else { state.runEvents = []; state.runError = ""; state.report = null; state.runStatus = ""; } clearAgentLogs(); await nextTick(); isLoadingChat = false; shouldAutoScroll = true; userHasScrolled = false; scheduleScrollToBottom("auto"); }
 async function openRun(id: string) { state.selectedRunId = id; const response = await api.runById(id); state.report = response.report; state.runStatus = response.run.status; state.runEvents = response.run.events ?? []; state.runError = response.run.error ?? ""; }
 
@@ -1038,6 +1086,67 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
         <div class="composer-actions"><span class="composer-hint">Enter — отправить · Shift+Enter — новая строка</span><button class="composer-send" :disabled="isSending || state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button></div>
       </footer>
 
+      <section v-if="selectedProject && (knowledgeGraph || state.projectMemory.length)" class="knowledge-panel">
+        <div class="knowledge-panel-header">
+          <div>
+            <h3 class="knowledge-panel-title">Knowledge Graph</h3>
+            <p class="knowledge-panel-subtitle">{{ selectedProject.name }} · живая карта проекта для команды</p>
+          </div>
+          <span v-if="knowledgeGraphIndexEntry" class="knowledge-panel-badge">{{ knowledgeGraphIndexEntry.kind }}</span>
+        </div>
+
+        <div v-if="knowledgeGraph" class="knowledge-grid">
+          <section class="knowledge-card">
+            <div class="knowledge-card-title">Покрытие знаний</div>
+            <div class="coverage-list">
+              <div v-for="entry in graphCoverageEntries" :key="entry.key" class="coverage-item">
+                <div class="coverage-row">
+                  <span class="coverage-label">{{ entry.key }}</span>
+                  <span class="coverage-value">{{ entry.value }}%</span>
+                </div>
+                <div class="coverage-bar"><span class="coverage-fill" :style="{ width: `${entry.value}%` }"></span></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="knowledge-card">
+            <div class="knowledge-card-title">Неизвестные участки</div>
+            <div v-if="graphUnknowns.length" class="knowledge-list">
+              <div v-for="(item, index) in graphUnknowns" :key="`unknown-${index}`" class="knowledge-list-item">{{ item }}</div>
+            </div>
+            <div v-else class="knowledge-empty">Явных пробелов не отмечено.</div>
+          </section>
+
+          <section class="knowledge-card">
+            <div class="knowledge-card-title">Features</div>
+            <div v-if="graphFeatures.length" class="knowledge-list">
+              <div v-for="feature in graphFeatures" :key="feature.id || feature.name" class="feature-item">
+                <div class="feature-name">{{ feature.name || feature.id }}</div>
+                <div class="feature-desc">{{ feature.description || feature.purpose || "Описание не заполнено" }}</div>
+              </div>
+            </div>
+            <div v-else class="knowledge-empty">Фичи пока не выделены.</div>
+          </section>
+
+          <section class="knowledge-card knowledge-card-wide">
+            <div class="knowledge-card-title">Индекс сущностей</div>
+            <div v-if="graphEntityIndex.length" class="entity-list">
+              <div v-for="entity in graphEntityIndex" :key="entity.id || `${entity.kind}-${entity.name}`" class="entity-item">
+                <div class="entity-head">
+                  <span class="entity-name">{{ entity.name || entity.id }}</span>
+                  <span class="entity-kind">{{ entity.kind || "unknown" }}</span>
+                </div>
+                <div class="entity-meta">{{ entity.location || "Местоположение неизвестно" }}</div>
+                <div class="entity-meta" v-if="entity.feature">Feature: {{ entity.feature }}</div>
+              </div>
+            </div>
+            <div v-else class="knowledge-empty">Индекс сущностей пока пуст.</div>
+          </section>
+        </div>
+
+        <div v-else class="knowledge-empty">Граф знаний для проекта пока не построен.</div>
+      </section>
+
     <!-- Модалка «Дать агенту новую задачу». На паузе — отложится до resume,
          в активном состоянии — перенаправит агента. -->
     <div v-if="state.showReplaceTask" class="modal-overlay" @click.self="state.showReplaceTask = false">
@@ -1203,6 +1312,30 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .composer-send:hover:not(:disabled) { transform:scale(1.05); }
 .composer-send:disabled { opacity:.4; cursor:not-allowed; }
 
+.knowledge-panel { max-width:980px; width:100%; margin:0 auto 20px; padding:16px; border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.02); }
+.knowledge-panel-header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:14px; }
+.knowledge-panel-title { margin:0; font-size:16px; color:var(--text); }
+.knowledge-panel-subtitle { margin:4px 0 0; font-size:12px; color:var(--muted); }
+.knowledge-panel-badge { display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; background:rgba(99,102,241,.12); border:1px solid rgba(99,102,241,.24); color:#a5b4fc; font-size:11px; font-family:var(--font-mono); }
+.knowledge-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
+.knowledge-card { display:flex; flex-direction:column; gap:10px; padding:14px; border-radius:12px; background:var(--panel); border:1px solid var(--line); min-width:0; }
+.knowledge-card-wide { grid-column:1 / -1; }
+.knowledge-card-title { font-size:13px; font-weight:600; color:var(--text); }
+.coverage-list, .knowledge-list, .entity-list { display:flex; flex-direction:column; gap:10px; }
+.coverage-item, .knowledge-list-item, .feature-item, .entity-item { min-width:0; }
+.coverage-row { display:flex; justify-content:space-between; gap:8px; font-size:12px; color:var(--text); }
+.coverage-label { text-transform:capitalize; color:var(--muted); }
+.coverage-value { font-family:var(--font-mono); color:var(--text); }
+.coverage-bar { height:8px; border-radius:999px; background:rgba(255,255,255,.06); overflow:hidden; }
+.coverage-fill { display:block; height:100%; border-radius:999px; background:linear-gradient(90deg, #6366f1, #10b981); }
+.knowledge-list-item, .feature-item, .entity-item { padding:10px 12px; border-radius:10px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.05); font-size:12px; color:var(--text-dim); line-height:1.5; }
+.feature-name, .entity-name { font-size:13px; font-weight:600; color:var(--text); }
+.feature-desc { margin-top:4px; color:var(--text-dim); }
+.entity-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.entity-kind { padding:2px 8px; border-radius:999px; background:rgba(16,185,129,.12); border:1px solid rgba(16,185,129,.24); color:#6ee7b7; font-size:10px; text-transform:uppercase; }
+.entity-meta { margin-top:4px; color:var(--muted); font-family:var(--font-mono); font-size:11px; word-break:break-word; }
+.knowledge-empty { font-size:12px; color:var(--muted); padding:10px 0; }
+
 .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; z-index:100; }
 .modal { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:24px; min-width:360px; max-width:90vw; }
 .modal-header { margin-bottom:16px; }
@@ -1221,4 +1354,9 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .toast.success .toast-icon { color:#10b981; }
 .toast.error .toast-icon { color:#ef4444; }
 .toast.info .toast-icon { color:#3b82f6; }
+
+@media (max-width: 900px) {
+  .knowledge-grid { grid-template-columns:1fr; }
+  .knowledge-card-wide { grid-column:auto; }
+}
 </style>

@@ -4,6 +4,7 @@ export class SaveProjectMemoryDto {
   title?: string;
   summary?: string;
   details?: string;
+  graph?: Record<string, unknown>;
   kind?: string;
   tags?: string[];
   relatedFiles?: string[];

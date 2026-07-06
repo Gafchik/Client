@@ -22,6 +22,9 @@ export class ProjectMemoryEntryEntity {
   @Column("text", { default: "" })
   details!: string;
 
+  @Column("jsonb", { default: {} })
+  graph!: Record<string, unknown>;
+
   @Column("varchar", { default: "feature" })
   kind!: string;
 
