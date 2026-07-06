@@ -204,6 +204,13 @@ export class ChatsService {
     }
     const project = await this.projectsRepository.findOneBy({ id: chat.projectId });
     if (!project) throw new Error("Project not found");
+
+    // Вычисляем путь в контейнере (как в runs.service.ts)
+    const projectPath = path.resolve(project.localPath || "").replace(
+      process.env.HOST_PROJECTS_ROOT || "/projects",
+      process.env.CONTAINER_PROJECTS_ROOT || "/workspace",
+    );
+
     const resolvedTeamId = overrideTeamId || project.teamId || chat.teamId;
     if (!resolvedTeamId) throw new Error("Project team is not configured");
     const team = await this.teamsService.getById(resolvedTeamId);
@@ -224,7 +231,7 @@ export class ChatsService {
       throw new Error("Orchestrator model is not configured");
     }
 
-    const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code, project.localPath || "");
+    const systemPrompt = this.loadOrchestratorPrompt(teamLanguage.label, teamLanguage.code, projectPath);
     const memoryEntries = (await this.projectMemoryRepository.find({
       where: { projectId: project.id, isActive: true },
       order: { updatedAt: "DESC" },
@@ -278,7 +285,7 @@ export class ChatsService {
                   id: project.id,
                   name: project.name,
                   description: project.description,
-                  localPath: project.localPath,
+                  localPath: projectPath,
                 },
                 team: {
                   id: team.id,
@@ -484,7 +491,7 @@ export class ChatsService {
         originalMessage: content,
         teamId: resolvedTeamId,
         teamName: team.name,
-        projectPath: project.localPath,
+        projectPath: projectPath,
       });
       autoRunId = run.runId;
       // Локальная константа со строгим типом string — TS не сужает let autoRunId
