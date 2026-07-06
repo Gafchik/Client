@@ -6,6 +6,7 @@ export const AGENT_DISPLAY: Record<string, { name: string; letter: string; cls: 
   pm: { name: "Mira (PM)", letter: "M", cls: "pm", placeholder: "Изучаю код и составляю техническое задание…" },
   developer: { name: "Kai (Разработчик)", letter: "K", cls: "developer", placeholder: "Пишу код и применяю изменения…" },
   tester: { name: "Nova (Тестировщик)", letter: "N", cls: "tester", placeholder: "Проверяю изменения…" },
+  reviewer: { name: "Rex (Ревьювер)", letter: "R", cls: "reviewer", placeholder: "Провожу код-ревью и проверяю качество…" },
 };
 
 export function agentDisplay(role: string) {
@@ -20,6 +21,7 @@ export function avatarColor(role: string): string {
     developer: "#f59e0b",
     coder: "#f59e0b",
     tester: "#ef4444",
+    reviewer: "#8b5cf6",
     system: "#6b7280",
     user: "#3b82f6",
   };

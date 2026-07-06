@@ -32,9 +32,10 @@ const newTeam = ref({
   testing: { commands: [] },
   agents: {
     orchestrator: { name: "Alex", label: "Оркестратор", model: "", multiplier: 1, temperature: 0.2 },
+    pm: { name: "Mira", label: "Проджект-менеджер", model: "", multiplier: 1, temperature: 0.2 },
     developer: { name: "Kai", label: "Разработчик", model: "", multiplier: 1, temperature: 0.15 },
     tester: { name: "Nova", label: "Тестировщик", model: "", multiplier: 1, temperature: 0.1 },
-    analyst: { name: "Mira", label: "Бизнес-аналитик", model: "", multiplier: 1, temperature: 0.2 },
+    reviewer: { name: "Rex", label: "Ревьювер", model: "", multiplier: 1, temperature: 0.1 },
   },
 });
 
@@ -122,9 +123,10 @@ async function createTeam() {
       run: { maxReviewRounds: 1, applyChanges: true }, testing: { commands: [] },
       agents: {
         orchestrator: { name: "Alex", label: "Оркестратор", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.2 },
+        pm: { name: "Mira", label: "Проджект-менеджер", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.2 },
         developer: { name: "Kai", label: "Разработчик", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.15 },
         tester: { name: "Nova", label: "Тестировщик", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.1 },
-        analyst: { name: "Mira", label: "Бизнес-аналитик", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.2 },
+        reviewer: { name: "Rex", label: "Ревьювер", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.1 },
       },
     };
     showCreateForm.value = false;
@@ -323,7 +325,8 @@ onMounted(loadData);
 .agent-avatar.orchestrator { background:#6366f1; }
 .agent-avatar.developer { background:#f59e0b; }
 .agent-avatar.tester { background:#ef4444; }
-.agent-avatar.analyst { background:#10b981; }
+.agent-avatar.pm { background:#10b981; }
+.agent-avatar.reviewer { background:#8b5cf6; }
 .agent-info h4 { margin:0; font-size:14px; }
 .agent-role { font-size:11px; color:var(--muted); text-transform:uppercase; }
 .agent-fields { display:flex; flex-direction:column; gap:12px; }
