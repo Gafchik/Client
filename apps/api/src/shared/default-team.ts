@@ -1,4 +1,4 @@
-export const ROLE_ORDER = ["orchestrator", "analyst", "developer", "tester", "reviewer"] as const;
+export const ROLE_ORDER = ["pm", "developer", "tester", "reviewer"] as const;
 
 /** Tool kinds that can be requested during a run */
 export type ToolKind = "file_read" | "file_write" | "shell" | "migration" | "search";
@@ -10,13 +10,9 @@ export interface RoleToolPolicy {
 }
 
 export const ROLE_TOOL_POLICIES: Record<string, RoleToolPolicy> = {
-  orchestrator: {
+  pm: {
     allowed: ["file_read", "search"],
     shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree"],
-  },
-  analyst: {
-    allowed: ["file_read", "search"],
-    shellWhitelist: ["ls", "cat", "head", "tail", "grep", "find", "wc", "tree", "rg"],
   },
   developer: {
     allowed: ["file_read", "file_write", "shell", "migration", "search"],
@@ -85,16 +81,9 @@ export function createDefaultTeam(name = "Core Team") {
       commands: [],
     },
     agents: {
-      orchestrator: {
-        name: "Alex",
-        label: "Оркестратор",
-        model: "deepseek/deepseek-v3.2",
-        multiplier: 0.5,
-        temperature: 0.05,
-      },
-      analyst: {
+      pm: {
         name: "Mira",
-        label: "Аналитик",
+        label: "Проджект-менеджер",
         model: "deepseek/deepseek-v4-pro",
         multiplier: 0.7,
         temperature: 0.1,

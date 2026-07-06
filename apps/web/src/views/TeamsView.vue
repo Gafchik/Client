@@ -31,7 +31,6 @@ const newTeam = ref({
   run: { maxReviewRounds: 1, applyChanges: true },
   testing: { commands: [] },
   agents: {
-    orchestrator: { name: "Alex", label: "Оркестратор", model: "", multiplier: 1, temperature: 0.2 },
     pm: { name: "Mira", label: "Проджект-менеджер", model: "", multiplier: 1, temperature: 0.2 },
     developer: { name: "Kai", label: "Разработчик", model: "", multiplier: 1, temperature: 0.15 },
     tester: { name: "Nova", label: "Тестировщик", model: "", multiplier: 1, temperature: 0.1 },
@@ -122,7 +121,6 @@ async function createTeam() {
       workspace: { maxFiles: 12, maxCharsPerFile: 12000, includeExtensions: [".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".css", ".html", ".py", ".php", ".vue"], ignoreDirs: [".git", "node_modules", "dist", "build"] },
       run: { maxReviewRounds: 1, applyChanges: true }, testing: { commands: [] },
       agents: {
-        orchestrator: { name: "Alex", label: "Оркестратор", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.2 },
         pm: { name: "Mira", label: "Проджект-менеджер", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.2 },
         developer: { name: "Kai", label: "Разработчик", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.15 },
         tester: { name: "Nova", label: "Тестировщик", model: models.value[0]?.id || "", multiplier: models.value[0]?.multiplier || 1, temperature: 0.1 },
@@ -154,8 +152,13 @@ async function saveTeam() {
   }
 }
 
+function confirmDeleteTeam() {
+  if (!selectedTeam.value) return;
+  if (!confirm(`Удалить команду «${selectedTeam.value.name}»? Это действие нельзя отменить.`)) return;
+  deleteTeam(selectedTeam.value.id);
+}
+
 async function deleteTeam(id: string) {
-  if (!confirm("Удалить команду?")) return;
   busy.value = true;
   try {
     await api.deleteTeam(id);
@@ -252,7 +255,10 @@ onMounted(loadData);
         <div class="card">
           <header class="detail-header">
             <h3>{{ selectedTeam.name }}</h3>
-            <button class="btn btn-primary" @click="saveTeam" :disabled="busy">Сохранить</button>
+            <div class="detail-actions">
+              <button class="btn btn-primary" @click="saveTeam" :disabled="busy">Сохранить</button>
+              <button class="btn btn-danger" @click="confirmDeleteTeam" :disabled="busy">Удалить команду</button>
+            </div>
           </header>
           <div class="detail-grid">
             <div class="setting-card">
@@ -322,7 +328,6 @@ onMounted(loadData);
 .agent-card { padding:16px; border-radius:var(--radius); background:var(--panel); border:1px solid var(--line); }
 .agent-header { display:flex; align-items:center; gap:12px; margin-bottom:16px; }
 .agent-avatar { width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:600; font-size:14px; }
-.agent-avatar.orchestrator { background:#6366f1; }
 .agent-avatar.developer { background:#f59e0b; }
 .agent-avatar.tester { background:#ef4444; }
 .agent-avatar.pm { background:#10b981; }
@@ -332,4 +337,8 @@ onMounted(loadData);
 .agent-fields { display:flex; flex-direction:column; gap:12px; }
 .empty-state { color:var(--muted); text-align:center; padding:40px; }
 .report-view.small { padding:8px 12px; font-size:12px; }
+.detail-actions { display:flex; gap:8px; align-items:center; }
+.btn-danger { background:#ef4444; color:#fff; border:none; }
+.btn-danger:hover { background:#dc2626; }
+.btn-danger:disabled { opacity:0.6; cursor:not-allowed; }
 </style>
