@@ -2397,8 +2397,8 @@ export class RunsService implements OnModuleInit {
     applyChanges = true,
   ): Promise<{ ok: boolean; error?: string }> {
     try {
-      if (isUrlLikePath(fileChange.path) || hasSuspiciousMirroredPath(fileChange.path)) {
-        return { ok: false, error: `Подозрительный путь от агента: ${fileChange.path}` };
+      if (isUrlLikePath(fileChange.path)) {
+        return { ok: false, error: `URL-подобный путь от агента: ${fileChange.path}` };
       }
       const relPath = this.relPathWithinProject(projectPath, fileChange.path);
       if (!relPath) return { ok: true };
