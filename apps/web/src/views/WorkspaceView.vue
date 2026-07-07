@@ -72,7 +72,7 @@ const state = reactive({
 
 const quickTemplates = [
   "Исправить баг в сервисе с сохранением обратной совместимости",
-  "Добавить feature с тестами и кратким ADR",
+  "Добавить фичу с тестами и кратким ADR",
   "Провести архитектурный разбор модуля и дать рекомендации",
   "Оптимизировать производительность узкого места и описать изменения",
 ];
@@ -117,16 +117,16 @@ const liveActivity = computed<LiveActivityItem[]>(() => {
       const payload = (event.payload && typeof event.payload === "object" ? event.payload : {}) as Record<string, unknown>;
       const roleRaw = String(payload.agentRole || payload.role || "").toLowerCase();
       const role = roleRaw.includes("pm")
-        ? "Project Manager"
+        ? "Проектный менеджер"
         : roleRaw.includes("review")
-          ? "Reviewer"
+          ? "Ревьюер"
           : roleRaw.includes("test")
-            ? "Tester"
+            ? "Тестировщик"
             : roleRaw.includes("knowledge")
-              ? "Knowledge Engine"
+              ? "Система знаний"
               : roleRaw.includes("dev")
-                ? "Developer"
-                : "Orchestrator";
+                ? "Разработчик"
+                : "Оркестратор";
       return {
         id: `${event.at}-${event.event}`,
         at: event.at,
@@ -150,15 +150,15 @@ const missionPipeline = computed<PipelineStage[]>(() => {
   const hasRun = Boolean(mission.runId);
 
   return [
-    { id: "intent", title: "Intent Analysis", description: "Классификация задачи", status: "done", duration: "~1s", model: inferModel(mission, "orchestrator") },
-    { id: "ir", title: "Compiler IR", description: "Построение структуры задачи", status: "done", duration: "~1s", model: inferModel(mission, "orchestrator") },
-    { id: "knowledge", title: "Knowledge Lookup", description: "Поиск знаний проекта", status: "done", duration: "~1s", model: inferModel(mission, "pm") },
-    { id: "impact", title: "Impact Analysis", description: "Анализ влияния изменений", status: "done", duration: "~1s", model: inferModel(mission, "pm") },
-    { id: "context", title: "Context Building", description: "Сбор context pack", status: "done", duration: "~1s", model: inferModel(mission, "orchestrator") },
-    { id: "planning", title: "Execution Planning", description: "План выполнения", status: "done", duration: "~1s", model: inferModel(mission, "pm") },
+    { id: "intent", title: "Анализ намерения", description: "Классификация задачи", status: "done", duration: "~1s", model: inferModel(mission, "orchestrator") },
+    { id: "ir", title: "IR компилятора", description: "Построение структуры задачи", status: "done", duration: "~1s", model: inferModel(mission, "orchestrator") },
+    { id: "knowledge", title: "Поиск знаний", description: "Поиск знаний проекта", status: "done", duration: "~1s", model: inferModel(mission, "pm") },
+    { id: "impact", title: "Анализ влияния", description: "Анализ влияния изменений", status: "done", duration: "~1s", model: inferModel(mission, "pm") },
+    { id: "context", title: "Сбор контекста", description: "Сбор контекст-пакета", status: "done", duration: "~1s", model: inferModel(mission, "orchestrator") },
+    { id: "planning", title: "Планирование выполнения", description: "План выполнения", status: "done", duration: "~1s", model: inferModel(mission, "pm") },
     {
       id: "development",
-      title: "Development",
+      title: "Разработка",
       description: "Выполнение изменений",
       status: mission.mode === "ask" ? "done" : runErrored ? "error" : runDone ? "done" : runActive || hasRun ? "active" : "pending",
       duration: hasRun ? formatDuration(mission.durationSec) : "—",
@@ -167,7 +167,7 @@ const missionPipeline = computed<PipelineStage[]>(() => {
     },
     {
       id: "review",
-      title: "Review",
+      title: "Ревью",
       description: "Проверка архитектуры",
       status: mission.mode === "ask" ? "pending" : runDone ? "done" : runErrored ? "error" : runActive ? "active" : "pending",
       duration: hasRun ? formatDuration(Math.round(mission.durationSec * 0.3)) : "—",
@@ -175,7 +175,7 @@ const missionPipeline = computed<PipelineStage[]>(() => {
     },
     {
       id: "testing",
-      title: "Testing",
+      title: "Тестирование",
       description: "Запуск тестов",
       status: mission.mode === "ask" ? "pending" : runDone ? "done" : runErrored ? "error" : runActive ? "active" : "pending",
       duration: hasRun ? formatDuration(Math.round(mission.durationSec * 0.2)) : "—",
@@ -184,7 +184,7 @@ const missionPipeline = computed<PipelineStage[]>(() => {
     },
     {
       id: "memory",
-      title: "Memory Update",
+      title: "Обновление памяти",
       description: "Обновление Knowledge Graph",
       status: runDone ? "done" : runErrored ? "error" : runActive ? "active" : "pending",
       duration: hasRun ? formatDuration(Math.max(1, Math.round(mission.durationSec * 0.1))) : "—",
@@ -192,7 +192,7 @@ const missionPipeline = computed<PipelineStage[]>(() => {
     },
     {
       id: "completed",
-      title: "Completed",
+      title: "Завершено",
       description: "Финализация миссии",
       status: runDone || mission.mode === "ask" ? "done" : runErrored ? "error" : "pending",
       duration: formatDuration(mission.durationSec),
@@ -206,15 +206,15 @@ const askArticleSections = computed(() => {
   if (!mission || mission.mode !== "ask") return [];
   const compile = mission.compile;
   return [
-    { title: "Overview", body: mission.askAnswer || compile?.answer || mission.resultSummary || "—" },
-    { title: "Architecture", body: compile?.impact?.reasons?.join("\n") || "Архитектурные пояснения отсутствуют." },
-    { title: "Dependencies", body: (compile?.impact?.impactedServices || []).join("\n") || "Нет выявленных зависимостей." },
-    { title: "Files", body: (compile?.impact?.impactedFiles || []).join("\n") || "Файлы не затрагиваются." },
+    { title: "Обзор", body: mission.askAnswer || compile?.answer || mission.resultSummary || "—" },
+    { title: "Архитектура", body: compile?.impact?.reasons?.join("\n") || "Архитектурные пояснения отсутствуют." },
+    { title: "Зависимости", body: (compile?.impact?.impactedServices || []).join("\n") || "Нет выявленных зависимостей." },
+    { title: "Файлы", body: (compile?.impact?.impactedFiles || []).join("\n") || "Файлы не затрагиваются." },
     { title: "API", body: (compile?.impact?.impactedApi || []).join("\n") || "Изменений API не обнаружено." },
-    { title: "Related Features", body: (compile?.impact?.impactedPages || []).join("\n") || "Нет связанных feature." },
-    { title: "Tests", body: (compile?.impact?.testsToRun || []).join("\n") || "Рекомендованные тесты не указаны." },
-    { title: "Git History", body: "Использованы текущие артефакты проекта и run history." },
-    { title: "Knowledge Sources", body: "Knowledge Graph\nProject Memory\nDocumentation\nExperience Memory" },
+    { title: "Связанные фичи", body: (compile?.impact?.impactedPages || []).join("\n") || "Нет связанных фич." },
+    { title: "Тесты", body: (compile?.impact?.testsToRun || []).join("\n") || "Рекомендованные тесты не указаны." },
+    { title: "История Git", body: "Использованы текущие артефакты проекта и история запусков." },
+    { title: "Источники знаний", body: "Граф знаний\nПамять проекта\nДокументация\nПамять опыта" },
   ];
 });
 
@@ -233,7 +233,7 @@ function formatDuration(sec?: number): string {
   if (!value) return "—";
   const m = Math.floor(value / 60);
   const s = Math.max(0, value % 60);
-  return m ? `${m}m ${s}s` : `${s}s`;
+  return m ? `${m}м ${s}с` : `${s}с`;
 }
 function formatTokens(value?: number): string {
   return new Intl.NumberFormat().format(Number(value || 0));
@@ -243,20 +243,22 @@ function formatMoney(value?: number): string {
 }
 function formatMs(ms?: number): string {
   const value = Number(ms || 0);
-  if (!value) return "0ms";
-  if (value < 1000) return `${value}ms`;
+  if (!value) return "0мс";
+  if (value < 1000) return `${value}мс`;
   const sec = Math.round((value / 1000) * 10) / 10;
-  return `${sec}s`;
+  return `${sec}с`;
 }
 function priorityLabel(weight: number): string {
-  if (weight >= 0.85) return "Critical";
-  if (weight >= 0.65) return "High";
-  if (weight >= 0.45) return "Medium";
-  return "Low";
+  if (weight >= 0.85) return "Критично";
+  if (weight >= 0.65) return "Высокий";
+  if (weight >= 0.45) return "Средний";
+  return "Низкий";
 }
 function priorityClass(weight: number): string {
-  const label = priorityLabel(weight).toLowerCase();
-  return label;
+  if (weight >= 0.85) return "critical";
+  if (weight >= 0.65) return "high";
+  if (weight >= 0.45) return "medium";
+  return "low";
 }
 
 function normalizeEvents(events: Array<{ at: string; event: string; payload?: unknown }>) {
@@ -264,15 +266,15 @@ function normalizeEvents(events: Array<{ at: string; event: string; payload?: un
 }
 function normalizeEventTitle(event: string): string {
   const map: Record<string, string> = {
-    "run:created": "Task Created",
-    "intent:ready": "Intent Analysis",
-    "compiler:ir": "Compiler IR Ready",
-    "context:built": "Context Built",
-    "developer:started": "Developer Started",
-    "review:started": "Review Started",
-    "testing:started": "Testing Started",
-    "knowledge:updated": "Knowledge Updated",
-    completed: "Completed",
+    "run:created": "Задача создана",
+    "intent:ready": "Намерение определено",
+    "compiler:ir": "IR компилятора готов",
+    "context:built": "Контекст собран",
+    "developer:started": "Разработка начата",
+    "review:started": "Ревью начато",
+    "testing:started": "Тестирование начато",
+    "knowledge:updated": "Знания обновлены",
+    completed: "Завершено",
   };
   return map[event] || event.replace(/[._]/g, ":").split(":").map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
 }
@@ -285,17 +287,17 @@ function formatPayloadSummary(payload: unknown): string {
 }
 function inferModel(mission: MissionHistoryItem, role: string): string {
   const byRole = mission.models.find((m) => m.toLowerCase().includes(role));
-  return byRole || mission.models[0] || "auto";
+  return byRole || mission.models[0] || "авто";
 }
 function summarizeFinal(report: unknown, error?: string): string {
   if (error) return `Ошибка: ${error}`;
-  if (!report) return "Mission завершена.";
+  if (!report) return "Миссия завершена.";
   if (typeof report === "string") return report.slice(0, 240);
   if (typeof report === "object") {
     const summary = (report as Record<string, unknown>).summary;
     if (typeof summary === "string") return summary.slice(0, 240);
   }
-  return "Mission завершена.";
+  return "Миссия завершена.";
 }
 
 function autoResizeComposer() {
@@ -355,8 +357,8 @@ async function ensureChatId() {
   const chat = await api.saveChat({
     projectId: state.selectedProjectId,
     teamId: state.selectedTeamId,
-    title: `Mission ${new Date().toLocaleString()}`,
-    summary: "Mission Control session",
+    title: `Миссия ${new Date().toLocaleString()}`,
+    summary: "Сессия центра миссий",
     isActive: true,
   });
   state.selectedChatId = chat.chat.id;
@@ -416,15 +418,15 @@ async function runProjectResync() {
   state.resyncSummaryModalOpen = false;
   state.resyncResult = null;
   state.resyncStages = [
-    { key: "scan", title: "Scanning Project...", status: "active", durationMs: 0 },
-    { key: "detect", title: "Detecting Changes...", status: "pending", durationMs: 0 },
-    { key: "kg", title: "Updating Knowledge Graph...", status: "pending", durationMs: 0 },
-    { key: "relations", title: "Rebuilding Relationships...", status: "pending", durationMs: 0 },
-    { key: "docs", title: "Refreshing Documentation...", status: "pending", durationMs: 0 },
-    { key: "memory", title: "Optimizing Memory...", status: "pending", durationMs: 0 },
-    { key: "coverage", title: "Calculating Coverage...", status: "pending", durationMs: 0 },
-    { key: "validation", title: "Final Validation...", status: "pending", durationMs: 0 },
-    { key: "completed", title: "Completed.", status: "pending", durationMs: 0 },
+    { key: "scan", title: "Сканирование проекта...", status: "active", durationMs: 0 },
+    { key: "detect", title: "Определение изменений...", status: "pending", durationMs: 0 },
+    { key: "kg", title: "Обновление графа знаний...", status: "pending", durationMs: 0 },
+    { key: "relations", title: "Перестроение связей...", status: "pending", durationMs: 0 },
+    { key: "docs", title: "Обновление документации...", status: "pending", durationMs: 0 },
+    { key: "memory", title: "Оптимизация памяти...", status: "pending", durationMs: 0 },
+    { key: "coverage", title: "Пересчёт покрытия...", status: "pending", durationMs: 0 },
+    { key: "validation", title: "Финальная валидация...", status: "pending", durationMs: 0 },
+    { key: "completed", title: "Завершено.", status: "pending", durationMs: 0 },
   ];
 
   try {
@@ -443,7 +445,7 @@ async function runProjectResync() {
 
     state.resyncSummaryModalOpen = true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Resync failed";
+    const message = error instanceof Error ? error.message : "Синхронизация не удалась";
     state.resyncStages = state.resyncStages.map((stage, index) =>
       index === state.resyncStages.findIndex((x) => x.status === "active")
         ? { ...stage, status: "error", message }
@@ -544,7 +546,7 @@ function composedTask() {
   const task = state.composer.trim();
   if (!task) return "";
   if (!state.attachedContext.length) return task;
-  return `${task}\n\nAttached context:\n${state.attachedContext.map((f) => `- ${f}`).join("\n")}`;
+  return `${task}\n\nПриложенный контекст:\n${state.attachedContext.map((f) => `- ${f}`).join("\n")}`;
 }
 
 async function handlePreview() {
@@ -780,35 +782,35 @@ watch(
     <div v-if="state.previewOpen && state.previewResult" class="preview-backdrop">
       <div class="preview-modal">
         <header>
-          <h3>Preview before Compile</h3>
+          <h3>Предпросмотр перед компиляцией</h3>
           <button @click="state.previewOpen = false">✕</button>
         </header>
         <div class="preview-grid">
           <section>
-            <h4>Compiler IR</h4>
+            <h4>IR компилятора</h4>
             <pre>{{ JSON.stringify(state.previewResult.intent, null, 2) }}</pre>
           </section>
           <section>
-            <h4>Execution Plan</h4>
+            <h4>План выполнения</h4>
             <pre>{{ state.previewResult.plan.executionTask }}</pre>
           </section>
           <section>
-            <h4>Impact Analysis</h4>
+            <h4>Анализ влияния</h4>
             <pre>{{ JSON.stringify(state.previewResult.impact, null, 2) }}</pre>
           </section>
           <section>
-            <h4>Context Pack</h4>
+            <h4>Контекст-пакет</h4>
             <pre>{{ JSON.stringify(state.previewResult.contextPack, null, 2) }}</pre>
           </section>
           <div class="estimate">
-            <span>Estimated Cost: {{ formatMoney(((state.previewResult.contextPack?.totalEstimatedTokens || 0) / 1000) * 0.004) }}</span>
-            <span>Estimated Tokens: {{ formatTokens(state.previewResult.contextPack?.totalEstimatedTokens || 0) }}</span>
-            <span>Estimated Time: 1-10m</span>
+            <span>Оценка стоимости: {{ formatMoney(((state.previewResult.contextPack?.totalEstimatedTokens || 0) / 1000) * 0.004) }}</span>
+            <span>Оценка токенов: {{ formatTokens(state.previewResult.contextPack?.totalEstimatedTokens || 0) }}</span>
+            <span>Оценка времени: 1-10м</span>
           </div>
         </div>
         <footer class="actions">
-          <button class="btn ghost" @click="state.previewOpen = false">Cancel</button>
-          <button class="btn primary" :disabled="state.compileBusy" @click="handleCompileFromPreview">Compile</button>
+          <button class="btn ghost" @click="state.previewOpen = false">Отмена</button>
+          <button class="btn primary" :disabled="state.compileBusy" @click="handleCompileFromPreview">Компилировать</button>
         </footer>
       </div>
     </div>
@@ -816,9 +818,9 @@ watch(
     <div v-if="state.resyncRunningModalOpen" class="preview-backdrop">
       <div class="preview-modal resync-modal">
         <header>
-          <h3>Resync Project</h3>
+          <h3>🔄 Resync Project</h3>
         </header>
-        <p class="resync-subtitle">Synchronization pipeline is running...</p>
+        <p class="resync-subtitle">Выполняется пайплайн синхронизации...</p>
         <div class="resync-stages">
           <div v-for="stage in state.resyncStages" :key="stage.key" class="resync-stage" :class="stage.status">
             <div class="resync-stage-dot" />
@@ -827,7 +829,7 @@ watch(
                 <strong>{{ stage.title }}</strong>
                 <span class="resync-time">{{ formatMs(stage.durationMs) }}</span>
               </div>
-              <div class="resync-stage-meta">Status: {{ stage.status }}<span v-if="stage.message"> · {{ stage.message }}</span></div>
+              <div class="resync-stage-meta">Статус: {{ stage.status }}<span v-if="stage.message"> · {{ stage.message }}</span></div>
             </div>
           </div>
         </div>
@@ -837,29 +839,29 @@ watch(
     <div v-if="state.resyncSummaryModalOpen && state.resyncResult" class="preview-backdrop">
       <div class="preview-modal resync-modal">
         <header>
-          <h3>{{ state.resyncResult.summary.alreadySynchronized ? "Project is already synchronized." : "Project synchronized successfully." }}</h3>
+          <h3>{{ state.resyncResult.summary.alreadySynchronized ? "Проект уже синхронизирован." : "Синхронизация проекта успешно завершена." }}</h3>
           <button @click="state.resyncSummaryModalOpen = false">✕</button>
         </header>
         <p v-if="state.resyncResult.summary.alreadySynchronized" class="resync-subtitle">
-          Knowledge Graph is up to date. No code changes detected.
+          Граф знаний актуален. Изменений в коде не обнаружено.
         </p>
         <div class="resync-summary-grid">
-          <div class="metric"><span>Scanned files</span><strong>{{ state.resyncResult.summary.scannedFiles }}</strong></div>
-          <div class="metric"><span>Changed files</span><strong>{{ state.resyncResult.summary.changedFiles }}</strong></div>
-          <div class="metric"><span>New files</span><strong>{{ state.resyncResult.summary.newFiles }}</strong></div>
-          <div class="metric"><span>Deleted files</span><strong>{{ state.resyncResult.summary.deletedFiles }}</strong></div>
-          <div class="metric"><span>New entities</span><strong>{{ state.resyncResult.summary.newEntities }}</strong></div>
-          <div class="metric"><span>New relations</span><strong>{{ state.resyncResult.summary.newRelations }}</strong></div>
-          <div class="metric"><span>Updated services</span><strong>{{ state.resyncResult.summary.updatedServices }}</strong></div>
-          <div class="metric"><span>Updated components</span><strong>{{ state.resyncResult.summary.updatedComponents }}</strong></div>
-          <div class="metric"><span>Updated API</span><strong>{{ state.resyncResult.summary.updatedApi }}</strong></div>
-          <div class="metric"><span>Updated documentation</span><strong>{{ state.resyncResult.summary.updatedDocumentation }}</strong></div>
-          <div class="metric"><span>Updated decisions</span><strong>{{ state.resyncResult.summary.updatedArchitecturalDecisions }}</strong></div>
-          <div class="metric"><span>Updated memory entries</span><strong>{{ state.resyncResult.summary.updatedMemoryEntries }}</strong></div>
-          <div class="metric"><span>Coverage before</span><strong>{{ Math.round(state.resyncResult.summary.coverageBefore * 100) }}%</strong></div>
-          <div class="metric"><span>Coverage after</span><strong>{{ Math.round(state.resyncResult.summary.coverageAfter * 100) }}%</strong></div>
-          <div class="metric"><span>Execution time</span><strong>{{ formatMs(state.resyncResult.summary.durationMs) }}</strong></div>
-          <div class="metric"><span>Memory integrity</span><strong>{{ state.resyncResult.summary.memoryIntegrity }}</strong></div>
+          <div class="metric"><span>Просканировано файлов</span><strong>{{ state.resyncResult.summary.scannedFiles }}</strong></div>
+          <div class="metric"><span>Изменено файлов</span><strong>{{ state.resyncResult.summary.changedFiles }}</strong></div>
+          <div class="metric"><span>Новых файлов</span><strong>{{ state.resyncResult.summary.newFiles }}</strong></div>
+          <div class="metric"><span>Удалено файлов</span><strong>{{ state.resyncResult.summary.deletedFiles }}</strong></div>
+          <div class="metric"><span>Новых сущностей</span><strong>{{ state.resyncResult.summary.newEntities }}</strong></div>
+          <div class="metric"><span>Новых связей</span><strong>{{ state.resyncResult.summary.newRelations }}</strong></div>
+          <div class="metric"><span>Обновлено сервисов</span><strong>{{ state.resyncResult.summary.updatedServices }}</strong></div>
+          <div class="metric"><span>Обновлено компонентов</span><strong>{{ state.resyncResult.summary.updatedComponents }}</strong></div>
+          <div class="metric"><span>Обновлено API</span><strong>{{ state.resyncResult.summary.updatedApi }}</strong></div>
+          <div class="metric"><span>Обновлено документации</span><strong>{{ state.resyncResult.summary.updatedDocumentation }}</strong></div>
+          <div class="metric"><span>Обновлено решений</span><strong>{{ state.resyncResult.summary.updatedArchitecturalDecisions }}</strong></div>
+          <div class="metric"><span>Обновлено записей памяти</span><strong>{{ state.resyncResult.summary.updatedMemoryEntries }}</strong></div>
+          <div class="metric"><span>Покрытие до</span><strong>{{ Math.round(state.resyncResult.summary.coverageBefore * 100) }}%</strong></div>
+          <div class="metric"><span>Покрытие после</span><strong>{{ Math.round(state.resyncResult.summary.coverageAfter * 100) }}%</strong></div>
+          <div class="metric"><span>Время выполнения</span><strong>{{ formatMs(state.resyncResult.summary.durationMs) }}</strong></div>
+          <div class="metric"><span>Целостность памяти</span><strong>{{ state.resyncResult.summary.memoryIntegrity }}</strong></div>
         </div>
       </div>
     </div>
@@ -867,7 +869,7 @@ watch(
     <div v-if="state.resyncHistoryModalOpen" class="preview-backdrop">
       <div class="preview-modal resync-modal">
         <header>
-          <h3>Resync History</h3>
+          <h3>История синхронизаций</h3>
           <button @click="state.resyncHistoryModalOpen = false">✕</button>
         </header>
         <div class="resync-history-layout">
@@ -881,17 +883,17 @@ watch(
             >
               <strong>{{ item.title }}</strong>
               <span>{{ formatDateTime(item.date) }}</span>
-              <span>Duration: {{ formatMs(item.durationMs) }}</span>
+              <span>Длительность: {{ formatMs(item.durationMs) }}</span>
             </button>
           </aside>
           <section v-if="selectedResyncHistoryEntry" class="resync-history-details">
             <h4>{{ selectedResyncHistoryEntry.title }}</h4>
             <p>{{ selectedResyncHistoryEntry.summary }}</p>
             <ul>
-              <li>Changed files: {{ selectedResyncHistoryEntry.changedFiles }}</li>
-              <li>Updated entities: {{ selectedResyncHistoryEntry.updatedEntities }}</li>
-              <li>Coverage: {{ Math.round(selectedResyncHistoryEntry.coverageBefore * 100) }}% → {{ Math.round(selectedResyncHistoryEntry.coverageAfter * 100) }}%</li>
-              <li>Memory integrity: {{ selectedResyncHistoryEntry.memoryIntegrity }}</li>
+              <li>Изменено файлов: {{ selectedResyncHistoryEntry.changedFiles }}</li>
+              <li>Обновлено сущностей: {{ selectedResyncHistoryEntry.updatedEntities }}</li>
+              <li>Покрытие: {{ Math.round(selectedResyncHistoryEntry.coverageBefore * 100) }}% → {{ Math.round(selectedResyncHistoryEntry.coverageAfter * 100) }}%</li>
+              <li>Целостность памяти: {{ selectedResyncHistoryEntry.memoryIntegrity }}</li>
             </ul>
           </section>
         </div>

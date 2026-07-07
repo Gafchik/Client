@@ -35,7 +35,7 @@ const isEmpty = computed(() => !props.mission);
 </script>
 
 <template>
-  <section v-if="isEmpty" class="empty-card">Выберите задачу из истории или создайте новую Mission.</section>
+  <section v-if="isEmpty" class="empty-card">Выберите задачу из истории или создайте новую миссию.</section>
 
   <section v-else class="mission-card">
     <header class="mission-header">
@@ -50,7 +50,7 @@ const isEmpty = computed(() => !props.mission);
         </div>
         <div>
           <span>Модели</span>
-          <strong>{{ mission!.models.join(", ") || "auto" }}</strong>
+          <strong>{{ mission!.models.join(", ") || "авто" }}</strong>
         </div>
         <div>
           <span>Стоимость</span>
@@ -64,7 +64,7 @@ const isEmpty = computed(() => !props.mission);
     </header>
 
     <section class="card-section">
-      <h3>Pipeline</h3>
+      <h3>Пайплайн</h3>
       <div class="pipeline-list">
         <article v-for="stage in missionPipeline" :key="stage.id" class="pipeline-stage" :class="stage.status">
           <button class="stage-head" @click="ui.expandPipeline[stage.id] = !ui.expandPipeline[stage.id]">
@@ -87,7 +87,7 @@ const isEmpty = computed(() => !props.mission);
 
     <section class="card-section split">
       <div>
-        <h3>Live Activity</h3>
+        <h3>Живая активность</h3>
         <div class="activity-list">
           <div v-for="item in liveActivity" :key="item.id" class="activity-item">
             <div>
@@ -100,7 +100,7 @@ const isEmpty = computed(() => !props.mission);
         </div>
       </div>
       <div>
-        <h3>Timeline</h3>
+        <h3>Таймлайн</h3>
         <div class="timeline">
           <div v-for="event in missionTimeline" :key="`${event.at}-${event.title}`" class="timeline-item">
             <time>{{ formatTime(event.at) }}</time>
@@ -115,7 +115,7 @@ const isEmpty = computed(() => !props.mission);
 
     <section class="card-section split">
       <div>
-        <h3>Context Pack</h3>
+        <h3>Контекст-пакет</h3>
         <div v-if="mission!.compile?.contextPack?.items?.length" class="context-pack">
           <details
             v-for="item in mission!.compile?.contextPack?.items"
@@ -131,7 +131,7 @@ const isEmpty = computed(() => !props.mission);
               </div>
               <div class="meta">
                 <span :class="priorityClass(item.weight)">{{ priorityLabel(item.weight) }}</span>
-                <span>{{ item.estimatedTokens }} tokens</span>
+                <span>{{ item.estimatedTokens }} токенов</span>
               </div>
             </summary>
             <pre>{{ item.content }}</pre>
@@ -141,14 +141,14 @@ const isEmpty = computed(() => !props.mission);
       </div>
 
       <div>
-        <h3>Impact Analysis</h3>
+        <h3>Анализ влияния</h3>
         <div class="impact-grid" v-if="mission!.compile?.impact">
           <div>
-            <span>Files</span>
+            <span>Файлы</span>
             <strong>{{ mission!.compile!.impact.impactedFiles.length }}</strong>
           </div>
           <div>
-            <span>Services</span>
+            <span>Сервисы</span>
             <strong>{{ mission!.compile!.impact.impactedServices.length }}</strong>
           </div>
           <div>
@@ -156,24 +156,24 @@ const isEmpty = computed(() => !props.mission);
             <strong>{{ mission!.compile!.impact.impactedApi.length }}</strong>
           </div>
           <div>
-            <span>Features</span>
+            <span>Фичи</span>
             <strong>{{ mission!.compile!.impact.impactedPages.length }}</strong>
           </div>
           <div>
-            <span>Tests</span>
+            <span>Тесты</span>
             <strong>{{ mission!.compile!.impact.testsToRun.length }}</strong>
           </div>
           <div>
-            <span>Risk</span>
+            <span>Риск</span>
             <strong>{{ mission!.compile!.impact.riskLevel }} ({{ mission!.compile!.impact.riskScore }})</strong>
           </div>
         </div>
-        <p v-else class="empty">Impact analysis пока недоступен.</p>
+        <p v-else class="empty">Анализ влияния пока недоступен.</p>
       </div>
     </section>
 
     <section class="card-section">
-      <h3>Final Report</h3>
+      <h3>Итоговый отчёт</h3>
       <div class="final-grid">
         <details :open="ui.expandFinal.done">
           <summary>Что сделано</summary>
@@ -192,30 +192,30 @@ const isEmpty = computed(() => !props.mission);
           </ul>
         </details>
         <details :open="ui.expandFinal.review">
-          <summary>Review</summary>
-          <p>{{ mission!.mode === "ask" ? "Не применяется в Ask mode." : "Проверка выполнена в рамках пайплайна." }}</p>
+          <summary>Ревью</summary>
+          <p>{{ mission!.mode === "ask" ? "Не применяется в режиме «Вопрос»." : "Проверка выполнена в рамках пайплайна." }}</p>
         </details>
         <details :open="ui.expandFinal.testing">
-          <summary>Testing</summary>
+          <summary>Тестирование</summary>
           <ul>
             <li v-for="test in mission!.compile?.plan?.testsToRun || []" :key="test">{{ test }}</li>
           </ul>
         </details>
         <details :open="ui.expandFinal.memory">
-          <summary>Memory Update</summary>
+          <summary>Обновление памяти</summary>
           <ul>
             <li v-for="memory in mission!.compile?.knowledge?.topMemory || []" :key="memory.id">{{ memory.title }}</li>
           </ul>
         </details>
         <details :open="ui.expandFinal.next">
           <summary>Следующие рекомендации</summary>
-          <p>Проверьте критичные участки из Impact Analysis и выполните smoke/regression тесты в CI.</p>
+          <p>Проверьте критичные участки из анализа влияния и выполните smoke/regression тесты в CI.</p>
         </details>
       </div>
     </section>
 
     <section v-if="mission!.mode === 'ask'" class="card-section">
-      <h3>Ask Documentation View</h3>
+      <h3>Документация ответа</h3>
       <article class="ask-doc">
         <section v-for="section in askArticleSections" :key="section.title">
           <h4>{{ section.title }}</h4>

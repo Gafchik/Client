@@ -33,10 +33,10 @@ const emit = defineEmits<{
   <aside class="left-panel">
     <div class="left-head">
       <div>
-        <h1>Mission Control</h1>
-        <p>AI Compiler Workspace</p>
+        <h1>Центр миссий</h1>
+        <p>Рабочее пространство AI Compiler</p>
       </div>
-      <span class="mode-pill" :class="missionMode">{{ missionMode.toUpperCase() }}</span>
+      <span class="mode-pill" :class="missionMode">{{ missionMode === "build" ? "СБОРКА" : "ВОПРОС" }}</span>
     </div>
 
     <div class="left-block">
@@ -58,28 +58,28 @@ const emit = defineEmits<{
     </div>
 
     <div class="mode-switch">
-      <button class="switch-btn" :class="{ active: missionMode === 'build' }" @click="emit('update:missionMode', 'build')">Build</button>
-      <button class="switch-btn" :class="{ active: missionMode === 'ask' }" @click="emit('update:missionMode', 'ask')">Ask</button>
+      <button class="switch-btn" :class="{ active: missionMode === 'build' }" @click="emit('update:missionMode', 'build')">Сборка</button>
+      <button class="switch-btn" :class="{ active: missionMode === 'ask' }" @click="emit('update:missionMode', 'ask')">Вопрос</button>
     </div>
 
     <div class="resync-card" :class="resyncStatus?.status || 'synchronized'">
       <div class="row between">
-        <strong>Knowledge Status</strong>
+        <strong>Статус знаний</strong>
         <span class="status-chip" :class="resyncStatus?.status || 'synchronized'">
-          {{ (resyncStatus?.status || "synchronized") === "outdated" ? "outdated" : "synchronized" }}
+          {{ (resyncStatus?.status || "synchronized") === "outdated" ? "устарели" : "синхронизированы" }}
         </span>
       </div>
       <p v-if="resyncStatus?.status === 'outdated'" class="resync-note">
-        Knowledge is outdated. {{ resyncStatus.changedFiles }} files changed since last synchronization.
+        Знания устарели. С момента последней синхронизации изменилось файлов: {{ resyncStatus.changedFiles }}.
       </p>
       <p v-else class="resync-note">
-        Knowledge is synchronized. Coverage: {{ Math.round((resyncStatus?.coverage || 0) * 100) }}%
+        Знания синхронизированы. Покрытие: {{ Math.round((resyncStatus?.coverage || 0) * 100) }}%
       </p>
       <button class="resync-btn" :disabled="resyncBusy || !selectedProjectId" @click="emit('resync-project')">
-        {{ resyncBusy ? "Resync in progress..." : "🔄 Resync Project" }}
+        {{ resyncBusy ? "Синхронизация выполняется..." : "🔄 Resync Project" }}
       </button>
       <button class="resync-history-link" :disabled="!resyncHistory.length" @click="emit('open-resync-history')">
-        View resync history ({{ resyncHistory.length }})
+        История синхронизаций ({{ resyncHistory.length }})
       </button>
     </div>
 
@@ -103,11 +103,11 @@ const emit = defineEmits<{
         </div>
         <div class="row mini">
           <span>{{ formatDateTime(mission.createdAt) }}</span>
-          <span>{{ mission.models.join(", ") || "auto" }}</span>
+          <span>{{ mission.models.join(", ") || "авто" }}</span>
         </div>
         <div class="row mini">
-          <span>Duration: {{ formatDuration(mission.durationSec) }}</span>
-          <span>Files: {{ mission.changedFiles }}</span>
+          <span>Длительность: {{ formatDuration(mission.durationSec) }}</span>
+          <span>Файлы: {{ mission.changedFiles }}</span>
         </div>
         <div class="result">{{ mission.resultSummary }}</div>
       </button>

@@ -26,10 +26,10 @@ function setRef(el: Element | null) {
 <template>
   <section class="composer">
     <div class="composer-top">
-      <h2>Новая Mission</h2>
+      <h2>Новая миссия</h2>
       <div class="kbd-hints">
-        <span>⌘/Ctrl + Enter → Build</span>
-        <span>Shift + Enter → Ask</span>
+        <span>⌘/Ctrl + Enter → Сборка</span>
+        <span>Shift + Enter → Вопрос</span>
       </div>
     </div>
 
@@ -49,7 +49,7 @@ function setRef(el: Element | null) {
     </div>
 
     <div class="attach-block">
-      <div class="label">Attach context</div>
+      <div class="label">Прикрепить контекст</div>
       <div class="attach-list">
         <button
           v-for="file in suggestedContext"
@@ -64,9 +64,9 @@ function setRef(el: Element | null) {
     </div>
 
     <div class="composer-actions">
-      <button class="btn ghost" :disabled="compileBusy || !composer.trim()" @click="emit('preview')">Preview</button>
-      <button class="btn primary" :disabled="compileBusy || !composer.trim()" @click="emit('build')">Build</button>
-      <button class="btn ask" :disabled="compileBusy || !composer.trim()" @click="emit('ask')">Ask</button>
+      <button class="btn ghost" :disabled="compileBusy || !composer.trim()" @click="emit('preview')">Предпросмотр</button>
+      <button class="btn primary" :disabled="compileBusy || !composer.trim()" @click="emit('build')">Сборка</button>
+      <button class="btn ask" :disabled="compileBusy || !composer.trim()" @click="emit('ask')">Вопрос</button>
     </div>
   </section>
 </template>

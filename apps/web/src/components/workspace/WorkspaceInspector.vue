@@ -14,58 +14,58 @@ const emit = defineEmits<{
 <template>
   <aside class="right-panel">
     <div class="tabs">
-      <button :class="{ active: tab === 'knowledge' }" @click="emit('update:tab', 'knowledge')">Knowledge</button>
-      <button :class="{ active: tab === 'sources' }" @click="emit('update:tab', 'sources')">Sources</button>
-      <button :class="{ active: tab === 'ir' }" @click="emit('update:tab', 'ir')">Compiler IR</button>
-      <button :class="{ active: tab === 'plan' }" @click="emit('update:tab', 'plan')">Execution Plan</button>
+      <button :class="{ active: tab === 'knowledge' }" @click="emit('update:tab', 'knowledge')">Знания</button>
+      <button :class="{ active: tab === 'sources' }" @click="emit('update:tab', 'sources')">Источники</button>
+      <button :class="{ active: tab === 'ir' }" @click="emit('update:tab', 'ir')">IR компилятора</button>
+      <button :class="{ active: tab === 'plan' }" @click="emit('update:tab', 'plan')">План выполнения</button>
     </div>
 
     <div class="inspector-content" v-if="mission">
       <template v-if="tab === 'knowledge'">
-        <h4>Entities</h4>
+        <h4>Сущности</h4>
         <ul>
           <li v-for="entity in mission.compile?.knowledge?.topEntities || []" :key="entity.id">
             <strong>{{ entity.name }}</strong> · {{ entity.kind }} · {{ entity.location }}
           </li>
         </ul>
-        <h4>Graph / Feature / API / Tests / ADR</h4>
+        <h4>Граф / Фича / API / Тесты / ADR</h4>
         <p>Данные подтягиваются из существующего Knowledge Graph и Project Memory.</p>
       </template>
 
       <template v-else-if="tab === 'sources'">
         <ul>
-          <li>Knowledge Graph</li>
+          <li>Граф знаний</li>
           <li>Git</li>
-          <li>Documentation</li>
-          <li>Experience Memory</li>
-          <li>Project Memory</li>
+          <li>Документация</li>
+          <li>Память опыта</li>
+          <li>Память проекта</li>
         </ul>
       </template>
 
       <template v-else-if="tab === 'ir'">
         <dl>
-          <dt>Type</dt>
+          <dt>Тип</dt>
           <dd>{{ mission.compile?.intent?.intentType || "—" }}</dd>
-          <dt>Scope</dt>
+          <dt>Охват</dt>
           <dd>{{ mission.compile?.plan?.runMode || "—" }}</dd>
-          <dt>Entities</dt>
+          <dt>Сущности</dt>
           <dd>{{ (mission.compile?.intent?.entities || []).join(", ") || "—" }}</dd>
-          <dt>Acceptance Criteria</dt>
+          <dt>Критерии приёмки</dt>
           <dd>{{ mission.compile?.plan?.executionTask || "—" }}</dd>
-          <dt>Risk</dt>
+          <dt>Риск</dt>
           <dd>{{ mission.compile?.impact?.riskLevel || "—" }}</dd>
-          <dt>Restrictions</dt>
+          <dt>Ограничения</dt>
           <dd>{{ (mission.compile?.intent?.reasons || []).join("; ") || "—" }}</dd>
         </dl>
       </template>
 
       <template v-else>
-        <h4>Execution Plan</h4>
-        <p>{{ mission.compile?.plan?.executionTask || "План будет доступен после preview/compile." }}</p>
-        <h4>Stages</h4>
+        <h4>План выполнения</h4>
+        <p>{{ mission.compile?.plan?.executionTask || "План будет доступен после предпросмотра/сборки." }}</p>
+        <h4>Этапы</h4>
         <ul>
           <li v-for="stage in mission.compile?.plan?.stages || []" :key="stage.id">
-            {{ stage.title }} · {{ stage.enabled ? "enabled" : "disabled" }}
+            {{ stage.title }} · {{ stage.enabled ? "включён" : "выключен" }}
           </li>
         </ul>
       </template>
