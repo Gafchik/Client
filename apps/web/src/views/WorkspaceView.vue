@@ -78,6 +78,8 @@ const state = reactive({
   replaceTaskText: "",
   replaceTaskBusy: false,
   confirmStop: false,
+  // Knowledge Graph Dialog
+  showKnowledgeGraph: false,
 });
 
 
@@ -914,6 +916,16 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
         </div>
       </div>
       <div class="context-actions">
+        <button
+          v-if="selectedProject && (knowledgeGraph || state.projectMemory.length)"
+          class="btn btn-ghost"
+          @click="state.showKnowledgeGraph = true"
+          :disabled="state.busy"
+          title="Открыть граф знаний"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="btn-icon"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span>Граф знаний</span>
+        </button>
         <button class="btn btn-primary" @click="createChat" :disabled="state.busy || !selectedProject || !(selectedProject.teamId || state.selectedTeamId)">Новый чат</button>
       </div>
     </div>
@@ -1086,67 +1098,6 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
         <div class="composer-actions"><span class="composer-hint">Enter — отправить · Shift+Enter — новая строка</span><button class="composer-send" :disabled="isSending || state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button></div>
       </footer>
 
-      <section v-if="selectedProject && (knowledgeGraph || state.projectMemory.length)" class="knowledge-panel">
-        <div class="knowledge-panel-header">
-          <div>
-            <h3 class="knowledge-panel-title">Knowledge Graph</h3>
-            <p class="knowledge-panel-subtitle">{{ selectedProject.name }} · живая карта проекта для команды</p>
-          </div>
-          <span v-if="knowledgeGraphIndexEntry" class="knowledge-panel-badge">{{ knowledgeGraphIndexEntry.kind }}</span>
-        </div>
-
-        <div v-if="knowledgeGraph" class="knowledge-grid">
-          <section class="knowledge-card">
-            <div class="knowledge-card-title">Покрытие знаний</div>
-            <div class="coverage-list">
-              <div v-for="entry in graphCoverageEntries" :key="entry.key" class="coverage-item">
-                <div class="coverage-row">
-                  <span class="coverage-label">{{ entry.key }}</span>
-                  <span class="coverage-value">{{ entry.value }}%</span>
-                </div>
-                <div class="coverage-bar"><span class="coverage-fill" :style="{ width: `${entry.value}%` }"></span></div>
-              </div>
-            </div>
-          </section>
-
-          <section class="knowledge-card">
-            <div class="knowledge-card-title">Неизвестные участки</div>
-            <div v-if="graphUnknowns.length" class="knowledge-list">
-              <div v-for="(item, index) in graphUnknowns" :key="`unknown-${index}`" class="knowledge-list-item">{{ item }}</div>
-            </div>
-            <div v-else class="knowledge-empty">Явных пробелов не отмечено.</div>
-          </section>
-
-          <section class="knowledge-card">
-            <div class="knowledge-card-title">Features</div>
-            <div v-if="graphFeatures.length" class="knowledge-list">
-              <div v-for="feature in graphFeatures" :key="feature.id || feature.name" class="feature-item">
-                <div class="feature-name">{{ feature.name || feature.id }}</div>
-                <div class="feature-desc">{{ feature.description || feature.purpose || "Описание не заполнено" }}</div>
-              </div>
-            </div>
-            <div v-else class="knowledge-empty">Фичи пока не выделены.</div>
-          </section>
-
-          <section class="knowledge-card knowledge-card-wide">
-            <div class="knowledge-card-title">Индекс сущностей</div>
-            <div v-if="graphEntityIndex.length" class="entity-list">
-              <div v-for="entity in graphEntityIndex" :key="entity.id || `${entity.kind}-${entity.name}`" class="entity-item">
-                <div class="entity-head">
-                  <span class="entity-name">{{ entity.name || entity.id }}</span>
-                  <span class="entity-kind">{{ entity.kind || "unknown" }}</span>
-                </div>
-                <div class="entity-meta">{{ entity.location || "Местоположение неизвестно" }}</div>
-                <div class="entity-meta" v-if="entity.feature">Feature: {{ entity.feature }}</div>
-              </div>
-            </div>
-            <div v-else class="knowledge-empty">Индекс сущностей пока пуст.</div>
-          </section>
-        </div>
-
-        <div v-else class="knowledge-empty">Граф знаний для проекта пока не построен.</div>
-      </section>
-
     <!-- Модалка «Дать агенту новую задачу». На паузе — отложится до resume,
          в активном состоянии — перенаправит агента. -->
     <div v-if="state.showReplaceTask" class="modal-overlay" @click.self="state.showReplaceTask = false">
@@ -1162,6 +1113,70 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
           <button class="btn btn-primary" :disabled="state.replaceTaskBusy || !state.replaceTaskText.trim()" @click="submitReplaceTask">
             {{ state.replaceTaskBusy ? "Отправляю..." : "Поставить задачу" }}
           </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Knowledge Graph Dialog -->
+    <div v-if="state.showKnowledgeGraph" class="modal-overlay" @click.self="state.showKnowledgeGraph = false">
+      <div class="modal modal-lg">
+        <div class="modal-header">
+          <h3 class="modal-title">Knowledge Graph — {{ selectedProject?.name }}</h3>
+          <button class="btn btn-ghost btn-sm" @click="state.showKnowledgeGraph = false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="modal-body knowledge-dialog-body">
+          <div v-if="knowledgeGraph" class="knowledge-grid">
+            <section class="knowledge-card">
+              <div class="knowledge-card-title">Покрытие знаний</div>
+              <div class="coverage-list">
+                <div v-for="entry in graphCoverageEntries" :key="entry.key" class="coverage-item">
+                  <div class="coverage-row">
+                    <span class="coverage-label">{{ entry.key }}</span>
+                    <span class="coverage-value">{{ entry.value }}%</span>
+                  </div>
+                  <div class="coverage-bar"><span class="coverage-fill" :style="{ width: `${entry.value}%` }"></span></div>
+                </div>
+              </div>
+            </section>
+
+            <section class="knowledge-card">
+              <div class="knowledge-card-title">Неизвестные участки</div>
+              <div v-if="graphUnknowns.length" class="knowledge-list">
+                <div v-for="(item, index) in graphUnknowns" :key="`unknown-${index}`" class="knowledge-list-item">{{ item }}</div>
+              </div>
+              <div v-else class="knowledge-empty">Явных пробелов не отмечено.</div>
+            </section>
+
+            <section class="knowledge-card">
+              <div class="knowledge-card-title">Features</div>
+              <div v-if="graphFeatures.length" class="knowledge-list">
+                <div v-for="feature in graphFeatures" :key="feature.id || feature.name" class="feature-item">
+                  <div class="feature-name">{{ feature.name || feature.id }}</div>
+                  <div class="feature-desc">{{ feature.description || feature.purpose || "Описание не заполнено" }}</div>
+                </div>
+              </div>
+              <div v-else class="knowledge-empty">Фичи пока не выделены.</div>
+            </section>
+
+            <section class="knowledge-card knowledge-card-wide">
+              <div class="knowledge-card-title">Индекс сущностей</div>
+              <div v-if="graphEntityIndex.length" class="entity-list">
+                <div v-for="entity in graphEntityIndex" :key="entity.id || `${entity.kind}-${entity.name}`" class="entity-item">
+                  <div class="entity-head">
+                    <span class="entity-name">{{ entity.name || entity.id }}</span>
+                    <span class="entity-kind">{{ entity.kind || "unknown" }}</span>
+                  </div>
+                  <div class="entity-meta">{{ entity.location || "Местоположение неизвестно" }}</div>
+                  <div class="entity-meta" v-if="entity.feature">Feature: {{ entity.feature }}</div>
+                </div>
+              </div>
+              <div v-else class="knowledge-empty">Индекс сущностей пока пуст.</div>
+            </section>
+          </div>
+
+          <div v-else class="knowledge-empty">Граф знаний для проекта пока не построен.</div>
         </div>
       </div>
     </div>
@@ -1338,13 +1353,15 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 
 .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; z-index:100; }
 .modal { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:24px; min-width:360px; max-width:90vw; }
-.modal-header { margin-bottom:16px; }
+.modal-lg { max-width:1100px; width:95vw; max-height:90vh; }
+.modal-header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }
 .modal-title { margin:0; font-size:18px; }
 .delete-confirm { display:flex; flex-direction:column; gap:12px; }
 .delete-confirm-icon { width:48px; height:48px; border-radius:50%; background:rgba(239,68,68,.1); color:#ef4444; display:flex; align-items:center; justify-content:center; margin:0 auto; }
 .delete-confirm-title { margin:0; font-size:16px; text-align:center; }
 .delete-confirm-text { margin:0; font-size:13px; color:var(--muted); text-align:center; }
 .modal-footer { display:flex; justify-content:flex-end; gap:8px; margin-top:20px; }
+.knowledge-dialog-body { max-height:65vh; overflow:auto; padding-right:8px; }
 .toast { position:fixed; bottom:20px; right:20px; display:flex; align-items:center; gap:12px; padding:12px 16px; border-radius:var(--radius); background:var(--panel); border:1px solid var(--line); box-shadow:0 10px 30px rgba(0,0,0,.2); z-index:200; animation:slideIn .3s ease; }
 @keyframes slideIn { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
 .toast.success { border-color:#10b981; }
