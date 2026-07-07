@@ -84,6 +84,7 @@ const state = reactive({
 
 
 const chatDraft = ref("");
+const isSendDisabled = computed(() => !chatDraft.value.trim() || isSending.value || state.busy || state.streamingMessage);
 const isSending = ref(false);
 const messagesListRef = ref<HTMLElement | null>(null);
 const composerTextareaRef = ref<HTMLTextAreaElement | null>(null);
@@ -98,6 +99,14 @@ let isLoadingChat = false;
 let lastStreamLength = 0;
 let userHasScrolled = false;
 let loadModelsTimer: number | null = null;
+function handleTextareaKeydown(event: KeyboardEvent) {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    if (isSendDisabled.value) return;
+    event.preventDefault();
+    sendMessage();
+  }
+}
+
 function loadModelsForProvider() {
   if (loadModelsTimer) window.clearTimeout(loadModelsTimer);
   loadModelsTimer = window.setTimeout(async () => {
@@ -1118,68 +1127,70 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
     </div>
 
     <!-- Knowledge Graph Dialog -->
-    <div v-if="state.showKnowledgeGraph" class="modal-overlay" @click.self="state.showKnowledgeGraph = false">
-      <div class="modal modal-lg">
-        <div class="modal-header">
-          <h3 class="modal-title">Knowledge Graph — {{ selectedProject?.name }}</h3>
-          <button class="btn btn-ghost btn-sm" @click="state.showKnowledgeGraph = false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-          </button>
-        </div>
-        <div class="modal-body knowledge-dialog-body">
-          <div v-if="knowledgeGraph" class="knowledge-grid">
-            <section class="knowledge-card">
-              <div class="knowledge-card-title">Покрытие знаний</div>
-              <div class="coverage-list">
-                <div v-for="entry in graphCoverageEntries" :key="entry.key" class="coverage-item">
-                  <div class="coverage-row">
-                    <span class="coverage-label">{{ entry.key }}</span>
-                    <span class="coverage-value">{{ entry.value }}%</span>
-                  </div>
-                  <div class="coverage-bar"><span class="coverage-fill" :style="{ width: `${entry.value}%` }"></span></div>
-                </div>
-              </div>
-            </section>
-
-            <section class="knowledge-card">
-              <div class="knowledge-card-title">Неизвестные участки</div>
-              <div v-if="graphUnknowns.length" class="knowledge-list">
-                <div v-for="(item, index) in graphUnknowns" :key="`unknown-${index}`" class="knowledge-list-item">{{ item }}</div>
-              </div>
-              <div v-else class="knowledge-empty">Явных пробелов не отмечено.</div>
-            </section>
-
-            <section class="knowledge-card">
-              <div class="knowledge-card-title">Features</div>
-              <div v-if="graphFeatures.length" class="knowledge-list">
-                <div v-for="feature in graphFeatures" :key="feature.id || feature.name" class="feature-item">
-                  <div class="feature-name">{{ feature.name || feature.id }}</div>
-                  <div class="feature-desc">{{ feature.description || feature.purpose || "Описание не заполнено" }}</div>
-                </div>
-              </div>
-              <div v-else class="knowledge-empty">Фичи пока не выделены.</div>
-            </section>
-
-            <section class="knowledge-card knowledge-card-wide">
-              <div class="knowledge-card-title">Индекс сущностей</div>
-              <div v-if="graphEntityIndex.length" class="entity-list">
-                <div v-for="entity in graphEntityIndex" :key="entity.id || `${entity.kind}-${entity.name}`" class="entity-item">
-                  <div class="entity-head">
-                    <span class="entity-name">{{ entity.name || entity.id }}</span>
-                    <span class="entity-kind">{{ entity.kind || "unknown" }}</span>
-                  </div>
-                  <div class="entity-meta">{{ entity.location || "Местоположение неизвестно" }}</div>
-                  <div class="entity-meta" v-if="entity.feature">Feature: {{ entity.feature }}</div>
-                </div>
-              </div>
-              <div v-else class="knowledge-empty">Индекс сущностей пока пуст.</div>
-            </section>
+    <Teleport to="body">
+      <div v-if="state.showKnowledgeGraph" class="modal-overlay" @click.self="state.showKnowledgeGraph = false">
+        <div class="modal modal-lg">
+          <div class="modal-header">
+            <h3 class="modal-title">Knowledge Graph — {{ selectedProject?.name }}</h3>
+            <button class="btn btn-ghost btn-sm" @click="state.showKnowledgeGraph = false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
           </div>
+          <div class="modal-body knowledge-dialog-body">
+            <div v-if="knowledgeGraph" class="knowledge-grid">
+              <section class="knowledge-card">
+                <div class="knowledge-card-title">Покрытие знаний</div>
+                <div class="coverage-list">
+                  <div v-for="entry in graphCoverageEntries" :key="entry.key" class="coverage-item">
+                    <div class="coverage-row">
+                      <span class="coverage-label">{{ entry.key }}</span>
+                      <span class="coverage-value">{{ entry.value }}%</span>
+                    </div>
+                    <div class="coverage-bar"><span class="coverage-fill" :style="{ width: `${entry.value}%` }"></span></div>
+                  </div>
+                </div>
+              </section>
 
-          <div v-else class="knowledge-empty">Граф знаний для проекта пока не построен.</div>
+              <section class="knowledge-card">
+                <div class="knowledge-card-title">Неизвестные участки</div>
+                <div v-if="graphUnknowns.length" class="knowledge-list">
+                  <div v-for="(item, index) in graphUnknowns" :key="`unknown-${index}`" class="knowledge-list-item">{{ item }}</div>
+                </div>
+                <div v-else class="knowledge-empty">Явных пробелов не отмечено.</div>
+              </section>
+
+              <section class="knowledge-card">
+                <div class="knowledge-card-title">Features</div>
+                <div v-if="graphFeatures.length" class="knowledge-list">
+                  <div v-for="feature in graphFeatures" :key="feature.id || feature.name" class="feature-item">
+                    <div class="feature-name">{{ feature.name || feature.id }}</div>
+                    <div class="feature-desc">{{ feature.description || feature.purpose || "Описание не заполнено" }}</div>
+                  </div>
+                </div>
+                <div v-else class="knowledge-empty">Фичи пока не выделены.</div>
+              </section>
+
+              <section class="knowledge-card knowledge-card-wide">
+                <div class="knowledge-card-title">Индекс сущностей</div>
+                <div v-if="graphEntityIndex.length" class="entity-list">
+                  <div v-for="entity in graphEntityIndex" :key="entity.id || `${entity.kind}-${entity.name}`" class="entity-item">
+                    <div class="entity-head">
+                      <span class="entity-name">{{ entity.name || entity.id }}</span>
+                      <span class="entity-kind">{{ entity.kind || "unknown" }}</span>
+                    </div>
+                    <div class="entity-meta">{{ entity.location || "Местоположение неизвестно" }}</div>
+                    <div class="entity-meta" v-if="entity.feature">Feature: {{ entity.feature }}</div>
+                  </div>
+                </div>
+                <div v-else class="knowledge-empty">Индекс сущностей пока пуст.</div>
+              </section>
+            </div>
+
+            <div v-else class="knowledge-empty">Граф знаний для проекта пока не построен.</div>
+          </div>
         </div>
       </div>
-    </div>
+    </Teleport>
 
     </main>
 
