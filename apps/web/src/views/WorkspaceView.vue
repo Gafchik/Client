@@ -2,7 +2,7 @@
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
-import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunApproval, RunItem, Team } from "../types";
+import type { Chat, ChatMessage, ChatStats, CompileResult, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunApproval, RunItem, Team } from "../types";
 
 type StreamItem = {
   id: string;
@@ -80,6 +80,12 @@ const state = reactive({
   confirmStop: false,
   // Knowledge Graph Dialog
   showKnowledgeGraph: false,
+  missionMode: "build" as "build" | "ask",
+  workspaceTab: "mission" as "mission" | "chat",
+  compile: null as CompileResult | null,
+  compileBusy: false,
+  runStartedAt: "" as string,
+  missionLog: [] as Array<{ at: string; title: string; detail: string }>,
 });
 
 
@@ -99,12 +105,65 @@ let isLoadingChat = false;
 let lastStreamLength = 0;
 let userHasScrolled = false;
 let loadModelsTimer: number | null = null;
-function handleTextareaKeydown(event: KeyboardEvent) {
-  if (event.key === 'Enter' && !event.shiftKey) {
-    if (isSendDisabled.value) return;
-    event.preventDefault();
-    sendMessage();
+let currentWsChatId = "";
+let currentWsProjectId = "";
+
+function runEventKey(e: { at: string; event: string; payload?: unknown }): string {
+  return `${String(e.at || "")}|${String(e.event || "")}|${JSON.stringify(e.payload ?? "")}`;
+}
+
+function appendRunEvents(entries: Array<{ at?: string; event: string; payload?: unknown }>) {
+  const normalized = entries
+    .map((entry) => ({
+      at: String(entry.at || new Date().toISOString()),
+      event: entry.event,
+      payload: entry.payload,
+    }))
+    .filter((entry) => Boolean(entry.event));
+
+  const existing = new Set(state.runEvents.map(runEventKey));
+  for (const entry of normalized) {
+    const key = runEventKey(entry);
+    if (!existing.has(key)) {
+      state.runEvents.push(entry);
+      existing.add(key);
+    }
   }
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function updateWsChatRoom(nextChatId: string) {
+  if (!ws || !ws.connected) {
+    currentWsChatId = nextChatId || "";
+    return;
+  }
+  if (currentWsChatId && currentWsChatId !== nextChatId) {
+    ws.emit("leave:chat", { chatId: currentWsChatId });
+  }
+  if (nextChatId && currentWsChatId !== nextChatId) {
+    ws.emit("join:chat", { chatId: nextChatId });
+  }
+  currentWsChatId = nextChatId || "";
+}
+
+function updateWsProjectRoom(nextProjectId: string) {
+  if (!ws || !ws.connected) {
+    currentWsProjectId = nextProjectId || "";
+    return;
+  }
+  if (currentWsProjectId && currentWsProjectId !== nextProjectId) {
+    ws.emit("leave:project", { projectId: currentWsProjectId });
+  }
+  if (nextProjectId && currentWsProjectId !== nextProjectId) {
+    ws.emit("join:project", { projectId: nextProjectId });
+  }
+  currentWsProjectId = nextProjectId || "";
 }
 
 function loadModelsForProvider() {
@@ -145,6 +204,59 @@ const selectedProjectTeam = computed(() => {
   const project = selectedProject.value;
   if (!project?.teamId) return emptyTeam();
   return state.teams.find((item) => item.id === project.teamId) ?? emptyTeam();
+});
+const compileStages = computed(() => state.compile?.plan?.stages || []);
+const missionProgress = computed(() => {
+  const stages = compileStages.value.filter((s) => s.enabled);
+  if (!stages.length) return 0;
+  const completed = stages.filter((s) => {
+    if (s.id === "intent" || s.id === "knowledge" || s.id === "impact" || s.id === "context" || s.id === "planning") return true;
+    if (s.id === "developer") return ["running", "completed", "done", "failed", "cancelled", "paused", "waiting_approval", "awaiting_approval"].includes(state.runStatus);
+    if (s.id === "reviewer") return ["completed", "done", "failed", "cancelled"].includes(state.runStatus);
+    if (s.id === "tester") return ["completed", "done", "failed", "cancelled"].includes(state.runStatus);
+    if (s.id === "knowledge-update") return ["completed", "done", "failed", "cancelled"].includes(state.runStatus);
+    return false;
+  }).length;
+  return Math.round((completed / stages.length) * 100);
+});
+const compilerIr = computed(() => {
+  if (!state.compile) return null;
+  return {
+    mode: state.compile.mode,
+    intentType: state.compile.intent.intentType,
+    confidence: state.compile.intent.confidence,
+    runMode: state.compile.plan.runMode,
+    executionTask: state.compile.plan.executionTask,
+    roles: state.compile.plan.roles,
+  };
+});
+const selectedContextItems = computed(() => state.compile?.contextPack?.items || []);
+const missionRisk = computed(() => state.compile?.impact || null);
+const missionRiskLabel = computed(() => {
+  const level = String(missionRisk.value?.riskLevel || "").toLowerCase();
+  if (level === "low") return "Низкий";
+  if (level === "medium") return "Средний";
+  if (level === "high") return "Высокий";
+  return missionRisk.value?.riskLevel || "—";
+});
+const missionEntities = computed(() => state.compile?.knowledge?.topEntities || []);
+const missionImpactedFiles = computed(() => state.compile?.impact?.impactedFiles || []);
+const missionTests = computed(() => state.compile?.plan?.testsToRun || []);
+const missionMemoryUpdates = computed(() => (state.compile?.knowledge?.topMemory || []).slice(0, 8));
+const missionTokenEstimate = computed(() => state.compile?.contextPack?.totalEstimatedTokens || 0);
+const missionCostEstimate = computed(() => {
+  const tokens = missionTokenEstimate.value;
+  return Number(((tokens / 1000) * 0.004).toFixed(4));
+});
+const missionElapsed = computed(() => {
+  if (!state.runStartedAt) return "—";
+  const start = new Date(state.runStartedAt).getTime();
+  if (!Number.isFinite(start)) return "—";
+  const diff = Math.max(0, Date.now() - start);
+  const sec = Math.floor(diff / 1000);
+  const min = Math.floor(sec / 60);
+  const rem = sec % 60;
+  return `${min}m ${rem}s`;
 });
 
 const modelGroups = computed(() => state.models.reduce<Record<string, ModelCatalogItem[]>>((groups, model) => { if (!groups[model.provider]) groups[model.provider] = []; groups[model.provider].push(model); return groups; }, {}));
@@ -553,11 +665,75 @@ async function refreshProjectMemory(projectId?: string) {
   }
 }
 
-async function refreshChats(projectId?: string, preferredChatId?: string) { if (!projectId) { state.chats = []; state.selectedChatId = ""; state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; state.projectMemory = []; return; } await refreshProjectMemory(projectId); const response = await api.chats(projectId); state.chats = response.chats; const targetChatId = (preferredChatId && state.chats.some(c => c.id === preferredChatId)) ? preferredChatId : state.chats[0]?.id || ""; state.selectedChatId = targetChatId; if (state.selectedChatId) await openChat(state.selectedChatId); else { state.messages = []; state.chatRuns = []; state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} }; } }
-async function openChat(id: string) { state.selectedChatId = id; isLoadingChat = true; const response = await api.chatById(id); state.messages = response.messages; state.chatRuns = response.runs; state.chatStats = response.stats; const persistedActiveRun = response.runs.find((run) => ["queued", "running", "paused", "awaiting_approval", "waiting_approval"].includes(run.status)); if (persistedActiveRun) { state.selectedRunId = persistedActiveRun.id; await openRun(persistedActiveRun.id); if (["queued", "running", "awaiting_approval", "waiting_approval"].includes(persistedActiveRun.status)) startPolling(persistedActiveRun.id); } else { state.runEvents = []; state.runError = ""; state.report = null; state.runStatus = ""; } clearAgentLogs(); await nextTick(); isLoadingChat = false; shouldAutoScroll = true; userHasScrolled = false; scheduleScrollToBottom("auto"); }
+async function refreshChats(projectId?: string, preferredChatId?: string) {
+  if (!projectId) {
+    stopPolling();
+    state.chats = [];
+    state.selectedChatId = "";
+    state.messages = [];
+    state.chatRuns = [];
+    state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} };
+    state.projectMemory = [];
+    state.busy = false;
+    updateWsChatRoom("");
+    return;
+  }
+  await refreshProjectMemory(projectId);
+  const response = await api.chats(projectId);
+  state.chats = response.chats;
+  const targetChatId = (preferredChatId && state.chats.some(c => c.id === preferredChatId)) ? preferredChatId : state.chats[0]?.id || "";
+  state.selectedChatId = targetChatId;
+  updateWsChatRoom(targetChatId);
+  if (targetChatId) {
+    await openChat(targetChatId);
+  } else {
+    stopPolling();
+    state.messages = [];
+    state.chatRuns = [];
+    state.chatStats = { requestCount: 0, runCount: 0, totalActualTokens: 0, totalWeightedTokens: 0, byRole: {} };
+    state.busy = false;
+  }
+}
+async function openChat(id: string) {
+  state.selectedChatId = id;
+  updateWsChatRoom(id);
+  isLoadingChat = true;
+  const response = await api.chatById(id);
+  state.messages = response.messages;
+  state.chatRuns = response.runs;
+  state.chatStats = response.stats;
+  const persistedActiveRun = response.runs.find((run) => ["queued", "running", "paused", "awaiting_approval", "waiting_approval"].includes(run.status));
+  if (persistedActiveRun) {
+    state.selectedRunId = persistedActiveRun.id;
+    await openRun(persistedActiveRun.id);
+    if (["queued", "running", "awaiting_approval", "waiting_approval"].includes(persistedActiveRun.status)) {
+      startPolling(persistedActiveRun.id);
+    } else {
+      stopPolling();
+      state.busy = false;
+    }
+  } else {
+    stopPolling();
+    state.runEvents = [];
+    state.runError = "";
+    state.report = null;
+    state.runStatus = "";
+    state.busy = false;
+  }
+  clearAgentLogs();
+  await nextTick();
+  isLoadingChat = false;
+  shouldAutoScroll = true;
+  userHasScrolled = false;
+  scheduleScrollToBottom("auto");
+}
 async function openRun(id: string) { state.selectedRunId = id; const response = await api.runById(id); state.report = response.report; state.runStatus = response.run.status; state.runEvents = response.run.events ?? []; state.runError = response.run.error ?? ""; }
 
 function showToast(type: 'success' | 'error' | 'info', message: string) { const id = ++toastId; state.toasts.push({ id, type, message }); setTimeout(() => { const idx = state.toasts.findIndex(t => t.id === id); if (idx !== -1) state.toasts.splice(idx, 1); }, 4000); }
+function pushMissionLog(title: string, detail: string) {
+  state.missionLog.unshift({ at: new Date().toISOString(), title, detail });
+  state.missionLog = state.missionLog.slice(0, 80);
+}
 function confirmDelete(type: 'project' | 'chat', id: string, name: string, onConfirm: () => Promise<void>) { state.deleteConfirm = { type, id, name, onConfirm }; }
 async function executeDelete() { if (!state.deleteConfirm) return; const { onConfirm } = state.deleteConfirm; state.deleteConfirm = null; try { await onConfirm(); showToast('success', 'Удалено'); } catch (e) { showToast('error', e instanceof Error ? e.message : 'Ошибка удаления'); } }
 async function createChat() { if (!selectedProject.value || !(selectedProject.value.teamId || state.selectedTeamId)) return; state.busy = true; try { const response = await api.saveChat({ projectId: selectedProject.value.id, teamId: selectedProject.value.teamId || state.selectedTeamId, title: `Чат ${state.chats.length + 1}`, summary: "" }); state.chats.unshift(response.chat); state.selectedChatId = response.chat.id; await openChat(response.chat.id); showToast('success', 'Чат создан'); } catch (e) { showToast('error', e instanceof Error ? e.message : 'Ошибка'); } finally { state.busy = false; } }
@@ -573,6 +749,14 @@ function onComposerKeydown(e: KeyboardEvent) {
     composerTextareaRef.value?.blur();
   }
 }
+
+function handleTextareaKeydown(event: KeyboardEvent) {
+  if (event.key === "Enter" && !event.shiftKey) {
+    if (isSendDisabled.value) return;
+    event.preventDefault();
+    sendChatMessage();
+  }
+}
 async function sendChatMessage() {
   if (!selectedChat.value || !chatDraft.value.trim() || isSending.value) return;
   const draft = chatDraft.value.trim();
@@ -582,29 +766,68 @@ async function sendChatMessage() {
   state.busy = true;
   chatDraft.value = "";
   try {
-    const response = await api.sendChatMessage(
-      selectedChat.value.id,
-      draft,
-      state.selectedTeamId || undefined,
-      project.id,
-    );
-    await openChat(selectedChat.value.id);
-    if (response.autoRunId) {
-      state.selectedRunId = response.autoRunId;
+    const teamId = state.selectedTeamId || selectedProjectTeam.value?.id;
+    if (!teamId) throw new Error("Сначала выберите команду проекта");
+
+    state.compileBusy = true;
+    pushMissionLog("Миссия принята", `Задача: ${draft}`);
+    const compileResponse = state.missionMode === "ask"
+      ? await api.compileAsk({ projectId: project.id, task: draft, chatId: selectedChat.value.id, teamId, maxContextTokens: 2600 })
+      : await api.compileBuild({ projectId: project.id, task: draft, chatId: selectedChat.value.id, teamId, execute: true, maxContextTokens: 2600 });
+    state.compile = compileResponse.result;
+    pushMissionLog("Промежуточный план готов", `Интент: ${state.compile.intent.intentType}, режим: ${state.compile.plan.runMode}`);
+    pushMissionLog("Контекст выбран", `Элементов: ${state.compile.contextPack.items.length}, токены~${state.compile.contextPack.totalEstimatedTokens}`);
+
+    if (state.missionMode === "ask") {
+      const answer = state.compile.answer || "Ответ сформирован.";
+      await api.sendChatMessage(
+        selectedChat.value.id,
+        `[ASK MODE]\n${draft}\n\n${answer}`,
+        state.selectedTeamId || undefined,
+        project.id,
+      );
+      await openChat(selectedChat.value.id);
+      state.busy = false;
+      return;
+    }
+
+    if (state.compile.run?.runId) {
+      state.selectedRunId = state.compile.run.runId;
+      state.runStartedAt = new Date().toISOString();
       state.runStatus = "queued";
       state.runEvents = [];
       state.runError = "";
       state.report = null;
       clearAgentLogs();
-      startPolling(response.autoRunId);
+      startPolling(state.compile.run.runId);
+      pushMissionLog("Выполнение запущено", `ID запуска: ${state.compile.run.runId}`);
     } else {
-      state.busy = false;
+      const response = await api.sendChatMessage(
+        selectedChat.value.id,
+        draft,
+        state.selectedTeamId || undefined,
+        project.id,
+      );
+      await openChat(selectedChat.value.id);
+      if (response.autoRunId) {
+        state.selectedRunId = response.autoRunId;
+        state.runStartedAt = new Date().toISOString();
+        state.runStatus = "queued";
+        state.runEvents = [];
+        state.runError = "";
+        state.report = null;
+        clearAgentLogs();
+        startPolling(response.autoRunId);
+      } else {
+        state.busy = false;
+      }
     }
   } catch (e) {
     chatDraft.value = draft;
     showToast('error', e instanceof Error ? e.message : 'Ошибка');
     state.busy = false;
   } finally {
+    state.compileBusy = false;
     isSending.value = false;
     // Возвращаем фокус в поле ввода
     await nextTick();
@@ -613,32 +836,24 @@ async function sendChatMessage() {
 }
 async function runTask() { if (!selectedChat.value || !chatDraft.value.trim()) return; const draft = chatDraft.value.trim(); const project = selectedProject.value; const team = selectedProjectTeam.value; if (!project || !team) return; state.busy = true; chatDraft.value = ""; try { const response = await api.startRun({ chatId: selectedChat.value.id, projectId: project.id, task: draft, teamId: team.id, teamName: team.name, projectPath: project.localPath || '' }); state.selectedRunId = response.runId; state.runStatus = "queued"; state.runEvents = []; state.runError = ""; state.report = null; clearAgentLogs(); startPolling(response.runId); showToast('success', 'Работа запущена'); /* busy stays true until run completes via polling */ } catch (e) { chatDraft.value = draft; showToast('error', e instanceof Error ? e.message : 'Ошибка'); state.busy = false; } }
 function startPolling(runId: string) {
-  if (pollTimer) window.clearInterval(pollTimer);
+  stopPolling();
   const tick = async () => {
     try {
       const response = await api.job(runId);
       state.runStatus = response.status;
       state.runError = response.error ?? "";
-      // Мерджим события вместо полной замены. WS уже складывает токены и
-      // agent:activity в реальном времени, а поллинг каждые 2с затирал массив
-      // → мельтешение и «скачки» чата. Дедуп по at|event|payload.
-      const incoming = response.events ?? [];
-      const keyOf = (e: { at: string; event: string; payload?: unknown }) =>
-        `${e.at}|${e.event}|${JSON.stringify(e.payload ?? "")}`;
-      const existing = new Set(state.runEvents.map(keyOf));
-      for (const e of incoming) {
-        if (!existing.has(keyOf(e))) state.runEvents.push(e);
-      }
+      appendRunEvents(response.events ?? []);
       const runsResponse = await api.runs();
       state.runs = runsResponse.runs;
       await nextTick();
       // Скроллим вниз ТОЛЬКО если пользователь сам не ушёл вверх. Раньше
       // поллинг дёргал скролл на каждом тике — чат «прыгал» при чтении истории.
       if (shouldAutoScroll && !userHasScrolled) scheduleScrollToBottom("smooth");
-      if (response.status === "completed" || response.status === "done" || response.status === "failed") {
-        if (pollTimer) window.clearInterval(pollTimer);
+      if (response.status === "completed" || response.status === "done" || response.status === "failed" || response.status === "cancelled") {
+        stopPolling();
         state.streamingMessage = null;
         state.busy = false;
+        pushMissionLog("Выполнение завершено", `Статус: ${response.status}${state.runError ? `, ошибка: ${state.runError}` : ""}`);
         await openRun(runId);
         if (state.selectedChatId) await openChat(state.selectedChatId);
       }
@@ -752,10 +967,7 @@ async function refreshRunStatus(runId: string) {
     const job = await api.job(runId);
     state.runStatus = job.status;
     state.runError = job.error ?? "";
-    const incoming = job.events ?? [];
-    const keyOf = (e: { at: string; event: string; payload?: unknown }) => `${e.at}|${e.event}|${JSON.stringify(e.payload ?? "")}`;
-    const existing = new Set(state.runEvents.map(keyOf));
-    for (const e of incoming) if (!existing.has(keyOf(e))) state.runEvents.push(e);
+    appendRunEvents(job.events ?? []);
     const runsResponse = await api.runs();
     state.runs = runsResponse.runs;
   } catch (e) {
@@ -839,14 +1051,39 @@ async function submitReplaceTask() {
   }
 }
 
-function reportText(): string { if (!state.report) return "Пока нет отчёта."; const r = state.report as any; return [`Task: ${r.task || "-"}`, `Project: ${r.projectPath || "-"}`, r.summary ? `Summary: ${r.summary}` : "", r.testResult ? `Test result: ${r.testResult}` : "", Array.isArray(r.filesChanged) && r.filesChanged.length ? `Files: ${r.filesChanged.join(", ")}` : "", r.usageSummary ? `Tokens: actual ${r.usageSummary.totalActualTokens}, weighted ${r.usageSummary.totalWeightedTokens}` : ""].filter(Boolean).join("\n"); }
+function reportText(): string { if (!state.report) return "Пока нет отчёта."; const r = state.report as any; return [`Задача: ${r.task || "-"}`, `Проект: ${r.projectPath || "-"}`, r.summary ? `Итог: ${r.summary}` : "", r.testResult ? `Результат тестов: ${r.testResult}` : "", Array.isArray(r.filesChanged) && r.filesChanged.length ? `Файлы: ${r.filesChanged.join(", ")}` : "", r.usageSummary ? `Токены: фактические ${r.usageSummary.totalActualTokens}, взвешенные ${r.usageSummary.totalWeightedTokens}` : ""].filter(Boolean).join("\n"); }
 
-function connectWebSocket() { if (ws) { ws.disconnect(); ws = null; } import('socket.io-client').then(({ io }) => { const wsUrl = window.location.origin; try { ws = io(wsUrl, { path: '/ws/socket.io', transports: ['websocket', 'polling'], autoConnect: true }); ws.on('connect', () => { if (state.selectedChatId) ws.emit("join:chat", { chatId: state.selectedChatId }); if (state.selectedProjectId) ws.emit("join:project", { projectId: state.selectedProjectId }); }); ws.on('token:stream', (msg: any) => { handleWsMessage({ event: "token:stream", data: msg }); }); ws.on('run:event', (msg: any) => { handleWsMessage({ event: "run:event", data: msg }); }); ws.on('agent:activity', (msg: any) => { handleWsMessage({ event: "agent:activity", data: msg }); }); ws.on('disconnect', () => { wsReconnectTimer = window.setTimeout(connectWebSocket, 3000); }); ws.on('connect_error', () => {}); } catch { ws = null; } }).catch(() => { ws = null; }); }
+function connectWebSocket() {
+  if (ws) {
+    ws.disconnect();
+    ws = null;
+  }
+  import('socket.io-client').then(({ io }) => {
+    const wsUrl = window.location.origin;
+    try {
+      ws = io(wsUrl, { path: '/ws/socket.io', transports: ['websocket', 'polling'], autoConnect: true });
+      ws.on('connect', () => {
+        updateWsChatRoom(state.selectedChatId);
+        updateWsProjectRoom(state.selectedProjectId);
+      });
+      ws.on('token:stream', (msg: any) => { handleWsMessage({ event: "token:stream", data: msg }); });
+      ws.on('run:event', (msg: any) => { handleWsMessage({ event: "run:event", data: msg }); });
+      ws.on('agent:activity', (msg: any) => { handleWsMessage({ event: "agent:activity", data: msg }); });
+      ws.on('disconnect', () => {
+        if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = window.setTimeout(connectWebSocket, 3000);
+      });
+      ws.on('connect_error', () => {});
+    } catch {
+      ws = null;
+    }
+  }).catch(() => { ws = null; });
+}
 function handleWsMessage(msg: any) { 
   if (msg.event === "token:stream") { 
-    const { role, content, done, usage } = msg.data; 
+    const { role, content, done } = msg.data; 
     // Only show streaming for conversation mode (orchestrator), not for run execution agents
-    const isRunExecution = state.runStatus === 'running' && ['orchestrator', 'pm', 'developer', 'tester'].includes(role);
+    const isRunExecution = ['orchestrator', 'pm', 'developer', 'tester'].includes(role) && state.selectedRunId !== "";
     if (done) { 
       state.streamingMessage = null; 
       // If this was a conversation response (not run execution), the final message will be loaded via openChat
@@ -858,21 +1095,37 @@ function handleWsMessage(msg: any) {
       }
     } 
   } else if (msg.event === "run:event") { 
-    const { runId, event: runEvent, data } = msg.data; 
+    const { runId, event: runEvent, data, timestamp } = msg.data; 
     if (runId === state.selectedRunId) { 
-      state.runEvents.push({ at: msg.timestamp, event: runEvent, payload: data }); 
+      appendRunEvents([{ at: timestamp || new Date().toISOString(), event: runEvent, payload: data }]); 
+      pushMissionLog(`Событие запуска: ${runEvent}`, typeof data === "string" ? data : JSON.stringify(data || {}));
       nextTick(() => { if (shouldAutoScroll && !userHasScrolled) scheduleScrollToBottom('smooth'); });
     } 
   } else if (msg.event === "agent:activity") { 
     const data = msg.data; 
-    state.runEvents.push({ at: msg.timestamp, event: "agent:activity", payload: data }); 
+    appendRunEvents([{ at: data?.timestamp || new Date().toISOString(), event: "agent:activity", payload: data }]); 
+    if (data?.agentName || data?.detail) {
+      pushMissionLog(`${data.agentName || "Агент"} (${data.status || "в работе"})`, String(data.detail || ""));
+    }
     nextTick(() => { if (shouldAutoScroll && !userHasScrolled) scheduleScrollToBottom('smooth'); });
   } 
 }
 function disconnectWebSocket() { if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer); if (ws) { ws.disconnect(); ws = null; } }
 
-watch(() => state.selectedChatId, async (v) => { if (v) { localStorage.setItem("ws_selectedChatId", v); await openChat(v); if (ws && ws.connected) ws.emit("join:chat", { chatId: v }); } });
-watch(() => state.selectedProjectId, async (v: string) => { if (v) localStorage.setItem("ws_selectedProjectId", v); await refreshChats(v || ""); const p = state.projects.find(i => i.id === v); if (p?.teamId) state.selectedTeamId = p.teamId; if (ws && ws.connected && v) ws.emit("join:project", { projectId: v }); });
+watch(() => state.selectedChatId, async (v, prev) => {
+  if (!v || v === prev || isLoadingChat) return;
+  localStorage.setItem("ws_selectedChatId", v);
+  updateWsChatRoom(v);
+  await openChat(v);
+});
+watch(() => state.selectedProjectId, async (v: string, prev: string) => {
+  if (v) localStorage.setItem("ws_selectedProjectId", v);
+  updateWsProjectRoom(v || "");
+  if (v === prev) return;
+  await refreshChats(v || "");
+  const p = state.projects.find(i => i.id === v);
+  if (p?.teamId) state.selectedTeamId = p.teamId;
+});
 async function onTeamChange(event: Event) {
   const newTeamId = (event.target as HTMLSelectElement).value;
   state.selectedTeamId = newTeamId;
@@ -893,7 +1146,7 @@ watch(() => state.messages.length, async (curr, prev) => { if (curr === prev) re
 watch(chatDraft, async () => { await nextTick(); autoResizeComposer(); });
 
 onMounted(() => { isMounted = true; void loadInitialData(); connectWebSocket(); void nextTick(() => autoResizeComposer()); });
-onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(pollTimer); if (scrollFrame) cancelAnimationFrame(scrollFrame); disconnectWebSocket(); });
+onBeforeUnmount(() => { isMounted = false; stopPolling(); if (scrollFrame) cancelAnimationFrame(scrollFrame); disconnectWebSocket(); });
 </script>
 
 <template>
@@ -939,7 +1192,159 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
       </div>
     </div>
 
-    <main class="chat-area">
+    <main class="chat-area mission-control">
+      <section class="mission-top">
+        <div class="mission-header-card">
+          <div class="mission-title-wrap">
+            <h2 class="mission-title">Центр миссии</h2>
+            <p class="mission-subtitle">Компиляция задачи в план выполнения вместо обычного чата</p>
+          </div>
+          <div class="mission-metrics">
+            <span class="mission-metric"><strong>{{ missionProgress }}%</strong><small>прогресс</small></span>
+            <span class="mission-metric"><strong>{{ missionTokenEstimate }}</strong><small>токены~</small></span>
+            <span class="mission-metric"><strong>${{ missionCostEstimate }}</strong><small>стоимость~</small></span>
+            <span class="mission-metric"><strong>{{ missionElapsed }}</strong><small>время</small></span>
+          </div>
+        </div>
+
+        <div class="mission-input-card">
+          <div class="mission-mode-switch">
+            <button class="mode-btn" :class="{ active: state.missionMode === 'build' }" :disabled="state.busy || state.compileBusy" @click="state.missionMode = 'build'">Сборка</button>
+            <button class="mode-btn" :class="{ active: state.missionMode === 'ask' }" :disabled="state.busy || state.compileBusy" @click="state.missionMode = 'ask'">Вопрос</button>
+          </div>
+          <textarea
+            ref="composerTextareaRef"
+            class="composer-textarea mission-textarea"
+            v-model="chatDraft"
+            rows="2"
+            placeholder="Опишите миссию. Система скомпилирует задачу в IR, контекст и этапы выполнения."
+            @keydown="onComposerKeydown"
+          ></textarea>
+          <div class="mission-actions">
+            <span class="composer-hint">Режим: {{ state.missionMode === "build" ? "Сборка" : "Вопрос" }}</span>
+            <button class="composer-send" :disabled="isSending || state.busy || state.compileBusy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace-tabs">
+        <button class="tab-btn" :class="{ active: state.workspaceTab === 'mission' }" @click="state.workspaceTab = 'mission'">Миссия</button>
+        <button class="tab-btn" :class="{ active: state.workspaceTab === 'chat' }" @click="state.workspaceTab = 'chat'">Чат и выполнение</button>
+      </section>
+
+      <section v-if="state.workspaceTab === 'mission'" class="mission-grid">
+        <article class="mission-card">
+          <h3>🧠 Что понял Project Manager</h3>
+          <p class="muted">{{ state.compile?.intent?.intentType || "—" }} · уверенность {{ state.compile ? Math.round((state.compile.intent.confidence || 0) * 100) : 0 }}%</p>
+          <ul>
+            <li v-for="reason in (state.compile?.intent?.reasons || []).slice(0, 5)" :key="reason">{{ reason }}</li>
+          </ul>
+        </article>
+
+        <article class="mission-card">
+          <h3>📦 Промежуточный план (IR)</h3>
+          <div v-if="compilerIr" class="ir-list">
+            <div><strong>режим:</strong> {{ compilerIr.mode }}</div>
+            <div><strong>тип запуска:</strong> {{ compilerIr.runMode }}</div>
+            <div><strong>интент:</strong> {{ compilerIr.intentType }}</div>
+            <div><strong>задача:</strong> {{ compilerIr.executionTask }}</div>
+          </div>
+          <div v-else class="muted">IR будет построен после запуска миссии.</div>
+        </article>
+
+        <article class="mission-card">
+          <h3>📁 Выбранные файлы</h3>
+          <ul>
+            <li v-for="file in missionImpactedFiles.slice(0, 10)" :key="file">{{ file }}</li>
+          </ul>
+          <div v-if="!missionImpactedFiles.length" class="muted">Файлы еще не выбраны.</div>
+        </article>
+
+        <article class="mission-card">
+          <h3>🌐 Сущности графа</h3>
+          <ul>
+            <li v-for="entity in missionEntities.slice(0, 10)" :key="entity.id">{{ entity.name }} <span class="muted">({{ entity.kind }})</span></li>
+          </ul>
+          <div v-if="!missionEntities.length" class="muted">Сущности не определены.</div>
+        </article>
+
+        <article class="mission-card">
+          <h3>⚠️ Риск</h3>
+          <div v-if="missionRisk">
+            <div class="risk-chip" :class="missionRisk.riskLevel">{{ missionRiskLabel }} ({{ missionRisk.riskScore }})</div>
+            <ul>
+              <li v-for="reason in missionRisk.reasons.slice(0, 4)" :key="reason">{{ reason }}</li>
+            </ul>
+          </div>
+          <div v-else class="muted">Профиль риска пока не рассчитан.</div>
+        </article>
+
+        <article class="mission-card">
+          <h3>🤖 Модели и этапы</h3>
+          <div class="stages-list">
+            <div v-for="stage in compileStages" :key="stage.id" class="stage-row" :class="{ disabled: !stage.enabled }">
+              <span>{{ stage.title }}</span>
+              <span class="muted">{{ stage.deterministic ? "код" : "LLM" }}</span>
+            </div>
+          </div>
+          <div v-if="!compileStages.length" class="muted">Этапы появятся после компиляции.</div>
+        </article>
+
+        <article class="mission-card">
+          <h3>💰 Токены и стоимость</h3>
+          <div class="ir-list">
+            <div><strong>выбранный контекст:</strong> {{ selectedContextItems.length }} элементов</div>
+            <div><strong>оценка токенов:</strong> {{ missionTokenEstimate }}</div>
+            <div><strong>оценка стоимости:</strong> ${{ missionCostEstimate }}</div>
+            <div><strong>исключено элементов:</strong> {{ state.compile?.contextPack?.droppedItems || 0 }}</div>
+          </div>
+        </article>
+
+        <article class="mission-card">
+          <h3>✅ Выполнено</h3>
+          <div class="progress-wrap">
+            <div class="progress-bar"><span :style="{ width: `${missionProgress}%` }"></span></div>
+            <div class="muted">{{ missionProgress }}% пайплайна завершено</div>
+          </div>
+          <ul>
+            <li v-for="stage in compileStages.filter((s) => s.enabled).slice(0, 8)" :key="stage.id">{{ stage.title }} <span class="muted">— {{ stage.reason }}</span></li>
+          </ul>
+        </article>
+
+        <article class="mission-card">
+          <h3>🧪 План тестирования</h3>
+          <ul>
+            <li v-for="test in missionTests.slice(0, 10)" :key="test">{{ test }}</li>
+          </ul>
+          <div v-if="!missionTests.length" class="muted">Тесты не запланированы.</div>
+        </article>
+
+        <article class="mission-card">
+          <h3>📚 Обновления памяти</h3>
+          <ul>
+            <li v-for="item in missionMemoryUpdates" :key="item.id">{{ item.title }} <span class="muted">({{ item.kind }})</span></li>
+          </ul>
+          <div v-if="!missionMemoryUpdates.length" class="muted">Обновления памяти появятся после компиляции.</div>
+        </article>
+      </section>
+
+      <section v-if="state.workspaceTab === 'mission'" class="mission-log-card">
+        <h3>Журнал миссии</h3>
+        <div class="mission-log-list">
+          <div v-for="entry in state.missionLog.slice(0, 24)" :key="`${entry.at}-${entry.title}`" class="mission-log-row">
+            <span class="mission-log-time">{{ formatTime(entry.at) }}</span>
+            <span class="mission-log-title">{{ entry.title }}</span>
+            <span class="mission-log-detail">{{ entry.detail }}</span>
+          </div>
+        </div>
+      </section>
+
+      <section v-if="state.workspaceTab === 'chat'" class="chat-secondary">
+      <div class="chat-secondary-header">
+        <h3>Лента чата и выполнение</h3>
+      </div>
       <div ref="messagesListRef" class="chat-messages" @scroll="onUserScroll">
         <div v-if="unifiedChatStream.length === 0 && !state.streamingMessage" class="chat-empty">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
@@ -1101,11 +1506,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
           </div>
         </div>
       </div>
-
-      <footer class="chat-composer">
-        <div class="composer-input"><textarea ref="composerTextareaRef" class="composer-textarea" v-model="chatDraft" rows="1" placeholder="Например: кто в команде, что сейчас в работе, добавь задачу на экспорт CSV" @keydown="onComposerKeydown"></textarea></div>
-        <div class="composer-actions"><span class="composer-hint">Enter — отправить · Shift+Enter — новая строка</span><button class="composer-send" :disabled="isSending || state.busy || !selectedChat || !chatDraft.trim()" @click="sendChatMessage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button></div>
-      </footer>
+      </section>
 
     <!-- Модалка «Дать агенту новую задачу». На паузе — отложится до resume,
          в активном состоянии — перенаправит агента. -->
@@ -1131,7 +1532,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
       <div v-if="state.showKnowledgeGraph" class="modal-overlay" @click.self="state.showKnowledgeGraph = false">
         <div class="modal modal-lg">
           <div class="modal-header">
-            <h3 class="modal-title">Knowledge Graph — {{ selectedProject?.name }}</h3>
+            <h3 class="modal-title">Граф знаний — {{ selectedProject?.name }}</h3>
             <button class="btn btn-ghost btn-sm" @click="state.showKnowledgeGraph = false">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
             </button>
@@ -1160,7 +1561,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
               </section>
 
               <section class="knowledge-card">
-                <div class="knowledge-card-title">Features</div>
+                <div class="knowledge-card-title">Функции</div>
                 <div v-if="graphFeatures.length" class="knowledge-list">
                   <div v-for="feature in graphFeatures" :key="feature.id || feature.name" class="feature-item">
                     <div class="feature-name">{{ feature.name || feature.id }}</div>
@@ -1179,7 +1580,7 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
                       <span class="entity-kind">{{ entity.kind || "unknown" }}</span>
                     </div>
                     <div class="entity-meta">{{ entity.location || "Местоположение неизвестно" }}</div>
-                    <div class="entity-meta" v-if="entity.feature">Feature: {{ entity.feature }}</div>
+                    <div class="entity-meta" v-if="entity.feature">Функция: {{ entity.feature }}</div>
                   </div>
                 </div>
                 <div v-else class="knowledge-empty">Индекс сущностей пока пуст.</div>
@@ -1216,6 +1617,50 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .context-actions { display:flex; gap:8px; margin-left:auto; }
 
 .chat-area { flex:1; display:flex; flex-direction:column; min-height:0; }
+.mission-control { overflow:auto; padding-bottom:20px; }
+.mission-top { display:grid; grid-template-columns: 1fr 1.2fr; gap:12px; padding:14px 20px 8px; }
+.mission-header-card, .mission-input-card, .mission-log-card { border:1px solid var(--line); border-radius:14px; background:var(--panel); padding:14px; }
+.mission-title { margin:0; font-size:20px; letter-spacing:.2px; }
+.mission-subtitle { margin:4px 0 0; color:var(--muted); font-size:12px; }
+.mission-metrics { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }
+.mission-metric { display:inline-flex; align-items:baseline; gap:5px; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:rgba(255,255,255,.02); }
+.mission-metric strong { font-size:13px; }
+.mission-metric small { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+.mission-mode-switch { display:flex; gap:8px; margin-bottom:10px; }
+.mode-btn { border:1px solid var(--line); background:var(--bg); color:var(--text); border-radius:10px; padding:6px 12px; cursor:pointer; font-size:12px; }
+.mode-btn.active { border-color:var(--accent); color:var(--accent); background:rgba(59,130,246,.1); }
+.mode-btn:disabled { opacity:.6; cursor:not-allowed; }
+.mission-textarea { min-height:74px; }
+.mission-actions { display:flex; justify-content:space-between; align-items:center; margin-top:10px; }
+.workspace-tabs { display:flex; gap:8px; padding:0 20px 8px; }
+.tab-btn { border:1px solid var(--line); background:var(--bg); color:var(--text); border-radius:10px; padding:8px 12px; cursor:pointer; font-size:12px; transition:border-color .15s, background .15s, color .15s; }
+.tab-btn.active { border-color:var(--accent); color:var(--accent); background:rgba(59,130,246,.1); }
+.mission-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:12px; padding:10px 20px; }
+.mission-card { border:1px solid var(--line); border-radius:12px; background:rgba(255,255,255,.02); padding:12px; min-height:140px; }
+.mission-card h3 { margin:0 0 10px; font-size:14px; }
+.mission-card ul { margin:0; padding-left:16px; display:flex; flex-direction:column; gap:6px; }
+.mission-card li { font-size:12px; line-height:1.4; }
+.muted { color:var(--muted); font-size:12px; }
+.risk-chip { display:inline-flex; padding:4px 9px; border-radius:999px; border:1px solid var(--line); font-size:12px; margin-bottom:8px; text-transform:uppercase; }
+.risk-chip.low { color:#22c55e; border-color:rgba(34,197,94,.4); background:rgba(34,197,94,.12); }
+.risk-chip.medium { color:#f59e0b; border-color:rgba(245,158,11,.4); background:rgba(245,158,11,.12); }
+.risk-chip.high { color:#ef4444; border-color:rgba(239,68,68,.4); background:rgba(239,68,68,.12); }
+.stages-list { display:flex; flex-direction:column; gap:6px; }
+.stage-row { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:12px; padding:6px 8px; border-radius:8px; background:rgba(255,255,255,.03); }
+.stage-row.disabled { opacity:.5; }
+.progress-wrap { margin-bottom:8px; }
+.progress-bar { height:8px; border-radius:999px; background:rgba(255,255,255,.07); overflow:hidden; margin-bottom:6px; }
+.progress-bar span { display:block; height:100%; background:linear-gradient(90deg,#10b981,#3b82f6); }
+.ir-list { display:flex; flex-direction:column; gap:6px; font-size:12px; }
+.mission-log-card { margin:0 20px 12px; }
+.mission-log-list { display:flex; flex-direction:column; gap:6px; max-height:220px; overflow:auto; }
+.mission-log-row { display:grid; grid-template-columns:70px 220px 1fr; gap:10px; font-size:12px; padding:6px 8px; border-radius:8px; background:rgba(255,255,255,.03); align-items:start; }
+.mission-log-time { color:var(--muted); font-family:var(--font-mono); }
+.mission-log-title { color:var(--text); font-weight:600; }
+.mission-log-detail { color:var(--text-dim); word-break:break-word; }
+.chat-secondary { margin:0 20px 12px; border:1px solid var(--line); border-radius:14px; overflow:hidden; background:rgba(255,255,255,.01); display:flex; flex-direction:column; min-height:380px; }
+.chat-secondary-header { padding:10px 14px; border-bottom:1px solid var(--line); background:var(--panel); }
+.chat-secondary-header h3 { margin:0; font-size:14px; }
 .chat-messages { flex:1; overflow:auto; padding:24px 20px 32px; display:flex; flex-direction:column; gap:14px; scroll-behavior:smooth; overscroll-behavior:contain; }
 .chat-stream-inner { display:flex; flex-direction:column; gap:14px; width:100%; max-width:980px; margin:0 auto; }
 .chat-empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--muted); text-align:center; gap:12px; }
@@ -1279,7 +1724,6 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .typing-dots span:nth-child(2) { animation-delay:-.16s; }
 @keyframes bounce { 0%,80%,100%{transform:scale(0)} 40%{transform:scale(1)} }
 
-.chat-composer { padding:16px 20px; border-top:1px solid var(--line); background:var(--panel); }
 .approval-stack { max-width:980px; margin:0 auto 12px; display:flex; flex-direction:column; gap:10px; width:100%; }
 .approval-card { border:1px solid rgba(245, 158, 11, 0.28); background:rgba(245, 158, 11, 0.08); border-radius:12px; padding:14px; }
 .clarification-card { border-color: rgba(99, 102, 241, 0.28); background: rgba(99, 102, 241, 0.08); }
@@ -1384,6 +1828,12 @@ onBeforeUnmount(() => { isMounted = false; if (pollTimer) window.clearInterval(p
 .toast.info .toast-icon { color:#3b82f6; }
 
 @media (max-width: 900px) {
+  .mission-top { grid-template-columns:1fr; }
+  .mission-grid { grid-template-columns:1fr; }
+  .workspace-tabs { padding:0 12px 8px; }
+  .mission-log-row { grid-template-columns:64px 1fr; }
+  .mission-log-detail { grid-column:1 / -1; }
+  .chat-secondary, .mission-log-card { margin:0 12px 12px; }
   .knowledge-grid { grid-template-columns:1fr; }
   .knowledge-card-wide { grid-column:auto; }
 }

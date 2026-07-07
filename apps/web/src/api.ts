@@ -1,4 +1,4 @@
-import type { Chat, ChatMessage, ChatStats, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunApproval, RunItem, Team } from "./types";
+import type { Chat, ChatMessage, ChatStats, CompileResult, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunApproval, RunItem, Team } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
 
@@ -141,4 +141,19 @@ export const api = {
         body: JSON.stringify({ task }),
       },
     ),
+  compile: (payload: { projectId: string; task: string; chatId?: string; teamId?: string; mode?: "auto" | "build" | "ask"; execute?: boolean; maxContextTokens?: number }) =>
+    request<{ result: CompileResult }>("/compile", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  compileBuild: (payload: { projectId: string; task: string; chatId?: string; teamId?: string; execute?: boolean; maxContextTokens?: number }) =>
+    request<{ result: CompileResult }>("/compile/build", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  compileAsk: (payload: { projectId: string; task: string; chatId?: string; teamId?: string; maxContextTokens?: number }) =>
+    request<{ result: CompileResult }>("/compile/ask", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };

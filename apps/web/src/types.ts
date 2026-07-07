@@ -186,3 +186,63 @@ export interface ModelCatalogItem {
   multiplier: number;
   notes?: string;
 }
+
+export interface CompilerStage {
+  id: string;
+  title: string;
+  deterministic: boolean;
+  enabled: boolean;
+  reason: string;
+}
+
+export interface CompilerPlan {
+  mode: "build" | "ask";
+  runMode: "implementation" | "diagnostics" | "research";
+  executionTask: string;
+  testsToRun: string[];
+  stages: CompilerStage[];
+  roles: {
+    pm: boolean;
+    developer: boolean;
+    reviewer: boolean;
+    tester: boolean;
+  };
+}
+
+export interface CompileResult {
+  mode: "build" | "ask";
+  intent: {
+    mode: "build" | "ask";
+    intentType: string;
+    confidence: number;
+    reasons: string[];
+    entities: string[];
+  };
+  project: { id: string; name: string };
+  knowledge: {
+    coverage: Record<string, number>;
+    unknowns: string[];
+    topEntities: Array<{ id: string; name: string; kind: string; location: string }>;
+    topMemory: Array<{ id: string; title: string; summary: string; kind: string; relatedFiles: string[] }>;
+  };
+  impact: {
+    changed: string[];
+    impactedNodes: string[];
+    impactedFiles: string[];
+    impactedServices: string[];
+    impactedApi: string[];
+    impactedPages: string[];
+    testsToRun: string[];
+    riskScore: number;
+    riskLevel: "low" | "medium" | "high";
+    reasons: string[];
+  };
+  contextPack: {
+    items: Array<{ type: "memory" | "file" | "entity" | "impact" | "test"; id: string; title: string; content: string; weight: number; estimatedTokens: number }>;
+    totalEstimatedTokens: number;
+    droppedItems: number;
+  };
+  plan: CompilerPlan;
+  run?: { runId: string } | null;
+  answer?: string;
+}

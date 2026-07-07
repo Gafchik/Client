@@ -17,6 +17,7 @@ import { ProjectsModule } from "./projects/projects.module.js";
 import { ProvidersModule } from "./providers/providers.module.js";
 import { SettingsModule } from "./settings/settings.module.js";
 import { WsModule } from "./ws/ws.module.js";
+import { CompilerModule } from "./compiler/compiler.module.js";
 
 @Module({
   imports: [
@@ -53,6 +54,7 @@ import { WsModule } from "./ws/ws.module.js";
     HealthModule,
     SettingsModule,
     WsModule,
+    CompilerModule,
   ],
 })
 export class AppModule {}
