@@ -25,6 +25,25 @@ export class ProjectsController {
     return { entries };
   }
 
+  @Get(":id/memory/knowledge-graph")
+  async getKnowledgeGraph(@Param("id") id: string) {
+    const entry = await this.projectsService.getKnowledgeGraph(id);
+    return { entry };
+  }
+
+  @Get(":id/memory/dependencies/:entity")
+  async getEntityDependencies(@Param("id") id: string, @Param("entity") entity: string) {
+    const dependencies = await this.projectsService.getEntityDependencies(id, decodeURIComponent(entity));
+    return { dependencies };
+  }
+
+  @Post(":id/memory/impact")
+  async analyzeImpact(@Param("id") id: string, @Body() body: { changed?: string[] }) {
+    const changed = Array.isArray(body?.changed) ? body.changed.map((item) => String(item).trim()).filter(Boolean) : [];
+    const impact = await this.projectsService.analyzeImpact(id, changed);
+    return { impact };
+  }
+
   @Post("memory")
   async saveProjectMemory(@Body() body: SaveProjectMemoryDto) {
     const entry = await this.projectsService.saveMemory(body);
