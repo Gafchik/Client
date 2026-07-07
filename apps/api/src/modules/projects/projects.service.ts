@@ -1,6 +1,7 @@
 import { Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
+import { execSync } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
 import * as fs from "fs";
@@ -11,8 +12,30 @@ import { TeamEntity } from "../../persistence/team.entity.js";
 import { ChatEntity } from "../../persistence/chat.entity.js";
 import { MessageEntity } from "../../persistence/message.entity.js";
 import { RunEntity } from "../../persistence/run.entity.js";
+import { WsGateway } from "../ws/ws.gateway.js";
 import { SaveProjectMemoryDto } from "./dto/save-project-memory.dto.js";
 import { SaveProjectDto } from "./dto/save-project.dto.js";
+
+type ResyncStageKey =
+  | "scan"
+  | "detect"
+  | "knowledge_graph"
+  | "relationships"
+  | "documentation"
+  | "memory"
+  | "coverage"
+  | "validation"
+  | "optimize";
+
+type ResyncStageState = {
+  key: ResyncStageKey;
+  title: string;
+  status: "pending" | "active" | "done" | "error";
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs: number;
+  message?: string;
+};
 
 @Injectable()
 export class ProjectsService {
@@ -63,7 +86,42 @@ export class ProjectsService {
     private readonly runsRepository: Repository<RunEntity>,
     @Inject(ConfigService)
     private readonly configService: ConfigService,
+    @Inject(WsGateway)
+    private readonly wsGateway: WsGateway,
   ) {}
+
+  private readonly scanIgnoreDirs = new Set([
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    "coverage",
+    ".idea",
+    ".vscode",
+  ]);
+
+  private readonly scanExtensions = new Set([
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".vue",
+    ".md",
+    ".mdx",
+    ".yml",
+    ".yaml",
+    ".sql",
+    ".sh",
+    ".css",
+    ".scss",
+    ".html",
+    ".xml",
+    ".env",
+  ]);
 
   async list() {
     return this.projectsRepository.find({
@@ -572,6 +630,609 @@ export class ProjectsService {
       impactedPages: Array.from(new Set(impactedPages)),
       testsToRun: Array.from(new Set(testsToRun)),
     };
+  }
+
+  private getResyncStageTemplate(): ResyncStageState[] {
+    return [
+      { key: "scan", title: "Scanning Project...", status: "pending", durationMs: 0 },
+      { key: "detect", title: "Detecting Changes...", status: "pending", durationMs: 0 },
+      { key: "knowledge_graph", title: "Updating Knowledge Graph...", status: "pending", durationMs: 0 },
+      { key: "relationships", title: "Rebuilding Relationships...", status: "pending", durationMs: 0 },
+      { key: "documentation", title: "Refreshing Documentation...", status: "pending", durationMs: 0 },
+      { key: "memory", title: "Optimizing Memory...", status: "pending", durationMs: 0 },
+      { key: "coverage", title: "Calculating Coverage...", status: "pending", durationMs: 0 },
+      { key: "validation", title: "Final Validation...", status: "pending", durationMs: 0 },
+      { key: "optimize", title: "Optimizing Indexes...", status: "pending", durationMs: 0 },
+    ];
+  }
+
+  private computeCoverageAverage(coverage: Record<string, unknown> | undefined): number {
+    const values = Object.values(coverage || {}).map((value) => this.normalizeCoverageValue(value));
+    if (!values.length) return 0;
+    return Math.round(values.reduce((sum, n) => sum + n, 0) / values.length);
+  }
+
+  private listProjectFiles(projectLocalPath: string): Array<{ path: string; size: number; mtimeMs: number; ext: string }> {
+    const out: Array<{ path: string; size: number; mtimeMs: number; ext: string }> = [];
+
+    const walk = (absDir: string) => {
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(absDir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const abs = path.join(absDir, entry.name);
+        if (entry.isDirectory()) {
+          if (this.scanIgnoreDirs.has(entry.name)) continue;
+          walk(abs);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        const rel = path.relative(projectLocalPath, abs).replace(/\\/g, "/");
+        if (!rel || rel.startsWith("..")) continue;
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!this.scanExtensions.has(ext) && !entry.name.startsWith(".env")) continue;
+        try {
+          const stat = fs.statSync(abs);
+          out.push({ path: rel, size: stat.size, mtimeMs: stat.mtimeMs, ext: ext || path.basename(entry.name).toLowerCase() });
+        } catch {
+          // ignore broken entries
+        }
+      }
+    };
+
+    walk(projectLocalPath);
+    out.sort((a, b) => a.path.localeCompare(b.path));
+    return out;
+  }
+
+  private computeProjectDigest(files: Array<{ path: string; size: number; mtimeMs: number }>): string {
+    const hash = crypto.createHash("sha1");
+    for (const file of files) {
+      hash.update(`${file.path}|${file.size}|${Math.round(file.mtimeMs)}\n`);
+    }
+    return hash.digest("hex");
+  }
+
+  private runGit(projectLocalPath: string, command: string): string | null {
+    try {
+      return execSync(`git -C ${JSON.stringify(projectLocalPath)} ${command}`, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    } catch {
+      return null;
+    }
+  }
+
+  private parseGitNameStatus(lines: string[]): { changed: Set<string>; added: Set<string>; deleted: Set<string> } {
+    const changed = new Set<string>();
+    const added = new Set<string>();
+    const deleted = new Set<string>();
+    for (const line of lines) {
+      const trimmed = String(line || "").trim();
+      if (!trimmed) continue;
+      const parts = trimmed.split(/\s+/);
+      const status = parts[0] || "M";
+      const file = (parts[parts.length - 1] || "").replace(/\\/g, "/");
+      if (!file) continue;
+      if (status.includes("D")) {
+        deleted.add(file);
+        continue;
+      }
+      if (status.includes("A") || status.startsWith("??")) {
+        added.add(file);
+        changed.add(file);
+        continue;
+      }
+      changed.add(file);
+    }
+    return { changed, added, deleted };
+  }
+
+  private detectIncrementalChanges(projectLocalPath: string, previousGitHead?: string | null) {
+    const insideGit = this.runGit(projectLocalPath, "rev-parse --is-inside-work-tree");
+    const gitAvailable = insideGit === "true";
+    const currentGitHead = gitAvailable ? this.runGit(projectLocalPath, "rev-parse HEAD") : null;
+
+    if (!gitAvailable || !currentGitHead || !previousGitHead) {
+      return {
+        strategy: "full-scan" as const,
+        gitAvailable,
+        gitHead: currentGitHead,
+        changedFiles: [] as string[],
+        newFiles: [] as string[],
+        deletedFiles: [] as string[],
+      };
+    }
+
+    const diffOutput = this.runGit(projectLocalPath, `diff --name-status ${previousGitHead}..${currentGitHead}`) || "";
+    const stagedOutput = this.runGit(projectLocalPath, "diff --name-status --cached") || "";
+    const worktreeOutput = this.runGit(projectLocalPath, "diff --name-status") || "";
+    const untrackedOutput = this.runGit(projectLocalPath, "ls-files --others --exclude-standard") || "";
+
+    const parsed = this.parseGitNameStatus([
+      ...diffOutput.split("\n"),
+      ...stagedOutput.split("\n"),
+      ...worktreeOutput.split("\n"),
+      ...untrackedOutput.split("\n").filter(Boolean).map((file) => `?? ${file}`),
+    ]);
+
+    return {
+      strategy: "git-incremental" as const,
+      gitAvailable,
+      gitHead: currentGitHead,
+      changedFiles: Array.from(parsed.changed),
+      newFiles: Array.from(parsed.added),
+      deletedFiles: Array.from(parsed.deleted),
+    };
+  }
+
+  private buildGraphFromFiles(
+    projectLocalPath: string,
+    files: Array<{ path: string; size: number; mtimeMs: number; ext: string }>,
+  ): Record<string, unknown> {
+    const modulesMap = new Map<string, { id: string; name: string; paths: string[]; fileCount: number }>();
+    const entities: Array<Record<string, unknown>> = [];
+    const relations: Array<Record<string, unknown>> = [];
+    const features: Array<Record<string, unknown>> = [];
+    const apiMap: Array<Record<string, unknown>> = [];
+    const frontendMap: Array<Record<string, unknown>> = [];
+    const dataModels: Array<Record<string, unknown>> = [];
+    const adrs: Array<Record<string, unknown>> = [];
+
+    for (const file of files) {
+      const top = file.path.split("/")[0] || "root";
+      const moduleId = `module:${top}`;
+      if (!modulesMap.has(moduleId)) {
+        modulesMap.set(moduleId, { id: top, name: top, paths: [top], fileCount: 0 });
+      }
+      modulesMap.get(moduleId)!.fileCount += 1;
+
+      const fileId = `file:${file.path}`;
+      const lowered = file.path.toLowerCase();
+      const kind = lowered.includes("service")
+        ? "Service"
+        : lowered.includes("controller")
+          ? "Controller"
+          : lowered.includes("component") || file.ext === ".vue"
+            ? "Component"
+            : lowered.includes("api") || lowered.includes("route")
+              ? "API"
+              : lowered.includes("test") || lowered.includes("spec")
+                ? "Test"
+                : lowered.endsWith(".md")
+                  ? "Documentation"
+                  : "File";
+
+      entities.push({
+        id: fileId,
+        name: path.basename(file.path),
+        kind,
+        location: file.path,
+        module: top,
+      });
+      relations.push({ from: moduleId, type: "contains", to: fileId, reason: "File belongs to top-level module" });
+
+      if (lowered.includes("/views/") || lowered.includes("/features/") || lowered.includes("feature")) {
+        features.push({ id: `feature:${file.path}`, name: path.basename(file.path), files: [file.path] });
+      }
+      if (kind === "API") {
+        apiMap.push({ method: "AUTO", url: `/${file.path.replace(/\.[^.]+$/, "")}`, source: file.path });
+      }
+      if (kind === "Component") {
+        frontendMap.push({ route: file.path, page: path.basename(file.path), source: file.path });
+      }
+      if (lowered.includes("entity") || lowered.includes("model") || lowered.includes("schema")) {
+        dataModels.push({ name: path.basename(file.path), location: file.path });
+      }
+      if (lowered.includes("adr") || lowered.includes("decision")) {
+        adrs.push({ id: `adr:${file.path}`, title: path.basename(file.path), location: file.path });
+      }
+    }
+
+    const coverage = {
+      backend: Math.min(100, Math.round((files.filter((f) => f.path.includes("apps/api") || f.path.includes("src/modules")).length / Math.max(files.length, 1)) * 100)),
+      frontend: Math.min(100, Math.round((files.filter((f) => f.path.includes("apps/web") || f.ext === ".vue").length / Math.max(files.length, 1)) * 100)),
+      infrastructure: Math.min(100, Math.round((files.filter((f) => f.path.includes("docker") || f.path.includes("k8s") || f.path.includes("infra")).length / Math.max(files.length, 1)) * 100)),
+      config: Math.min(100, Math.round((files.filter((f) => f.ext === ".json" || f.ext === ".yml" || f.ext === ".yaml" || f.path.includes(".env")).length / Math.max(files.length, 1)) * 100)),
+      tests: Math.min(100, Math.round((files.filter((f) => f.path.includes("test") || f.path.includes("spec")).length / Math.max(files.length, 1)) * 100)),
+      scripts: Math.min(100, Math.round((files.filter((f) => f.path.includes("scripts/") || f.ext === ".sh").length / Math.max(files.length, 1)) * 100)),
+      docs: Math.min(100, Math.round((files.filter((f) => f.ext === ".md" || f.ext === ".mdx").length / Math.max(files.length, 1)) * 100)),
+    };
+
+    return {
+      version: Date.now(),
+      generatedAt: new Date().toISOString(),
+      projectPath: projectLocalPath,
+      modules: Array.from(modulesMap.values()),
+      files: files.map((file) => ({ path: file.path, size: file.size, mtimeMs: file.mtimeMs, type: file.ext })),
+      entities,
+      relations,
+      features,
+      apiMap,
+      frontendMap,
+      dataModels,
+      adrs,
+      entityIndex: entities,
+      coverage,
+      unknowns: [],
+    };
+  }
+
+  private async pruneDuplicateMemoryEntries(projectId: string) {
+    const entries = await this.projectMemoryRepository.find({
+      where: { projectId, isActive: true },
+      order: { updatedAt: "DESC" },
+    });
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      const key = `${entry.kind}|${entry.title}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        continue;
+      }
+      entry.isActive = false;
+      await this.projectMemoryRepository.save(entry);
+    }
+  }
+
+  async runResync(projectId: string) {
+    const project = await this.getById(projectId);
+    const startedAtDate = new Date();
+    const startedAt = startedAtDate.toISOString();
+    const runId = `resync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const stages = this.getResyncStageTemplate();
+
+    const [latestResync] = await this.projectMemoryRepository.find({
+      where: { projectId, isActive: true, kind: "resync-history" },
+      order: { updatedAt: "DESC" },
+      take: 1,
+    });
+    const previousMeta = latestResync?.graph && typeof latestResync.graph === "object"
+      ? latestResync.graph as Record<string, any>
+      : {};
+    const previousGitHead = String(previousMeta?.meta?.gitHead || "") || null;
+
+    const runStage = async <T>(key: ResyncStageKey, work: () => Promise<T> | T, message?: string): Promise<T> => {
+      const stage = stages.find((item) => item.key === key);
+      if (!stage) return await work();
+      const started = Date.now();
+      stage.status = "active";
+      stage.startedAt = new Date().toISOString();
+      stage.message = message;
+      this.wsGateway.broadcastToProject(projectId, "project:resync:stage", {
+        runId,
+        projectId,
+        stage,
+      });
+
+      try {
+        const result = await work();
+        stage.status = "done";
+        stage.finishedAt = new Date().toISOString();
+        stage.durationMs = Date.now() - started;
+        this.wsGateway.broadcastToProject(projectId, "project:resync:stage", {
+          runId,
+          projectId,
+          stage,
+        });
+        return result;
+      } catch (error) {
+        stage.status = "error";
+        stage.finishedAt = new Date().toISOString();
+        stage.durationMs = Date.now() - started;
+        stage.message = error instanceof Error ? error.message : String(error);
+        this.wsGateway.broadcastToProject(projectId, "project:resync:stage", {
+          runId,
+          projectId,
+          stage,
+        });
+        throw error;
+      }
+    };
+
+    const existingKg = await this.getLatestKnowledgeGraphEntry(projectId);
+    const previousCoverage = this.computeCoverageAverage((existingKg?.graph as Record<string, any> | undefined)?.coverage);
+
+    const files = await runStage("scan", async () => this.listProjectFiles(project.localPath));
+    const changeDetection = await runStage("detect", async () => this.detectIncrementalChanges(project.localPath, previousGitHead));
+
+    const digest = this.computeProjectDigest(files);
+    const fullRescan = changeDetection.strategy !== "git-incremental";
+    const changedFiles = fullRescan
+      ? files.map((file) => file.path)
+      : changeDetection.changedFiles;
+
+    const graph = await runStage("knowledge_graph", async () => this.buildGraphFromFiles(project.localPath, files));
+
+    const knowledgeEntry = await runStage("relationships", async () => this.saveMemory({
+      id: existingKg?.id,
+      projectId,
+      title: "Knowledge Graph Index",
+      summary: "Сводный граф знаний проекта обновлён через Resync Project",
+      details: `Resync run: ${runId}`,
+      kind: "knowledge-graph-index",
+      tags: ["knowledge-graph", "source-of-truth", "resync"],
+      relatedFiles: files.map((file) => file.path),
+      graph: graph as Record<string, unknown>,
+      sourceRunId: runId,
+    }));
+
+    const docsFiles = files.filter((file) => [".md", ".mdx"].includes(file.ext));
+    const apiFiles = files.filter((file) => file.path.toLowerCase().includes("controller") || file.path.toLowerCase().includes("api"));
+    const serviceFiles = files.filter((file) => file.path.toLowerCase().includes("service"));
+    const componentFiles = files.filter((file) => file.path.toLowerCase().includes("component") || file.ext === ".vue");
+
+    await runStage("documentation", async () => this.saveMemory({
+      projectId,
+      title: `Resync Documentation Snapshot (${new Date().toLocaleString()})`,
+      kind: "documentation-index",
+      summary: `Обновлено документации: ${docsFiles.length}`,
+      details: docsFiles.slice(0, 400).map((file) => file.path).join("\n"),
+      tags: ["documentation", "resync"],
+      relatedFiles: docsFiles.map((file) => file.path),
+      sourceRunId: runId,
+      relevanceScore: 0.8,
+    }));
+
+    await runStage("memory", async () => {
+      await this.saveMemory({
+        projectId,
+        title: `Fact Memory Snapshot (${new Date().toLocaleString()})`,
+        kind: "fact-memory",
+        summary: `Файлов: ${files.length}, API: ${apiFiles.length}, сервисов: ${serviceFiles.length}, компонентов: ${componentFiles.length}`,
+        details: JSON.stringify({
+          totalFiles: files.length,
+          apiFiles: apiFiles.length,
+          serviceFiles: serviceFiles.length,
+          componentFiles: componentFiles.length,
+          docsFiles: docsFiles.length,
+        }, null, 2),
+        tags: ["facts", "resync"],
+        sourceRunId: runId,
+      });
+      await this.saveMemory({
+        projectId,
+        title: `Decision Memory (${new Date().toLocaleString()})`,
+        kind: "decision-memory",
+        summary: fullRescan
+          ? "Использован полный рескан проекта"
+          : "Использована инкрементальная git-синхронизация",
+        details: JSON.stringify({
+          strategy: fullRescan ? "full" : "git-incremental",
+          gitHead: changeDetection.gitHead,
+          changedFiles: changeDetection.changedFiles.length,
+        }, null, 2),
+        tags: ["decisions", "resync"],
+        sourceRunId: runId,
+      });
+      await this.saveMemory({
+        projectId,
+        title: `Experience Memory (${new Date().toLocaleString()})`,
+        kind: "experience-memory",
+        summary: `Resync completed. Strategy: ${fullRescan ? "full" : "incremental"}`,
+        details: "Pipeline completed successfully with automatic cleanup, deduplication and graph refresh.",
+        tags: ["experience", "resync"],
+        sourceRunId: runId,
+      });
+      await this.pruneDuplicateMemoryEntries(projectId);
+    });
+
+    const coverageAfter = await runStage("coverage", async () => {
+      const graphCoverage = (knowledgeEntry.graph as Record<string, any> | undefined)?.coverage as Record<string, unknown> | undefined;
+      return this.computeCoverageAverage(graphCoverage);
+    });
+
+    const validation = await runStage("validation", async () => {
+      const graphData = (knowledgeEntry.graph || {}) as Record<string, any>;
+      const hasEntityIndex = Array.isArray(graphData.entityIndex) && graphData.entityIndex.length > 0;
+      const hasRelations = Array.isArray(graphData.relations);
+      const duplicateCheck = new Set((graphData.entityIndex || []).map((item: any) => String(item?.id || ""))).size
+        === (graphData.entityIndex || []).length;
+      return {
+        ok: Boolean(hasEntityIndex && hasRelations && duplicateCheck),
+        hasEntityIndex,
+        hasRelations,
+        duplicateCheck,
+      };
+    });
+
+    await runStage("optimize", async () => {
+      const graphData = (knowledgeEntry.graph || {}) as Record<string, any>;
+      const dedupedRelations = this.mergeUniqueObjects(
+        Array.isArray(graphData.relations) ? graphData.relations : [],
+        [],
+        (item: Record<string, any>) => `${item.from || ""}|${item.type || ""}|${item.to || ""}`,
+      );
+      if (Array.isArray(graphData.relations) && dedupedRelations.length !== graphData.relations.length) {
+        await this.saveMemory({
+          id: knowledgeEntry.id,
+          projectId,
+          title: knowledgeEntry.title,
+          summary: knowledgeEntry.summary,
+          details: knowledgeEntry.details,
+          kind: knowledgeEntry.kind,
+          tags: knowledgeEntry.tags,
+          relatedFiles: knowledgeEntry.relatedFiles,
+          graph: {
+            ...graphData,
+            relations: dedupedRelations,
+            optimizedAt: new Date().toISOString(),
+          },
+          sourceRunId: runId,
+        });
+      }
+    });
+
+    const finishedAtDate = new Date();
+    const finishedAt = finishedAtDate.toISOString();
+    const durationMs = Math.max(0, finishedAtDate.getTime() - startedAtDate.getTime());
+
+    const summary = {
+      scannedFiles: files.length,
+      changedFiles: changedFiles.length,
+      newFiles: fullRescan ? 0 : changeDetection.newFiles.length,
+      deletedFiles: fullRescan ? 0 : changeDetection.deletedFiles.length,
+      newEntities: Array.isArray((knowledgeEntry.graph as Record<string, any>)?.entityIndex)
+        ? ((knowledgeEntry.graph as Record<string, any>).entityIndex as unknown[]).length
+        : 0,
+      newRelations: Array.isArray((knowledgeEntry.graph as Record<string, any>)?.relations)
+        ? ((knowledgeEntry.graph as Record<string, any>).relations as unknown[]).length
+        : 0,
+      updatedServices: serviceFiles.length,
+      updatedComponents: componentFiles.length,
+      updatedApi: apiFiles.length,
+      updatedDocumentation: docsFiles.length,
+      updatedArchitecturalDecisions: files.filter((file) => file.path.toLowerCase().includes("adr") || file.path.toLowerCase().includes("decision")).length,
+      updatedMemoryEntries: 3,
+      coverageBefore: previousCoverage,
+      coverageAfter,
+      durationMs,
+      memoryIntegrity: validation.ok ? "ok" : "warning",
+      alreadySynchronized: Boolean(!fullRescan && !changeDetection.changedFiles.length && !changeDetection.newFiles.length && !changeDetection.deletedFiles.length),
+    };
+
+    const historyEntry = await this.saveMemory({
+      projectId,
+      title: `Resync Project — ${new Date().toLocaleString()}`,
+      kind: "resync-history",
+      summary: summary.alreadySynchronized
+        ? "Project is already synchronized"
+        : "Project synchronized successfully",
+      details: JSON.stringify(summary, null, 2),
+      tags: ["resync", "history"],
+      relatedFiles: changedFiles.slice(0, 500),
+      sourceRunId: runId,
+      graph: {
+        runId,
+        startedAt,
+        finishedAt,
+        durationMs,
+        stages,
+        summary,
+        validation,
+        changes: {
+          strategy: changeDetection.strategy,
+          changedFiles,
+          newFiles: changeDetection.newFiles,
+          deletedFiles: changeDetection.deletedFiles,
+        },
+        meta: {
+          gitHead: changeDetection.gitHead,
+          digest,
+        },
+      },
+    });
+
+    const result = {
+      runId,
+      projectId,
+      startedAt,
+      finishedAt,
+      durationMs,
+      status: "completed",
+      stages,
+      summary,
+      historyEntryId: historyEntry.id,
+      message: summary.alreadySynchronized
+        ? "Project is already synchronized. Knowledge Graph is up to date."
+        : "Project synchronized successfully.",
+    };
+
+    this.wsGateway.broadcastToProject(projectId, "project:resync:completed", result);
+    return result;
+  }
+
+  async getResyncStatus(projectId: string) {
+    const project = await this.getById(projectId);
+    const [latestResync] = await this.projectMemoryRepository.find({
+      where: { projectId, isActive: true, kind: "resync-history" },
+      order: { updatedAt: "DESC" },
+      take: 1,
+    });
+
+    const statusWithoutHistory = {
+      projectId,
+      status: "outdated",
+      changedFiles: 0,
+      changedPreview: [] as string[],
+      message: "Knowledge is outdated.",
+      coverage: 0,
+      lastSynchronization: null as null | Record<string, unknown>,
+    };
+
+    if (!latestResync || !latestResync.graph || typeof latestResync.graph !== "object") {
+      return statusWithoutHistory;
+    }
+
+    const graphData = latestResync.graph as Record<string, any>;
+    const lastDigest = String(graphData?.meta?.digest || "");
+    const lastGitHead = String(graphData?.meta?.gitHead || "") || null;
+
+    const files = this.listProjectFiles(project.localPath);
+    const digest = this.computeProjectDigest(files);
+    const changedByDigest = lastDigest !== digest;
+    const incremental = this.detectIncrementalChanges(project.localPath, lastGitHead);
+    const changedFiles = incremental.strategy === "git-incremental"
+      ? incremental.changedFiles
+      : changedByDigest
+        ? files.map((file) => file.path)
+        : [];
+
+    const coverage = Number(graphData?.summary?.coverageAfter || 0);
+    const outdated = changedByDigest || changedFiles.length > 0;
+
+    return {
+      projectId,
+      status: outdated ? "outdated" : "synchronized",
+      changedFiles: changedFiles.length,
+      changedPreview: changedFiles.slice(0, 30),
+      message: outdated ? "Knowledge is outdated." : "Knowledge is synchronized.",
+      coverage,
+      lastSynchronization: {
+        at: latestResync.updatedAt,
+        durationMs: Number(graphData?.durationMs || 0),
+        result: latestResync.summary,
+      },
+    };
+  }
+
+  async listResyncHistory(projectId: string) {
+    await this.getById(projectId);
+    const entries = await this.projectMemoryRepository.find({
+      where: { projectId, isActive: true, kind: "resync-history" },
+      order: { updatedAt: "DESC" },
+      take: 50,
+    });
+
+    return entries.map((entry) => {
+      const graphData = entry.graph && typeof entry.graph === "object" ? entry.graph as Record<string, any> : {};
+      const summary = graphData.summary && typeof graphData.summary === "object" ? graphData.summary as Record<string, any> : {};
+      return {
+        id: entry.id,
+        title: entry.title,
+        summary: entry.summary,
+        date: entry.updatedAt,
+        durationMs: Number(graphData.durationMs || summary.durationMs || 0),
+        changedFiles: Number(summary.changedFiles || 0),
+        updatedEntities: Number(summary.newEntities || 0),
+        coverageBefore: Number(summary.coverageBefore || 0),
+        coverageAfter: Number(summary.coverageAfter || 0),
+        memoryIntegrity: String(summary.memoryIntegrity || "unknown"),
+        details: graphData,
+      };
+    });
+  }
+
+  async getResyncHistoryEntry(projectId: string, entryId: string) {
+    await this.getById(projectId);
+    const entry = await this.projectMemoryRepository.findOne({
+      where: { id: entryId, projectId, isActive: true, kind: "resync-history" },
+    });
+    if (!entry) {
+      throw new NotFoundException("Resync history entry not found");
+    }
+    return entry;
   }
 
   async upsertKnowledgeGraphIndex(input: SaveProjectMemoryDto) {

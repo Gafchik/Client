@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Project, Team } from "../../types";
+import type { Project, ResyncHistoryItem, ResyncStatus, Team } from "../../types";
 import type { MissionHistoryItem } from "./types";
 
 const props = defineProps<{
@@ -11,6 +11,9 @@ const props = defineProps<{
   search: string;
   missions: MissionHistoryItem[];
   selectedMissionId: string;
+  resyncStatus: ResyncStatus | null;
+  resyncHistory: ResyncHistoryItem[];
+  resyncBusy: boolean;
   formatDateTime: (value?: string) => string;
   formatDuration: (sec?: number) => string;
 }>();
@@ -21,6 +24,8 @@ const emit = defineEmits<{
   (e: "update:missionMode", value: "build" | "ask"): void;
   (e: "update:search", value: string): void;
   (e: "select-mission", missionId: string): void;
+  (e: "resync-project"): void;
+  (e: "open-resync-history"): void;
 }>();
 </script>
 
@@ -55,6 +60,27 @@ const emit = defineEmits<{
     <div class="mode-switch">
       <button class="switch-btn" :class="{ active: missionMode === 'build' }" @click="emit('update:missionMode', 'build')">Build</button>
       <button class="switch-btn" :class="{ active: missionMode === 'ask' }" @click="emit('update:missionMode', 'ask')">Ask</button>
+    </div>
+
+    <div class="resync-card" :class="resyncStatus?.status || 'synchronized'">
+      <div class="row between">
+        <strong>Knowledge Status</strong>
+        <span class="status-chip" :class="resyncStatus?.status || 'synchronized'">
+          {{ (resyncStatus?.status || "synchronized") === "outdated" ? "outdated" : "synchronized" }}
+        </span>
+      </div>
+      <p v-if="resyncStatus?.status === 'outdated'" class="resync-note">
+        Knowledge is outdated. {{ resyncStatus.changedFiles }} files changed since last synchronization.
+      </p>
+      <p v-else class="resync-note">
+        Knowledge is synchronized. Coverage: {{ Math.round((resyncStatus?.coverage || 0) * 100) }}%
+      </p>
+      <button class="resync-btn" :disabled="resyncBusy || !selectedProjectId" @click="emit('resync-project')">
+        {{ resyncBusy ? "Resync in progress..." : "🔄 Resync Project" }}
+      </button>
+      <button class="resync-history-link" :disabled="!resyncHistory.length" @click="emit('open-resync-history')">
+        View resync history ({{ resyncHistory.length }})
+      </button>
     </div>
 
     <div class="left-block">
@@ -176,6 +202,71 @@ input {
   background: rgba(16, 185, 129, 0.16);
   border-color: rgba(52, 211, 153, 0.45);
   color: #6ee7b7;
+}
+
+.resync-card {
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  background: #0b0d10;
+}
+
+.resync-card.outdated {
+  border-color: rgba(248, 113, 113, 0.45);
+  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.2) inset;
+}
+
+.status-chip {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-radius: 99px;
+  padding: 2px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.status-chip.outdated {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
+.status-chip.synchronized {
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.45);
+}
+
+.resync-note {
+  margin: 8px 0;
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.resync-btn {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgba(52, 211, 153, 0.45);
+  background: rgba(16, 185, 129, 0.18);
+  color: #6ee7b7;
+  font-weight: 700;
+  padding: 9px 10px;
+}
+
+.resync-btn:disabled,
+.resync-history-link:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.resync-history-link {
+  width: 100%;
+  margin-top: 8px;
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  background: transparent;
+  color: #93c5fd;
+  border-radius: 10px;
+  padding: 8px 10px;
 }
 
 .history-title {

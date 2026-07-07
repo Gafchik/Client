@@ -80,6 +80,77 @@ export interface ProjectMemoryEntry {
   updatedAt?: string;
 }
 
+export interface ResyncStage {
+  key: string;
+  title: string;
+  status: "pending" | "active" | "done" | "error";
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs: number;
+  message?: string;
+}
+
+export interface ResyncSummary {
+  scannedFiles: number;
+  changedFiles: number;
+  newFiles: number;
+  deletedFiles: number;
+  newEntities: number;
+  newRelations: number;
+  updatedServices: number;
+  updatedComponents: number;
+  updatedApi: number;
+  updatedDocumentation: number;
+  updatedArchitecturalDecisions: number;
+  updatedMemoryEntries: number;
+  coverageBefore: number;
+  coverageAfter: number;
+  durationMs: number;
+  memoryIntegrity: string;
+  alreadySynchronized: boolean;
+}
+
+export interface ResyncResult {
+  runId: string;
+  projectId: string;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  status: string;
+  stages: ResyncStage[];
+  summary: ResyncSummary;
+  historyEntryId: string;
+  message: string;
+}
+
+export interface ResyncStatus {
+  projectId: string;
+  status: "outdated" | "synchronized";
+  changedFiles: number;
+  changedPreview: string[];
+  message: string;
+  coverage: number;
+  lastSynchronization: {
+    at?: string;
+    durationMs?: number;
+    result?: string;
+  } | null;
+}
+
+export interface ResyncHistoryItem {
+  id: string;
+  title: string;
+  summary: string;
+  date: string;
+  durationMs: number;
+  changedFiles: number;
+  updatedEntities: number;
+  coverageBefore: number;
+  coverageAfter: number;
+  memoryIntegrity: string;
+  details?: Record<string, unknown>;
+}
+
 export interface Chat {
   id: string;
   projectId: string;

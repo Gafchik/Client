@@ -1,4 +1,19 @@
-import type { Chat, ChatMessage, ChatStats, CompileResult, ModelCatalogItem, Project, ProjectMemoryEntry, Provider, RunApproval, RunItem, Team } from "./types";
+import type {
+  Chat,
+  ChatMessage,
+  ChatStats,
+  CompileResult,
+  ModelCatalogItem,
+  Project,
+  ProjectMemoryEntry,
+  Provider,
+  ResyncHistoryItem,
+  ResyncResult,
+  ResyncStatus,
+  RunApproval,
+  RunItem,
+  Team,
+} from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
 
@@ -71,6 +86,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(entry),
     }),
+  resyncProject: (projectId: string) =>
+    request<{ result: ResyncResult }>(`/projects/${projectId}/resync`, {
+      method: "POST",
+    }),
+  resyncStatus: (projectId: string) =>
+    request<{ status: ResyncStatus }>(`/projects/${projectId}/resync/status`),
+  resyncHistory: (projectId: string) =>
+    request<{ items: ResyncHistoryItem[] }>(`/projects/${projectId}/resync/history`),
+  resyncHistoryEntry: (projectId: string, entryId: string) =>
+    request<{ entry: ResyncHistoryItem }>(`/projects/${projectId}/resync/history/${entryId}`),
   deleteProject: (id: string) =>
     request<{ ok: boolean }>(`/projects/${id}`, {
       method: "DELETE",

@@ -44,6 +44,30 @@ export class ProjectsController {
     return { impact };
   }
 
+  @Post(":id/resync")
+  async runResync(@Param("id") id: string) {
+    const result = await this.projectsService.runResync(id);
+    return { result };
+  }
+
+  @Get(":id/resync/status")
+  async getResyncStatus(@Param("id") id: string) {
+    const status = await this.projectsService.getResyncStatus(id);
+    return { status };
+  }
+
+  @Get(":id/resync/history")
+  async listResyncHistory(@Param("id") id: string) {
+    const items = await this.projectsService.listResyncHistory(id);
+    return { items };
+  }
+
+  @Get(":id/resync/history/:entryId")
+  async getResyncHistoryEntry(@Param("id") id: string, @Param("entryId") entryId: string) {
+    const entry = await this.projectsService.getResyncHistoryEntry(id, entryId);
+    return { entry };
+  }
+
   @Post("memory")
   async saveProjectMemory(@Body() body: SaveProjectMemoryDto) {
     const entry = await this.projectsService.saveMemory(body);

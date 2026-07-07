@@ -2,7 +2,19 @@
 import { computed, inject, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { io, Socket } from "socket.io-client";
 import { api } from "../api";
-import type { Chat, CompileResult, Project, ProjectMemoryEntry, Provider, RunItem, Team } from "../types";
+import type {
+  Chat,
+  CompileResult,
+  Project,
+  ProjectMemoryEntry,
+  Provider,
+  ResyncHistoryItem,
+  ResyncResult,
+  ResyncStage,
+  ResyncStatus,
+  RunItem,
+  Team,
+} from "../types";
 import MissionCard from "../components/workspace/MissionCard.vue";
 import MissionComposer from "../components/workspace/MissionComposer.vue";
 import WorkspaceInspector from "../components/workspace/WorkspaceInspector.vue";
@@ -46,6 +58,15 @@ const state = reactive({
   previewOpen: false,
   previewResult: null as CompileResult | null,
   previewTask: "",
+  resyncBusy: false,
+  resyncRunningModalOpen: false,
+  resyncSummaryModalOpen: false,
+  resyncHistoryModalOpen: false,
+  resyncStatus: null as ResyncStatus | null,
+  resyncHistory: [] as ResyncHistoryItem[],
+  resyncResult: null as ResyncResult | null,
+  resyncStages: [] as ResyncStage[],
+  selectedResyncHistoryId: "",
   missions: [] as MissionHistoryItem[],
 });
 
@@ -220,6 +241,13 @@ function formatTokens(value?: number): string {
 function formatMoney(value?: number): string {
   return `$${Number(value || 0).toFixed(4)}`;
 }
+function formatMs(ms?: number): string {
+  const value = Number(ms || 0);
+  if (!value) return "0ms";
+  if (value < 1000) return `${value}ms`;
+  const sec = Math.round((value / 1000) * 10) / 10;
+  return `${sec}s`;
+}
 function priorityLabel(weight: number): string {
   if (weight >= 0.85) return "Critical";
   if (weight >= 0.65) return "High";
@@ -352,6 +380,84 @@ async function loadRuns() {
     mergeRunIntoMission(run);
   }
 }
+
+async function loadResyncStatus() {
+  if (!state.selectedProjectId) {
+    state.resyncStatus = null;
+    return;
+  }
+  const response = await api.resyncStatus(state.selectedProjectId);
+  state.resyncStatus = response.status;
+}
+
+async function loadResyncHistory() {
+  if (!state.selectedProjectId) {
+    state.resyncHistory = [];
+    state.selectedResyncHistoryId = "";
+    return;
+  }
+  const response = await api.resyncHistory(state.selectedProjectId);
+  state.resyncHistory = response.items;
+  if (!state.selectedResyncHistoryId && response.items.length) {
+    state.selectedResyncHistoryId = response.items[0].id;
+  }
+}
+
+function openResyncHistory() {
+  if (!state.resyncHistory.length) return;
+  state.resyncHistoryModalOpen = true;
+}
+
+async function runProjectResync() {
+  if (!state.selectedProjectId || state.resyncBusy) return;
+
+  state.resyncBusy = true;
+  state.resyncRunningModalOpen = true;
+  state.resyncSummaryModalOpen = false;
+  state.resyncResult = null;
+  state.resyncStages = [
+    { key: "scan", title: "Scanning Project...", status: "active", durationMs: 0 },
+    { key: "detect", title: "Detecting Changes...", status: "pending", durationMs: 0 },
+    { key: "kg", title: "Updating Knowledge Graph...", status: "pending", durationMs: 0 },
+    { key: "relations", title: "Rebuilding Relationships...", status: "pending", durationMs: 0 },
+    { key: "docs", title: "Refreshing Documentation...", status: "pending", durationMs: 0 },
+    { key: "memory", title: "Optimizing Memory...", status: "pending", durationMs: 0 },
+    { key: "coverage", title: "Calculating Coverage...", status: "pending", durationMs: 0 },
+    { key: "validation", title: "Final Validation...", status: "pending", durationMs: 0 },
+    { key: "completed", title: "Completed.", status: "pending", durationMs: 0 },
+  ];
+
+  try {
+    const response = await api.resyncProject(state.selectedProjectId);
+    state.resyncResult = response.result;
+    state.resyncStages = response.result.stages;
+
+    await Promise.all([
+      loadProjectMemory(),
+      loadRuns(),
+      loadChats(),
+      loadResyncStatus(),
+      loadResyncHistory(),
+      refreshActiveMission(),
+    ]);
+
+    state.resyncSummaryModalOpen = true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Resync failed";
+    state.resyncStages = state.resyncStages.map((stage, index) =>
+      index === state.resyncStages.findIndex((x) => x.status === "active")
+        ? { ...stage, status: "error", message }
+        : stage,
+    );
+  } finally {
+    state.resyncBusy = false;
+    state.resyncRunningModalOpen = false;
+  }
+}
+
+const selectedResyncHistoryEntry = computed(() =>
+  state.resyncHistory.find((item) => item.id === state.selectedResyncHistoryId) || state.resyncHistory[0] || null,
+);
 
 async function refreshActiveMission() {
   const mission = selectedMission.value;
@@ -556,7 +662,7 @@ onMounted(async () => {
 
   state.loading = true;
   try {
-    await Promise.all([loadChats(), loadProjectMemory(), loadRuns()]);
+    await Promise.all([loadChats(), loadProjectMemory(), loadRuns(), loadResyncStatus(), loadResyncHistory()]);
   } finally {
     state.loading = false;
   }
@@ -592,7 +698,7 @@ watch(
   async (next, prev) => {
     if (ws && prev) ws.emit("leave:project", { projectId: prev });
     if (ws && next) ws.emit("join:project", { projectId: next });
-    await Promise.all([loadChats(), loadProjectMemory(), loadRuns()]);
+    await Promise.all([loadChats(), loadProjectMemory(), loadRuns(), loadResyncStatus(), loadResyncHistory()]);
   },
 );
 
@@ -622,6 +728,9 @@ watch(
       :search="state.search"
       :missions="filteredMissions"
       :selected-mission-id="state.selectedMissionId"
+      :resync-status="state.resyncStatus"
+      :resync-history="state.resyncHistory"
+      :resync-busy="state.resyncBusy"
       :format-date-time="formatDateTime"
       :format-duration="formatDuration"
       @update:selected-project-id="state.selectedProjectId = $event"
@@ -629,6 +738,8 @@ watch(
       @update:mission-mode="state.missionMode = $event"
       @update:search="state.search = $event"
       @select-mission="state.selectedMissionId = $event"
+      @resync-project="runProjectResync"
+      @open-resync-history="openResyncHistory"
     />
 
     <main class="center-panel">
@@ -699,6 +810,91 @@ watch(
           <button class="btn ghost" @click="state.previewOpen = false">Cancel</button>
           <button class="btn primary" :disabled="state.compileBusy" @click="handleCompileFromPreview">Compile</button>
         </footer>
+      </div>
+    </div>
+
+    <div v-if="state.resyncRunningModalOpen" class="preview-backdrop">
+      <div class="preview-modal resync-modal">
+        <header>
+          <h3>Resync Project</h3>
+        </header>
+        <p class="resync-subtitle">Synchronization pipeline is running...</p>
+        <div class="resync-stages">
+          <div v-for="stage in state.resyncStages" :key="stage.key" class="resync-stage" :class="stage.status">
+            <div class="resync-stage-dot" />
+            <div>
+              <div class="row between">
+                <strong>{{ stage.title }}</strong>
+                <span class="resync-time">{{ formatMs(stage.durationMs) }}</span>
+              </div>
+              <div class="resync-stage-meta">Status: {{ stage.status }}<span v-if="stage.message"> · {{ stage.message }}</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="state.resyncSummaryModalOpen && state.resyncResult" class="preview-backdrop">
+      <div class="preview-modal resync-modal">
+        <header>
+          <h3>{{ state.resyncResult.summary.alreadySynchronized ? "Project is already synchronized." : "Project synchronized successfully." }}</h3>
+          <button @click="state.resyncSummaryModalOpen = false">✕</button>
+        </header>
+        <p v-if="state.resyncResult.summary.alreadySynchronized" class="resync-subtitle">
+          Knowledge Graph is up to date. No code changes detected.
+        </p>
+        <div class="resync-summary-grid">
+          <div class="metric"><span>Scanned files</span><strong>{{ state.resyncResult.summary.scannedFiles }}</strong></div>
+          <div class="metric"><span>Changed files</span><strong>{{ state.resyncResult.summary.changedFiles }}</strong></div>
+          <div class="metric"><span>New files</span><strong>{{ state.resyncResult.summary.newFiles }}</strong></div>
+          <div class="metric"><span>Deleted files</span><strong>{{ state.resyncResult.summary.deletedFiles }}</strong></div>
+          <div class="metric"><span>New entities</span><strong>{{ state.resyncResult.summary.newEntities }}</strong></div>
+          <div class="metric"><span>New relations</span><strong>{{ state.resyncResult.summary.newRelations }}</strong></div>
+          <div class="metric"><span>Updated services</span><strong>{{ state.resyncResult.summary.updatedServices }}</strong></div>
+          <div class="metric"><span>Updated components</span><strong>{{ state.resyncResult.summary.updatedComponents }}</strong></div>
+          <div class="metric"><span>Updated API</span><strong>{{ state.resyncResult.summary.updatedApi }}</strong></div>
+          <div class="metric"><span>Updated documentation</span><strong>{{ state.resyncResult.summary.updatedDocumentation }}</strong></div>
+          <div class="metric"><span>Updated decisions</span><strong>{{ state.resyncResult.summary.updatedArchitecturalDecisions }}</strong></div>
+          <div class="metric"><span>Updated memory entries</span><strong>{{ state.resyncResult.summary.updatedMemoryEntries }}</strong></div>
+          <div class="metric"><span>Coverage before</span><strong>{{ Math.round(state.resyncResult.summary.coverageBefore * 100) }}%</strong></div>
+          <div class="metric"><span>Coverage after</span><strong>{{ Math.round(state.resyncResult.summary.coverageAfter * 100) }}%</strong></div>
+          <div class="metric"><span>Execution time</span><strong>{{ formatMs(state.resyncResult.summary.durationMs) }}</strong></div>
+          <div class="metric"><span>Memory integrity</span><strong>{{ state.resyncResult.summary.memoryIntegrity }}</strong></div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="state.resyncHistoryModalOpen" class="preview-backdrop">
+      <div class="preview-modal resync-modal">
+        <header>
+          <h3>Resync History</h3>
+          <button @click="state.resyncHistoryModalOpen = false">✕</button>
+        </header>
+        <div class="resync-history-layout">
+          <aside class="resync-history-list">
+            <button
+              v-for="item in state.resyncHistory"
+              :key="item.id"
+              class="history-run"
+              :class="{ active: state.selectedResyncHistoryId === item.id }"
+              @click="state.selectedResyncHistoryId = item.id"
+            >
+              <strong>{{ item.title }}</strong>
+              <span>{{ formatDateTime(item.date) }}</span>
+              <span>Duration: {{ formatMs(item.durationMs) }}</span>
+            </button>
+          </aside>
+          <section v-if="selectedResyncHistoryEntry" class="resync-history-details">
+            <h4>{{ selectedResyncHistoryEntry.title }}</h4>
+            <p>{{ selectedResyncHistoryEntry.summary }}</p>
+            <ul>
+              <li>Changed files: {{ selectedResyncHistoryEntry.changedFiles }}</li>
+              <li>Updated entities: {{ selectedResyncHistoryEntry.updatedEntities }}</li>
+              <li>Coverage: {{ Math.round(selectedResyncHistoryEntry.coverageBefore * 100) }}% → {{ Math.round(selectedResyncHistoryEntry.coverageAfter * 100) }}%</li>
+              <li>Memory integrity: {{ selectedResyncHistoryEntry.memoryIntegrity }}</li>
+            </ul>
+          </section>
+        </div>
       </div>
     </div>
   </div>
@@ -799,6 +995,123 @@ watch(
   background: rgba(16, 185, 129, 0.2);
   border-color: rgba(52, 211, 153, 0.45);
   color: #6ee7b7;
+}
+
+.resync-modal {
+  width: min(980px, calc(100vw - 40px));
+}
+
+.resync-subtitle {
+  margin: 8px 0 12px;
+  color: #94a3b8;
+}
+
+.resync-stages {
+  display: grid;
+  gap: 8px;
+}
+
+.resync-stage {
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  gap: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.resync-stage-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-top: 4px;
+  background: #64748b;
+}
+
+.resync-stage.active .resync-stage-dot {
+  background: #f59e0b;
+  box-shadow: 0 0 0 6px rgba(245, 158, 11, 0.18);
+}
+
+.resync-stage.done .resync-stage-dot {
+  background: #10b981;
+}
+
+.resync-stage.error .resync-stage-dot {
+  background: #ef4444;
+}
+
+.resync-stage-meta {
+  margin-top: 4px;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.resync-time {
+  color: #93c5fd;
+  font-size: 12px;
+}
+
+.resync-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.metric {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.metric span {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.resync-history-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 12px;
+}
+
+.resync-history-list {
+  display: grid;
+  gap: 8px;
+}
+
+.history-run {
+  text-align: left;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 10px;
+  padding: 10px;
+  background: #0f1319;
+  color: #e2e8f0;
+  display: grid;
+  gap: 4px;
+}
+
+.history-run.active {
+  border-color: rgba(52, 211, 153, 0.5);
+}
+
+.history-run span {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.resync-history-details {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.resync-history-details p {
+  color: #cbd5e1;
 }
 
 @media (max-width: 1440px) {
