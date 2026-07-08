@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
+  type AnswerPackage,
   type ControlledExecutionRuntime,
   type ContextPackage,
   type ExecutionPlan,
@@ -35,6 +36,7 @@ interface SaveKnowledgeInput {
   plan: ExecutionPlan;
   executionPreview: ExecutionPreview;
   executionRuntime: ControlledExecutionRuntime;
+  answer: AnswerPackage;
 }
 
 export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise<KnowledgeSaveResult> {
@@ -74,6 +76,11 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
     plan: input.plan,
     executionPreview: input.executionPreview,
     executionRuntime: input.executionRuntime,
+    answer: input.answer,
+    runtimeCache: {
+      index: input.index,
+      graph: input.graph,
+    },
   };
 
   await fs.writeFile(storagePath, JSON.stringify(artifact, null, 2));
@@ -251,9 +258,41 @@ function normalizePipelineRunArtifact(
     plan,
     executionPreview,
     executionRuntime,
+    answer:
+      artifact.answer
+      ?? {
+        answerId: stableId(["answer", artifact.runId]),
+        runId: artifact.runId,
+        answerMode: "fallback-answer",
+        summary: artifact.research.summary,
+        explanation: artifact.research.functionalSummary ?? artifact.research.summary,
+        evidenceHighlights: safeEvidenceHighlights(artifact.research.findings ?? []),
+        confidence: artifact.research.confidence ?? 0,
+        unknowns: artifact.research.unknowns ?? [],
+        warnings: ["Старый артефакт не содержал Answer Package и был восстановлен в режиме совместимости."],
+        nextActions: ["Для полноценного answer synthesis требуется повторный запуск pipeline на новом формате."],
+        inspectorHints: ["Открыть Research и Plan для деталей."],
+        generatedAt: artifact.knowledge.savedAt,
+        synthesis: "deterministic-fallback",
+      },
     knowledge: {
       ...artifact.knowledge,
       artifactCount: artifact.knowledge.artifactCount ?? 8,
     },
+    ...(artifact.runtimeCache && artifact.runtimeCache.index && artifact.runtimeCache.graph
+      ? {
+          runtimeCache: {
+            index: artifact.runtimeCache.index as IndexResult,
+            graph: artifact.runtimeCache.graph as GraphState,
+          },
+        }
+      : {}),
   };
+}
+
+function safeEvidenceHighlights(findings: string[]): Array<{ label: string; detail: string }> {
+  return findings.slice(0, 3).map((finding, index) => ({
+    label: `Finding ${index + 1}`,
+    detail: finding,
+  }));
 }

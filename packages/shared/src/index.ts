@@ -94,6 +94,7 @@ export interface WorkspaceSnapshot {
 
 export interface IndexSymbol {
   id: string;
+  stableSymbolId: string;
   name: string;
   kind: SymbolKind;
   language: LanguageId;
@@ -116,13 +117,45 @@ export interface IndexedFile {
   fileId: string;
   filePath: string;
   language: LanguageId;
+  contentHash: string;
+  modifiedAt: string;
+  parseCacheKey: string;
+  astFingerprint: string;
   symbolIds: string[];
   imports: string[];
+}
+
+export interface ParseCacheSummary {
+  eligibleFiles: number;
+  reusedFiles: number;
+  reparsedFiles: number;
+  invalidatedFiles: number;
+  reason: string;
+}
+
+export interface AstCacheSummary {
+  eligibleFiles: number;
+  reusedAstCount: number;
+  rebuiltAstCount: number;
+  invalidatedFiles: number;
+  reason: string;
+}
+
+export interface SymbolDiffSummary {
+  changedFiles: number;
+  renamedFiles: number;
+  deletedFiles: number;
+  addedSymbols: number;
+  removedSymbols: number;
+  updatedSymbols: number;
+  unchangedSymbols: number;
+  reusedSymbols: number;
 }
 
 export interface IndexManifest {
   indexId: string;
   mode: "full" | "selective";
+  baseIndexId?: string;
   startedAt: string;
   completedAt: string;
   projectId: string;
@@ -130,6 +163,14 @@ export interface IndexManifest {
   symbolCount: number;
   relationCount: number;
   diagnosticsCount: number;
+  reusedFileCount: number;
+  reusedSymbolCount: number;
+  reusedRelationCount: number;
+  reindexedFileCount: number;
+  deletedFileCount: number;
+  parseCache: ParseCacheSummary;
+  astCache: AstCacheSummary;
+  symbolDiff: SymbolDiffSummary;
 }
 
 export interface IndexResult {
@@ -220,6 +261,9 @@ export interface GraphInvalidationPlan {
   changedPaths: string[];
   invalidatedFiles: string[];
   invalidatedModules: string[];
+  invalidatedSymbolIds: string[];
+  reusedNodeCount?: number;
+  reusedEdgeCount?: number;
   reason: string;
 }
 
@@ -227,6 +271,13 @@ export interface IncrementalIndexPlan {
   mode: "full-index" | "incremental-index";
   previousRunId?: string;
   candidatePaths: string[];
+  changedPaths: string[];
+  deletedPaths: string[];
+  renamedPaths: Array<{
+    from: string;
+    to: string;
+  }>;
+  reusablePaths: string[];
   reusedSignals: string[];
   reason: string;
 }
@@ -390,6 +441,38 @@ export interface ControlledExecutionRuntime {
   executionAllowed: false;
 }
 
+export type AnswerMode =
+  | "direct-answer"
+  | "diagnostic-answer"
+  | "plan-summary-answer"
+  | "insufficient-data-answer"
+  | "fallback-answer";
+
+export interface AnswerEvidenceHighlight {
+  label: string;
+  detail: string;
+}
+
+export interface AnswerPackage {
+  answerId: string;
+  runId: string;
+  answerMode: AnswerMode;
+  summary: string;
+  explanation: string;
+  evidenceHighlights: AnswerEvidenceHighlight[];
+  confidence: number;
+  unknowns: string[];
+  warnings: string[];
+  nextActions: string[];
+  inspectorHints: string[];
+  generatedAt: string;
+  providerUsed?: {
+    baseUrl: string;
+    model: string;
+  };
+  synthesis: "llm" | "deterministic-fallback";
+}
+
 export interface KnowledgeCatalogEntry {
   runId: string;
   task: string;
@@ -407,7 +490,7 @@ export interface KnowledgeSaveResult {
 }
 
 export interface PipelineStage {
-  key: "workspace" | "repository" | "index" | "graph" | "research" | "impact" | "context" | "plan" | "preview" | "runtime" | "knowledge";
+  key: "workspace" | "repository" | "index" | "graph" | "research" | "impact" | "context" | "plan" | "preview" | "runtime" | "answer" | "knowledge";
   label: string;
   status: "pending" | "running" | "completed" | "failed";
   startedAt: string;
@@ -425,6 +508,32 @@ export interface ProviderRuntimeConfig {
   baseUrl: string;
   model: string;
   apiKeyMasked: string;
+}
+
+export interface ProviderRecord {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKeyMasked: string;
+  hasApiKey: boolean;
+  isActive: boolean;
+  isCurrent: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProviderModelRecord {
+  id: string;
+  label: string;
+  providerId: string;
+  isDefault?: boolean;
+}
+
+export interface ProviderCatalogResponse {
+  providers: ProviderRecord[];
+  currentProvider: ProviderRecord | null;
+  models: ProviderModelRecord[];
+  recommendedModelId?: string;
 }
 
 export interface PipelineRunResult {
@@ -454,7 +563,14 @@ export interface PipelineRunResult {
   plan: ExecutionPlan;
   executionPreview: ExecutionPreview;
   executionRuntime: ControlledExecutionRuntime;
+  answer: AnswerPackage;
   knowledge: KnowledgeSaveResult;
+  runtimeCache?: PipelineRuntimeCache;
+}
+
+export interface PipelineRuntimeCache {
+  index: IndexResult;
+  graph: GraphState;
 }
 
 export interface PipelinePartialArtifacts {
@@ -470,6 +586,7 @@ export interface PipelinePartialArtifacts {
   plan?: ExecutionPlan;
   executionPreview?: ExecutionPreview;
   executionRuntime?: ControlledExecutionRuntime;
+  answer?: AnswerPackage;
 }
 
 export interface PipelineRunStatus {

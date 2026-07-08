@@ -1,5 +1,15 @@
 import { startTransition, useEffect, useRef, useState } from "react";
-import type { ContextCandidate, KnowledgeCatalogEntry, PipelineRunResult, PipelineRunStatus, PipelineStage } from "@client/shared";
+import type { FormEvent } from "react";
+import type {
+  ContextCandidate,
+  KnowledgeCatalogEntry,
+  PipelineRunResult,
+  PipelineRunStatus,
+  PipelineStage,
+  ProviderCatalogResponse,
+  ProviderModelRecord,
+  ProviderRecord,
+} from "@client/shared";
 
 interface ProjectInfo {
   name: string;
@@ -14,16 +24,19 @@ interface ProjectInfo {
   latestRun: PipelineRunResult | null;
 }
 
-type ArtifactTab = "research" | "impact" | "index" | "knowledge";
 type ProviderDraft = {
+  id: string;
+  name: string;
   baseUrl: string;
-  model: string;
   apiKey: string;
 };
+
+type InspectorTab = "overview" | "research" | "impact" | "context" | "plan" | "execution" | "knowledge" | "git" | "diagnostics";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
 const PROVIDER_STORAGE_KEY = "client.provider-config";
 const REQUEST_TIMEOUT_MS = 15000;
+const DEFAULT_MODEL_ID = "nvidia/nemotron-3-ultra";
 
 function hasRunArtifacts(result: PipelineRunResult | null): result is PipelineRunResult {
   return Boolean(result?.runId && result?.project && result?.research && result?.impact);
@@ -39,6 +52,63 @@ function safeText(value: string | undefined | null, fallback = "Недоступ
 
 function safeCount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function normalizeProjectInfo(data: ProjectInfo): ProjectInfo {
+  return {
+    ...data,
+    recentRuns: safeList(data.recentRuns),
+    summary: {
+      totalFiles: safeCount(data.summary?.totalFiles),
+      indexedFiles: safeCount(data.summary?.indexedFiles),
+      languages: data.summary?.languages ?? {},
+      ...(data.summary?.profile ? { profile: data.summary.profile } : {}),
+    },
+  };
+}
+
+function normalizeProviderCatalog(data: ProviderCatalogResponse): ProviderCatalogResponse {
+  return {
+    providers: safeList(data.providers),
+    currentProvider: data.currentProvider ?? null,
+    models: safeList(data.models),
+    ...(data.recommendedModelId ? { recommendedModelId: data.recommendedModelId } : {}),
+  };
+}
+
+function formatDateTime(value: string | undefined | null): string {
+  if (!value) {
+    return "Недоступно";
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function stageStatusLabel(status: PipelineStage["status"]): string {
+  switch (status) {
+    case "completed":
+      return "Готово";
+    case "running":
+      return "В работе";
+    case "failed":
+      return "Ошибка";
+    default:
+      return "Ожидание";
+  }
+}
+
+function stageTone(status: PipelineStage["status"]): string {
+  switch (status) {
+    case "completed":
+      return "done";
+    case "running":
+      return "running";
+    case "failed":
+      return "failed";
+    default:
+      return "pending";
+  }
 }
 
 function PanelFallback({ title, message }: { title: string; message: string }) {
@@ -87,7 +157,279 @@ async function fetchJsonWithTimeout<T>(input: string, init?: RequestInit, timeou
   }
 }
 
-function PartialArtifactsPanel({ runStatus }: { runStatus: PipelineRunStatus | null }) {
+function SidebarProjectCard({ project, loading, onRefresh }: { project: ProjectInfo | null; loading: boolean; onRefresh: () => void }) {
+  return (
+    <section className="sidebar-card">
+      <div className="section-head">
+        <div>
+          <p className="section-kicker">Проект</p>
+          <h2>{loading ? "Загрузка..." : safeText(project?.name, "Проект не выбран")}</h2>
+        </div>
+        <button type="button" className="ghost-button" onClick={onRefresh}>
+          Обновить
+        </button>
+      </div>
+
+      <p className="sidebar-copy">{safeText(project?.rootPath, "Укажи путь к репозиторию внизу, чтобы начать run.")}</p>
+
+      <div className="mini-stats">
+        <div className="mini-stat">
+          <strong>{safeCount(project?.summary?.indexedFiles)}</strong>
+          <span>файлов</span>
+        </div>
+        <div className="mini-stat">
+          <strong>{Object.keys(project?.summary?.languages ?? {}).length}</strong>
+          <span>языков</span>
+        </div>
+        <div className="mini-stat">
+          <strong>{safeText(project?.summary?.profile, "standard")}</strong>
+          <span>профиль</span>
+        </div>
+      </div>
+
+      <div className="chip-row">
+        {Object.entries(project?.summary?.languages ?? {}).slice(0, 8).map(([language, count]) => (
+          <span key={language} className="chip">
+            {language}: {count}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function SidebarRuns({
+  project,
+  selectedRunId,
+  activeRunId,
+  onOpenRun,
+}: {
+  project: ProjectInfo | null;
+  selectedRunId: string | null;
+  activeRunId: string | null;
+  onOpenRun: (runId: string) => void;
+}) {
+  return (
+    <section className="sidebar-card">
+      <div className="section-head">
+        <div>
+          <p className="section-kicker">История</p>
+          <h2>Последние run</h2>
+        </div>
+        <span className="section-caption">{safeList(project?.recentRuns).length}</span>
+      </div>
+
+      <div className="stack compact-stack">
+        {safeList(project?.recentRuns).length ? (
+          safeList(project?.recentRuns)
+            .slice(0, 8)
+            .map((entry) => (
+              <button
+                key={entry.runId}
+                type="button"
+                className={`history-item ${selectedRunId === entry.runId ? "history-item-active" : ""}`}
+                onClick={() => onOpenRun(entry.runId)}
+              >
+                <strong>{safeText(entry.summary)}</strong>
+                <span>{safeText(entry.task)}</span>
+                <span className="history-meta">
+                  {activeRunId === entry.runId ? "Запуск активен" : formatDateTime(entry.savedAt)}
+                </span>
+              </button>
+            ))
+        ) : (
+          <p className="muted">Сохранённые исследования появятся здесь после первого запуска.</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ProviderSettings({
+  providers,
+  selectedProviderId,
+  providerDraft,
+  providerModels,
+  providerModelDraft,
+  onSelectProvider,
+  onChangeDraft,
+  onChangeModel,
+  onSaveProvider,
+  onRemoveProvider,
+}: {
+  providers: ProviderRecord[];
+  selectedProviderId: string;
+  providerDraft: ProviderDraft;
+  providerModels: ProviderModelRecord[];
+  providerModelDraft: string;
+  onSelectProvider: (providerId: string) => void;
+  onChangeDraft: (value: ProviderDraft) => void;
+  onChangeModel: (modelId: string) => void;
+  onSaveProvider: () => void;
+  onRemoveProvider: (providerId: string) => void;
+}) {
+  return (
+    <section className="sidebar-card">
+      <div className="section-head">
+        <div>
+          <p className="section-kicker">Среда ИИ</p>
+          <h2>Провайдер и модель</h2>
+        </div>
+        <span className="section-caption">{providers.length || 0}</span>
+      </div>
+
+      <div className="stack">
+        <label className="field">
+          <span>Активный провайдер</span>
+          <select value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)}>
+            <option value="">Не выбран</option>
+            {safeList(providers).map((provider) => (
+              <option key={provider.id} value={provider.id}>
+                {provider.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="field">
+          <span>Название провайдера</span>
+          <input
+            value={providerDraft.name}
+            onChange={(event) =>
+              onChangeDraft({
+                ...providerDraft,
+                name: event.target.value,
+              })
+            }
+            placeholder="rout.my"
+          />
+        </label>
+
+        <label className="field">
+          <span>Base URL</span>
+          <input
+            value={providerDraft.baseUrl}
+            onChange={(event) =>
+              onChangeDraft({
+                ...providerDraft,
+                baseUrl: event.target.value,
+              })
+            }
+            placeholder="https://api.rout.my/v1"
+          />
+        </label>
+
+        <label className="field">
+          <span>Модель для запуска</span>
+          <select value={providerModelDraft} onChange={(event) => onChangeModel(event.target.value)}>
+            {safeList(providerModels).map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.label}
+              </option>
+            ))}
+            {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
+          </select>
+        </label>
+
+        <label className="field">
+          <span>API ключ</span>
+          <input
+            type="password"
+            value={providerDraft.apiKey}
+            onChange={(event) =>
+              onChangeDraft({
+                ...providerDraft,
+                apiKey: event.target.value,
+              })
+            }
+            placeholder="sk-..."
+          />
+        </label>
+
+        <div className="action-row">
+          <button type="button" className="primary-button" onClick={onSaveProvider}>
+            Сохранить
+          </button>
+        </div>
+
+        <div className="stack compact-stack">
+          {safeList(providers).map((provider) => (
+            <div key={provider.id} className="provider-card">
+              <strong>
+                {provider.name}
+                {provider.isCurrent ? " / активный" : ""}
+              </strong>
+              <span>{provider.baseUrl}</span>
+              <span>Ключ: {provider.apiKeyMasked || "Не задан"}</span>
+              <div className="action-row">
+                <button type="button" className="ghost-button" onClick={() => onSelectProvider(provider.id)} disabled={provider.isCurrent}>
+                  Сделать активным
+                </button>
+                <button type="button" className="ghost-button danger-button" onClick={() => onRemoveProvider(provider.id)}>
+                  Удалить
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function IntroMessage() {
+  return (
+    <div className="message assistant-message">
+      <div className="message-badge">Client</div>
+      <div className="message-card">
+        <h3>Простой диалог с инженерной глубиной внутри</h3>
+        <p>
+          Напиши задачу так, как написал бы её разработчику. Система сама создаст внутренний run, соберёт structural
+          context, выполнит research, impact, context build и planner, а потом покажет результат в этом же диалоге.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function UserTaskMessage({ task, projectPath }: { task: string; projectPath: string }) {
+  return (
+    <div className="message user-message">
+      <div className="message-badge">Ты</div>
+      <div className="message-card">
+        <p className="message-label">Задача</p>
+        <p>{safeText(task)}</p>
+        <p className="message-footnote">Проект: {safeText(projectPath)}</p>
+      </div>
+    </div>
+  );
+}
+
+function InlinePipeline({ stages, currentStageLabel }: { stages: PipelineStage[]; currentStageLabel?: string }) {
+  return (
+    <div className="inline-pipeline">
+      <div className="inline-pipeline-head">
+        <strong>Pipeline</strong>
+        <span>{safeText(currentStageLabel, "Подготовка run")}</span>
+      </div>
+      <div className="pipeline-list">
+        {stages.map((stage) => (
+          <div key={stage.key} className={`pipeline-item pipeline-item-${stageTone(stage.status)}`}>
+            <div className="pipeline-marker" />
+            <div className="pipeline-copy">
+              <strong>
+                {stage.label} · {stageStatusLabel(stage.status)}
+              </strong>
+              <span>{safeText(stage.details, "Без дополнительных деталей")}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PartialArtifactHighlights({ runStatus }: { runStatus: PipelineRunStatus | null }) {
   const partial = runStatus?.partialArtifacts;
 
   if (!runStatus || !partial) {
@@ -95,540 +437,285 @@ function PartialArtifactsPanel({ runStatus }: { runStatus: PipelineRunStatus | n
   }
 
   return (
-    <article className="panel">
-      <div className="panel-header">
-        <h2>Промежуточные Артефакты</h2>
-        <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span>
+    <div className="inline-highlights">
+      <div className="highlight-card">
+        <strong>Workspace</strong>
+        <span>
+          {partial.workspace
+            ? `ignored paths: ${safeList(partial.workspace.ignoredPaths).length}`
+            : "ещё не собран"}
+        </span>
       </div>
-
-      <div className="stack">
-        <div className="list">
-          <div className="list-item">
-            <strong>Статус запуска</strong>
-            <span>{runStatus.status}</span>
-          </div>
-          <div className="list-item">
-            <strong>Текущий этап</strong>
-            <span>{safeText(runStatus.currentStageLabel, "Не определён")}</span>
-          </div>
-        </div>
-
-        <div className="list">
-          <div className="list-item">
-            <strong>Workspace</strong>
-            <span>{partial.workspace ? `Файлы подготовлены, ignored paths: ${safeList(partial.workspace.ignoredPaths).length}` : "Ещё не готов"}</span>
-          </div>
-          <div className="list-item">
-            <strong>Repository</strong>
-            <span>
-              {partial.repository
-                ? `Ветка ${safeText(partial.repository.branch, "unknown")}, изменений ${safeCount(partial.repository.summary?.changedFileCount)}`
-                : "Ещё не готов"}
-            </span>
-          </div>
-          <div className="list-item">
-            <strong>Index</strong>
-            <span>
-              {partial.index
-                ? `${safeText(partial.index.manifest?.mode, "full")} / ${safeCount(partial.index.manifest?.symbolCount)} символов`
-                : "Ещё не готов"}
-            </span>
-          </div>
-          <div className="list-item">
-            <strong>Incremental index</strong>
-            <span>
-              {partial.incrementalIndex
-                ? `${safeText(partial.incrementalIndex.mode)} / кандидатов: ${safeCount(partial.incrementalIndex.candidatePaths?.length)}`
-                : "Ещё не готов"}
-            </span>
-          </div>
-          <div className="list-item">
-            <strong>Graph</strong>
-            <span>
-              {partial.graph
-                ? `${safeCount(partial.graph.summary?.nodeCount)} узлов / ${safeCount(partial.graph.summary?.edgeCount)} рёбер`
-                : "Ещё не готов"}
-            </span>
-          </div>
-          <div className="list-item">
-            <strong>Graph invalidation</strong>
-            <span>
-              {partial.graphInvalidation
-                ? `${safeText(partial.graphInvalidation.mode)} / файлов: ${safeCount(partial.graphInvalidation.invalidatedFiles?.length)} / модулей: ${safeCount(partial.graphInvalidation.invalidatedModules?.length)}`
-                : "Ещё не готов"}
-            </span>
-          </div>
-          <div className="list-item">
-            <strong>Research</strong>
-            <span>{partial.research ? safeText(partial.research.summary) : "Ещё не готов"}</span>
-          </div>
-          <div className="list-item">
-            <strong>Impact</strong>
-            <span>{partial.impact ? safeText(partial.impact.summary) : "Ещё не готов"}</span>
-          </div>
-          <div className="list-item">
-            <strong>Context</strong>
-            <span>{partial.context ? safeText(partial.context.summary) : "Ещё не готов"}</span>
-          </div>
-          <div className="list-item">
-            <strong>Plan</strong>
-            <span>{partial.plan ? safeText(partial.plan.summary) : "Ещё не готов"}</span>
-          </div>
-        </div>
+      <div className="highlight-card">
+        <strong>Repository</strong>
+        <span>
+          {partial.repository
+            ? `${safeText(partial.repository.branch, "HEAD")} · изменений ${safeCount(partial.repository.summary?.changedFileCount)}`
+            : "ещё не собран"}
+        </span>
       </div>
-    </article>
+      <div className="highlight-card">
+        <strong>Index</strong>
+        <span>
+          {partial.index
+            ? `${safeText(partial.index.manifest?.mode, "full")} · ${safeCount(partial.index.manifest?.symbolCount)} символов`
+            : "ещё не готов"}
+        </span>
+      </div>
+      <div className="highlight-card">
+        <strong>Graph</strong>
+        <span>
+          {partial.graph
+            ? `${safeCount(partial.graph.summary?.nodeCount)} узлов · ${safeCount(partial.graph.summary?.edgeCount)} рёбер`
+            : "ещё не готов"}
+        </span>
+      </div>
+      <div className="highlight-card">
+        <strong>Research</strong>
+        <span>{partial.research ? safeText(partial.research.summary) : "ожидает очереди"}</span>
+      </div>
+      <div className="highlight-card">
+        <strong>Plan</strong>
+        <span>{partial.plan ? safeText(partial.plan.summary) : "ещё не построен"}</span>
+      </div>
+    </div>
   );
 }
 
-function ProjectPanel({ project, loading }: { project: ProjectInfo | null; loading: boolean }) {
-  return (
-    <article className="panel">
-      <div className="panel-header">
-        <h2>Проект</h2>
-        <span>{loading ? "Загрузка" : safeText(project?.name, "Неизвестно")}</span>
-      </div>
-
-      {project ? (
-        <div className="stack">
-          <div className="list">
-            <div className="list-item">
-              <strong>Текущий анализируемый проект</strong>
-              <span>{safeText(project.name)}</span>
-            </div>
-            <div className="list-item compact">
-              <span>{safeText(project.rootPath)}</span>
-            </div>
-          </div>
-          <p className="stat">
-            <strong>{safeCount(project.summary?.indexedFiles)}</strong> файлов проиндексировано в{" "}
-            <strong>{Object.keys(project.summary?.languages ?? {}).length}</strong> языках.
-          </p>
-          <p className="muted">
-            Профиль репозитория: {safeText(project.summary?.profile, "standard")}
-          </p>
-          <div className="chips">
-            {Object.entries(project.summary?.languages ?? {}).map(([language, count]) => (
-              <span key={language} className="chip">
-                {language}: {count}
-              </span>
-            ))}
-          </div>
-        </div>
-      ) : (
-        <p className="muted">Сводка по проекту появится здесь после ответа API.</p>
-      )}
-    </article>
-  );
-}
-
-function RunsPanel({
-  project,
-  selectedRunId,
-  onOpenRun,
+function AssistantRunMessage({
+  runStatus,
+  result,
+  onOpenInspector,
 }: {
-  project: ProjectInfo | null;
-  selectedRunId: string | null;
-  onOpenRun: (runId: string) => void;
+  runStatus: PipelineRunStatus | null;
+  result: PipelineRunResult | null;
+  onOpenInspector: (tab?: InspectorTab) => void;
 }) {
-  return (
-    <article className="panel">
-      <div className="panel-header">
-        <h2>Последние Сохранённые Запуски</h2>
-        <span>{safeList(project?.recentRuns).length}</span>
-      </div>
+  const running = runStatus && (runStatus.status === "queued" || runStatus.status === "running");
+  const completed = hasRunArtifacts(result);
+  const failed = runStatus?.status === "failed";
 
-      <div className="stack">
-        {safeList(project?.recentRuns).length ? (
-          safeList(project?.recentRuns)
-            .slice(0, 5)
-            .map((entry) => (
-              <button
-                key={entry.runId}
-                type="button"
-                className={`list-item selectable ${selectedRunId === entry.runId ? "selected" : ""}`}
-                onClick={() => onOpenRun(entry.runId)}
-              >
-                <strong>{safeText(entry.summary)}</strong>
-                <span>{safeText(entry.task)}</span>
-                <span className="subtle">{new Date(entry.savedAt).toLocaleString()}</span>
+  if (!running && !completed && !failed) {
+    return (
+      <div className="message assistant-message">
+        <div className="message-badge">Client</div>
+        <div className="message-card">
+          <h3>Run ещё не запущен</h3>
+          <p>Сформулируй вопрос или инженерную задачу, а дальше система сама построит pipeline и покажет артефакты.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="message assistant-message">
+      <div className="message-badge">Client</div>
+      <div className="message-card">
+        {running ? (
+          <>
+            <p className="message-label">Сейчас система думает</p>
+            <h3>{safeText(runStatus?.currentStageLabel, "Готовлю исследование проекта")}</h3>
+            <p>
+              Run уже создан и выполняется во внутреннем pipeline. Ты видишь наружу только безопасный прогресс, а все
+              детальные артефакты можно открыть через Inspector.
+            </p>
+            <InlinePipeline
+              stages={safeList(runStatus?.stages)}
+              {...(runStatus?.currentStageLabel ? { currentStageLabel: runStatus.currentStageLabel } : {})}
+            />
+            <PartialArtifactHighlights runStatus={runStatus} />
+            <div className="action-row">
+              <button type="button" className="ghost-button" onClick={() => onOpenInspector("overview")}>
+                Подробнее
               </button>
-            ))
-        ) : (
-          <p className="muted">Пока нет сохранённых структурных запусков.</p>
-        )}
-      </div>
-    </article>
-  );
-}
+            </div>
+          </>
+        ) : null}
 
-function ArtifactTabs({
-  activeArtifact,
-  setActiveArtifact,
-}: {
-  activeArtifact: ArtifactTab;
-  setActiveArtifact: (value: ArtifactTab) => void;
-}) {
-  return (
-    <div className="tabs">
-      <button type="button" className={`tab ${activeArtifact === "research" ? "tab-active" : ""}`} onClick={() => setActiveArtifact("research")}>
-        Исследование
-      </button>
-      <button type="button" className={`tab ${activeArtifact === "impact" ? "tab-active" : ""}`} onClick={() => setActiveArtifact("impact")}>
-        Влияние
-      </button>
-      <button type="button" className={`tab ${activeArtifact === "index" ? "tab-active" : ""}`} onClick={() => setActiveArtifact("index")}>
-        Индекс / Граф
-      </button>
-      <button type="button" className={`tab ${activeArtifact === "knowledge" ? "tab-active" : ""}`} onClick={() => setActiveArtifact("knowledge")}>
-        Знания
-      </button>
+        {failed ? (
+          <>
+            <p className="message-label">Run завершился ошибкой</p>
+            <h3>Нужно проверить сервер или пересоздать запуск</h3>
+            <p>{safeText(runStatus?.errorMessage, "Причина ошибки недоступна.")}</p>
+          </>
+        ) : null}
+
+        {completed ? (
+          <>
+            <p className="message-label">Ответ подготовлен</p>
+            <h3>{safeText(result.answer?.summary, result.research.summary)}</h3>
+            <p>{safeText(result.answer?.explanation, result.research.functionalSummary || "Функциональная картина пока не сформирована.")}</p>
+
+            <div className="list">
+              {safeList(result.answer?.evidenceHighlights).length ? (
+                safeList(result.answer?.evidenceHighlights).map((item) => (
+                  <div key={`${item.label}:${item.detail}`} className="list-item">
+                    <strong>{item.label}</strong>
+                    <span>{item.detail}</span>
+                  </div>
+                ))
+              ) : null}
+            </div>
+
+            <div className="result-quick-grid">
+              <div className="result-card">
+                <strong>Ответ</strong>
+                <span>{safeCount(result.answer?.confidence)}% уверенность</span>
+              </div>
+              <div className="result-card">
+                <strong>Impact</strong>
+                <span>{safeCount(result.impact.confidence)}% уверенность</span>
+              </div>
+              <div className="result-card">
+                <strong>Context</strong>
+                <span>{safeCount(result.context.estimatedTokens)} токенов</span>
+              </div>
+              <div className="result-card">
+                <strong>Plan</strong>
+                <span>{safeList(result.plan.steps).length} шагов</span>
+              </div>
+            </div>
+
+            {safeList(result.answer?.warnings).length ? (
+              <div className="execution-preview-card">
+                <div>
+                  <p className="message-label">Ограничения</p>
+                  <strong>{safeList(result.answer?.warnings).join(" ")}</strong>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="execution-preview-card">
+              <div>
+                <p className="message-label">Execution Preview</p>
+                <strong>{safeText(result.executionPreview.summary)}</strong>
+              </div>
+              <div className="execution-preview-metrics">
+                <span>Файлы: {safeList(result.plan.targetFiles).length || safeList(result.impact.affectedFiles).length}</span>
+                <span>Модули: {safeList(result.plan.targetModules).length || safeList(result.research.affectedModules).length}</span>
+                <span>Approval: требуется</span>
+              </div>
+            </div>
+
+            <div className="action-row">
+              <button type="button" className="ghost-button" onClick={() => onOpenInspector("overview")}>
+                Почему я так ответил
+              </button>
+              <button type="button" className="ghost-button" onClick={() => onOpenInspector("research")}>
+                Открыть исследование
+              </button>
+              <button type="button" className="ghost-button" onClick={() => onOpenInspector("plan")}>
+                Посмотреть план
+              </button>
+              <button type="button" className="ghost-button" onClick={() => onOpenInspector("execution")}>
+                Execution preview
+              </button>
+            </div>
+          </>
+        ) : null}
+      </div>
     </div>
   );
 }
 
-function ResearchArtifact({ result }: { result: PipelineRunResult }) {
+function EmptyState({ project }: { project: ProjectInfo | null }) {
   return (
-    <div className="stack">
-      <p className="stat">
-        Уверенность исследования: <strong>{safeCount(result.research?.confidence)}%</strong>
+    <div className="empty-state">
+      <h3>Что уже можно тестировать через фронт</h3>
+      <div className="empty-grid">
+        <div className="empty-card">
+          <strong>Структурные вопросы</strong>
+          <span>Например: как устроен модуль авторизации, где находятся маршруты, что затрагивает конкретный flow.</span>
+        </div>
+        <div className="empty-card">
+          <strong>Infrastructure / storage</strong>
+          <span>Например: где хранятся SSH подключения, какие конфиги используются, как устроены интеграции.</span>
+        </div>
+        <div className="empty-card">
+          <strong>Inventory</strong>
+          <span>Например: сколько языков локализации есть в проекте, какие миграции связаны с доменом, какие зоны меняются чаще.</span>
+        </div>
+      </div>
+      <p className="muted">
+        Сейчас выбран проект: <strong>{safeText(project?.name, "не выбран")}</strong>. После запуска результаты появятся в этом диалоге, а глубинные артефакты откроются справа.
       </p>
-      <div className="list">
-        <div className="list-item">
-          <strong>Сводка</strong>
-          <span>{safeText(result.research?.summary)}</span>
+    </div>
+  );
+}
+
+function OverviewPanel({ result }: { result: PipelineRunResult | null }) {
+  if (!hasRunArtifacts(result)) {
+    return (
+      <article className="inspector-panel">
+        <div className="panel-header">
+          <h2>Обзор run</h2>
+          <span>Ожидание</span>
         </div>
-        <div className="list-item">
-          <strong>Класс вопроса</strong>
-          <span>{safeText(result.research?.intentClass, "Не определён")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Стратегия исследования</strong>
-          <span>{safeText(result.research?.strategyKey, "Не определена")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Профиль обхода</strong>
-          <span>{safeText(result.research?.queryProfileKey, "Не определён")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Приоритетный модуль</strong>
-          <span>{safeText(result.research?.dominantModule, "Не определён")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Затронутые модули</strong>
-          <span>{safeList(result.research?.affectedModules).join(", ") || "Не определены"}</span>
-        </div>
-        <div className="list-item">
-          <strong>Функциональная картина</strong>
-          <span>{safeText(result.research?.functionalSummary)}</span>
-        </div>
+        <p className="muted">Inspector наполнится после завершения хотя бы одного run.</p>
+      </article>
+    );
+  }
+
+  return (
+    <article className="inspector-panel">
+      <div className="panel-header">
+        <h2>Обзор run</h2>
+        <span>{safeText(result.runId.slice(0, 8))}</span>
       </div>
-      <div className="list">
-        {safeList(result.research?.moduleIntents).length ? (
-          safeList(result.research?.moduleIntents).slice(0, 3).map((intent) => (
-            <div key={intent.module} className="list-item">
-              <strong>{intent.module}</strong>
-              <span>score {safeCount(intent.score)} / {intent.reasons.join(" ")}</span>
-            </div>
-          ))
-        ) : (
-          <PanelFallback title="Доменные модули" message="Для этого запуска модульный приоритет не был определён." />
-        )}
-      </div>
-      <div className="list">
-        <div className="list-item">
-          <strong>Точки входа</strong>
-          <span>{safeList(result.research?.entryPoints).join(", ") || "Не определены"}</span>
-        </div>
-        <div className="list-item">
-          <strong>Ключевые сущности</strong>
-          <span>{safeList(result.research?.primaryEntities).join(", ") || "Не определены"}</span>
-        </div>
-      </div>
-      <div className="list">
-        <div className="list-item">
-          <strong>Побочные эффекты</strong>
-          <span>{safeList(result.research?.sideEffects).join(", ") || "Не подтверждены"}</span>
-        </div>
-        <div className="list-item">
-          <strong>Источники данных</strong>
-          <span>{safeList(result.research?.dataSources).join(", ") || "Не определены"}</span>
-        </div>
-      </div>
-      <div className="list">
-        {safeList(result.research?.findings).length ? (
-          safeList(result.research?.findings).map((finding) => (
-            <div key={finding} className="list-item">
-              <strong>Вывод</strong>
-              <span>{finding}</span>
-            </div>
-          ))
-        ) : (
-          <PanelFallback title="Выводы" message="Для этого запуска выводы отсутствуют." />
-        )}
-      </div>
-      <div className="list">
-        {safeList(result.research?.unknowns).length ? (
-          safeList(result.research?.unknowns).map((unknown) => (
-            <div key={unknown} className="list-item">
-              <strong>Неизвестная зона</strong>
-              <span>{unknown}</span>
-            </div>
-          ))
-        ) : (
+
+      <div className="stack">
+        <div className="list">
           <div className="list-item">
-            <strong>Неизвестные зоны</strong>
-            <span>Критичных неизвестных зон не зафиксировано.</span>
+            <strong>Финальный ответ</strong>
+            <span>{safeText(result.answer?.summary, "Недоступно")}</span>
           </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ImpactArtifact({ result }: { result: PipelineRunResult }) {
-  return (
-    <div className="stack">
-      <p className="stat">
-        Уверенность impact-анализа: <strong>{safeCount(result.impact?.confidence)}%</strong>
-      </p>
-      <div className="list">
-        <div className="list-item">
-          <strong>Сводка</strong>
-          <span>{safeText(result.impact?.summary)}</span>
-        </div>
-        <div className="list-item">
-          <strong>Стартовые точки</strong>
-          <span>{safeList(result.impact?.startingPoints).length}</span>
-        </div>
-      </div>
-      <div className="list">
-        <div className="list-item">
-          <strong>Затронутые файлы</strong>
-          <span>{safeList(result.impact?.affectedFiles).join(", ") || "Не определены"}</span>
-        </div>
-        <div className="list-item">
-          <strong>Затронутые символы</strong>
-          <span>{safeList(result.impact?.affectedSymbols).join(", ") || "Не определены"}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function IndexArtifact({ result }: { result: PipelineRunResult }) {
-  return (
-    <div className="stack">
-      <div className="list">
-        <div className="list-item">
-          <strong>Git / ветка</strong>
-          <span>{safeText(result.repository?.branch, result.repository?.isGitRepository ? "HEAD" : "Не Git-репозиторий")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Git / HEAD</strong>
-          <span>{safeText(result.repository?.headCommit, "Недоступно")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Git / working tree</strong>
-          <span>
-            Всего {safeCount(result.repository?.summary?.changedFileCount)}, staged {safeCount(result.repository?.summary?.stagedCount)}, unstaged {safeCount(result.repository?.summary?.unstagedCount)}, untracked {safeCount(result.repository?.summary?.untrackedCount)}
-          </span>
-        </div>
-        <div className="list-item">
-          <strong>Манифест</strong>
-          <span>{safeText(result.index?.manifest?.indexId)}</span>
-        </div>
-        <div className="list-item">
-          <strong>Incremental index plan</strong>
-          <span>
-            {result.incrementalIndex
-              ? `${safeText(result.incrementalIndex.mode)} / кандидатов ${safeCount(result.incrementalIndex.candidatePaths?.length)}`
-              : "Недоступно"}
-          </span>
-        </div>
-        <div className="list-item">
-          <strong>Сводка графа</strong>
-          <span>
-            Узлы: {safeCount(result.graph?.summary?.nodeCount)}, рёбра: {safeCount(result.graph?.summary?.edgeCount)}
-          </span>
-        </div>
-        <div className="list-item">
-          <strong>Graph invalidation</strong>
-          <span>
-            {result.graphInvalidation
-              ? `${safeText(result.graphInvalidation.mode)} / файлов ${safeCount(result.graphInvalidation.invalidatedFiles?.length)} / модулей ${safeCount(result.graphInvalidation.invalidatedModules?.length)}`
-              : "Недоступно"}
-          </span>
-        </div>
-      </div>
-      <div className="chips">
-        {Object.entries(result.index?.stats?.languages ?? {}).map(([language, count]) => (
-          <span key={language} className="chip">
-            {language}: {count}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function KnowledgeArtifact({ result }: { result: PipelineRunResult }) {
-  return (
-    <div className="stack">
-      <div className="list">
-        <div className="list-item">
-          <strong>Repository Git</strong>
-          <span>{result.repository?.isGitRepository ? "Подключён" : "Не обнаружен"}</span>
-        </div>
-        <div className="list-item">
-          <strong>Base URL провайдера</strong>
-          <span>{safeText(result.provider?.baseUrl, "Не задан")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Модель</strong>
-          <span>{safeText(result.provider?.model, "Не задана")}</span>
-        </div>
-        <div className="list-item">
-          <strong>API ключ</strong>
-          <span>{safeText(result.provider?.apiKeyMasked, "Не задан")}</span>
-        </div>
-        <div className="list-item">
-          <strong>Путь хранения</strong>
-          <span>{safeText(result.knowledge?.storagePath)}</span>
-        </div>
-        <div className="list-item">
-          <strong>Путь каталога</strong>
-          <span>{safeText(result.knowledge?.catalogPath)}</span>
-        </div>
-        <div className="list-item">
-          <strong>Количество артефактов</strong>
-          <span>{safeCount(result.knowledge?.artifactCount)}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ArtifactViewer({ result, activeArtifact, setActiveArtifact }: { result: PipelineRunResult | null; activeArtifact: ArtifactTab; setActiveArtifact: (value: ArtifactTab) => void }) {
-  return (
-    <section className="panel panel-form">
-      <div className="panel-header">
-        <h2>Просмотр Артефактов</h2>
-        <span>{result ? `Run ${result.runId.slice(0, 8)}` : "Ожидание"}</span>
-      </div>
-
-      <ArtifactTabs activeArtifact={activeArtifact} setActiveArtifact={setActiveArtifact} />
-
-      {hasRunArtifacts(result) ? (
-        <div className="artifact-view">
-          {activeArtifact === "research" ? <ResearchArtifact result={result} /> : null}
-          {activeArtifact === "impact" ? <ImpactArtifact result={result} /> : null}
-          {activeArtifact === "index" ? <IndexArtifact result={result} /> : null}
-          {activeArtifact === "knowledge" ? <KnowledgeArtifact result={result} /> : null}
-        </div>
-      ) : (
-        <p className="muted">Выбери сохранённый запуск или запусти новый, чтобы открыть артефакты.</p>
-      )}
-    </section>
-  );
-}
-
-function StagesPanel({ result }: { result: PipelineRunResult | null }) {
-  const stages = hasRunArtifacts(result) ? safeList(result.stages) : [];
-
-  return (
-    <article className="panel">
-      <div className="panel-header">
-        <h2>Стадии Пайплайна</h2>
-        <span>{hasRunArtifacts(result) ? `${stages.length} этапов` : "Ожидание"}</span>
-      </div>
-
-      {hasRunArtifacts(result) ? (
-        stages.length ? (
-          <div className="list">
-            {stages.map((stage: PipelineStage) => (
-              <div key={stage.key} className="list-item">
-                <strong>
-                  {safeText(stage.label)} / {stage.status === "completed" ? "завершено" : safeText(stage.status)}
-                </strong>
-                <span>{safeText(stage.details)}</span>
-                <span className="subtle">
-                  {safeText(stage.startedAt, "-")} - {safeText(stage.completedAt, "-")}
-                </span>
-              </div>
-            ))}
+          <div className="list-item">
+            <strong>Проект</strong>
+            <span>{safeText(result.project.name)}</span>
           </div>
-        ) : (
-          <PanelFallback title="Стадии" message="Для этого запуска список стадий недоступен." />
-        )
-      ) : (
-        <p className="muted">Статусы этапов появятся после запуска или выбора сохранённого run.</p>
-      )}
-    </article>
-  );
-}
-
-function DiagnosticsPanel({ result }: { result: PipelineRunResult | null }) {
-  const ignoredPaths = hasRunArtifacts(result) ? safeList(result.workspace?.ignoredPaths) : [];
-  const diagnostics = hasRunArtifacts(result) ? safeList(result.index?.diagnostics) : [];
-  const repositoryDiagnostics = hasRunArtifacts(result) ? safeList(result.repository?.diagnostics) : [];
-  const diagnosticsCount = ignoredPaths.length + diagnostics.length + repositoryDiagnostics.length;
-
-  return (
-    <article className="panel">
-      <div className="panel-header">
-        <h2>Диагностика и Исключения</h2>
-        <span>{hasRunArtifacts(result) ? diagnosticsCount : 0}</span>
-      </div>
-
-      {hasRunArtifacts(result) ? (
-        <div className="stack">
-          <div className="list">
-            <div className="list-item">
-              <strong>Диагностика repository/git</strong>
-              <span>{repositoryDiagnostics.length}</span>
-            </div>
-            {repositoryDiagnostics.length ? (
-              repositoryDiagnostics.slice(0, 10).map((diagnostic) => (
-                <div key={diagnostic} className="list-item compact">
-                  <span>{diagnostic}</span>
-                </div>
-              ))
-            ) : (
-              <p className="muted">Git-диагностика не выявила критичных проблем.</p>
-            )}
+          <div className="list-item">
+            <strong>Путь</strong>
+            <span>{safeText(result.project.rootPath)}</span>
           </div>
-
-          <div className="list">
-            <div className="list-item">
-              <strong>Игнорируемые пути</strong>
-              <span>{ignoredPaths.length}</span>
-            </div>
-            {ignoredPaths.slice(0, 10).map((pathValue) => (
-              <div key={pathValue} className="list-item compact">
-                <span>{pathValue}</span>
-              </div>
-            ))}
+          <div className="list-item">
+            <strong>Провайдер / модель</strong>
+            <span>
+              {safeText(result.provider.baseUrl)} / {safeText(result.provider.model)}
+            </span>
           </div>
-
-          <div className="list">
-            <div className="list-item">
-              <strong>Диагностика index/workspace</strong>
-              <span>{diagnostics.length}</span>
-            </div>
-            {diagnostics.length ? (
-              diagnostics.slice(0, 10).map((diagnostic) => (
-                <div key={diagnostic} className="list-item compact">
-                  <span>{diagnostic}</span>
-                </div>
-              ))
-            ) : (
-              <p className="muted">Критичных диагностических сообщений нет.</p>
-            )}
+          <div className="list-item">
+            <strong>Knowledge saved at</strong>
+            <span>{formatDateTime(result.knowledge.savedAt)}</span>
+          </div>
+          <div className="list-item">
+            <strong>Синтез ответа</strong>
+            <span>{safeText(result.answer?.synthesis, "Недоступно")}</span>
           </div>
         </div>
-      ) : (
-        <p className="muted">Ignored paths и diagnostics будут показаны после запуска пайплайна.</p>
-      )}
+
+        <div className="mini-stats">
+          <div className="mini-stat">
+            <strong>{safeCount(result.index.manifest.fileCount)}</strong>
+            <span>файлов</span>
+          </div>
+          <div className="mini-stat">
+            <strong>{safeCount(result.index.manifest.symbolCount)}</strong>
+            <span>символов</span>
+          </div>
+          <div className="mini-stat">
+            <strong>{safeCount(result.graph.summary.nodeCount)}</strong>
+            <span>узлов graph</span>
+          </div>
+        </div>
+
+        <div className="chip-row">
+          {Object.entries(result.project.summary.languages ?? {}).map(([language, count]) => (
+            <span key={language} className="chip">
+              {language}: {count}
+            </span>
+          ))}
+        </div>
+      </div>
     </article>
   );
 }
@@ -641,10 +728,10 @@ function ResearchPanel({ result }: { result: PipelineRunResult | null }) {
   const sideEffects = hasRunArtifacts(result) ? safeList(result.research?.sideEffects).slice(0, 4) : [];
 
   return (
-    <article className="panel">
+    <article className="inspector-panel">
       <div className="panel-header">
-        <h2>Отчёт Исследования</h2>
-        <span>{hasRunArtifacts(result) ? `${safeCount(result.research?.confidence)}% уверенность` : "Ожидание"}</span>
+        <h2>Research Report</h2>
+        <span>{hasRunArtifacts(result) ? `${safeCount(result.research?.confidence)}%` : "Ожидание"}</span>
       </div>
 
       {hasRunArtifacts(result) ? (
@@ -720,7 +807,7 @@ function ResearchPanel({ result }: { result: PipelineRunResult | null }) {
           </div>
         </div>
       ) : (
-        <p className="muted">Запусти пайплайн, чтобы получить детерминированный отчёт исследования.</p>
+        <p className="muted">Запусти pipeline, чтобы получить детерминированный research report.</p>
       )}
     </article>
   );
@@ -731,15 +818,25 @@ function ImpactPanel({ result }: { result: PipelineRunResult | null }) {
   const scope = hasRunArtifacts(result) ? safeList(result.impact?.validationScope).slice(0, 6) : [];
 
   return (
-    <article className="panel">
+    <article className="inspector-panel">
       <div className="panel-header">
-        <h2>Отчёт Влияния</h2>
-        <span>{hasRunArtifacts(result) ? `${safeCount(result.impact?.confidence)}% уверенность` : "Ожидание"}</span>
+        <h2>Impact Report</h2>
+        <span>{hasRunArtifacts(result) ? `${safeCount(result.impact?.confidence)}%` : "Ожидание"}</span>
       </div>
 
       {hasRunArtifacts(result) ? (
         <div className="stack">
           <p>{safeText(result.impact?.summary)}</p>
+          <div className="list">
+            <div className="list-item">
+              <strong>Затронутые файлы</strong>
+              <span>{safeList(result.impact?.affectedFiles).join(", ") || "Не определены"}</span>
+            </div>
+            <div className="list-item">
+              <strong>Затронутые символы</strong>
+              <span>{safeList(result.impact?.affectedSymbols).join(", ") || "Не определены"}</span>
+            </div>
+          </div>
           <div className="list">
             {risks.length ? (
               risks.map((risk) => (
@@ -766,7 +863,7 @@ function ImpactPanel({ result }: { result: PipelineRunResult | null }) {
           </div>
         </div>
       ) : (
-        <p className="muted">Анализ влияния появится здесь после завершения research.</p>
+        <p className="muted">Impact-анализ появится после завершения research.</p>
       )}
     </article>
   );
@@ -779,16 +876,16 @@ function ContextPanel({ result }: { result: PipelineRunResult | null }) {
   const rankingSummary = hasRunArtifacts(result) ? safeList(result.context?.rankingSummary).slice(0, 4) : [];
 
   return (
-    <article className="panel">
+    <article className="inspector-panel">
       <div className="panel-header">
-        <h2>Контекстный пакет</h2>
-        <span>{hasRunArtifacts(result) ? `${safeCount(result.context?.confidence)}% уверенность` : "Ожидание"}</span>
+        <h2>Context Package</h2>
+        <span>{hasRunArtifacts(result) ? `${safeCount(result.context?.confidence)}%` : "Ожидание"}</span>
       </div>
 
       {hasRunArtifacts(result) ? (
         <div className="stack">
           <p className="stat">
-            <strong>{safeList(result.context?.selectedChunks).length}</strong> выбранных фрагментов,{" "}
+            <strong>{safeList(result.context?.selectedChunks).length}</strong> фрагментов,{" "}
             <strong>{safeList(result.context?.omittedCandidates).length}</strong> исключено,{" "}
             <strong>{safeCount(result.context?.estimatedTokens)}</strong> оценочных токенов.
           </p>
@@ -845,7 +942,7 @@ function ContextPanel({ result }: { result: PipelineRunResult | null }) {
           </div>
         </div>
       ) : (
-        <p className="muted">Собранный context package появится здесь.</p>
+        <p className="muted">Context package появится здесь после research и impact.</p>
       )}
     </article>
   );
@@ -859,12 +956,11 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
   const validationScope = hasRunArtifacts(result) ? safeList(result.plan?.validationScope).slice(0, 6) : [];
   const planningNotes = hasRunArtifacts(result) ? safeList(result.plan?.planningNotes).slice(0, 6) : [];
   const dependencyChains = hasRunArtifacts(result) ? safeList(result.plan?.dependencyChains).slice(0, 6) : [];
-  const repositoryChanges = hasRunArtifacts(result) ? safeList(result.repository?.changedFiles).slice(0, 8) : [];
 
   return (
-    <article className="panel">
+    <article className="inspector-panel">
       <div className="panel-header">
-        <h2>План Выполнения и Превью</h2>
+        <h2>Execution Plan</h2>
         <span>{hasRunArtifacts(result) ? `${steps.length} шагов` : "Ожидание"}</span>
       </div>
 
@@ -895,21 +991,6 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
               ))
             ) : (
               <PanelFallback title="Planning notes" message="Для этого запуска notes планирования недоступны." />
-            )}
-          </div>
-          <div className="list">
-            {repositoryChanges.length ? (
-              repositoryChanges.map((change) => (
-                <div key={`${change.scope}:${change.changeType}:${change.previousPath ?? ""}:${change.path}`} className="list-item">
-                  <strong>Git change scope</strong>
-                  <span>
-                    {change.scope} / {change.changeType} / {change.previousPath ? `${change.previousPath} -> ` : ""}
-                    {change.path}
-                  </span>
-                </div>
-              ))
-            ) : (
-              <PanelFallback title="Git change scope" message="Локальные изменения в репозитории не обнаружены или Git недоступен." />
             )}
           </div>
           <div className="list">
@@ -954,6 +1035,24 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
               <span>{validationScope.join(", ") || "Не определён"}</span>
             </div>
           </div>
+        </div>
+      ) : (
+        <p className="muted">Execution plan появится здесь после завершения pipeline.</p>
+      )}
+    </article>
+  );
+}
+
+function ExecutionPanel({ result }: { result: PipelineRunResult | null }) {
+  return (
+    <article className="inspector-panel">
+      <div className="panel-header">
+        <h2>Execution Preview</h2>
+        <span>{hasRunArtifacts(result) ? "Готово" : "Ожидание"}</span>
+      </div>
+
+      {hasRunArtifacts(result) ? (
+        <div className="stack">
           <div className="list">
             <div className="list-item">
               <strong>Безопасное превью выполнения</strong>
@@ -966,9 +1065,10 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
               <span>Запрещено: {safeList(result.executionPreview?.blockedActions).join(", ") || "Нет данных"}</span>
             </div>
             <div className="list-item compact">
-              <span>Переиндексация: да / Обновление графа: да / Обновление знаний: да</span>
+              <span>Переиндексация: да / Обновление graph: да / Обновление knowledge: да</span>
             </div>
           </div>
+
           <div className="list">
             <div className="list-item">
               <strong>Controlled execution runtime</strong>
@@ -990,12 +1090,275 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
               <span>Approval checks: {safeList(result.executionRuntime?.approvalChecks).slice(0, 3).join(" | ") || "Нет данных"}</span>
             </div>
           </div>
-          <code className="path">{safeText(result.knowledge?.storagePath)}</code>
         </div>
       ) : (
-        <p className="muted">Execution plan и safe preview появятся здесь после запуска.</p>
+        <p className="muted">Execution preview появится после planner и runtime contract layer.</p>
       )}
     </article>
+  );
+}
+
+function KnowledgePanel({ result }: { result: PipelineRunResult | null }) {
+  return (
+    <article className="inspector-panel">
+      <div className="panel-header">
+        <h2>Knowledge</h2>
+        <span>{hasRunArtifacts(result) ? "Сохранено" : "Ожидание"}</span>
+      </div>
+
+      {hasRunArtifacts(result) ? (
+        <div className="stack">
+          <div className="list">
+            <div className="list-item">
+              <strong>Repository Git</strong>
+              <span>{result.repository?.isGitRepository ? "Подключён" : "Не обнаружен"}</span>
+            </div>
+            <div className="list-item">
+              <strong>Base URL провайдера</strong>
+              <span>{safeText(result.provider?.baseUrl, "Не задан")}</span>
+            </div>
+            <div className="list-item">
+              <strong>Модель</strong>
+              <span>{safeText(result.provider?.model, "Не задана")}</span>
+            </div>
+            <div className="list-item">
+              <strong>API ключ</strong>
+              <span>{safeText(result.provider?.apiKeyMasked, "Не задан")}</span>
+            </div>
+            <div className="list-item">
+              <strong>Путь хранения</strong>
+              <span>{safeText(result.knowledge?.storagePath)}</span>
+            </div>
+            <div className="list-item">
+              <strong>Путь каталога</strong>
+              <span>{safeText(result.knowledge?.catalogPath)}</span>
+            </div>
+            <div className="list-item">
+              <strong>Количество артефактов</strong>
+              <span>{safeCount(result.knowledge?.artifactCount)}</span>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <p className="muted">Knowledge layer будет виден после завершения run.</p>
+      )}
+    </article>
+  );
+}
+
+function GitPanel({ result }: { result: PipelineRunResult | null }) {
+  const repositoryChanges = hasRunArtifacts(result) ? safeList(result.repository?.changedFiles).slice(0, 12) : [];
+
+  return (
+    <article className="inspector-panel">
+      <div className="panel-header">
+        <h2>Git и Graph</h2>
+        <span>{hasRunArtifacts(result) ? safeText(result.repository?.branch, "HEAD") : "Ожидание"}</span>
+      </div>
+
+      {hasRunArtifacts(result) ? (
+        <div className="stack">
+          <div className="list">
+            <div className="list-item">
+              <strong>Git / HEAD</strong>
+              <span>{safeText(result.repository?.headCommit, "Недоступно")}</span>
+            </div>
+            <div className="list-item">
+              <strong>Git / working tree</strong>
+              <span>
+                Всего {safeCount(result.repository?.summary?.changedFileCount)}, staged {safeCount(result.repository?.summary?.stagedCount)}, unstaged {safeCount(result.repository?.summary?.unstagedCount)}, untracked {safeCount(result.repository?.summary?.untrackedCount)}
+              </span>
+            </div>
+            <div className="list-item">
+              <strong>Index manifest</strong>
+              <span>{safeText(result.index?.manifest?.indexId)}</span>
+            </div>
+            <div className="list-item">
+              <strong>Incremental index</strong>
+              <span>
+                {result.incrementalIndex
+                  ? `${safeText(result.incrementalIndex.mode)} / кандидатов ${safeCount(result.incrementalIndex.candidatePaths?.length)}`
+                  : "Недоступно"}
+              </span>
+            </div>
+            <div className="list-item">
+              <strong>Graph summary</strong>
+              <span>
+                Узлы: {safeCount(result.graph?.summary?.nodeCount)}, рёбра: {safeCount(result.graph?.summary?.edgeCount)}
+              </span>
+            </div>
+            <div className="list-item">
+              <strong>Graph invalidation</strong>
+              <span>
+                {result.graphInvalidation
+                  ? `${safeText(result.graphInvalidation.mode)} / файлов ${safeCount(result.graphInvalidation.invalidatedFiles?.length)} / модулей ${safeCount(result.graphInvalidation.invalidatedModules?.length)}`
+                  : "Недоступно"}
+              </span>
+            </div>
+          </div>
+
+          <div className="list">
+            {repositoryChanges.length ? (
+              repositoryChanges.map((change) => (
+                <div key={`${change.scope}:${change.changeType}:${change.previousPath ?? ""}:${change.path}`} className="list-item">
+                  <strong>Git change scope</strong>
+                  <span>
+                    {change.scope} / {change.changeType} / {change.previousPath ? `${change.previousPath} -> ` : ""}
+                    {change.path}
+                  </span>
+                </div>
+              ))
+            ) : (
+              <PanelFallback title="Git change scope" message="Локальные изменения в репозитории не обнаружены или Git недоступен." />
+            )}
+          </div>
+
+          <div className="chip-row">
+            {Object.entries(result.index?.stats?.languages ?? {}).map(([language, count]) => (
+              <span key={language} className="chip">
+                {language}: {count}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p className="muted">Git и graph слой появятся здесь после индексирования.</p>
+      )}
+    </article>
+  );
+}
+
+function DiagnosticsPanel({ result }: { result: PipelineRunResult | null }) {
+  const ignoredPaths = hasRunArtifacts(result) ? safeList(result.workspace?.ignoredPaths) : [];
+  const diagnostics = hasRunArtifacts(result) ? safeList(result.index?.diagnostics) : [];
+  const repositoryDiagnostics = hasRunArtifacts(result) ? safeList(result.repository?.diagnostics) : [];
+  const diagnosticsCount = ignoredPaths.length + diagnostics.length + repositoryDiagnostics.length;
+
+  return (
+    <article className="inspector-panel">
+      <div className="panel-header">
+        <h2>Diagnostics</h2>
+        <span>{hasRunArtifacts(result) ? diagnosticsCount : 0}</span>
+      </div>
+
+      {hasRunArtifacts(result) ? (
+        <div className="stack">
+          <div className="list">
+            <div className="list-item">
+              <strong>Диагностика repository/git</strong>
+              <span>{repositoryDiagnostics.length}</span>
+            </div>
+            {repositoryDiagnostics.length ? (
+              repositoryDiagnostics.slice(0, 10).map((diagnostic) => (
+                <div key={diagnostic} className="list-item compact">
+                  <span>{diagnostic}</span>
+                </div>
+              ))
+            ) : (
+              <p className="muted">Git-диагностика не выявила критичных проблем.</p>
+            )}
+          </div>
+
+          <div className="list">
+            <div className="list-item">
+              <strong>Игнорируемые пути</strong>
+              <span>{ignoredPaths.length}</span>
+            </div>
+            {ignoredPaths.slice(0, 10).map((pathValue) => (
+              <div key={pathValue} className="list-item compact">
+                <span>{pathValue}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="list">
+            <div className="list-item">
+              <strong>Диагностика index/workspace</strong>
+              <span>{diagnostics.length}</span>
+            </div>
+            {diagnostics.length ? (
+              diagnostics.slice(0, 10).map((diagnostic) => (
+                <div key={diagnostic} className="list-item compact">
+                  <span>{diagnostic}</span>
+                </div>
+              ))
+            ) : (
+              <p className="muted">Критичных диагностических сообщений нет.</p>
+            )}
+          </div>
+        </div>
+      ) : (
+        <p className="muted">Диагностика будет показана после запуска pipeline.</p>
+      )}
+    </article>
+  );
+}
+
+function InspectorDrawer({
+  open,
+  activeTab,
+  onClose,
+  onChangeTab,
+  result,
+}: {
+  open: boolean;
+  activeTab: InspectorTab;
+  onClose: () => void;
+  onChangeTab: (tab: InspectorTab) => void;
+  result: PipelineRunResult | null;
+}) {
+  const tabs: Array<{ id: InspectorTab; label: string }> = [
+    { id: "overview", label: "Overview" },
+    { id: "research", label: "Research" },
+    { id: "impact", label: "Impact" },
+    { id: "context", label: "Context" },
+    { id: "plan", label: "Plan" },
+    { id: "execution", label: "Execution" },
+    { id: "knowledge", label: "Knowledge" },
+    { id: "git", label: "Git" },
+    { id: "diagnostics", label: "Diagnostics" },
+  ];
+
+  return (
+    <>
+      {open ? <button type="button" className="inspector-backdrop" aria-label="Закрыть inspector" onClick={onClose} /> : null}
+      <aside className={`inspector-drawer ${open ? "inspector-open" : ""}`}>
+        <div className="inspector-head">
+          <div>
+            <p className="section-kicker">Inspector</p>
+            <h2>Внутренние артефакты run</h2>
+          </div>
+          <button type="button" className="ghost-button" onClick={onClose}>
+            Закрыть
+          </button>
+        </div>
+
+        <div className="inspector-tabs">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={`inspector-tab ${activeTab === tab.id ? "inspector-tab-active" : ""}`}
+              onClick={() => onChangeTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="inspector-content">
+          {activeTab === "overview" ? <OverviewPanel result={result} /> : null}
+          {activeTab === "research" ? <ResearchPanel result={result} /> : null}
+          {activeTab === "impact" ? <ImpactPanel result={result} /> : null}
+          {activeTab === "context" ? <ContextPanel result={result} /> : null}
+          {activeTab === "plan" ? <PlanPanel result={result} /> : null}
+          {activeTab === "execution" ? <ExecutionPanel result={result} /> : null}
+          {activeTab === "knowledge" ? <KnowledgePanel result={result} /> : null}
+          {activeTab === "git" ? <GitPanel result={result} /> : null}
+          {activeTab === "diagnostics" ? <DiagnosticsPanel result={result} /> : null}
+        </div>
+      </aside>
+    </>
   );
 }
 
@@ -1004,18 +1367,25 @@ export function App() {
   const [task, setTask] = useState("Построй структурный отчёт по текущему проекту и покажи ключевые зависимости.");
   const [projectPath, setProjectPath] = useState("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>({
+    id: "",
+    name: "",
     baseUrl: "",
-    model: "",
     apiKey: "",
   });
+  const [providerModelDraft, setProviderModelDraft] = useState(DEFAULT_MODEL_ID);
+  const [providers, setProviders] = useState<ProviderRecord[]>([]);
+  const [providerModels, setProviderModels] = useState<ProviderModelRecord[]>([]);
+  const [selectedProviderId, setSelectedProviderId] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [runStatus, setRunStatus] = useState<PipelineRunStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PipelineRunResult | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [activeArtifact, setActiveArtifact] = useState<ArtifactTab>("research");
+  const [selectedTask, setSelectedTask] = useState<string>("");
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [activeInspectorTab, setActiveInspectorTab] = useState<InspectorTab>("overview");
   const activeRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -1030,25 +1400,38 @@ export function App() {
         return;
       }
 
-      const parsed = JSON.parse(raw) as Partial<ProviderDraft>;
+      const parsed = JSON.parse(raw) as Partial<ProviderDraft> & { model?: string };
 
       setProviderDraft({
+        id: parsed.id ?? "",
+        name: parsed.name ?? "",
         baseUrl: parsed.baseUrl ?? "",
-        model: parsed.model ?? "",
         apiKey: parsed.apiKey ?? "",
       });
+      setProviderModelDraft(typeof parsed.model === "string" ? parsed.model : DEFAULT_MODEL_ID);
     } catch {
       // ignore broken local storage payload
     }
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(PROVIDER_STORAGE_KEY, JSON.stringify(providerDraft));
-  }, [providerDraft]);
+    window.localStorage.setItem(
+      PROVIDER_STORAGE_KEY,
+      JSON.stringify({
+        ...providerDraft,
+        model: providerModelDraft,
+      }),
+    );
+  }, [providerDraft, providerModelDraft]);
 
   useEffect(() => {
     activeRunIdRef.current = activeRunId;
   }, [activeRunId]);
+
+  function openInspector(tab: InspectorTab = "overview") {
+    setActiveInspectorTab(tab);
+    setInspectorOpen(true);
+  }
 
   async function loadProject(nextProjectPath?: string) {
     setLoading(true);
@@ -1062,13 +1445,32 @@ export function App() {
         params.set("projectPath", requestedProjectPath);
       }
 
-      const data = await fetchJsonWithTimeout<ProjectInfo>(`${API_BASE_URL}/api/project${params.size ? `?${params.toString()}` : ""}`);
+      const projectResponse = await fetchJsonWithTimeout<ProjectInfo>(`${API_BASE_URL}/api/project${params.size ? `?${params.toString()}` : ""}`);
+      const providerResponse = await fetchJsonWithTimeout<ProviderCatalogResponse>(`${API_BASE_URL}/api/providers`);
+      const data = normalizeProjectInfo(projectResponse);
+      const providerData = normalizeProviderCatalog(providerResponse);
+      const latestEntry = data.latestRun ? safeList(data.recentRuns).find((entry) => entry.runId === data.latestRun?.runId) ?? null : null;
 
       startTransition(() => {
         setProject(data);
         setProjectPath(data.rootPath);
         setResult((current) => current ?? data.latestRun ?? null);
         setSelectedRunId((current) => current ?? data.latestRun?.runId ?? null);
+        setSelectedTask((current) => current || latestEntry?.task || "");
+        setProviders(providerData.providers);
+        setProviderModels(providerData.models);
+        setSelectedProviderId(providerData.currentProvider?.id ?? "");
+        setProviderModelDraft(providerData.recommendedModelId ?? DEFAULT_MODEL_ID);
+        const currentProvider = providerData.currentProvider;
+        if (currentProvider) {
+          setProviderDraft((current) => ({
+            ...current,
+            id: currentProvider.id,
+            name: currentProvider.name,
+            baseUrl: currentProvider.baseUrl,
+            apiKey: "",
+          }));
+        }
       });
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сводку по проекту.");
@@ -1077,7 +1479,7 @@ export function App() {
     }
   }
 
-  async function runPipeline(event: React.FormEvent<HTMLFormElement>) {
+  async function runPipeline(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setRunning(true);
     setError(null);
@@ -1091,8 +1493,9 @@ export function App() {
         body: JSON.stringify({
           task,
           projectPath,
+          providerId: selectedProviderId || undefined,
           providerBaseUrl: providerDraft.baseUrl,
-          providerModel: providerDraft.model,
+          providerModel: providerModelDraft,
           providerApiKey: providerDraft.apiKey,
         }),
       });
@@ -1100,13 +1503,14 @@ export function App() {
       startTransition(() => {
         setRunStatus(accepted);
         setSelectedRunId(accepted.runId);
+        setSelectedTask(task);
         setActiveRunId(accepted.runId);
-        setActiveArtifact("research");
+        setInspectorOpen(false);
       });
 
       await pollPipelineStatus(accepted.runId);
     } catch (runError) {
-      setError(runError instanceof Error ? runError.message : "Не удалось выполнить пайплайн.");
+      setError(runError instanceof Error ? runError.message : "Не удалось выполнить pipeline.");
     } finally {
       setRunning(false);
     }
@@ -1149,7 +1553,7 @@ export function App() {
                           storagePath: status.result.knowledge.storagePath,
                           summary: status.result.research.summary,
                         },
-                        ...current.recentRuns.filter((entry) => entry.runId !== status.result?.runId),
+                        ...safeList(current.recentRuns).filter((entry) => entry.runId !== status.result?.runId),
                       ].slice(0, 20)
                     : current.recentRuns,
                 }
@@ -1163,7 +1567,7 @@ export function App() {
         startTransition(() => {
           setActiveRunId(null);
         });
-        throw new Error(status.errorMessage || "Пайплайн завершился ошибкой.");
+        throw new Error(status.errorMessage || "Pipeline завершился ошибкой.");
       }
 
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
@@ -1179,14 +1583,16 @@ export function App() {
         runId,
       });
       const data = await fetchJsonWithTimeout<PipelineRunResult>(`${API_BASE_URL}/api/runs/selected?${params.toString()}`);
+      const historyEntry = project?.recentRuns.find((entry) => entry.runId === runId) ?? null;
 
       startTransition(() => {
         setResult(data);
         setSelectedRunId(runId);
-        setActiveArtifact("research");
+        setSelectedTask(historyEntry?.task ?? selectedTask);
+        setInspectorOpen(false);
       });
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сохранённый запуск.");
+      setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сохранённый run.");
     }
   }
 
@@ -1198,126 +1604,225 @@ export function App() {
     });
   }
 
-  return (
-    <main className="shell">
-      <section className="hero">
-        <p className="eyebrow">Client MVP / Срез 1</p>
-        <h1>Консоль Структурного Анализа</h1>
-        <p className="hero-copy">
-          Эта операторская консоль запускает первый воспроизводимый цикл: инициализация workspace, полная индексация,
-          построение graph, research, impact analysis и сохранение knowledge.
-        </p>
-      </section>
+  async function saveProvider() {
+    setError(null);
 
-      <section className="panel panel-form">
-        <div className="panel-header">
-          <h2>Запуск Пайплайна</h2>
-          <span>{running ? "Выполняется" : "Готово"}</span>
+    try {
+      const saved = await fetchJsonWithTimeout<ProviderRecord>(`${API_BASE_URL}/api/providers`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: providerDraft.id,
+          name: providerDraft.name,
+          baseUrl: providerDraft.baseUrl,
+          apiKey: providerDraft.apiKey,
+          isCurrent: true,
+          isActive: true,
+        }),
+      });
+
+      const providerData = normalizeProviderCatalog(await fetchJsonWithTimeout<ProviderCatalogResponse>(`${API_BASE_URL}/api/providers`));
+
+      startTransition(() => {
+        setProviders(providerData.providers);
+        setProviderModels(providerData.models);
+        setSelectedProviderId(saved.id);
+        setProviderModelDraft(providerData.recommendedModelId ?? providerModelDraft);
+        setProviderDraft((current) => ({
+          ...current,
+          id: saved.id,
+          apiKey: "",
+        }));
+      });
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Не удалось сохранить провайдера.");
+    }
+  }
+
+  async function selectProvider(providerId: string) {
+    if (!providerId) {
+      setSelectedProviderId("");
+      return;
+    }
+
+    setError(null);
+
+    try {
+      await fetchJsonWithTimeout<ProviderRecord>(`${API_BASE_URL}/api/providers/${encodeURIComponent(providerId)}/select`, {
+        method: "POST",
+      });
+      const providerData = normalizeProviderCatalog(await fetchJsonWithTimeout<ProviderCatalogResponse>(`${API_BASE_URL}/api/providers`));
+      const selected = safeList(providerData.providers).find((provider) => provider.id === providerId) ?? null;
+
+      startTransition(() => {
+        setProviders(providerData.providers);
+        setProviderModels(providerData.models);
+        setSelectedProviderId(providerId);
+        setProviderModelDraft(providerData.recommendedModelId ?? providerModelDraft);
+        if (selected) {
+          setProviderDraft({
+            id: selected.id,
+            name: selected.name,
+            baseUrl: selected.baseUrl,
+            apiKey: "",
+          });
+        }
+      });
+    } catch (selectError) {
+      setError(selectError instanceof Error ? selectError.message : "Не удалось выбрать провайдера.");
+    }
+  }
+
+  async function removeProvider(providerId: string) {
+    setError(null);
+
+    try {
+      await fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/providers/${encodeURIComponent(providerId)}`, {
+        method: "DELETE",
+      });
+      const providerData = normalizeProviderCatalog(await fetchJsonWithTimeout<ProviderCatalogResponse>(`${API_BASE_URL}/api/providers`));
+      const current = providerData.currentProvider;
+
+      startTransition(() => {
+        setProviders(providerData.providers);
+        setProviderModels(providerData.models);
+        setSelectedProviderId(current?.id ?? "");
+        setProviderModelDraft(providerData.recommendedModelId ?? DEFAULT_MODEL_ID);
+        setProviderDraft({
+          id: current?.id ?? "",
+          name: current?.name ?? "",
+          baseUrl: current?.baseUrl ?? "",
+          apiKey: "",
+        });
+      });
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : "Не удалось удалить провайдера.");
+    }
+  }
+
+  return (
+    <main className="app-shell">
+      <aside className="app-sidebar">
+        <SidebarProjectCard project={project} loading={loading} onRefresh={() => void loadProject()} />
+        <SidebarRuns project={project} selectedRunId={selectedRunId} activeRunId={activeRunId} onOpenRun={(runId) => void openSavedRun(runId)} />
+        <ProviderSettings
+          providers={providers}
+          selectedProviderId={selectedProviderId}
+          providerDraft={providerDraft}
+          providerModels={providerModels}
+          providerModelDraft={providerModelDraft}
+          onSelectProvider={(providerId) => void selectProvider(providerId)}
+          onChangeDraft={setProviderDraft}
+          onChangeModel={setProviderModelDraft}
+          onSaveProvider={() => void saveProvider()}
+          onRemoveProvider={(providerId) => void removeProvider(providerId)}
+        />
+      </aside>
+
+      <section className="chat-shell">
+        <header className="chat-header">
+          <div>
+            <p className="section-kicker">Client MVP / Slice 1</p>
+            <h1>Инженерный чат с внутренним pipeline</h1>
+            <p className="chat-subtitle">
+              Снаружи это простой диалог. Внутри каждый запрос становится воспроизводимым run с research, impact,
+              context и planner.
+            </p>
+          </div>
+
+          <div className="header-actions">
+            <button type="button" className="ghost-button" onClick={() => openInspector("overview")} disabled={!result}>
+              Inspector
+            </button>
+            {running ? (
+              <button type="button" className="ghost-button danger-button" onClick={resetStuckRun}>
+                Сбросить зависший run
+              </button>
+            ) : null}
+          </div>
+        </header>
+
+        <div className="chat-body">
+          <IntroMessage />
+
+          {selectedTask ? <UserTaskMessage task={selectedTask} projectPath={projectPath} /> : null}
+
+          <AssistantRunMessage runStatus={runStatus} result={result} onOpenInspector={openInspector} />
+
+          {!selectedTask && !running && !result ? <EmptyState project={project} /> : null}
         </div>
 
-        <form onSubmit={runPipeline} className="form">
-          <label>
-            <span>Путь к проекту</span>
-            <input value={projectPath} onChange={(event) => setProjectPath(event.target.value)} />
-          </label>
-
-          <div className="provider-grid">
-            <label>
-              <span>Base URL провайдера ИИ</span>
-              <input
-                value={providerDraft.baseUrl}
-                onChange={(event) =>
-                  setProviderDraft((current) => ({
-                    ...current,
-                    baseUrl: event.target.value,
-                  }))
-                }
-                placeholder="https://api.openai.com/v1"
-              />
+        <form className="composer" onSubmit={runPipeline}>
+          <div className="composer-runtime">
+            <label className="field">
+              <span>Путь к проекту</span>
+              <input value={projectPath} onChange={(event) => setProjectPath(event.target.value)} />
             </label>
 
-            <label>
-              <span>Название модели</span>
-              <input
-                value={providerDraft.model}
-                onChange={(event) =>
-                  setProviderDraft((current) => ({
-                    ...current,
-                    model: event.target.value,
-                  }))
-                }
-                placeholder="gpt-5"
-              />
+            <label className="field">
+              <span>Провайдер</span>
+              <select value={selectedProviderId} onChange={(event) => void selectProvider(event.target.value)}>
+                <option value="">Не выбран</option>
+                {safeList(providers).map((provider) => (
+                  <option key={provider.id} value={provider.id}>
+                    {provider.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="field">
+              <span>Модель</span>
+              <select value={providerModelDraft} onChange={(event) => setProviderModelDraft(event.target.value)}>
+                {safeList(providerModels).map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label}
+                  </option>
+                ))}
+                {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
+              </select>
             </label>
           </div>
 
-          <label>
-            <span>API ключ</span>
-            <input
-              type="password"
-              value={providerDraft.apiKey}
-              onChange={(event) =>
-                setProviderDraft((current) => ({
-                  ...current,
-                  apiKey: event.target.value,
-                }))
-              }
-              placeholder="sk-..."
+          <div className="composer-box">
+            <textarea
+              value={task}
+              onChange={(event) => setTask(event.target.value)}
+              rows={4}
+              placeholder="Напиши инженерную задачу или вопрос по проекту..."
             />
-          </label>
 
-          <label>
-            <span>Задача</span>
-            <textarea value={task} onChange={(event) => setTask(event.target.value)} rows={5} />
-          </label>
-
-          <button type="submit" disabled={running || loading}>
-            {running ? "Запускаю структурный пайплайн..." : "Запустить структурный пайплайн"}
-          </button>
-        </form>
-
-        {runStatus ? (
-          <div className="list">
-            <div className="list-item">
-              <strong>Статус запуска</strong>
-              <span>{runStatus.status}</span>
-            </div>
-            <div className="list-item">
-              <strong>Текущий этап</strong>
-              <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span>
-            </div>
-            <div className="list-item">
-              <strong>Resume</strong>
-              <span>{runStatus.resumeContext?.canResumeFromStart ? "доступен restart-from-start" : "не требуется"}</span>
+            <div className="composer-actions">
+              <div className="composer-meta">
+                <span>Run создаётся автоматически</span>
+                {runStatus ? <span>Текущий этап: {safeText(runStatus.currentStageLabel, "Ожидание")}</span> : null}
+              </div>
+              <button type="submit" className="primary-button" disabled={running || loading}>
+                {running ? "Система исследует проект..." : "Запустить исследование"}
+              </button>
             </div>
           </div>
-        ) : null}
 
-        {running ? (
-          <button type="button" onClick={resetStuckRun}>
-            Сбросить зависший запуск
-          </button>
-        ) : null}
+          {runStatus ? (
+            <div className="composer-status">
+              <span>Статус: {runStatus.status}</span>
+              <span>Resume: {runStatus.resumeContext?.canResumeFromStart ? "restart-from-start доступен" : "не требуется"}</span>
+            </div>
+          ) : null}
 
-        {error ? <p className="error">{error}</p> : null}
+          {error ? <p className="error">{error}</p> : null}
+        </form>
       </section>
 
-      <section className="grid">
-        <ProjectPanel project={project} loading={loading} />
-        <RunsPanel project={project} selectedRunId={selectedRunId} onOpenRun={(runId) => void openSavedRun(runId)} />
-      </section>
-
-      <PartialArtifactsPanel runStatus={runStatus} />
-      <ArtifactViewer result={result} activeArtifact={activeArtifact} setActiveArtifact={setActiveArtifact} />
-
-      <section className="grid grid-wide">
-        <StagesPanel result={result} />
-        <DiagnosticsPanel result={result} />
-        <ResearchPanel result={result} />
-        <ImpactPanel result={result} />
-        <ContextPanel result={result} />
-        <PlanPanel result={result} />
-      </section>
+      <InspectorDrawer
+        open={inspectorOpen}
+        activeTab={activeInspectorTab}
+        onClose={() => setInspectorOpen(false)}
+        onChangeTab={setActiveInspectorTab}
+        result={result}
+      />
     </main>
   );
 }

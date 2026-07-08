@@ -3,6 +3,8 @@ import {
   isLocalizationPath,
   type GraphNodeKind,
   type GraphRelationType,
+  normalizePath,
+  type PipelineRunResult,
   type ResearchQueryProfileKey,
   stableId,
   type GraphEdge,
@@ -12,7 +14,16 @@ import {
   type WorkspaceSnapshot,
 } from "@client/shared";
 
-export function buildGraph(workspace: WorkspaceSnapshot, index: IndexResult): GraphState {
+interface BuildGraphOptions {
+  previousRun?: PipelineRunResult | null;
+  invalidatedPaths?: string[];
+}
+
+export function buildGraph(
+  workspace: WorkspaceSnapshot,
+  index: IndexResult,
+  options: BuildGraphOptions = {},
+): GraphState {
   const nodes = new Map<string, GraphNode>();
   const edges = new Map<string, GraphEdge>();
   const fileById = new Map(workspace.files.map((file) => [file.id, file]));
@@ -217,25 +228,21 @@ export function buildGraph(workspace: WorkspaceSnapshot, index: IndexResult): Gr
 
   const nodeList = [...nodes.values()];
   const edgeList = [...edges.values()];
-
-  return {
-    graphId: stableId(["graph", workspace.projectId, index.manifest.indexId]),
-    projectId: workspace.projectId,
-    createdAt: new Date().toISOString(),
-    nodes: nodeList,
-    edges: edgeList,
-    summary: {
-      nodeCount: nodeList.length,
-      edgeCount: edgeList.length,
-      fileCount: nodeList.filter((node) => node.kind === "file").length,
-      symbolCount: nodeList.filter((node) => isCodeNode(node.kind)).length,
-      dependencyCount: nodeList.filter((node) => node.kind === "dependency").length,
-      repositoryCount: nodeList.filter((node) => node.kind === "repository").length,
-      moduleCount: nodeList.filter((node) => node.kind === "module").length,
-      folderCount: nodeList.filter((node) => node.kind === "folder").length,
-      routeCount: nodeList.filter((node) => node.kind === "route").length,
+  const merged = mergePreviousGraphState(
+    {
+      graphId: stableId(["graph", workspace.projectId, index.manifest.indexId]),
+      projectId: workspace.projectId,
+      createdAt: new Date().toISOString(),
+      nodes: nodeList,
+      edges: edgeList,
+      summary: buildGraphSummary(nodeList, edgeList),
     },
-  };
+    workspace,
+    options.previousRun,
+    options.invalidatedPaths ?? [],
+  );
+
+  return merged;
 }
 
 export function getIncomingNeighbors(graph: GraphState, nodeId: string): GraphNode[] {
@@ -818,4 +825,74 @@ function normalizeRelationType(
 
 function isDependencySignal(type: GraphRelationType): boolean {
   return ["IMPORTS", "REFERENCES", "CALLS", "USES", "IMPLEMENTS", "EXTENDS", "READS", "WRITES", "CREATES"].includes(type);
+}
+
+function mergePreviousGraphState(
+  current: GraphState,
+  workspace: WorkspaceSnapshot,
+  previousRun: PipelineRunResult | null | undefined,
+  invalidatedPaths: string[],
+): GraphState {
+  const previousGraph = previousRun?.runtimeCache?.graph;
+
+  if (!previousGraph) {
+    return current;
+  }
+
+  const invalidatedPathSet = new Set(invalidatedPaths.map((value) => normalizePath(value)));
+  const currentPathSet = new Set(workspace.files.map((file) => normalizePath(file.relativePath)));
+  const retainedNodes = new Map<string, GraphNode>();
+  const retainedEdges = new Map<string, GraphEdge>();
+
+  for (const node of previousGraph.nodes) {
+    const nodePath = node.filePath ? normalizePath(node.filePath) : undefined;
+
+    if (nodePath && (!currentPathSet.has(nodePath) || invalidatedPathSet.has(nodePath))) {
+      continue;
+    }
+
+    retainedNodes.set(node.id, node);
+  }
+
+  for (const edge of previousGraph.edges) {
+    if (!retainedNodes.has(edge.sourceId) || !retainedNodes.has(edge.targetId)) {
+      continue;
+    }
+
+    retainedEdges.set(edge.id, edge);
+  }
+
+  for (const node of current.nodes) {
+    retainedNodes.set(node.id, node);
+  }
+
+  for (const edge of current.edges) {
+    retainedEdges.set(edge.id, edge);
+  }
+
+  const nodes = [...retainedNodes.values()];
+  const edges = [...retainedEdges.values()];
+
+  return {
+    graphId: current.graphId,
+    projectId: current.projectId,
+    createdAt: current.createdAt,
+    nodes,
+    edges,
+    summary: buildGraphSummary(nodes, edges),
+  };
+}
+
+function buildGraphSummary(nodes: GraphNode[], edges: GraphEdge[]) {
+  return {
+    nodeCount: nodes.length,
+    edgeCount: edges.length,
+    fileCount: nodes.filter((node) => node.kind === "file").length,
+    symbolCount: nodes.filter((node) => isCodeNode(node.kind)).length,
+    dependencyCount: nodes.filter((node) => node.kind === "dependency").length,
+    repositoryCount: nodes.filter((node) => node.kind === "repository").length,
+    moduleCount: nodes.filter((node) => node.kind === "module").length,
+    folderCount: nodes.filter((node) => node.kind === "folder").length,
+    routeCount: nodes.filter((node) => node.kind === "route").length,
+  };
 }

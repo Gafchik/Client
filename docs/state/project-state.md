@@ -6,27 +6,27 @@
 ## Что уже реализовано
 
 - Базовый monorepo foundation на `apps/api`, `apps/web`, `packages/*`.
-- Рабочий структурный pipeline:
-- `Workspace`
-- `Index`
-- `Graph`
-- `Repository Git Intelligence`
-- `Research`
-- `Impact`
-- `Knowledge`
-- Русскоязычный операторский интерфейс для первого контура.
-- В операторском интерфейсе добавлен runtime-config слой для будущего AI provider integration:
-  - `Base URL провайдера`
-  - `Название модели`
-  - `API ключ`
-  - значения проходят через UI, API и knowledge artifacts как будущий execution/provider runtime input.
+- Рабочий структурный pipeline первого контура:
+  - `Workspace`
+  - `Index`
+  - `Graph`
+  - `Repository Git Intelligence`
+  - `Research`
+  - `Impact`
+  - `Context`
+  - `Planner`
+  - `Knowledge`
+- Русскоязычный chat-first интерфейс:
+  - основной экран теперь ведёт себя как простой диалог по задаче;
+  - каждый пользовательский запрос автоматически создаёт внутренний `Run`;
+  - прогресс pipeline показывается inline внутри AI-сообщения;
+  - детальные инженерные артефакты вынесены в правый `Inspector`.
 - Центральное хранение артефактов внутри проекта `client`, а не внутри внешних тестируемых репозиториев.
 - Сохранение истории запусков по каждому анализируемому проекту.
 - Просмотр сохранённых запусков в UI.
-- Отображение стадий pipeline в UI.
-- Отображение ignored paths и diagnostics в UI.
 - Project-aware отображение текущего анализируемого проекта.
-- Расширенный artifacts viewer для сохранённых run-артефактов.
+- Отображение стадий pipeline, ignored paths, diagnostics, Git-состояния и execution preview в UI.
+- История и сохранённые run-артефакты доступны через chat shell и `Inspector`.
 - Context Builder MVP с первым `Context Package`.
 - Context Builder Evolution pass:
   - введены priority-based candidate selection и token estimate;
@@ -92,7 +92,8 @@
   - `ErrorBoundary`;
   - fallback screen вместо белого экрана;
   - runtime failure logging в browser console;
-  - widget-level guards и мягкая деградация отдельных панелей при неполных или старых артефактах.
+  - widget-level guards и мягкая деградация отдельных панелей при неполных или старых артефактах;
+  - добавлена нормализация API-payload для provider/catalog ответов, чтобы UI не падал на частично пустых массивах.
 - Архитектурный слой исторического repository intelligence формализован отдельной спецификацией:
   - `docs/modules/repository-git.md`
   - Git закреплён как самостоятельный источник инженерных знаний, а не как вспомогательная утилита внутри `Research` или `Workspace`;
@@ -140,6 +141,40 @@
   - этот план учитывает previous run, Git changed set и selective candidate paths;
   - `incrementalIndex` и `graphInvalidation` теперь сохраняются в финальном knowledge run artifact;
   - UI показывает operator-facing сигналы: `incremental-index` и `graph invalidation`.
+- Stateful incremental reuse layer переведён из orchestration-only в runtime-capable состояние:
+  - knowledge run artifact теперь хранит полноценный `runtime cache` с полным `index` и `graph`, а не только summary;
+  - `Indexer` научен переиспользовать неизменённые файлы из предыдущего run по `content hash` и `file path`;
+  - `IndexManifest` теперь фиксирует `parse cache`, `AST cache`, `symbol diff`, reused/reindexed/deleted counters;
+  - введены `stableSymbolId`, `parseCacheKey`, `astFingerprint` как базовые runtime-сигналы повторного использования;
+  - `incremental index plan` теперь различает `changed`, `deleted`, `renamed`, `reusable` paths;
+  - `Graph` получил первый partial refresh поверх предыдущего graph state с удалением устаревших file-backed узлов и сохранением неизменённых зон.
+- Provider runtime config временно усилен операционным env-слоем:
+  - локальный `.env` может задавать `CLIENT_PROVIDER_BASE_URL`, `CLIENT_PROVIDER_MODEL`, `CLIENT_PROVIDER_API_KEY`;
+  - API использует эти значения как fallback, если оператор не передал provider credentials из UI;
+  - это временный мост для MVP-тестов;
+  - целевая архитектура остаётся прежней: provider credentials должны жить в отдельном provider-слое и управляться через интерфейс, а не через постоянный env-only workflow.
+- Provider-контур переведён на постоянное хранение:
+  - в проект добавлен Docker-first PostgreSQL контур для конфигурации provider-ов;
+  - API получил CRUD слой `providers` поверх PostgreSQL;
+  - таблица `providers` инициализируется автоматически на старте API;
+  - `env` теперь является bootstrap/fallback-слоем, а не целевым источником истины;
+  - реализация выровнена под Docker Postgres database `ai_agent_team`.
+- Зафиксирован важный контракт provider/runtime слоя:
+  - `Provider` хранит endpoint и credential layer, но не хранит выбранную модель;
+  - `Model` является runtime-параметром конкретного запуска;
+  - backend запрашивает provider-side model catalog через `GET /models`;
+  - UI использует catalog-driven выбор модели вместо provider-level model field;
+  - при недоступности каталога используется fallback-модельный список;
+  - для текущего тестового runtime дефолтной рекомендованной моделью установлен `nvidia/nemotron-3-ultra`.
+- Зафиксирован следующий user-facing архитектурный слой:
+  - добавлена спецификация `Answer Engine`;
+  - Answer Engine должен превращать внутренние артефакты (`Research`, `Impact`, `Context`, `Plan`) в человеко-понятный ответ;
+  - chat UX должен оставаться answer-first, а `Inspector` — вторичным expert/debug surface.
+- Live answer runtime усилен operational safety-контуром:
+  - добавлены timeout для внешнего LLM-вызова;
+  - добавлены retry/backoff для transient ошибок и `429/5xx`;
+  - учитывается `Retry-After`, если провайдер его возвращает;
+  - при ошибке провайдера система обязана отдавать deterministic fallback answer вместо падения run.
 
 ## Текущее состояние MVP Slice 1
 
@@ -159,6 +194,13 @@
 12. показать safe execution preview с границами разрешённых действий.
 13. показать первую функциональную картину затронутой зоны проекта, а не только структурные совпадения.
 14. объяснить, почему именно эти контекстные фрагменты были выбраны и какие были отброшены.
+15. запускать long-running pipeline в фоне через job-runner и наблюдать за ним через polling статуса.
+16. сохранять `PipelineRunStatus` и `partialArtifacts` на диск внутри `.client` и восстанавливать их после рестарта API.
+17. строить `incremental index plan` и `graph invalidation plan` на основе прошлого run и текущего Git changed set.
+18. переиспользовать runtime cache предыдущего запуска на уровне `index` и `graph`.
+19. хранить provider-конфигурации в PostgreSQL и выбирать runtime-модель отдельно от provider-record.
+20. работать через chat-first UX, где сложный pipeline скрыт за простым диалогом, а глубинные артефакты открываются через `Inspector`.
+21. готовить `Answer Package` как отдельный run-артефакт и использовать его как основной пользовательский результат.
 
 ## Что пока ограничено
 
@@ -184,9 +226,11 @@
 - Execution layer теперь имеет safe preview и controlled runtime contract, но всё ещё без фактической мутации файлов.
 - Provider runtime config уже собирается и сохраняется вместе с запуском, но фактический live-вызов модели ещё не подключён.
 - История запусков пока строится из локально сохранённых JSON-артефактов.
-- Фронт теперь защищён от полного белого экрана и от большинства partial-data сбоев на уровне отдельных виджетов, но всё ещё требует дальнейшего hardening UI-flow.
+- Фронт уже защищён от полного белого экрана и основных partial-data сбоев, но всё ещё требует дальнейшего hardening:
+  - нет автоматического reconnect/backoff policy;
+  - нет stage-level streaming через SSE/WebSocket;
+  - `Inspector` пока открывает итоговые артефакты run, а не отдельные persisted stage-scoped snapshots.
 - Large-repository профиль уже помечается системно, но сам pipeline всё ещё выполняется как один full run и требует дальнейшего staged/incremental разбиения.
-- Git как источник истории уже описан архитектурно, но ещё не реализован как runtime subsystem и пока не участвует в incremental reindex, regression analysis и rollback-aware planning.
 - Git уже встроен как runtime subsystem первого уровня, но пока ещё не участвует глубоко в:
   - настоящем incremental reindex на повторных прогонах;
   - regression origin analysis;
@@ -203,16 +247,16 @@
   - не стримит частичные артефакты по стадиям, а только статус и финальный результат.
 - Status persistence уже есть, но пока:
   - статус сохраняется как snapshot, а не как event log;
-  - нет отдельной cleanup / retention policy для pipeline-status файлов;
+  - cleanup / retention policy пока зафиксирована в коде, а не вынесена в конфигурацию;
   - нет полноценного resume незавершённого execution после рестарта процесса, есть только восстановление наблюдаемого status state.
 - Resume / cleanup / invalidation уже есть как first MVP, но пока:
   - `resume` реализован как безопасный `restart-from-start`, а не как продолжение с середины стадии;
-  - retention policy фиксирована в коде и ещё не вынесена в конфигурацию;
   - `graph invalidation plan` пока формируется эвристически по changed set и previous run, без symbol-level dependency diff.
 - Incremental reuse уже есть как path-level orchestration, но пока:
-  - сам индекс всё ещё пересчитывается целиком по текущему workspace snapshot;
-  - нет persisted symbol-level cache и AST reuse;
-  - нет частичной materialization graph поверх предыдущего graph state.
+- persisted reuse теперь уже есть на уровне file/index/graph runtime cache, но пока:
+  - reuse работает по file-level content hash, а не по полноценному symbol-level semantic diff;
+  - AST cache зафиксирован в runtime contract и manifest, но ещё не вынесен в отдельное постоянное cache-хранилище;
+  - graph partial refresh уже materialize-ится поверх прошлого state, но пока без тонкой symbol-edge invalidation и без dedicated graph snapshot/version store.
 - Partial artifacts уже есть, но пока:
   - они живут внутри snapshot статуса, а не как отдельные stage-scoped artifacts;
   - UI показывает их как прогресс-обзор, но ещё не умеет полноценно открывать каждую промежуточную стадию как отдельный сохранённый артефакт;
@@ -221,6 +265,13 @@
   - нет автоматического reconnect/backoff policy;
   - нет различения между кратковременной сетевой ошибкой и реальной смертью backend;
   - сброс зависшего запуска пока ручной, а не policy-driven.
+- Live LLM runtime пока отсутствует:
+  - полноценный mutation/runtime loop всё ещё не подключён;
+  - live model orchestration только начинается с answer synthesis слоя;
+  - token accounting, cost accounting и richer provider observability ещё не доведены до отдельного subsystem уровня.
+- Answer-first response layer пока описан архитектурно, но ещё не реализован в runtime:
+  - follow-up continuity и conversational answer reuse ещё не materialized;
+  - Inspector всё ещё остаётся довольно техническим и требует дальнейшего product pass.
 
 ## Где хранятся артефакты
 
@@ -250,21 +301,19 @@
 
 Следующий этап после текущего MVP expansion pass:
 
+- подключить первый реальный live LLM runtime поверх уже готового provider/model слоя;
+- реализовать `Answer Engine` как user-facing answer synthesis layer поверх внутреннего pipeline;
+- передавать во внешний inference runtime `Research + Impact + Context + Plan` вместо чисто локального preview-контура;
 - начать controlled execution runtime вместо одного preview-слоя;
 - добавить фактический mutation executor поверх уже готовых scope guard и write boundary;
 - подготовить post-change reindex, graph refresh и knowledge refresh orchestration как исполняемый runtime flow;
-- усилить data-shape validation между API, сохранёнными артефактами и UI.
-- продолжить staged pipeline для больших репозиториев: cheap-first workspace/index path, потом selective deep analysis.
-- углубить functional research, чтобы feature-level understanding было точнее и менее эвристическим.
-- добавить model-aware token budgeting и semantic reranking в Context Builder.
-- углубить Context Builder до graph-backed dependency expansion внутри query profile, а не только path/rule-based ranking.
-- продолжить graph-core evolution до уровня, удобного для переноса в БД.
-- продолжить graph-core evolution до richer relation semantics, snapshot/version layer и query surface, пригодных для будущего DB-backed graph storage.
-- продолжить перенос Research с file/content heuristics на более явный graph-first traversal и query-profile-specific expansion.
-- продолжить performance-pass для больших репозиториев: staged indexing, cheap-first pipeline stages и сокращение single-shot latency на full run.
-- реализовать `Repository Git Intelligence` как следующий фундаментальный слой перед live mutation runtime и перед подключением модели:
+- продолжить staged pipeline для больших репозиториев: cheap-first workspace/index path, потом selective deep analysis;
+- углубить functional research, чтобы feature-level understanding было точнее и менее эвристическим;
+- добавить model-aware token budgeting и semantic reranking в Context Builder;
+- углубить Context Builder до graph-backed dependency expansion внутри query profile, а не только path/rule-based ranking;
+- продолжить graph-core evolution до richer relation semantics, snapshot/version layer и query surface, пригодных для будущего DB-backed graph storage;
+- продолжить перенос Research с file/content heuristics на более явный graph-first traversal и query-profile-specific expansion;
 - развить `Repository Git Intelligence` от MVP к operational/historical subsystem:
-  - развить текущий selective Git-seeded scan до настоящего staged и incremental index;
   - связать Git change scope с planner safety rules;
   - добавить historical signals для research и impact;
   - добавить rollback anchors и run-scoped mutation ownership;
@@ -275,4 +324,5 @@
   - вынести retention и cleanup policy в конфигурационный слой;
   - углубить `incremental index plan` до symbol-aware incremental index и AST reuse;
   - углубить `graph invalidation plan` до partial graph refresh поверх предыдущего graph state;
-  - разнести partial artifacts в отдельные stage-scoped persisted artifacts.
+  - разнести partial artifacts в отдельные stage-scoped persisted artifacts;
+  - усилить data-shape validation между API, сохранёнными артефактами и UI.

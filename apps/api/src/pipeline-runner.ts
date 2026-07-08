@@ -1,6 +1,6 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { buildControlledExecutionRuntime } from "@client/ai";
+import { buildAnswerPackage, buildControlledExecutionRuntime } from "@client/ai";
 import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
@@ -234,14 +234,18 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   });
 
   const indexStartedAt = startStage(runId, "index");
-  const index = await runFullIndex(workspace);
+  const index = await runFullIndex(workspace, {
+    previousRun,
+    changedPaths: incrementalIndex.changedPaths,
+    deletedPaths: incrementalIndex.deletedPaths,
+  });
   completeStage(
     runId,
     "index",
     indexStartedAt,
     largeRepositoryProfile && index.manifest.mode === "selective"
-      ? `Построен selective index: ${index.manifest.symbolCount} символов и ${index.manifest.relationCount} связей.`
-      : `Построен index: ${index.manifest.symbolCount} символов и ${index.manifest.relationCount} связей.`,
+      ? `Построен selective index: ${index.manifest.symbolCount} символов, ${index.manifest.relationCount} связей, reused files ${index.manifest.reusedFileCount}.`
+      : `Построен index: ${index.manifest.symbolCount} символов, ${index.manifest.relationCount} связей, reused files ${index.manifest.reusedFileCount}.`,
   );
   updatePartialArtifacts(runId, {
     index: {
@@ -252,7 +256,10 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   });
 
   const graphStartedAt = startStage(runId, "graph");
-  const graph = buildGraph(workspace, index);
+  const graph = buildGraph(workspace, index, {
+    previousRun,
+    invalidatedPaths: graphInvalidation.invalidatedFiles,
+  });
   completeStage(runId, "graph", graphStartedAt, `Собран graph: ${graph.summary.nodeCount} узлов и ${graph.summary.edgeCount} рёбер.`);
   updatePartialArtifacts(runId, {
     graph: {
@@ -332,6 +339,25 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     executionRuntime,
   });
 
+  const answerStartedAt = startStage(runId, "answer");
+  const answer = await buildAnswerPackage({
+    runId,
+    task,
+    providerBaseUrl,
+    providerModel,
+    providerApiKey,
+    research,
+    impact,
+    context,
+    plan,
+    preview: executionPreview,
+    runtime: executionRuntime,
+  });
+  completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);
+  updatePartialArtifacts(runId, {
+    answer,
+  });
+
   const knowledgeStartedAt = startStage(runId, "knowledge");
   const knowledge = await saveKnowledgeArtifacts({
     runId,
@@ -354,6 +380,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     plan,
     executionPreview,
     executionRuntime,
+    answer,
   });
   completeStage(runId, "knowledge", knowledgeStartedAt, `Артефакты сохранены в центральное knowledge-хранилище: ${knowledge.artifactCount} групп.`);
 
@@ -392,7 +419,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     plan,
     executionPreview,
     executionRuntime,
+    answer,
     knowledge,
+    runtimeCache: {
+      index,
+      graph,
+    },
   };
 }
 
@@ -409,6 +441,7 @@ function createInitialStages(): PipelineStage[] {
     createPendingStage("plan", "План", now),
     createPendingStage("preview", "Превью выполнения", now),
     createPendingStage("runtime", "Execution Runtime", now),
+    createPendingStage("answer", "Ответ", now),
     createPendingStage("knowledge", "Знания", now),
   ];
 }
@@ -635,6 +668,13 @@ function buildGraphInvalidationPlan(
       }),
     ),
   );
+  const invalidatedSymbolIds = Array.from(
+    new Set(
+      (previousRun?.runtimeCache?.index.symbols ?? [])
+        .filter((symbol) => changedPaths.includes(normalizePath(symbol.filePath)))
+        .map((symbol) => symbol.stableSymbolId),
+    ),
+  );
   const previousRunPatch = previousRun ? { previousRunId: previousRun.runId } : {};
 
   if (!previousRun || repository.summary.changedFileCount === 0) {
@@ -644,16 +684,37 @@ function buildGraphInvalidationPlan(
       changedPaths,
       invalidatedFiles: changedPaths,
       invalidatedModules,
+      invalidatedSymbolIds,
       reason: previousRun ? "Локальные Git-изменения не обнаружены, безопаснее удерживать full-refresh baseline." : "Предыдущий run отсутствует, partial invalidation ещё не на что опереть.",
     };
   }
 
+  const previousGraph = previousRun.runtimeCache?.graph;
   return {
     mode: changedPaths.length > 0 && changedPaths.length <= 150 ? "partial-invalidation" : "full-refresh",
     ...previousRunPatch,
     changedPaths,
     invalidatedFiles: changedPaths,
     invalidatedModules,
+    invalidatedSymbolIds,
+    ...(previousGraph
+      ? {
+          reusedNodeCount: Math.max(
+            0,
+            previousGraph.nodes.filter((node) => !node.filePath || !changedPaths.includes(normalizePath(node.filePath))).length,
+          ),
+          reusedEdgeCount: Math.max(
+            0,
+            previousGraph.edges.filter((edge) => {
+              const sourceNode = previousGraph.nodes.find((node) => node.id === edge.sourceId);
+              const targetNode = previousGraph.nodes.find((node) => node.id === edge.targetId);
+              const sourceChanged = sourceNode?.filePath ? changedPaths.includes(normalizePath(sourceNode.filePath)) : false;
+              const targetChanged = targetNode?.filePath ? changedPaths.includes(normalizePath(targetNode.filePath)) : false;
+              return !sourceChanged && !targetChanged;
+            }).length,
+          ),
+        }
+      : {}),
     reason:
       changedPaths.length > 0 && changedPaths.length <= 150
         ? "Graph invalidation ограничен Git changed set и может идти как partial refresh."
@@ -668,10 +729,32 @@ function buildIncrementalIndexPlan(
   shouldUseSelectiveWorkspace: boolean,
 ): IncrementalIndexPlan {
   const reusedSignals: string[] = [];
+  const changedPaths = Array.from(new Set(repository.changedFiles.map((file) => normalizePath(file.path))));
+  const deletedPaths = Array.from(
+    new Set(repository.changedFiles.filter((file) => file.changeType === "deleted").map((file) => normalizePath(file.path))),
+  );
+  const renamedPaths = Array.from(
+    new Map(
+      repository.changedFiles
+        .filter((file) => file.changeType === "renamed" && file.previousPath)
+        .map((file) => [
+          `${file.previousPath}:${file.path}`,
+          {
+            from: normalizePath(file.previousPath ?? ""),
+            to: normalizePath(file.path),
+          },
+        ]),
+    ).values(),
+  );
+  const reusablePaths = previousRun?.runtimeCache?.index.files
+    .map((file) => normalizePath(file.filePath))
+    .filter((filePath) => !changedPaths.includes(filePath) && !deletedPaths.includes(filePath))
+    .slice(0, 500) ?? [];
 
   if (previousRun) {
     reusedSignals.push(`previous-run:${previousRun.runId}`);
     reusedSignals.push(`previous-graph:${previousRun.graph.summary.nodeCount}-nodes`);
+    reusedSignals.push(`previous-index:${previousRun.index.manifest.symbolCount}-symbols`);
   }
 
   if (repository.summary.changedFileCount > 0) {
@@ -684,6 +767,10 @@ function buildIncrementalIndexPlan(
       mode: "incremental-index",
       ...(previousRun ? { previousRunId: previousRun.runId } : {}),
       candidatePaths: selectiveCandidatePaths,
+      changedPaths,
+      deletedPaths,
+      renamedPaths,
+      reusablePaths,
       reusedSignals,
       reason: "Large-repository run использует Git changed set и selective candidate paths как incremental seed.",
     };
@@ -693,6 +780,10 @@ function buildIncrementalIndexPlan(
     mode: "full-index",
     ...(previousRun ? { previousRunId: previousRun.runId } : {}),
     candidatePaths: selectiveCandidatePaths,
+    changedPaths,
+    deletedPaths,
+    renamedPaths,
+    reusablePaths,
     reusedSignals,
     reason: previousRun
       ? "Сигналы предыдущего run известны, но текущий сценарий требует полный индекс вместо частичного прохода."

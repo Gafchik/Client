@@ -3,16 +3,27 @@ import ts from "typescript";
 import {
   normalizePath,
   stableId,
+  contentHash,
   type IndexRelation,
   type IndexResult,
   type IndexSymbol,
   type IndexedFile,
   type LanguageId,
+  type PipelineRunResult,
   type ProjectFile,
   type WorkspaceSnapshot,
 } from "@client/shared";
 
-export async function runFullIndex(workspace: WorkspaceSnapshot): Promise<IndexResult> {
+interface IncrementalIndexOptions {
+  previousRun?: PipelineRunResult | null;
+  changedPaths?: string[];
+  deletedPaths?: string[];
+}
+
+export async function runFullIndex(
+  workspace: WorkspaceSnapshot,
+  options: IncrementalIndexOptions = {},
+): Promise<IndexResult> {
   const startedAt = new Date().toISOString();
   const symbols: IndexSymbol[] = [];
   const relations: IndexRelation[] = [];
@@ -20,11 +31,41 @@ export async function runFullIndex(workspace: WorkspaceSnapshot): Promise<IndexR
   const diagnostics = [...workspace.diagnostics];
   const languages = { ...workspace.summary.languages };
   let unsupportedFiles = 0;
+  let reusedFileCount = 0;
+  let reusedSymbolCount = 0;
+  let reusedRelationCount = 0;
+
+  const previousIndex = options.previousRun?.runtimeCache?.index ?? null;
+  const previousFileMap = new Map(previousIndex?.files.map((file) => [normalizePath(file.filePath), file]) ?? []);
+  const previousSymbolsByFile = groupByFilePath(previousIndex?.symbols ?? []);
+  const previousRelationsByFile = groupRelationsByFilePath(previousIndex?.relations ?? [], previousIndex?.symbols ?? []);
+  const deletedPathSet = new Set((options.deletedPaths ?? []).map((value) => normalizePath(value)));
+  const explicitChangedPathSet = new Set((options.changedPaths ?? []).map((value) => normalizePath(value)));
 
   const fileByRelativePath = new Map(workspace.files.map((file) => [normalizePath(file.relativePath), file]));
 
   for (const file of workspace.files) {
     try {
+      const normalizedPath = normalizePath(file.relativePath);
+      const previousFile = previousFileMap.get(normalizedPath);
+      const canReuse =
+        previousFile
+        && !deletedPathSet.has(normalizedPath)
+        && !explicitChangedPathSet.has(normalizedPath)
+        && previousFile.contentHash === file.contentHash;
+
+      if (canReuse) {
+        const previousFileSymbols = previousSymbolsByFile.get(normalizedPath) ?? [];
+        const previousFileRelations = previousRelationsByFile.get(normalizedPath) ?? [];
+        files.push(previousFile);
+        symbols.push(...previousFileSymbols);
+        relations.push(...previousFileRelations);
+        reusedFileCount += 1;
+        reusedSymbolCount += previousFileSymbols.length;
+        reusedRelationCount += previousFileRelations.length;
+        continue;
+      }
+
       const record = indexFile(file, fileByRelativePath);
       files.push(record.file);
       symbols.push(...record.symbols);
@@ -36,9 +77,24 @@ export async function runFullIndex(workspace: WorkspaceSnapshot): Promise<IndexR
     }
   }
 
+  const previousPaths = new Set(previousFileMap.keys());
+  const currentPaths = new Set(workspace.files.map((file) => normalizePath(file.relativePath)));
+  const deletedFiles = Array.from(previousPaths).filter((filePath) => !currentPaths.has(filePath) || deletedPathSet.has(filePath));
+  const currentSymbolKeys = new Set(symbols.map((symbol) => buildSymbolStateKey(symbol)));
+  const previousSymbols = previousIndex?.symbols ?? [];
+  const previousSymbolKeys = new Set(previousSymbols.map((symbol) => buildSymbolStateKey(symbol)));
+  const addedSymbols = countDifference(currentSymbolKeys, previousSymbolKeys);
+  const removedSymbols = countDifference(previousSymbolKeys, currentSymbolKeys);
+  const unchangedSymbols = countIntersection(currentSymbolKeys, previousSymbolKeys);
+  const updatedSymbols = Math.max(0, currentSymbolKeys.size - unchangedSymbols - addedSymbols);
+  const renamedFiles = (options.changedPaths ?? []).filter((filePath) => previousFileMap.has(normalizePath(filePath)) === false).length;
+  const parseEligibleFiles = previousIndex ? workspace.files.length : 0;
+  const reparsedFiles = workspace.files.length - reusedFileCount;
+
   return {
     manifest: {
       indexId: stableId(["index", workspace.projectId, startedAt]),
+      ...(previousIndex ? { baseIndexId: previousIndex.manifest.indexId } : {}),
       mode: workspace.summary.selectionMode === "selective" ? "selective" : "full",
       startedAt,
       completedAt: new Date().toISOString(),
@@ -47,6 +103,39 @@ export async function runFullIndex(workspace: WorkspaceSnapshot): Promise<IndexR
       symbolCount: symbols.length,
       relationCount: relations.length,
       diagnosticsCount: diagnostics.length,
+      reusedFileCount,
+      reusedSymbolCount,
+      reusedRelationCount,
+      reindexedFileCount: reparsedFiles,
+      deletedFileCount: deletedFiles.length,
+      parseCache: {
+        eligibleFiles: parseEligibleFiles,
+        reusedFiles: reusedFileCount,
+        reparsedFiles,
+        invalidatedFiles: explicitChangedPathSet.size + deletedFiles.length,
+        reason: previousIndex
+          ? "Parse cache повторно использует неизменённые файлы по content hash и file path."
+          : "Предыдущий индекс отсутствует, parse cache reuse недоступен.",
+      },
+      astCache: {
+        eligibleFiles: parseEligibleFiles,
+        reusedAstCount: reusedFileCount,
+        rebuiltAstCount: reparsedFiles,
+        invalidatedFiles: explicitChangedPathSet.size + deletedFiles.length,
+        reason: previousIndex
+          ? "AST cache повторно использует прежние структурные артефакты для неизменённых файлов."
+          : "Предыдущий индекс отсутствует, AST cache reuse недоступен.",
+      },
+      symbolDiff: {
+        changedFiles: explicitChangedPathSet.size,
+        renamedFiles,
+        deletedFiles: deletedFiles.length,
+        addedSymbols,
+        removedSymbols,
+        updatedSymbols,
+        unchangedSymbols,
+        reusedSymbols: reusedSymbolCount,
+      },
     },
     files,
     symbols,
@@ -83,6 +172,10 @@ function indexFile(
           fileId: file.id,
           filePath: file.relativePath,
           language: file.language,
+          contentHash: file.contentHash,
+          modifiedAt: file.modifiedAt,
+          parseCacheKey: buildParseCacheKey(file),
+          astFingerprint: buildAstFingerprint(file),
           symbolIds: [],
           imports: [],
         },
@@ -115,6 +208,7 @@ function extractScriptFile(
     const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
     const symbol: IndexSymbol = {
       id: stableId(["symbol", file.relativePath, symbolKind, containerName ?? "", name]),
+      stableSymbolId: stableId(["stable-symbol", symbolKind, containerName ?? "", name]),
       name,
       kind: symbolKind,
       language: file.language,
@@ -226,6 +320,10 @@ function extractScriptFile(
       fileId: file.id,
       filePath: file.relativePath,
       language: file.language,
+      contentHash: file.contentHash,
+      modifiedAt: file.modifiedAt,
+      parseCacheKey: buildParseCacheKey(file),
+      astFingerprint: buildAstFingerprint(file),
       symbolIds: symbols.map((symbol) => symbol.id),
       imports,
     },
@@ -259,6 +357,7 @@ function extractMarkdownFile(file: ProjectFile): {
 
     const symbol: IndexSymbol = {
       id: stableId(["symbol", file.relativePath, "heading", title]),
+      stableSymbolId: stableId(["stable-symbol", "heading", title.trim()]),
       name: title.trim(),
       kind: "heading",
       language: file.language,
@@ -281,6 +380,10 @@ function extractMarkdownFile(file: ProjectFile): {
       fileId: file.id,
       filePath: file.relativePath,
       language: file.language,
+      contentHash: file.contentHash,
+      modifiedAt: file.modifiedAt,
+      parseCacheKey: buildParseCacheKey(file),
+      astFingerprint: buildAstFingerprint(file),
       symbolIds: symbols.map((symbol) => symbol.id),
       imports: [],
     },
@@ -303,6 +406,7 @@ function extractJsonFile(file: ProjectFile): {
     for (const key of Object.keys(parsed)) {
       const symbol: IndexSymbol = {
         id: stableId(["symbol", file.relativePath, "json-key", key]),
+        stableSymbolId: stableId(["stable-symbol", "json-key", key]),
         name: key,
         kind: "json-key",
         language: file.language,
@@ -324,6 +428,10 @@ function extractJsonFile(file: ProjectFile): {
         fileId: file.id,
         filePath: file.relativePath,
         language: file.language,
+        contentHash: file.contentHash,
+        modifiedAt: file.modifiedAt,
+        parseCacheKey: buildParseCacheKey(file),
+        astFingerprint: buildAstFingerprint(file),
         symbolIds: [],
         imports: [],
       },
@@ -337,6 +445,10 @@ function extractJsonFile(file: ProjectFile): {
       fileId: file.id,
       filePath: file.relativePath,
       language: file.language,
+      contentHash: file.contentHash,
+      modifiedAt: file.modifiedAt,
+      parseCacheKey: buildParseCacheKey(file),
+      astFingerprint: buildAstFingerprint(file),
       symbolIds: symbols.map((symbol) => symbol.id),
       imports: [],
     },
@@ -373,6 +485,7 @@ function extractPhpFile(
   ): IndexSymbol => {
     const symbol: IndexSymbol = {
       id: stableId(["symbol", file.relativePath, symbolKind, containerName ?? "", name]),
+      stableSymbolId: stableId(["stable-symbol", symbolKind, containerName ?? "", name]),
       name,
       kind: symbolKind,
       language: file.language,
@@ -600,12 +713,90 @@ function extractPhpFile(
       fileId: file.id,
       filePath: file.relativePath,
       language: file.language,
+      contentHash: file.contentHash,
+      modifiedAt: file.modifiedAt,
+      parseCacheKey: buildParseCacheKey(file),
+      astFingerprint: buildAstFingerprint(file),
       symbolIds: symbols.map((symbol) => symbol.id),
       imports,
     },
     symbols,
     relations,
   };
+}
+
+function buildParseCacheKey(file: ProjectFile): string {
+  return stableId(["parse-cache", file.relativePath, file.contentHash]);
+}
+
+function buildAstFingerprint(file: ProjectFile): string {
+  return contentHash(`${file.language}:${file.relativePath}:${file.contentHash}`);
+}
+
+function groupByFilePath(symbols: IndexSymbol[]): Map<string, IndexSymbol[]> {
+  const map = new Map<string, IndexSymbol[]>();
+
+  for (const symbol of symbols) {
+    const key = normalizePath(symbol.filePath);
+    const current = map.get(key) ?? [];
+    current.push(symbol);
+    map.set(key, current);
+  }
+
+  return map;
+}
+
+function groupRelationsByFilePath(relations: IndexRelation[], symbols: IndexSymbol[]): Map<string, IndexRelation[]> {
+  const symbolFileMap = new Map(symbols.map((symbol) => [symbol.id, normalizePath(symbol.filePath)]));
+  const map = new Map<string, IndexRelation[]>();
+
+  for (const relation of relations) {
+    const key = symbolFileMap.get(relation.sourceId) ?? relation.metadata?.sourceFilePath;
+
+    if (typeof key !== "string") {
+      continue;
+    }
+
+    const current = map.get(key) ?? [];
+    current.push(relation);
+    map.set(key, current);
+  }
+
+  return map;
+}
+
+function buildSymbolStateKey(symbol: IndexSymbol): string {
+  return [
+    symbol.stableSymbolId,
+    symbol.filePath,
+    symbol.line,
+    symbol.signature ?? "",
+    symbol.containerName ?? "",
+  ].join("::");
+}
+
+function countDifference(left: Set<string>, right: Set<string>): number {
+  let count = 0;
+
+  for (const item of left) {
+    if (!right.has(item)) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function countIntersection(left: Set<string>, right: Set<string>): number {
+  let count = 0;
+
+  for (const item of left) {
+    if (right.has(item)) {
+      count += 1;
+    }
+  }
+
+  return count;
 }
 
 function resolveImportTarget(
