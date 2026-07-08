@@ -10,6 +10,10 @@ import {
 } from "@client/graph";
 import {
   clamp,
+  deriveLocalizationBucket,
+  deriveStructuralModuleLabel,
+  isConfigPath,
+  isLocalizationPath,
   scoreText,
   tokenize,
   type GraphState,
@@ -1509,7 +1513,7 @@ function getLocalizationFileBoost(
     score += 60;
   }
 
-  if (pathText.startsWith("lang/") || pathText.includes("/lang/")) {
+  if (pathText.includes("/lang/") || pathText.startsWith("lang/") || pathText.includes("/translations/")) {
     score += 24;
   }
 
@@ -1829,11 +1833,18 @@ function extractResearchZonesFromPath(filePath: string): string[] {
   }
 
   if (isLocalizationPath(normalized)) {
-    zones.push("localization");
+    const localeBucket = deriveLocalizationBucket(filePath);
+    zones.push(localeBucket ? `localization:${localeBucket}` : "localization");
   }
 
   if (isConfigPath(normalized)) {
     zones.push("config");
+  }
+
+  const structuralModule = deriveStructuralModuleLabel(filePath);
+
+  if (structuralModule.startsWith("container:")) {
+    zones.push(structuralModule);
   }
 
   return zones;
@@ -1850,10 +1861,10 @@ function detectLocalizationEntryPoints(input: ResearchInput): string[] {
       continue;
     }
 
-    const parts = file.relativePath.split("/");
+    const localeBucket = deriveLocalizationBucket(file.relativePath);
 
-    if (parts.length >= 2) {
-      directories.add(`${parts[0]}/${parts[1]}`);
+    if (localeBucket) {
+      directories.add(`localization/${localeBucket}`);
     }
 
     files.push(file.relativePath);
@@ -1872,25 +1883,14 @@ function detectLocalizationCodes(input: ResearchInput): string[] {
       continue;
     }
 
-    const parts = file.relativePath.split("/");
+    const localeBucket = deriveLocalizationBucket(file.relativePath);
 
-    if (parts.length >= 2 && parts[1]) {
-      codes.add(parts[1]);
+    if (localeBucket) {
+      codes.add(localeBucket);
     }
   }
 
   return [...codes].sort();
-}
-
-function isLocalizationPath(filePath: string): boolean {
-  return (
-    filePath.startsWith("lang/")
-    || filePath.includes("/lang/")
-    || filePath.startsWith("locales/")
-    || filePath.includes("/locales/")
-    || filePath.includes("/i18n/")
-    || filePath.includes("/translations/")
-  );
 }
 
 function detectConfigEntryPoints(input: ResearchInput): string[] {
@@ -1926,14 +1926,6 @@ function detectEnvKeys(input: ResearchInput): string[] {
   return [...keys].sort();
 }
 
-function isConfigPath(filePath: string): boolean {
-  return (
-    filePath.startsWith("config/")
-    || filePath.includes("/config/")
-    || filePath.endsWith(".env")
-    || filePath.includes(".env.")
-  );
-}
 
 function hasSpecificIntentSignal(tokens: string[]): boolean {
   return INTENT_PROFILES.some((profile) =>

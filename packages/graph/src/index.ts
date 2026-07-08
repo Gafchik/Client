@@ -1,4 +1,6 @@
 import {
+  deriveStructuralModuleLabel,
+  isLocalizationPath,
   type GraphNodeKind,
   type GraphRelationType,
   type ResearchQueryProfileKey,
@@ -604,10 +606,7 @@ export function getLocalizationInventoryNodes(graph: GraphState): GraphNode[] {
       label.includes("localization")
       || label.includes("translation")
       || label.includes("locale")
-      || filePath.startsWith("lang/")
-      || filePath.includes("/lang/")
-      || filePath.includes("/locales/")
-      || filePath.includes("/i18n/")
+      || isLocalizationPath(filePath)
     );
   });
 }
@@ -660,7 +659,7 @@ export function getNodesForQueryProfile(
 }
 
 function getModuleLabel(filePath: string): string {
-  return filePath.split("/")[0] || "root";
+  return deriveStructuralModuleLabel(filePath);
 }
 
 function getFolderPath(filePath: string): string {

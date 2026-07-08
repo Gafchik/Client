@@ -1,5 +1,7 @@
 import {
   clamp,
+  isConfigPath,
+  isLocalizationPath,
   stableId,
   type ContextCandidate,
   type ContextPackage,
@@ -928,24 +930,6 @@ function scoreBroadScanContext(filePath: string, text: string, input: BuildConte
 
 function candidateFilePath(filePath: string, _input: BuildContextInput): string {
   return filePath;
-}
-
-function isLocalizationPath(filePath: string): boolean {
-  return (
-    filePath.startsWith("lang/")
-    || filePath.includes("/lang/")
-    || filePath.includes("/locales/")
-    || filePath.includes("/i18n/")
-  );
-}
-
-function isConfigPath(filePath: string): boolean {
-  return (
-    filePath.startsWith("config/")
-    || filePath.includes("/config/")
-    || filePath.endsWith(".env")
-    || filePath.includes(".env.")
-  );
 }
 
 function isStoragePath(filePath: string): boolean {

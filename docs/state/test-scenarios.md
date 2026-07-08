@@ -27,6 +27,13 @@
 - `yellow` — частично проходит, но есть шум
 - `red` — пока системно проваливается
 
+## Benchmark Projects
+
+- `slay-api` — базовый рабочий Laravel-like проект для быстрых функциональных и inventory проверок.
+- `magendamd_backend` — основной stress-benchmark для больших PHP/enterprise проектов с нестандартной container-style архитектурой.
+- Для `magendamd_backend` оценивается не только точность, но и latency полного pipeline на большом дереве проекта.
+- Для `magendamd_backend` large-repository режим считается обязательной частью наблюдаемого поведения pipeline.
+
 ## 1. Functional Flow
 
 ### 1.1 Авторизация

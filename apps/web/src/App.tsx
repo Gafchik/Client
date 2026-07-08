@@ -1,5 +1,5 @@
 import { startTransition, useEffect, useState } from "react";
-import type { ContextCandidate, KnowledgeCatalogEntry, PipelineRunResult, PipelineStage } from "@client/shared";
+import type { ContextCandidate, KnowledgeCatalogEntry, PipelineRunResult, PipelineRunStatus, PipelineStage } from "@client/shared";
 
 interface ProjectInfo {
   name: string;
@@ -8,6 +8,7 @@ interface ProjectInfo {
     totalFiles: number;
     indexedFiles: number;
     languages: Record<string, number>;
+    profile?: "standard" | "large-repository";
   };
   recentRuns: KnowledgeCatalogEntry[];
   latestRun: PipelineRunResult | null;
@@ -72,6 +73,9 @@ function ProjectPanel({ project, loading }: { project: ProjectInfo | null; loadi
           <p className="stat">
             <strong>{safeCount(project.summary?.indexedFiles)}</strong> файлов проиндексировано в{" "}
             <strong>{Object.keys(project.summary?.languages ?? {}).length}</strong> языках.
+          </p>
+          <p className="muted">
+            Профиль репозитория: {safeText(project.summary?.profile, "standard")}
           </p>
           <div className="chips">
             {Object.entries(project.summary?.languages ?? {}).map(([language, count]) => (
@@ -287,6 +291,20 @@ function IndexArtifact({ result }: { result: PipelineRunResult }) {
     <div className="stack">
       <div className="list">
         <div className="list-item">
+          <strong>Git / ветка</strong>
+          <span>{safeText(result.repository?.branch, result.repository?.isGitRepository ? "HEAD" : "Не Git-репозиторий")}</span>
+        </div>
+        <div className="list-item">
+          <strong>Git / HEAD</strong>
+          <span>{safeText(result.repository?.headCommit, "Недоступно")}</span>
+        </div>
+        <div className="list-item">
+          <strong>Git / working tree</strong>
+          <span>
+            Всего {safeCount(result.repository?.summary?.changedFileCount)}, staged {safeCount(result.repository?.summary?.stagedCount)}, unstaged {safeCount(result.repository?.summary?.unstagedCount)}, untracked {safeCount(result.repository?.summary?.untrackedCount)}
+          </span>
+        </div>
+        <div className="list-item">
           <strong>Манифест</strong>
           <span>{safeText(result.index?.manifest?.indexId)}</span>
         </div>
@@ -312,6 +330,10 @@ function KnowledgeArtifact({ result }: { result: PipelineRunResult }) {
   return (
     <div className="stack">
       <div className="list">
+        <div className="list-item">
+          <strong>Repository Git</strong>
+          <span>{result.repository?.isGitRepository ? "Подключён" : "Не обнаружен"}</span>
+        </div>
         <div className="list-item">
           <strong>Base URL провайдера</strong>
           <span>{safeText(result.provider?.baseUrl, "Не задан")}</span>
@@ -403,16 +425,34 @@ function StagesPanel({ result }: { result: PipelineRunResult | null }) {
 function DiagnosticsPanel({ result }: { result: PipelineRunResult | null }) {
   const ignoredPaths = hasRunArtifacts(result) ? safeList(result.workspace?.ignoredPaths) : [];
   const diagnostics = hasRunArtifacts(result) ? safeList(result.index?.diagnostics) : [];
+  const repositoryDiagnostics = hasRunArtifacts(result) ? safeList(result.repository?.diagnostics) : [];
+  const diagnosticsCount = ignoredPaths.length + diagnostics.length + repositoryDiagnostics.length;
 
   return (
     <article className="panel">
       <div className="panel-header">
         <h2>Диагностика и Исключения</h2>
-        <span>{hasRunArtifacts(result) ? ignoredPaths.length + diagnostics.length : 0}</span>
+        <span>{hasRunArtifacts(result) ? diagnosticsCount : 0}</span>
       </div>
 
       {hasRunArtifacts(result) ? (
         <div className="stack">
+          <div className="list">
+            <div className="list-item">
+              <strong>Диагностика repository/git</strong>
+              <span>{repositoryDiagnostics.length}</span>
+            </div>
+            {repositoryDiagnostics.length ? (
+              repositoryDiagnostics.slice(0, 10).map((diagnostic) => (
+                <div key={diagnostic} className="list-item compact">
+                  <span>{diagnostic}</span>
+                </div>
+              ))
+            ) : (
+              <p className="muted">Git-диагностика не выявила критичных проблем.</p>
+            )}
+          </div>
+
           <div className="list">
             <div className="list-item">
               <strong>Игнорируемые пути</strong>
@@ -674,6 +714,7 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
   const validationScope = hasRunArtifacts(result) ? safeList(result.plan?.validationScope).slice(0, 6) : [];
   const planningNotes = hasRunArtifacts(result) ? safeList(result.plan?.planningNotes).slice(0, 6) : [];
   const dependencyChains = hasRunArtifacts(result) ? safeList(result.plan?.dependencyChains).slice(0, 6) : [];
+  const repositoryChanges = hasRunArtifacts(result) ? safeList(result.repository?.changedFiles).slice(0, 8) : [];
 
   return (
     <article className="panel">
@@ -709,6 +750,21 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
               ))
             ) : (
               <PanelFallback title="Planning notes" message="Для этого запуска notes планирования недоступны." />
+            )}
+          </div>
+          <div className="list">
+            {repositoryChanges.length ? (
+              repositoryChanges.map((change) => (
+                <div key={`${change.scope}:${change.changeType}:${change.previousPath ?? ""}:${change.path}`} className="list-item">
+                  <strong>Git change scope</strong>
+                  <span>
+                    {change.scope} / {change.changeType} / {change.previousPath ? `${change.previousPath} -> ` : ""}
+                    {change.path}
+                  </span>
+                </div>
+              ))
+            ) : (
+              <PanelFallback title="Git change scope" message="Локальные изменения в репозитории не обнаружены или Git недоступен." />
             )}
           </div>
           <div className="list">
@@ -768,6 +824,27 @@ function PlanPanel({ result }: { result: PipelineRunResult | null }) {
               <span>Переиндексация: да / Обновление графа: да / Обновление знаний: да</span>
             </div>
           </div>
+          <div className="list">
+            <div className="list-item">
+              <strong>Controlled execution runtime</strong>
+              <span>{safeText(result.executionRuntime?.summary)}</span>
+            </div>
+            <div className="list-item compact">
+              <span>Статус: {safeText(result.executionRuntime?.status, "Недоступно")}</span>
+            </div>
+            <div className="list-item compact">
+              <span>Разрешённые файлы: {safeList(result.executionRuntime?.allowedWriteFiles).slice(0, 8).join(", ") || "Нет данных"}</span>
+            </div>
+            <div className="list-item compact">
+              <span>Заблокированные write-зоны: {safeList(result.executionRuntime?.blockedWriteZones).join(", ") || "Нет данных"}</span>
+            </div>
+            <div className="list-item compact">
+              <span>Scope guards: {safeList(result.executionRuntime?.scopeGuards).slice(0, 3).join(" | ") || "Нет данных"}</span>
+            </div>
+            <div className="list-item compact">
+              <span>Approval checks: {safeList(result.executionRuntime?.approvalChecks).slice(0, 3).join(" | ") || "Нет данных"}</span>
+            </div>
+          </div>
           <code className="path">{safeText(result.knowledge?.storagePath)}</code>
         </div>
       ) : (
@@ -788,6 +865,7 @@ export function App() {
   });
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [runStatus, setRunStatus] = useState<PipelineRunStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PipelineRunResult | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -874,38 +952,72 @@ export function App() {
         throw new Error(payload.message ?? "Не удалось запустить пайплайн.");
       }
 
-      const data = (await response.json()) as PipelineRunResult;
+      const accepted = (await response.json()) as PipelineRunStatus;
 
       startTransition(() => {
-        setResult(data);
-        setSelectedRunId(data.runId);
+        setRunStatus(accepted);
+        setSelectedRunId(accepted.runId);
         setActiveArtifact("research");
-        setProject((current) =>
-          current
-            ? {
-                ...current,
-                name: data.project.name,
-                rootPath: data.project.rootPath,
-                summary: data.project.summary,
-                latestRun: data,
-                recentRuns: [
-                  {
-                    runId: data.runId,
-                    task,
-                    savedAt: data.knowledge.savedAt,
-                    storagePath: data.knowledge.storagePath,
-                    summary: data.research.summary,
-                  },
-                  ...current.recentRuns.filter((entry) => entry.runId !== data.runId),
-                ].slice(0, 20),
-              }
-            : current,
-        );
       });
+
+      await pollPipelineStatus(accepted.runId);
     } catch (runError) {
       setError(runError instanceof Error ? runError.message : "Не удалось выполнить пайплайн.");
     } finally {
       setRunning(false);
+    }
+  }
+
+  async function pollPipelineStatus(runId: string) {
+    for (;;) {
+      const response = await fetch(`${API_BASE_URL}/api/pipeline/status?runId=${encodeURIComponent(runId)}`);
+
+      if (!response.ok) {
+        const payload = (await response.json()) as { message?: string };
+        throw new Error(payload.message ?? "Не удалось получить статус пайплайна.");
+      }
+
+      const status = (await response.json()) as PipelineRunStatus;
+
+      startTransition(() => {
+        setRunStatus(status);
+      });
+
+      if (status.status === "completed" && status.result) {
+        startTransition(() => {
+          setResult(status.result ?? null);
+          setProject((current) =>
+            current
+              ? {
+                  ...current,
+                  name: status.result?.project.name ?? current.name,
+                  rootPath: status.result?.project.rootPath ?? current.rootPath,
+                  summary: status.result?.project.summary ?? current.summary,
+                  latestRun: status.result ?? current.latestRun,
+                  recentRuns: status.result
+                    ? [
+                        {
+                          runId: status.result.runId,
+                          task: status.task,
+                          savedAt: status.result.knowledge.savedAt,
+                          storagePath: status.result.knowledge.storagePath,
+                          summary: status.result.research.summary,
+                        },
+                        ...current.recentRuns.filter((entry) => entry.runId !== status.result?.runId),
+                      ].slice(0, 20)
+                    : current.recentRuns,
+                }
+              : current,
+          );
+        });
+        return;
+      }
+
+      if (status.status === "failed") {
+        throw new Error(status.errorMessage || "Пайплайн завершился ошибкой.");
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
   }
 
@@ -1013,6 +1125,19 @@ export function App() {
             {running ? "Запускаю структурный пайплайн..." : "Запустить структурный пайплайн"}
           </button>
         </form>
+
+        {runStatus ? (
+          <div className="list">
+            <div className="list-item">
+              <strong>Статус запуска</strong>
+              <span>{runStatus.status}</span>
+            </div>
+            <div className="list-item">
+              <strong>Текущий этап</strong>
+              <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span>
+            </div>
+          </div>
+        ) : null}
 
         {error ? <p className="error">{error}</p> : null}
       </section>

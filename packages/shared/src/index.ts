@@ -77,6 +77,8 @@ export interface WorkspaceSummary {
   totalFiles: number;
   indexedFiles: number;
   languages: Record<string, number>;
+  profile?: "standard" | "large-repository";
+  selectionMode?: "full" | "selective";
 }
 
 export interface WorkspaceSnapshot {
@@ -120,7 +122,7 @@ export interface IndexedFile {
 
 export interface IndexManifest {
   indexId: string;
-  mode: "full";
+  mode: "full" | "selective";
   startedAt: string;
   completedAt: string;
   projectId: string;
@@ -140,6 +142,39 @@ export interface IndexResult {
     languages: Record<string, number>;
     unsupportedFiles: number;
   };
+}
+
+export interface RepositoryChangedFile {
+  path: string;
+  previousPath?: string;
+  changeType: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "type-changed" | "unknown";
+  scope: "staged" | "unstaged" | "untracked";
+}
+
+export interface RepositorySnapshot {
+  repositoryId: string;
+  projectId: string;
+  rootPath: string;
+  branch: string;
+  headCommit: string;
+  mergeBase: string;
+  upstream: string;
+  isGitRepository: boolean;
+  isDirty: boolean;
+  isDetachedHead: boolean;
+  hasUnmergedPaths: boolean;
+  hasUntrackedFiles: boolean;
+  changedFiles: RepositoryChangedFile[];
+  diagnostics: string[];
+  summary: {
+    changedFileCount: number;
+    stagedCount: number;
+    unstagedCount: number;
+    untrackedCount: number;
+    deletedCount: number;
+    renamedCount: number;
+  };
+  scannedAt: string;
 }
 
 export interface GraphNode {
@@ -324,6 +359,20 @@ export interface ExecutionPreview {
   knowledgeRefreshRequired: true;
 }
 
+export interface ControlledExecutionRuntime {
+  runtimeId: string;
+  runId: string;
+  mode: "controlled-runtime";
+  status: "ready-for-approval" | "blocked";
+  summary: string;
+  allowedWriteFiles: string[];
+  blockedWriteZones: string[];
+  scopeGuards: string[];
+  approvalChecks: string[];
+  refreshPlan: string[];
+  executionAllowed: false;
+}
+
 export interface KnowledgeCatalogEntry {
   runId: string;
   task: string;
@@ -341,9 +390,9 @@ export interface KnowledgeSaveResult {
 }
 
 export interface PipelineStage {
-  key: "workspace" | "index" | "graph" | "research" | "impact" | "context" | "plan" | "preview" | "knowledge";
+  key: "workspace" | "repository" | "index" | "graph" | "research" | "impact" | "context" | "plan" | "preview" | "runtime" | "knowledge";
   label: string;
-  status: "completed";
+  status: "pending" | "running" | "completed" | "failed";
   startedAt: string;
   completedAt: string;
   details: string;
@@ -369,6 +418,7 @@ export interface PipelineRunResult {
     summary: WorkspaceSummary;
   };
   workspace: PipelineWorkspaceDetails;
+  repository: RepositorySnapshot;
   provider: ProviderRuntimeConfig;
   index: {
     manifest: IndexManifest;
@@ -384,7 +434,22 @@ export interface PipelineRunResult {
   context: ContextPackage;
   plan: ExecutionPlan;
   executionPreview: ExecutionPreview;
+  executionRuntime: ControlledExecutionRuntime;
   knowledge: KnowledgeSaveResult;
+}
+
+export interface PipelineRunStatus {
+  runId: string;
+  task: string;
+  projectPath: string;
+  status: "queued" | "running" | "completed" | "failed";
+  createdAt: string;
+  updatedAt: string;
+  currentStageKey?: PipelineStage["key"];
+  currentStageLabel?: string;
+  stages: PipelineStage[];
+  result?: PipelineRunResult;
+  errorMessage?: string;
 }
 
 export function stableId(parts: Array<string | number>): string {
@@ -422,4 +487,86 @@ export function scoreText(haystack: string, tokens: string[]): number {
 
 export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+export function isLocalizationPath(filePath: string): boolean {
+  const normalized = normalizePath(filePath).toLowerCase();
+
+  return (
+    normalized.startsWith("lang/")
+    || normalized.includes("/lang/")
+    || normalized.startsWith("locales/")
+    || normalized.includes("/locales/")
+    || normalized.includes("/i18n/")
+    || normalized.includes("/translations/")
+  );
+}
+
+export function isConfigPath(filePath: string): boolean {
+  const normalized = normalizePath(filePath).toLowerCase();
+
+  return (
+    normalized.startsWith("config/")
+    || normalized.includes("/config/")
+    || normalized.endsWith(".env")
+    || normalized.includes(".env.")
+  );
+}
+
+export function deriveStructuralModuleLabel(filePath: string): string {
+  const normalized = normalizePath(filePath);
+  const parts = normalized.split("/").filter(Boolean);
+
+  if (parts.length === 0) {
+    return "root";
+  }
+
+  if (parts[0] === "app" && parts[1] === "src" && parts[2] === "Containers" && parts[3]) {
+    return `container:${parts[3]}`;
+  }
+
+  if (parts[0] === "app" && parts[1] === "src" && parts[2] === "Ship") {
+    return "ship";
+  }
+
+  if (parts[0] === "resources" && parts[1] === "lang" && parts[2]) {
+    return `localization:${parts[2]}`;
+  }
+
+  if (parts[0] === "resources" && parts[1] === "views" && parts[2]) {
+    return `views:${parts[2]}`;
+  }
+
+  if (parts[0] === "database" && parts[1]) {
+    return `database:${parts[1]}`;
+  }
+
+  if (parts[0] === "routes" && parts[1]) {
+    return `routes:${parts[1]}`;
+  }
+
+  return parts[0] || "root";
+}
+
+export function deriveLocalizationBucket(filePath: string): string | null {
+  const normalized = normalizePath(filePath);
+  const parts = normalized.split("/").filter(Boolean);
+
+  if (parts[0] === "lang" && parts[1]) {
+    return parts[1];
+  }
+
+  const langIndex = parts.findIndex((part) => part.toLowerCase() === "lang");
+
+  if (langIndex >= 0 && parts[langIndex + 1]) {
+    return parts[langIndex + 1] ?? null;
+  }
+
+  const localesIndex = parts.findIndex((part) => part.toLowerCase() === "locales");
+
+  if (localesIndex >= 0 && parts[localesIndex + 1]) {
+    return parts[localesIndex + 1] ?? null;
+  }
+
+  return null;
 }

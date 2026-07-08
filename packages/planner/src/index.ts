@@ -1,5 +1,7 @@
 import { getFileDependencies, getFileDependents, getModuleDependencyNeighbors, getModuleDependents } from "@client/graph";
 import {
+  isConfigPath,
+  isLocalizationPath,
   stableId,
   type ContextPackage,
   type ExecutionPlan,
@@ -529,11 +531,11 @@ function derivePlanningGroupLabel(filePath: string, targetModules: string[]): st
     return semanticPrefix ? `${semanticPrefix}-migrations` : matchedModule ? `${matchedModule}:migrations` : "migrations";
   }
 
-  if (normalized.startsWith("config/") || normalized.includes("/config/") || normalized.endsWith(".env") || normalized.includes(".env.")) {
+  if (isConfigPath(normalized)) {
     return semanticPrefix ? `${semanticPrefix}-config` : matchedModule ? `${matchedModule}:config` : "config";
   }
 
-  if (normalized.startsWith("lang/") || normalized.includes("/lang/") || normalized.includes("/locales/") || normalized.includes("/i18n/")) {
+  if (isLocalizationPath(normalized)) {
     return semanticPrefix ? `${semanticPrefix}-localization` : matchedModule ? `${matchedModule}:localization` : "localization";
   }
 
@@ -621,11 +623,11 @@ function deriveSemanticPrefix(filePath: string, matchedModule: string | undefine
     return "vault";
   }
 
-  if (normalized.startsWith("config/") || normalized.includes("/config/") || normalized.endsWith(".env") || normalized.includes(".env.")) {
+  if (isConfigPath(normalized)) {
     return "config";
   }
 
-  if (normalized.startsWith("lang/") || normalized.includes("/lang/") || normalized.includes("/locales/") || normalized.includes("/i18n/")) {
+  if (isLocalizationPath(normalized)) {
     return "localization";
   }
 

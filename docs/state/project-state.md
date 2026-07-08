@@ -7,12 +7,13 @@
 
 - Базовый monorepo foundation на `apps/api`, `apps/web`, `packages/*`.
 - Рабочий структурный pipeline:
-  - `Workspace`
-  - `Index`
-  - `Graph`
-  - `Research`
-  - `Impact`
-  - `Knowledge`
+- `Workspace`
+- `Index`
+- `Graph`
+- `Repository Git Intelligence`
+- `Research`
+- `Impact`
+- `Knowledge`
 - Русскоязычный операторский интерфейс для первого контура.
 - В операторском интерфейсе добавлен runtime-config слой для будущего AI provider integration:
   - `Base URL провайдера`
@@ -56,6 +57,10 @@
   - impact стал query-profile-aware: functional, storage, localization, config и broad вопросы теперь расширяют scope по разным правилам;
   - risk markers начали учитывать тип вопроса, а inventory-вопросы перестали принудительно раздуваться до runtime-like blast radius.
 - Safe execution preview без реальной модификации проекта.
+- Первый controlled execution runtime без модели:
+  - добавлен отдельный runtime contract layer;
+  - фиксируются allowed write files, blocked write zones, scope guards, approval checks и refresh plan;
+  - execution по-прежнему запрещён без отдельного mutation/runtime слоя и human approval.
 - Functional Research MVP:
   - `Research Report` теперь включает functional summary;
   - выделяются entry points, primary entities, side effects и data sources;
@@ -72,17 +77,49 @@
   - query layer теперь умеет отдавать module dependency neighbors, file dependencies/dependents, symbol dependencies/dependents, entry-point neighbors и relation summaries для downstream-модулей.
   - добавлен profile-driven graph query слой для `entrypoint-traversal`, `storage-topology`, `localization-inventory`, `config-inventory`, `broad-scan`;
   - Research теперь использует эти graph seed-наборы не только как metadata-label, а как реальный источник initial focus и structural boosting при сборе evidence.
+  - module labeling стал более универсальным: container-style, localization-, database- и route-oriented структуры теперь нормализуются в общие structural zones, а не завязаны на один проект.
 - Performance-pass для больших проектов:
   - лёгкий project overview scan без чтения содержимого файлов;
   - исключение тяжёлых директорий вроде `vendor`;
   - ограничение на слишком большие файлы;
   - снят повторный полный rescan после завершения run.
+  - workspace теперь дополнительно игнорирует шумные runtime/build директории больших PHP-монолитов (`storage`, `bootstrap/cache`, `generated`, `pub/static`, `var`, `logs`);
+  - indexer для PHP получил более дешёвый line-number lookup и pre-collected property types, чтобы heavy files не деградировали из-за повторных `slice/split` и повторного regex-поиска по всему файлу.
+  - введён `large-repository` профиль в workspace summary как первый шаг к fast-first staged pipeline для очень больших репозиториев;
+  - API и UI теперь явно показывают, когда full run выполняется в режиме большого репозитория.
 - Backward compatibility для старых run-артефактов без `Context Package`, `Execution Plan` и `Execution Preview`.
 - Frontend reliability pass:
   - `ErrorBoundary`;
   - fallback screen вместо белого экрана;
   - runtime failure logging в browser console;
   - widget-level guards и мягкая деградация отдельных панелей при неполных или старых артефактах.
+- Архитектурный слой исторического repository intelligence формализован отдельной спецификацией:
+  - `docs/modules/repository-git.md`
+  - Git закреплён как самостоятельный источник инженерных знаний, а не как вспомогательная утилита внутри `Research` или `Workspace`;
+  - зафиксировано разделение:
+    - `Graph` отвечает за текущее структурное состояние;
+    - `Repository Git Intelligence` отвечает за историческое и operational состояние репозитория;
+    - `Research`, `Planner`, `Execution Engine` и `Knowledge` должны использовать оба измерения совместно.
+- Реализован `Repository Git Intelligence MVP`:
+  - добавлен пакет `packages/repository-git`;
+  - pipeline теперь строит реальный `repository snapshot` перед индексированием;
+  - сохраняются `branch`, `HEAD`, `merge base`, `working tree changed set`, `repository diagnostics`;
+  - UI показывает Git-состояние, change scope и repository diagnostics;
+  - knowledge artifacts теперь включают repository layer как часть run context.
+- Large-repository fast-first evolution продолжена:
+  - добавлен `selective workspace open`;
+  - large-repository pipeline теперь может использовать Git changed set как seed для частичного чтения проекта;
+  - index manifest теперь различает `full` и `selective` режимы;
+  - API stage details показывают, когда large repository был обработан через selective scan вместо полного прохода.
+- Pipeline execution flow усилен:
+  - запуск пайплайна переведён в фоновый job-runner;
+  - `POST /api/pipeline/run` больше не держит HTTP-запрос до конца полного анализа;
+  - добавлен polling статуса выполнения через отдельный status endpoint;
+  - UI показывает текущий этап выполнения и больше не зависит от одного длинного синхронного HTTP-ответа.
+- Runtime status durability усилена:
+  - `PipelineRunStatus` теперь сохраняется на диск внутри `.client`;
+  - переходы между стадиями больше не живут только в памяти процесса;
+  - long-running анализы стали устойчивее к операторскому наблюдению и последующей отладке.
 
 ## Текущее состояние MVP Slice 1
 
@@ -117,16 +154,37 @@
 - Research уже начал использовать graph-derived entry points и module relation summaries, но всё ещё остаётся эвристическим и требует дальнейшего углубления semantic layer.
 - Research теперь частично graph-profile-driven на уровне seed selection, но всё ещё нуждается в более глубоком semantic traversal и снижении шума внутри близких доменов.
 - Research уже уверенно различает несколько классов вопросов (`functional`, `infrastructure`, `localization`, `config/env`), но всё ещё нуждается в дальнейшем semantic routing и лучшей защите от остаточного шума внутри близких доменных зон.
+- Research/Impact/Context/Planner теперь используют общие structural path helpers, но всё ещё нуждаются в более глубоком semantic понимании нестандартных enterprise-архитектур.
 - Context Builder уже использует priority-based ranking и explainable selection, но пока без model-aware tokenization и без полноценного semantic reranking.
 - Context Builder стал zone-aware и лучше отражает functional grouping, но пока без model-aware tokenization и без полноценного semantic reranking.
 - Context Builder уже умеет удерживать баланс между summary и structural anchors, но пока не строит model-specific chunk shapes и не использует semantic deduplication на уровне смысла.
 - Context Builder теперь учитывает query profile Research как фильтр против нерелевантных файлов, но всё ещё нуждается в semantic chunking и в более точном token budgeting под конкретные модели.
 - Planner теперь строит richer graph-backed deterministic plan, но всё ещё без полноценного execution runtime, rollback orchestration и live replanning.
 - Planner уже чувствителен к типу исследовательского профиля, но ещё не использует формальный rollback-plan и pre-execution blocking rules по confidence/unknowns.
-- Execution layer пока представлен только safe preview, без фактической мутации файлов.
+- Execution layer теперь имеет safe preview и controlled runtime contract, но всё ещё без фактической мутации файлов.
 - Provider runtime config уже собирается и сохраняется вместе с запуском, но фактический live-вызов модели ещё не подключён.
 - История запусков пока строится из локально сохранённых JSON-артефактов.
 - Фронт теперь защищён от полного белого экрана и от большинства partial-data сбоев на уровне отдельных виджетов, но всё ещё требует дальнейшего hardening UI-flow.
+- Large-repository профиль уже помечается системно, но сам pipeline всё ещё выполняется как один full run и требует дальнейшего staged/incremental разбиения.
+- Git как источник истории уже описан архитектурно, но ещё не реализован как runtime subsystem и пока не участвует в incremental reindex, regression analysis и rollback-aware planning.
+- Git уже встроен как runtime subsystem первого уровня, но пока ещё не участвует глубоко в:
+  - настоящем incremental reindex на повторных прогонах;
+  - regression origin analysis;
+  - co-change / hotspot intelligence;
+  - rollback-aware planner logic;
+  - historical enrichment research и knowledge.
+- Selective large-repository режим уже есть, но пока он остаётся cheap-first эвристикой:
+  - seed строится по Git changed set, path-token match и structural fallback;
+  - ещё нет настоящего symbol-aware partial graph invalidation;
+  - ещё нет persisted incremental cache между запусками.
+- Async job-runner уже убирает блокировку API на длинных прогонах, но пока:
+  - выполняется внутри одного процесса;
+  - ещё не умеет полноценный resume после рестарта через восстановление in-flight job execution;
+  - не стримит частичные артефакты по стадиям, а только статус и финальный результат.
+- Status persistence уже есть, но пока:
+  - статус сохраняется как snapshot, а не как event log;
+  - нет отдельной cleanup / retention policy для pipeline-status файлов;
+  - нет восстановления runStore из сохранённого статуса при cold start процесса.
 
 ## Где хранятся артефакты
 
@@ -157,12 +215,26 @@
 Следующий этап после текущего MVP expansion pass:
 
 - начать controlled execution runtime вместо одного preview-слоя;
-- добавить deterministic scope guard и write boundary перед фактической мутацией файлов;
-- подготовить post-change reindex, graph refresh и knowledge refresh orchestration;
+- добавить фактический mutation executor поверх уже готовых scope guard и write boundary;
+- подготовить post-change reindex, graph refresh и knowledge refresh orchestration как исполняемый runtime flow;
 - усилить data-shape validation между API, сохранёнными артефактами и UI.
+- продолжить staged pipeline для больших репозиториев: cheap-first workspace/index path, потом selective deep analysis.
 - углубить functional research, чтобы feature-level understanding было точнее и менее эвристическим.
 - добавить model-aware token budgeting и semantic reranking в Context Builder.
 - углубить Context Builder до graph-backed dependency expansion внутри query profile, а не только path/rule-based ranking.
 - продолжить graph-core evolution до уровня, удобного для переноса в БД.
 - продолжить graph-core evolution до richer relation semantics, snapshot/version layer и query surface, пригодных для будущего DB-backed graph storage.
 - продолжить перенос Research с file/content heuristics на более явный graph-first traversal и query-profile-specific expansion.
+- продолжить performance-pass для больших репозиториев: staged indexing, cheap-first pipeline stages и сокращение single-shot latency на full run.
+- реализовать `Repository Git Intelligence` как следующий фундаментальный слой перед live mutation runtime и перед подключением модели:
+- развить `Repository Git Intelligence` от MVP к operational/historical subsystem:
+  - развить текущий selective Git-seeded scan до настоящего staged и incremental index;
+  - связать Git change scope с planner safety rules;
+  - добавить historical signals для research и impact;
+  - добавить rollback anchors и run-scoped mutation ownership;
+  - начать co-change и hotspot анализ.
+- следующий инфраструктурный шаг для runtime:
+  - добавить восстановление persisted pipeline jobs при старте API;
+  - вынести тяжёлые стадии из одного процесса при необходимости;
+  - начать публиковать partial stage artifacts до завершения всего прогона;
+  - добавить retention и cleanup policy для runtime status artifacts.

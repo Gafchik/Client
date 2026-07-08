@@ -10,12 +10,14 @@
     "build": "npm run typecheck"
   },
   "dependencies": {
+    "@client/ai": "0.1.0",
     "@client/context": "0.1.0",
     "@client/graph": "0.1.0",
     "@client/impact-analysis": "0.1.0",
     "@client/indexer": "0.1.0",
     "@client/knowledge": "0.1.0",
     "@client/planner": "0.1.0",
+    "@client/repository-git": "0.1.0",
     "@client/research": "0.1.0",
     "@client/shared": "0.1.0",
     "@client/workspace": "0.1.0",

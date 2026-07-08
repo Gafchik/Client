@@ -39,7 +39,7 @@ export async function runFullIndex(workspace: WorkspaceSnapshot): Promise<IndexR
   return {
     manifest: {
       indexId: stableId(["index", workspace.projectId, startedAt]),
-      mode: "full",
+      mode: workspace.summary.selectionMode === "selective" ? "selective" : "full",
       startedAt,
       completedAt: new Date().toISOString(),
       projectId: workspace.projectId,
@@ -358,9 +358,10 @@ function extractPhpFile(
   const imports: string[] = [];
   const useMap = new Map<string, string>();
   const content = file.content;
+  const lineStarts = buildLineStarts(content);
   const symbolByContainerAndName = new Map<string, IndexSymbol>();
   const phpDeclaredNames = new Set<string>();
-  const propertyTypeByName = new Map<string, string>();
+  const propertyTypeByName = collectPhpPropertyTypes(content);
   const methodScopes: PhpMethodScope[] = [];
 
   const addSymbol = (
@@ -446,7 +447,7 @@ function extractPhpFile(
       continue;
     }
 
-    const line = getLineNumber(content, match.index ?? 0);
+    const line = getLineNumber(lineStarts, match.index ?? 0);
     const symbolKind: IndexSymbol["kind"] = kind === "interface" ? "interface" : kind === "enum" ? "enum" : "class";
     const classSymbol = addSymbol(name, symbolKind, line);
     classSymbols.set(name, classSymbol);
@@ -530,7 +531,7 @@ function extractPhpFile(
       continue;
     }
 
-    const line = getLineNumber(content, match.index ?? 0);
+    const line = getLineNumber(lineStarts, match.index ?? 0);
     const methodSymbol = addSymbol(methodName, "method", line, defaultContainerName);
     const bodyStart = content.indexOf("{", match.index ?? 0);
     const bodyEnd = bodyStart >= 0 ? findMatchingBraceIndex(content, bodyStart) : -1;
@@ -576,7 +577,7 @@ function extractPhpFile(
       continue;
     }
 
-    const line = getLineNumber(content, match.index ?? 0);
+    const line = getLineNumber(lineStarts, match.index ?? 0);
     addSymbol(functionName, "function", line);
   }
 
@@ -757,7 +758,7 @@ function extractPhpRoutes(
         const allMiddleware = uniqueStringList([...inheritedMiddleware, ...inlineMiddleware]);
 
         for (const middlewareName of allMiddleware) {
-          const middlewareSymbol = addSymbol(`middleware:${middlewareName}`, "middleware", index + 1, undefined, middlewareName);
+        const middlewareSymbol = addSymbol(`middleware:${middlewareName}`, "middleware", index + 1, undefined, middlewareName);
           relations.push({
             id: stableId(["uses", routeSymbol.id, middlewareSymbol.id, middlewareName]),
             type: "USES",
@@ -808,11 +809,51 @@ function normalizeRoutePath(value: string): string {
 }
 
 function countOccurrences(value: string, target: string): number {
-  return value.split(target).length - 1;
+  let count = 0;
+
+  for (const char of value) {
+    if (char === target) {
+      count += 1;
+    }
+  }
+
+  return count;
 }
 
-function getLineNumber(content: string, index: number): number {
-  return content.slice(0, index).split("\n").length;
+function buildLineStarts(content: string): number[] {
+  const lineStarts = [0];
+
+  for (let index = 0; index < content.length; index += 1) {
+    if (content[index] === "\n") {
+      lineStarts.push(index + 1);
+    }
+  }
+
+  return lineStarts;
+}
+
+function getLineNumber(lineStarts: number[], index: number): number {
+  let low = 0;
+  let high = lineStarts.length - 1;
+  let result = 0;
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = lineStarts[middle];
+
+    if (candidate === undefined) {
+      break;
+    }
+
+    if (candidate <= index) {
+      result = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  return result + 1;
 }
 
 function buildSymbolLookupKey(containerName: string | undefined, name: string): string {
@@ -875,9 +916,7 @@ function extractPhpServiceCalls(
       continue;
     }
 
-    const propertyPattern = new RegExp(`private\\s+readonly\\s+([A-Za-z_\\\\][A-Za-z0-9_\\\\]*)\\s+\\$${propertyName}\\b`);
-    const propertyMatch = propertyPattern.exec(content);
-    const serviceType = propertyTypeByName.get(propertyName) ?? propertyMatch?.[1];
+    const serviceType = propertyTypeByName.get(propertyName);
 
     if (!serviceType) {
       continue;
@@ -952,6 +991,25 @@ function extractPhpMethodParameterRelations(
       },
     });
   }
+}
+
+function collectPhpPropertyTypes(content: string): Map<string, string> {
+  const propertyTypeByName = new Map<string, string>();
+  const propertyPattern =
+    /\b(public|protected|private)\s+(?:readonly\s+)?([A-Za-z_\\][A-Za-z0-9_\\]*)\s+\$([A-Za-z_][A-Za-z0-9_]*)\b/g;
+
+  for (const match of content.matchAll(propertyPattern)) {
+    const typeName = match[2];
+    const propertyName = match[3];
+
+    if (!typeName || !propertyName || isBuiltInPhpType(typeName)) {
+      continue;
+    }
+
+    propertyTypeByName.set(propertyName, typeName);
+  }
+
+  return propertyTypeByName;
 }
 
 function extractPhpStaticCalls(

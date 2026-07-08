@@ -7,7 +7,7 @@ import {
   getOutgoingNeighbors,
   getStructuralNeighbors,
 } from "@client/graph";
-import { clamp, type GraphState, type ImpactReport, type ResearchReport } from "@client/shared";
+import { clamp, deriveStructuralModuleLabel, isConfigPath, isLocalizationPath, type GraphState, type ImpactReport, type ResearchReport } from "@client/shared";
 
 interface ImpactInput {
   runId: string;
@@ -38,20 +38,20 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
 
     if (node.kind === "file" && node.filePath) {
       affectedFiles.add(node.filePath);
-      affectedModules.add(node.filePath.split("/")[0] || "root");
+      affectedModules.add(deriveStructuralModuleLabel(node.filePath));
       expandFileImpact(input.graph, node.id, affectedFiles, affectedModules);
     }
 
     if (isGraphCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
       if (node.filePath) {
-        affectedModules.add(node.filePath.split("/")[0] || "root");
+        affectedModules.add(deriveStructuralModuleLabel(node.filePath));
       }
 
       for (const neighbor of getIncomingNeighbors(input.graph, nodeId)) {
         if (neighbor.kind === "file" && neighbor.filePath) {
           affectedFiles.add(neighbor.filePath);
-          affectedModules.add(neighbor.filePath.split("/")[0] || "root");
+          affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
           expandFileImpact(input.graph, neighbor.id, affectedFiles, affectedModules);
         }
       }
@@ -60,7 +60,7 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
     for (const neighbor of getIncomingNeighbors(input.graph, nodeId)) {
       if (neighbor.kind === "file" && neighbor.filePath) {
         affectedFiles.add(neighbor.filePath);
-        affectedModules.add(neighbor.filePath.split("/")[0] || "root");
+        affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
         expandFileImpact(input.graph, neighbor.id, affectedFiles, affectedModules);
       }
     }
@@ -68,14 +68,14 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
     for (const neighbor of getOutgoingNeighbors(input.graph, nodeId)) {
       if (neighbor.kind === "file" && neighbor.filePath) {
         affectedFiles.add(neighbor.filePath);
-        affectedModules.add(neighbor.filePath.split("/")[0] || "root");
+        affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
         expandFileImpact(input.graph, neighbor.id, affectedFiles, affectedModules);
       }
 
       if (isGraphCodeNode(neighbor.kind)) {
         affectedSymbols.add(neighbor.label);
         if (neighbor.filePath) {
-          affectedModules.add(neighbor.filePath.split("/")[0] || "root");
+          affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
         }
       }
     }
@@ -146,7 +146,7 @@ function expandEntrypointImpact(
     for (const neighbor of getStructuralNeighbors(graph, nodeId, ["CALLS", "USES", "REFERENCES", "BELONGS_TO"], "both")) {
       if (neighbor.filePath) {
         affectedFiles.add(neighbor.filePath);
-        affectedModules.add(neighbor.filePath.split("/")[0] || "root");
+        affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
       }
 
       if (isGraphCodeNode(neighbor.kind)) {
@@ -165,14 +165,14 @@ function expandFileImpact(
   for (const dependency of getFileDependencies(graph, fileNodeId)) {
     if (dependency.filePath) {
       affectedFiles.add(dependency.filePath);
-      affectedModules.add(dependency.filePath.split("/")[0] || "root");
+      affectedModules.add(deriveStructuralModuleLabel(dependency.filePath));
     }
   }
 
   for (const dependent of getFileDependents(graph, fileNodeId)) {
     if (dependent.filePath) {
       affectedFiles.add(dependent.filePath);
-      affectedModules.add(dependent.filePath.split("/")[0] || "root");
+      affectedModules.add(deriveStructuralModuleLabel(dependent.filePath));
     }
   }
 }
@@ -190,7 +190,7 @@ function expandInventoryImpact(
     }
 
     affectedFiles.add(node.filePath);
-    affectedModules.add(node.filePath.split("/")[0] || "root");
+    affectedModules.add(deriveStructuralModuleLabel(node.filePath));
 
     if (isGraphCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
@@ -254,7 +254,7 @@ function expandInfrastructureImpact(
     }
 
     affectedFiles.add(node.filePath!);
-    affectedModules.add(node.filePath!.split("/")[0] || "root");
+    affectedModules.add(deriveStructuralModuleLabel(node.filePath!));
 
     if (isGraphCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
@@ -281,7 +281,7 @@ function expandBroadImpact(
     }
 
     affectedFiles.add(node.filePath);
-    affectedModules.add(node.filePath.split("/")[0] || "root");
+    affectedModules.add(deriveStructuralModuleLabel(node.filePath));
 
     if (isGraphCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
@@ -410,24 +410,6 @@ function extractInfrastructureTerms(research: ResearchReport): string[] {
   ];
 
   return terms.filter((term) => values.includes(term));
-}
-
-function isLocalizationPath(filePath: string): boolean {
-  return (
-    filePath.startsWith("lang/")
-    || filePath.includes("/lang/")
-    || filePath.includes("/locales/")
-    || filePath.includes("/i18n/")
-  );
-}
-
-function isConfigPath(filePath: string): boolean {
-  return (
-    filePath.startsWith("config/")
-    || filePath.includes("/config/")
-    || filePath.endsWith(".env")
-    || filePath.includes(".env.")
-  );
 }
 
 function uniqueStrings(values: string[]): string[] {

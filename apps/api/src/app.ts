@@ -1,15 +1,10 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildContextPackage } from "@client/context";
-import { buildGraph } from "@client/graph";
-import { analyzeImpact } from "@client/impact-analysis";
-import { runFullIndex } from "@client/indexer";
-import { loadKnowledgeCatalog, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, saveKnowledgeArtifacts } from "@client/knowledge";
-import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
-import { runResearch } from "@client/research";
-import { normalizePath, stableId, type PipelineRunResult, type PipelineStage } from "@client/shared";
-import { openWorkspace, scanWorkspaceOverview } from "@client/workspace";
+import { loadKnowledgeCatalog, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { normalizePath, stableId, type PipelineRunStatus } from "@client/shared";
+import { scanWorkspaceOverview } from "@client/workspace";
+import { bootstrapPipelineRunStatuses, enqueuePipelineRun, loadPipelineRunStatus } from "./pipeline-runner.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -28,6 +23,8 @@ export function createApp() {
   app.register(cors, {
     origin: true,
   });
+
+  void bootstrapPipelineRunStatuses(appRootPath);
 
   app.get("/api/health", async () => {
     return { status: "ok", now: new Date().toISOString() };
@@ -79,6 +76,30 @@ export function createApp() {
     return artifact;
   });
 
+  app.get<{
+    Querystring: {
+      runId?: string;
+    };
+  }>("/api/pipeline/status", async (request, reply) => {
+    const runId = request.query.runId?.trim();
+
+    if (!runId) {
+      return reply.code(400).send({
+        message: "Нужно указать runId.",
+      });
+    }
+
+    const status = await loadPipelineRunStatus(appRootPath, runId);
+
+    if (!status) {
+      return reply.code(404).send({
+        message: "Статус запуска не найден.",
+      });
+    }
+
+    return status;
+  });
+
   app.post<{ Body: PipelineRunRequest }>("/api/pipeline/run", async (request, reply) => {
     const task = request.body.task?.trim();
 
@@ -93,198 +114,18 @@ export function createApp() {
     const providerModel = request.body.providerModel?.trim() || "";
     const providerApiKey = request.body.providerApiKey?.trim() || "";
     const runId = stableId(["run", projectPath, task, Date.now()]);
-    const workspaceStartedAt = new Date().toISOString();
-    const workspace = await openWorkspace(projectPath);
-    const workspaceCompletedAt = new Date().toISOString();
-    const indexStartedAt = new Date().toISOString();
-    const index = await runFullIndex(workspace);
-    const indexCompletedAt = new Date().toISOString();
-    const graphStartedAt = new Date().toISOString();
-    const graph = buildGraph(workspace, index);
-    const graphCompletedAt = new Date().toISOString();
-    const researchStartedAt = new Date().toISOString();
-    const research = runResearch({
+    const acceptedStatus = enqueuePipelineRun({
       runId,
       task,
-      workspace,
-      index,
-      graph,
-    });
-    const researchCompletedAt = new Date().toISOString();
-    const impactStartedAt = new Date().toISOString();
-    const impact = analyzeImpact({
-      runId,
-      graph,
-      research,
-    });
-    const impactCompletedAt = new Date().toISOString();
-    const contextStartedAt = new Date().toISOString();
-    const context = buildContextPackage({
-      runId,
-      task,
-      workspace,
-      index,
-      graph,
-      research,
-      impact,
-    });
-    const contextCompletedAt = new Date().toISOString();
-    const planStartedAt = new Date().toISOString();
-    const plan = buildExecutionPlan({
-      runId,
-      task,
-      research,
-      impact,
-      context,
-      graph,
-    });
-    const planCompletedAt = new Date().toISOString();
-    const previewStartedAt = new Date().toISOString();
-    const executionPreview = buildExecutionPreview(runId, plan);
-    const previewCompletedAt = new Date().toISOString();
-    const knowledgeStartedAt = new Date().toISOString();
-    const stages: PipelineStage[] = [
-      {
-        key: "workspace",
-        label: "Workspace",
-        status: "completed",
-        startedAt: workspaceStartedAt,
-        completedAt: workspaceCompletedAt,
-        details: `Открыто ${workspace.summary.indexedFiles} индексируемых файлов, проигнорировано ${workspace.ignoredPaths.length}.`,
-      },
-      {
-        key: "index",
-        label: "Index",
-        status: "completed",
-        startedAt: indexStartedAt,
-        completedAt: indexCompletedAt,
-        details: `Построен index: ${index.manifest.symbolCount} символов и ${index.manifest.relationCount} связей.`,
-      },
-      {
-        key: "graph",
-        label: "Graph",
-        status: "completed",
-        startedAt: graphStartedAt,
-        completedAt: graphCompletedAt,
-        details: `Собран graph: ${graph.summary.nodeCount} узлов и ${graph.summary.edgeCount} рёбер.`,
-      },
-      {
-        key: "research",
-        label: "Исследование",
-        status: "completed",
-        startedAt: researchStartedAt,
-        completedAt: researchCompletedAt,
-        details: `Подготовлено ${research.evidence.length} опорных ссылок с уверенностью ${research.confidence}%.`,
-      },
-      {
-        key: "impact",
-        label: "Анализ влияния",
-        status: "completed",
-        startedAt: impactStartedAt,
-        completedAt: impactCompletedAt,
-        details: `Определено ${impact.affectedFiles.length} затронутых файлов и ${impact.risks.length} рисков.`,
-      },
-      {
-        key: "context",
-        label: "Контекст",
-        status: "completed",
-        startedAt: contextStartedAt,
-        completedAt: contextCompletedAt,
-        details: `Собран контекстный пакет: ${context.selectedChunks.length} фрагментов при бюджете ${context.tokenBudget}.`,
-      },
-      {
-        key: "plan",
-        label: "План",
-        status: "completed",
-        startedAt: planStartedAt,
-        completedAt: planCompletedAt,
-        details: `Построен план выполнения: ${plan.steps.length} шагов, требуется согласование: ${plan.approvalRequired ? "да" : "нет"}.`,
-      },
-      {
-        key: "preview",
-        label: "Превью выполнения",
-        status: "completed",
-        startedAt: previewStartedAt,
-        completedAt: previewCompletedAt,
-        details: `Подготовлено безопасное превью выполнения с ${executionPreview.allowedActions.length} разрешёнными действиями.`,
-      },
-    ];
-    const knowledge = await saveKnowledgeArtifacts({
-      runId,
-      task,
+      projectPath,
+      providerBaseUrl,
+      providerModel,
+      providerApiKey,
       appRootPath,
-      workspace,
-      provider: {
-        baseUrl: providerBaseUrl,
-        model: providerModel,
-        apiKeyMasked: maskApiKey(providerApiKey),
-      },
-      index,
-      graph,
-      research,
-      impact,
-      context,
-      plan,
-      executionPreview,
-    });
-    const knowledgeCompletedAt = new Date().toISOString();
-    stages.push({
-      key: "knowledge",
-      label: "Знания",
-      status: "completed",
-      startedAt: knowledgeStartedAt,
-      completedAt: knowledgeCompletedAt,
-      details: `Артефакты сохранены в центральное knowledge-хранилище: ${knowledge.artifactCount} групп.`,
     });
 
-    const result: PipelineRunResult = {
-      runId,
-      project: {
-        name: workspace.projectName,
-        rootPath: workspace.rootPath,
-        summary: workspace.summary,
-      },
-      workspace: {
-        scannedAt: workspace.scannedAt,
-        ignoredPaths: workspace.ignoredPaths,
-        diagnostics: workspace.diagnostics,
-      },
-      provider: {
-        baseUrl: providerBaseUrl,
-        model: providerModel,
-        apiKeyMasked: maskApiKey(providerApiKey),
-      },
-      index: {
-        manifest: index.manifest,
-        stats: index.stats,
-        diagnostics: index.diagnostics,
-      },
-      graph: {
-        summary: graph.summary,
-      },
-      stages,
-      research,
-      impact,
-      context,
-      plan,
-      executionPreview,
-      knowledge,
-    };
-
-    return result;
+    return reply.code(202).send(acceptedStatus);
   });
 
   return app;
-}
-
-function maskApiKey(value: string): string {
-  if (!value) {
-    return "";
-  }
-
-  if (value.length <= 8) {
-    return "*".repeat(value.length);
-  }
-
-  return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }

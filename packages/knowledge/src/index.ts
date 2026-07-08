@@ -1,10 +1,10 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
+  type ControlledExecutionRuntime,
   type ContextPackage,
   type ExecutionPlan,
   type ExecutionPreview,
-  stableId,
   type GraphState,
   type ImpactReport,
   type IndexResult,
@@ -12,7 +12,9 @@ import {
   type KnowledgeSaveResult,
   type PipelineRunResult,
   type ProviderRuntimeConfig,
+  type RepositorySnapshot,
   type ResearchReport,
+  stableId,
   type WorkspaceSnapshot,
 } from "@client/shared";
 
@@ -21,6 +23,7 @@ interface SaveKnowledgeInput {
   task: string;
   appRootPath: string;
   workspace: WorkspaceSnapshot;
+  repository: RepositorySnapshot;
   provider: ProviderRuntimeConfig;
   index: IndexResult;
   graph: GraphState;
@@ -29,6 +32,7 @@ interface SaveKnowledgeInput {
   context: ContextPackage;
   plan: ExecutionPlan;
   executionPreview: ExecutionPreview;
+  executionRuntime: ControlledExecutionRuntime;
 }
 
 export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise<KnowledgeSaveResult> {
@@ -49,6 +53,7 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       rootPath: input.workspace.rootPath,
       summary: input.workspace.summary,
     },
+    repository: input.repository,
     provider: input.provider,
     index: {
       manifest: input.index.manifest,
@@ -64,6 +69,7 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
     context: input.context,
     plan: input.plan,
     executionPreview: input.executionPreview,
+    executionRuntime: input.executionRuntime,
   };
 
   await fs.writeFile(storagePath, JSON.stringify(artifact, null, 2));
@@ -141,6 +147,7 @@ function normalizePipelineRunArtifact(
     !artifact.runId ||
     !artifact.project ||
     !artifact.workspace ||
+    !artifact.repository ||
     !artifact.provider ||
     !artifact.index ||
     !artifact.graph ||
@@ -195,12 +202,27 @@ function normalizePipelineRunArtifact(
     knowledgeRefreshRequired: true,
   };
 
+  const executionRuntime: ControlledExecutionRuntime = artifact.executionRuntime ?? {
+    runtimeId: stableId(["controlled-runtime", artifact.runId]),
+    runId: artifact.runId,
+    mode: "controlled-runtime",
+    status: "blocked",
+    summary: "Controlled runtime отсутствовал в старом артефакте и был восстановлен в режиме совместимости.",
+    allowedWriteFiles: [],
+    blockedWriteZones: [".git", ".client/knowledge"],
+    scopeGuards: ["Старый артефакт не содержал execution runtime contract."],
+    approvalChecks: ["Перед execution требуется повторный запуск pipeline на новом формате артефакта."],
+    refreshPlan: ["После изменений обязательны reindex, graph refresh и knowledge refresh."],
+    executionAllowed: false,
+  };
+
   const stages = artifact.stages ?? [];
 
   return {
     runId: artifact.runId,
     project: artifact.project,
     workspace: artifact.workspace,
+    repository: artifact.repository,
     provider: artifact.provider,
     index: artifact.index,
     graph: artifact.graph,
@@ -222,6 +244,7 @@ function normalizePipelineRunArtifact(
     context,
     plan,
     executionPreview,
+    executionRuntime,
     knowledge: {
       ...artifact.knowledge,
       artifactCount: artifact.knowledge.artifactCount ?? 8,
