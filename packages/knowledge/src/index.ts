@@ -26,7 +26,9 @@ interface SaveKnowledgeInput {
   repository: RepositorySnapshot;
   provider: ProviderRuntimeConfig;
   index: IndexResult;
+  incrementalIndex: PipelineRunResult["incrementalIndex"];
   graph: GraphState;
+  graphInvalidation: PipelineRunResult["graphInvalidation"];
   research: ResearchReport;
   impact: ImpactReport;
   context: ContextPackage;
@@ -60,10 +62,12 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       stats: input.index.stats,
       diagnostics: input.index.diagnostics,
     },
+    incrementalIndex: input.incrementalIndex,
     graph: {
       graphId: input.graph.graphId,
       summary: input.graph.summary,
     },
+    graphInvalidation: input.graphInvalidation,
     research: input.research,
     impact: input.impact,
     context: input.context,
@@ -225,7 +229,9 @@ function normalizePipelineRunArtifact(
     repository: artifact.repository,
     provider: artifact.provider,
     index: artifact.index,
+    ...(artifact.incrementalIndex ? { incrementalIndex: artifact.incrementalIndex } : {}),
     graph: artifact.graph,
+    ...(artifact.graphInvalidation ? { graphInvalidation: artifact.graphInvalidation } : {}),
     stages,
     research: {
       ...artifact.research,

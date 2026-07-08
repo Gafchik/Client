@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import type { ContextCandidate, KnowledgeCatalogEntry, PipelineRunResult, PipelineRunStatus, PipelineStage } from "@client/shared";
 
 interface ProjectInfo {
@@ -23,6 +23,7 @@ type ProviderDraft = {
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
 const PROVIDER_STORAGE_KEY = "client.provider-config";
+const REQUEST_TIMEOUT_MS = 15000;
 
 function hasRunArtifacts(result: PipelineRunResult | null): result is PipelineRunResult {
   return Boolean(result?.runId && result?.project && result?.research && result?.impact);
@@ -48,6 +49,134 @@ function PanelFallback({ title, message }: { title: string; message: string }) {
         <span>{message}</span>
       </div>
     </div>
+  );
+}
+
+async function fetchJsonWithTimeout<T>(input: string, init?: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      let message = "Ошибка запроса.";
+
+      try {
+        const payload = (await response.json()) as { message?: string };
+        message = payload.message ?? message;
+      } catch {
+        // ignore invalid error payload
+      }
+
+      throw new Error(message);
+    }
+
+    return (await response.json()) as T;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("Запрос превысил лимит ожидания. Сервер мог зависнуть или быть недоступен.");
+    }
+
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+function PartialArtifactsPanel({ runStatus }: { runStatus: PipelineRunStatus | null }) {
+  const partial = runStatus?.partialArtifacts;
+
+  if (!runStatus || !partial) {
+    return null;
+  }
+
+  return (
+    <article className="panel">
+      <div className="panel-header">
+        <h2>Промежуточные Артефакты</h2>
+        <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span>
+      </div>
+
+      <div className="stack">
+        <div className="list">
+          <div className="list-item">
+            <strong>Статус запуска</strong>
+            <span>{runStatus.status}</span>
+          </div>
+          <div className="list-item">
+            <strong>Текущий этап</strong>
+            <span>{safeText(runStatus.currentStageLabel, "Не определён")}</span>
+          </div>
+        </div>
+
+        <div className="list">
+          <div className="list-item">
+            <strong>Workspace</strong>
+            <span>{partial.workspace ? `Файлы подготовлены, ignored paths: ${safeList(partial.workspace.ignoredPaths).length}` : "Ещё не готов"}</span>
+          </div>
+          <div className="list-item">
+            <strong>Repository</strong>
+            <span>
+              {partial.repository
+                ? `Ветка ${safeText(partial.repository.branch, "unknown")}, изменений ${safeCount(partial.repository.summary?.changedFileCount)}`
+                : "Ещё не готов"}
+            </span>
+          </div>
+          <div className="list-item">
+            <strong>Index</strong>
+            <span>
+              {partial.index
+                ? `${safeText(partial.index.manifest?.mode, "full")} / ${safeCount(partial.index.manifest?.symbolCount)} символов`
+                : "Ещё не готов"}
+            </span>
+          </div>
+          <div className="list-item">
+            <strong>Incremental index</strong>
+            <span>
+              {partial.incrementalIndex
+                ? `${safeText(partial.incrementalIndex.mode)} / кандидатов: ${safeCount(partial.incrementalIndex.candidatePaths?.length)}`
+                : "Ещё не готов"}
+            </span>
+          </div>
+          <div className="list-item">
+            <strong>Graph</strong>
+            <span>
+              {partial.graph
+                ? `${safeCount(partial.graph.summary?.nodeCount)} узлов / ${safeCount(partial.graph.summary?.edgeCount)} рёбер`
+                : "Ещё не готов"}
+            </span>
+          </div>
+          <div className="list-item">
+            <strong>Graph invalidation</strong>
+            <span>
+              {partial.graphInvalidation
+                ? `${safeText(partial.graphInvalidation.mode)} / файлов: ${safeCount(partial.graphInvalidation.invalidatedFiles?.length)} / модулей: ${safeCount(partial.graphInvalidation.invalidatedModules?.length)}`
+                : "Ещё не готов"}
+            </span>
+          </div>
+          <div className="list-item">
+            <strong>Research</strong>
+            <span>{partial.research ? safeText(partial.research.summary) : "Ещё не готов"}</span>
+          </div>
+          <div className="list-item">
+            <strong>Impact</strong>
+            <span>{partial.impact ? safeText(partial.impact.summary) : "Ещё не готов"}</span>
+          </div>
+          <div className="list-item">
+            <strong>Context</strong>
+            <span>{partial.context ? safeText(partial.context.summary) : "Ещё не готов"}</span>
+          </div>
+          <div className="list-item">
+            <strong>Plan</strong>
+            <span>{partial.plan ? safeText(partial.plan.summary) : "Ещё не готов"}</span>
+          </div>
+        </div>
+      </div>
+    </article>
   );
 }
 
@@ -309,9 +438,25 @@ function IndexArtifact({ result }: { result: PipelineRunResult }) {
           <span>{safeText(result.index?.manifest?.indexId)}</span>
         </div>
         <div className="list-item">
+          <strong>Incremental index plan</strong>
+          <span>
+            {result.incrementalIndex
+              ? `${safeText(result.incrementalIndex.mode)} / кандидатов ${safeCount(result.incrementalIndex.candidatePaths?.length)}`
+              : "Недоступно"}
+          </span>
+        </div>
+        <div className="list-item">
           <strong>Сводка графа</strong>
           <span>
             Узлы: {safeCount(result.graph?.summary?.nodeCount)}, рёбра: {safeCount(result.graph?.summary?.edgeCount)}
+          </span>
+        </div>
+        <div className="list-item">
+          <strong>Graph invalidation</strong>
+          <span>
+            {result.graphInvalidation
+              ? `${safeText(result.graphInvalidation.mode)} / файлов ${safeCount(result.graphInvalidation.invalidatedFiles?.length)} / модулей ${safeCount(result.graphInvalidation.invalidatedModules?.length)}`
+              : "Недоступно"}
           </span>
         </div>
       </div>
@@ -870,6 +1015,8 @@ export function App() {
   const [result, setResult] = useState<PipelineRunResult | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [activeArtifact, setActiveArtifact] = useState<ArtifactTab>("research");
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     void loadProject();
@@ -899,6 +1046,10 @@ export function App() {
     window.localStorage.setItem(PROVIDER_STORAGE_KEY, JSON.stringify(providerDraft));
   }, [providerDraft]);
 
+  useEffect(() => {
+    activeRunIdRef.current = activeRunId;
+  }, [activeRunId]);
+
   async function loadProject(nextProjectPath?: string) {
     setLoading(true);
     setError(null);
@@ -911,8 +1062,7 @@ export function App() {
         params.set("projectPath", requestedProjectPath);
       }
 
-      const response = await fetch(`${API_BASE_URL}/api/project${params.size ? `?${params.toString()}` : ""}`);
-      const data = (await response.json()) as ProjectInfo;
+      const data = await fetchJsonWithTimeout<ProjectInfo>(`${API_BASE_URL}/api/project${params.size ? `?${params.toString()}` : ""}`);
 
       startTransition(() => {
         setProject(data);
@@ -933,7 +1083,7 @@ export function App() {
     setError(null);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/pipeline/run`, {
+      const accepted = await fetchJsonWithTimeout<PipelineRunStatus>(`${API_BASE_URL}/api/pipeline/run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -947,16 +1097,10 @@ export function App() {
         }),
       });
 
-      if (!response.ok) {
-        const payload = (await response.json()) as { message?: string };
-        throw new Error(payload.message ?? "Не удалось запустить пайплайн.");
-      }
-
-      const accepted = (await response.json()) as PipelineRunStatus;
-
       startTransition(() => {
         setRunStatus(accepted);
         setSelectedRunId(accepted.runId);
+        setActiveRunId(accepted.runId);
         setActiveArtifact("research");
       });
 
@@ -970,14 +1114,15 @@ export function App() {
 
   async function pollPipelineStatus(runId: string) {
     for (;;) {
-      const response = await fetch(`${API_BASE_URL}/api/pipeline/status?runId=${encodeURIComponent(runId)}`);
-
-      if (!response.ok) {
-        const payload = (await response.json()) as { message?: string };
-        throw new Error(payload.message ?? "Не удалось получить статус пайплайна.");
+      if (activeRunIdRef.current && activeRunIdRef.current !== runId) {
+        return;
       }
 
-      const status = (await response.json()) as PipelineRunStatus;
+      const status = await fetchJsonWithTimeout<PipelineRunStatus>(
+        `${API_BASE_URL}/api/pipeline/status?runId=${encodeURIComponent(runId)}`,
+        undefined,
+        8000,
+      );
 
       startTransition(() => {
         setRunStatus(status);
@@ -986,6 +1131,7 @@ export function App() {
       if (status.status === "completed" && status.result) {
         startTransition(() => {
           setResult(status.result ?? null);
+          setActiveRunId(null);
           setProject((current) =>
             current
               ? {
@@ -1014,6 +1160,9 @@ export function App() {
       }
 
       if (status.status === "failed") {
+        startTransition(() => {
+          setActiveRunId(null);
+        });
         throw new Error(status.errorMessage || "Пайплайн завершился ошибкой.");
       }
 
@@ -1029,14 +1178,7 @@ export function App() {
         projectPath,
         runId,
       });
-      const response = await fetch(`${API_BASE_URL}/api/runs/selected?${params.toString()}`);
-
-      if (!response.ok) {
-        const payload = (await response.json()) as { message?: string };
-        throw new Error(payload.message ?? "Не удалось загрузить сохранённый запуск.");
-      }
-
-      const data = (await response.json()) as PipelineRunResult;
+      const data = await fetchJsonWithTimeout<PipelineRunResult>(`${API_BASE_URL}/api/runs/selected?${params.toString()}`);
 
       startTransition(() => {
         setResult(data);
@@ -1046,6 +1188,14 @@ export function App() {
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сохранённый запуск.");
     }
+  }
+
+  function resetStuckRun() {
+    startTransition(() => {
+      setRunning(false);
+      setActiveRunId(null);
+      setRunStatus(null);
+    });
   }
 
   return (
@@ -1136,7 +1286,17 @@ export function App() {
               <strong>Текущий этап</strong>
               <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span>
             </div>
+            <div className="list-item">
+              <strong>Resume</strong>
+              <span>{runStatus.resumeContext?.canResumeFromStart ? "доступен restart-from-start" : "не требуется"}</span>
+            </div>
           </div>
+        ) : null}
+
+        {running ? (
+          <button type="button" onClick={resetStuckRun}>
+            Сбросить зависший запуск
+          </button>
         ) : null}
 
         {error ? <p className="error">{error}</p> : null}
@@ -1147,6 +1307,7 @@ export function App() {
         <RunsPanel project={project} selectedRunId={selectedRunId} onOpenRun={(runId) => void openSavedRun(runId)} />
       </section>
 
+      <PartialArtifactsPanel runStatus={runStatus} />
       <ArtifactViewer result={result} activeArtifact={activeArtifact} setActiveArtifact={setActiveArtifact} />
 
       <section className="grid grid-wide">

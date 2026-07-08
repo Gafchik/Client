@@ -214,6 +214,23 @@ export interface GraphState {
   summary: GraphSummary;
 }
 
+export interface GraphInvalidationPlan {
+  mode: "full-refresh" | "partial-invalidation";
+  previousRunId?: string;
+  changedPaths: string[];
+  invalidatedFiles: string[];
+  invalidatedModules: string[];
+  reason: string;
+}
+
+export interface IncrementalIndexPlan {
+  mode: "full-index" | "incremental-index";
+  previousRunId?: string;
+  candidatePaths: string[];
+  reusedSignals: string[];
+  reason: string;
+}
+
 export interface ScoredReference {
   id: string;
   label: string;
@@ -428,6 +445,8 @@ export interface PipelineRunResult {
   graph: {
     summary: GraphSummary;
   };
+  incrementalIndex?: IncrementalIndexPlan;
+  graphInvalidation?: GraphInvalidationPlan;
   stages: PipelineStage[];
   research: ResearchReport;
   impact: ImpactReport;
@@ -436,6 +455,21 @@ export interface PipelineRunResult {
   executionPreview: ExecutionPreview;
   executionRuntime: ControlledExecutionRuntime;
   knowledge: KnowledgeSaveResult;
+}
+
+export interface PipelinePartialArtifacts {
+  workspace?: PipelineRunResult["workspace"];
+  repository?: RepositorySnapshot;
+  index?: PipelineRunResult["index"];
+  graph?: PipelineRunResult["graph"];
+  incrementalIndex?: IncrementalIndexPlan;
+  graphInvalidation?: GraphInvalidationPlan;
+  research?: ResearchReport;
+  impact?: ImpactReport;
+  context?: ContextPackage;
+  plan?: ExecutionPlan;
+  executionPreview?: ExecutionPreview;
+  executionRuntime?: ControlledExecutionRuntime;
 }
 
 export interface PipelineRunStatus {
@@ -447,7 +481,14 @@ export interface PipelineRunStatus {
   updatedAt: string;
   currentStageKey?: PipelineStage["key"];
   currentStageLabel?: string;
+  resumeContext?: {
+    providerBaseUrl: string;
+    providerModel: string;
+    canResumeFromStart: boolean;
+    resumeAttempts: number;
+  };
   stages: PipelineStage[];
+  partialArtifacts?: PipelinePartialArtifacts;
   result?: PipelineRunResult;
   errorMessage?: string;
 }

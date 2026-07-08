@@ -120,6 +120,26 @@
   - `PipelineRunStatus` теперь сохраняется на диск внутри `.client`;
   - переходы между стадиями больше не живут только в памяти процесса;
   - long-running анализы стали устойчивее к операторскому наблюдению и последующей отладке.
+  - API при старте теперь поднимает сохранённые pipeline statuses обратно в runtime;
+  - endpoint статуса умеет читать persisted status даже после потери in-memory состояния.
+- Partial stage artifacts добавлены в runtime status:
+  - `PipelineRunStatus` теперь содержит `partialArtifacts`;
+  - промежуточные результаты `workspace`, `repository`, `index`, `graph`, `research`, `impact`, `context`, `plan`, `execution preview`, `execution runtime` публикуются по мере готовности;
+  - UI показывает промежуточные артефакты до завершения всего pipeline.
+- Frontend runtime hardening усилен:
+  - все ключевые API-запросы UI теперь имеют client-side timeout через `AbortController`;
+  - polling статуса больше не может держать кнопку запуска в вечной загрузке при умершем backend-процессе;
+  - добавлен ручной сброс зависшего запуска в интерфейсе.
+- Runtime continuation / cleanup / invalidation MVP добавлены:
+  - при старте API незавершённые `queued/running` run помечаются как прерванные и получают безопасный `resume-from-start` semantics;
+  - для `pipeline-status` добавлен retention cleanup по возрасту файлов;
+  - pipeline теперь строит `graph invalidation plan` на основе предыдущего run и текущего Git changed set;
+  - large/small runs теперь различают `full-refresh` и `partial-invalidation` как часть runtime plan.
+- Incremental reuse layer усилен:
+  - pipeline теперь строит отдельный `incremental index plan`;
+  - этот план учитывает previous run, Git changed set и selective candidate paths;
+  - `incrementalIndex` и `graphInvalidation` теперь сохраняются в финальном knowledge run artifact;
+  - UI показывает operator-facing сигналы: `incremental-index` и `graph invalidation`.
 
 ## Текущее состояние MVP Slice 1
 
@@ -184,7 +204,23 @@
 - Status persistence уже есть, но пока:
   - статус сохраняется как snapshot, а не как event log;
   - нет отдельной cleanup / retention policy для pipeline-status файлов;
-  - нет восстановления runStore из сохранённого статуса при cold start процесса.
+  - нет полноценного resume незавершённого execution после рестарта процесса, есть только восстановление наблюдаемого status state.
+- Resume / cleanup / invalidation уже есть как first MVP, но пока:
+  - `resume` реализован как безопасный `restart-from-start`, а не как продолжение с середины стадии;
+  - retention policy фиксирована в коде и ещё не вынесена в конфигурацию;
+  - `graph invalidation plan` пока формируется эвристически по changed set и previous run, без symbol-level dependency diff.
+- Incremental reuse уже есть как path-level orchestration, но пока:
+  - сам индекс всё ещё пересчитывается целиком по текущему workspace snapshot;
+  - нет persisted symbol-level cache и AST reuse;
+  - нет частичной materialization graph поверх предыдущего graph state.
+- Partial artifacts уже есть, но пока:
+  - они живут внутри snapshot статуса, а не как отдельные stage-scoped artifacts;
+  - UI показывает их как прогресс-обзор, но ещё не умеет полноценно открывать каждую промежуточную стадию как отдельный сохранённый артефакт;
+  - нет deduplication и retention policy для промежуточных payload.
+- Frontend polling уже защищён от бесконечного ожидания, но пока:
+  - нет автоматического reconnect/backoff policy;
+  - нет различения между кратковременной сетевой ошибкой и реальной смертью backend;
+  - сброс зависшего запуска пока ручной, а не policy-driven.
 
 ## Где хранятся артефакты
 
@@ -234,7 +270,9 @@
   - добавить rollback anchors и run-scoped mutation ownership;
   - начать co-change и hotspot анализ.
 - следующий инфраструктурный шаг для runtime:
-  - добавить восстановление persisted pipeline jobs при старте API;
   - вынести тяжёлые стадии из одного процесса при необходимости;
-  - начать публиковать partial stage artifacts до завершения всего прогона;
-  - добавить retention и cleanup policy для runtime status artifacts.
+  - углубить `resume` от restart-from-start до stage-aware continuation;
+  - вынести retention и cleanup policy в конфигурационный слой;
+  - углубить `incremental index plan` до symbol-aware incremental index и AST reuse;
+  - углубить `graph invalidation plan` до partial graph refresh поверх предыдущего graph state;
+  - разнести partial artifacts в отдельные stage-scoped persisted artifacts.

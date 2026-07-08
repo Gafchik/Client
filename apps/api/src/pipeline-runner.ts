@@ -5,11 +5,20 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { saveKnowledgeArtifacts } from "@client/knowledge";
+import { loadLatestPipelineRunArtifact, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
-import { normalizePath, stableId, type PipelineRunResult, type PipelineRunStatus, type PipelineStage } from "@client/shared";
+import {
+  type IncrementalIndexPlan,
+  normalizePath,
+  stableId,
+  type GraphInvalidationPlan,
+  type PipelinePartialArtifacts,
+  type PipelineRunResult,
+  type PipelineRunStatus,
+  type PipelineStage,
+} from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 
 export interface PipelineExecutionRequest {
@@ -24,6 +33,7 @@ export interface PipelineExecutionRequest {
 
 const runStore = new Map<string, PipelineRunStatus>();
 const runAppRootStore = new Map<string, string>();
+const PIPELINE_STATUS_RETENTION_MS = 1000 * 60 * 60 * 24 * 3;
 
 export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineRunStatus {
   const createdAt = new Date().toISOString();
@@ -34,7 +44,14 @@ export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineR
     status: "queued",
     createdAt,
     updatedAt: createdAt,
+    resumeContext: {
+      providerBaseUrl: request.providerBaseUrl,
+      providerModel: request.providerModel,
+      canResumeFromStart: true,
+      resumeAttempts: 0,
+    },
     stages: createInitialStages(),
+    partialArtifacts: {},
   };
 
   runStore.set(request.runId, initialStatus);
@@ -70,6 +87,7 @@ export async function loadPipelineRunStatus(appRootPath: string, runId: string):
 }
 
 export async function bootstrapPipelineRunStatuses(appRootPath: string): Promise<void> {
+  await cleanupExpiredPipelineStatuses(appRootPath);
   const directory = getPipelineStatusDirectory(appRootPath);
 
   try {
@@ -81,7 +99,35 @@ export async function bootstrapPipelineRunStatuses(appRootPath: string): Promise
       }
 
       const runId = entry.name.replace(/\.json$/i, "");
-      await loadPipelineRunStatus(appRootPath, runId);
+      const status = await loadPipelineRunStatus(appRootPath, runId);
+
+      if (status && (status.status === "queued" || status.status === "running")) {
+        updateRunStatus(runId, {
+          ...status,
+          status: "failed",
+          updatedAt: new Date().toISOString(),
+          errorMessage: "API был перезапущен во время выполнения. Run можно безопасно перезапустить с начала.",
+          stages: status.stages.map((stage) =>
+            stage.status === "running"
+              ? {
+                  ...stage,
+                  status: "failed",
+                  completedAt: new Date().toISOString(),
+                  details: "Run был прерван перезапуском API. Доступен resume-from-start.",
+                }
+              : stage,
+          ),
+          resumeContext: {
+            ...(status.resumeContext ?? {
+              providerBaseUrl: "",
+              providerModel: "",
+              canResumeFromStart: true,
+              resumeAttempts: 0,
+            }),
+            canResumeFromStart: true,
+          },
+        });
+      }
     }
   } catch {
     // ignore missing status directory during bootstrap
@@ -170,6 +216,22 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
         : `Открыто ${workspace.summary.indexedFiles} индексируемых файлов. Активирован large-repository профиль для fast-first pipeline.`
       : `Открыто ${workspace.summary.indexedFiles} индексируемых файлов.`,
   );
+  updatePartialArtifacts(runId, {
+    workspace: {
+      scannedAt: workspace.scannedAt,
+      ignoredPaths: workspace.ignoredPaths,
+      diagnostics: workspace.diagnostics,
+    },
+    repository,
+  });
+
+  const previousRun = await loadLatestPipelineRunArtifact(appRootPath, workspace.rootPath);
+  const incrementalIndex = buildIncrementalIndexPlan(previousRun, repository, selectiveCandidatePaths, shouldUseSelectiveWorkspace);
+  const graphInvalidation = buildGraphInvalidationPlan(previousRun, repository, workspace.rootPath);
+  updatePartialArtifacts(runId, {
+    incrementalIndex,
+    graphInvalidation,
+  });
 
   const indexStartedAt = startStage(runId, "index");
   const index = await runFullIndex(workspace);
@@ -181,10 +243,22 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       ? `Построен selective index: ${index.manifest.symbolCount} символов и ${index.manifest.relationCount} связей.`
       : `Построен index: ${index.manifest.symbolCount} символов и ${index.manifest.relationCount} связей.`,
   );
+  updatePartialArtifacts(runId, {
+    index: {
+      manifest: index.manifest,
+      stats: index.stats,
+      diagnostics: index.diagnostics,
+    },
+  });
 
   const graphStartedAt = startStage(runId, "graph");
   const graph = buildGraph(workspace, index);
   completeStage(runId, "graph", graphStartedAt, `Собран graph: ${graph.summary.nodeCount} узлов и ${graph.summary.edgeCount} рёбер.`);
+  updatePartialArtifacts(runId, {
+    graph: {
+      summary: graph.summary,
+    },
+  });
 
   const researchStartedAt = startStage(runId, "research");
   const research = runResearch({
@@ -195,6 +269,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     graph,
   });
   completeStage(runId, "research", researchStartedAt, `Подготовлено ${research.evidence.length} опорных ссылок с уверенностью ${research.confidence}%.`);
+  updatePartialArtifacts(runId, {
+    research,
+  });
 
   const impactStartedAt = startStage(runId, "impact");
   const impact = analyzeImpact({
@@ -203,6 +280,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     research,
   });
   completeStage(runId, "impact", impactStartedAt, `Определено ${impact.affectedFiles.length} затронутых файлов и ${impact.risks.length} рисков.`);
+  updatePartialArtifacts(runId, {
+    impact,
+  });
 
   const contextStartedAt = startStage(runId, "context");
   const context = buildContextPackage({
@@ -215,6 +295,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     impact,
   });
   completeStage(runId, "context", contextStartedAt, `Собран контекстный пакет: ${context.selectedChunks.length} фрагментов при бюджете ${context.tokenBudget}.`);
+  updatePartialArtifacts(runId, {
+    context,
+  });
 
   const planStartedAt = startStage(runId, "plan");
   const plan = buildExecutionPlan({
@@ -226,10 +309,16 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     graph,
   });
   completeStage(runId, "plan", planStartedAt, `Построен план выполнения: ${plan.steps.length} шагов, требуется согласование: ${plan.approvalRequired ? "да" : "нет"}.`);
+  updatePartialArtifacts(runId, {
+    plan,
+  });
 
   const previewStartedAt = startStage(runId, "preview");
   const executionPreview = buildExecutionPreview(runId, plan);
   completeStage(runId, "preview", previewStartedAt, `Подготовлено безопасное превью выполнения с ${executionPreview.allowedActions.length} разрешёнными действиями.`);
+  updatePartialArtifacts(runId, {
+    executionPreview,
+  });
 
   const runtimeStartedAt = startStage(runId, "runtime");
   const executionRuntime = buildControlledExecutionRuntime({
@@ -239,6 +328,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     preview: executionPreview,
   });
   completeStage(runId, "runtime", runtimeStartedAt, `Подготовлен controlled runtime: статус ${executionRuntime.status}, write scope ${executionRuntime.allowedWriteFiles.length} файлов.`);
+  updatePartialArtifacts(runId, {
+    executionRuntime,
+  });
 
   const knowledgeStartedAt = startStage(runId, "knowledge");
   const knowledge = await saveKnowledgeArtifacts({
@@ -253,7 +345,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       apiKeyMasked: maskApiKey(providerApiKey),
     },
     index,
+    incrementalIndex,
     graph,
+    graphInvalidation,
     research,
     impact,
     context,
@@ -286,9 +380,11 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       stats: index.stats,
       diagnostics: index.diagnostics,
     },
+    incrementalIndex,
     graph: {
       summary: graph.summary,
     },
+    graphInvalidation,
     stages: getCompletedStages(runId),
     research,
     impact,
@@ -473,10 +569,133 @@ function updateRunStatus(runId: string, status: PipelineRunStatus): void {
   void persistRunStatus(appRootPath, status);
 }
 
+function updatePartialArtifacts(runId: string, patch: PipelinePartialArtifacts): void {
+  const current = runStore.get(runId);
+
+  if (!current) {
+    return;
+  }
+
+  updateRunStatus(runId, {
+    ...current,
+    updatedAt: new Date().toISOString(),
+    partialArtifacts: {
+      ...(current.partialArtifacts ?? {}),
+      ...patch,
+    },
+  });
+}
+
 function getPipelineStatusDirectory(appRootPath: string): string {
   return path.join(appRootPath, ".client", "pipeline-status");
 }
 
 function getPipelineStatusPath(appRootPath: string, runId: string): string {
   return path.join(getPipelineStatusDirectory(appRootPath), `${runId}.json`);
+}
+
+async function cleanupExpiredPipelineStatuses(appRootPath: string): Promise<void> {
+  const directory = getPipelineStatusDirectory(appRootPath);
+  const now = Date.now();
+
+  try {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        continue;
+      }
+
+      const filePath = path.join(directory, entry.name);
+      const stat = await fs.stat(filePath);
+
+      if (now - stat.mtimeMs > PIPELINE_STATUS_RETENTION_MS) {
+        await fs.unlink(filePath);
+      }
+    }
+  } catch {
+    // ignore cleanup errors in bootstrap path
+  }
+}
+
+function buildGraphInvalidationPlan(
+  previousRun: PipelineRunResult | null,
+  repository: PipelineRunResult["repository"],
+  projectRootPath: string,
+): GraphInvalidationPlan {
+  const normalizedProjectRoot = normalizePath(projectRootPath);
+  const changedPaths = repository.changedFiles
+    .map((file) => normalizePath(file.path))
+    .filter((filePath) => filePath.startsWith(normalizedProjectRoot) || !filePath.startsWith("/"));
+  const invalidatedModules = Array.from(
+    new Set(
+      changedPaths.map((filePath) => {
+        const parts = filePath.split("/").filter(Boolean);
+        return parts[0] ?? "root";
+      }),
+    ),
+  );
+  const previousRunPatch = previousRun ? { previousRunId: previousRun.runId } : {};
+
+  if (!previousRun || repository.summary.changedFileCount === 0) {
+    return {
+      mode: "full-refresh",
+      ...previousRunPatch,
+      changedPaths,
+      invalidatedFiles: changedPaths,
+      invalidatedModules,
+      reason: previousRun ? "Локальные Git-изменения не обнаружены, безопаснее удерживать full-refresh baseline." : "Предыдущий run отсутствует, partial invalidation ещё не на что опереть.",
+    };
+  }
+
+  return {
+    mode: changedPaths.length > 0 && changedPaths.length <= 150 ? "partial-invalidation" : "full-refresh",
+    ...previousRunPatch,
+    changedPaths,
+    invalidatedFiles: changedPaths,
+    invalidatedModules,
+    reason:
+      changedPaths.length > 0 && changedPaths.length <= 150
+        ? "Graph invalidation ограничен Git changed set и может идти как partial refresh."
+        : "Changed set слишком широк или пуст, поэтому используется full-refresh.",
+  };
+}
+
+function buildIncrementalIndexPlan(
+  previousRun: PipelineRunResult | null,
+  repository: PipelineRunResult["repository"],
+  selectiveCandidatePaths: string[],
+  shouldUseSelectiveWorkspace: boolean,
+): IncrementalIndexPlan {
+  const reusedSignals: string[] = [];
+
+  if (previousRun) {
+    reusedSignals.push(`previous-run:${previousRun.runId}`);
+    reusedSignals.push(`previous-graph:${previousRun.graph.summary.nodeCount}-nodes`);
+  }
+
+  if (repository.summary.changedFileCount > 0) {
+    reusedSignals.push(`git-changed-set:${repository.summary.changedFileCount}`);
+  }
+
+  if (shouldUseSelectiveWorkspace) {
+    reusedSignals.push(`selective-candidates:${selectiveCandidatePaths.length}`);
+    return {
+      mode: "incremental-index",
+      ...(previousRun ? { previousRunId: previousRun.runId } : {}),
+      candidatePaths: selectiveCandidatePaths,
+      reusedSignals,
+      reason: "Large-repository run использует Git changed set и selective candidate paths как incremental seed.",
+    };
+  }
+
+  return {
+    mode: "full-index",
+    ...(previousRun ? { previousRunId: previousRun.runId } : {}),
+    candidatePaths: selectiveCandidatePaths,
+    reusedSignals,
+    reason: previousRun
+      ? "Сигналы предыдущего run известны, но текущий сценарий требует полный индекс вместо частичного прохода."
+      : "Предыдущий run отсутствует, поэтому incremental reuse ещё не на что опереть.",
+  };
 }
