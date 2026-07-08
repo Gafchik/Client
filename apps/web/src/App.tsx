@@ -157,241 +157,6 @@ async function fetchJsonWithTimeout<T>(input: string, init?: RequestInit, timeou
   }
 }
 
-function SidebarProjectCard({ project, loading, onRefresh }: { project: ProjectInfo | null; loading: boolean; onRefresh: () => void }) {
-  return (
-    <section className="sidebar-card">
-      <div className="section-head">
-        <div>
-          <p className="section-kicker">Проект</p>
-          <h2>{loading ? "Загрузка..." : safeText(project?.name, "Проект не выбран")}</h2>
-        </div>
-        <button type="button" className="ghost-button" onClick={onRefresh}>
-          Обновить
-        </button>
-      </div>
-
-      <p className="sidebar-copy">{safeText(project?.rootPath, "Укажи путь к репозиторию внизу, чтобы начать run.")}</p>
-
-      <div className="mini-stats">
-        <div className="mini-stat">
-          <strong>{safeCount(project?.summary?.indexedFiles)}</strong>
-          <span>файлов</span>
-        </div>
-        <div className="mini-stat">
-          <strong>{Object.keys(project?.summary?.languages ?? {}).length}</strong>
-          <span>языков</span>
-        </div>
-        <div className="mini-stat">
-          <strong>{safeText(project?.summary?.profile, "standard")}</strong>
-          <span>профиль</span>
-        </div>
-      </div>
-
-      <div className="chip-row">
-        {Object.entries(project?.summary?.languages ?? {}).slice(0, 8).map(([language, count]) => (
-          <span key={language} className="chip">
-            {language}: {count}
-          </span>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function SidebarRuns({
-  project,
-  selectedRunId,
-  activeRunId,
-  onOpenRun,
-}: {
-  project: ProjectInfo | null;
-  selectedRunId: string | null;
-  activeRunId: string | null;
-  onOpenRun: (runId: string) => void;
-}) {
-  return (
-    <section className="sidebar-card">
-      <div className="section-head">
-        <div>
-          <p className="section-kicker">История</p>
-          <h2>Последние run</h2>
-        </div>
-        <span className="section-caption">{safeList(project?.recentRuns).length}</span>
-      </div>
-
-      <div className="stack compact-stack">
-        {safeList(project?.recentRuns).length ? (
-          safeList(project?.recentRuns)
-            .slice(0, 8)
-            .map((entry) => (
-              <button
-                key={entry.runId}
-                type="button"
-                className={`history-item ${selectedRunId === entry.runId ? "history-item-active" : ""}`}
-                onClick={() => onOpenRun(entry.runId)}
-              >
-                <strong>{safeText(entry.summary)}</strong>
-                <span>{safeText(entry.task)}</span>
-                <span className="history-meta">
-                  {activeRunId === entry.runId ? "Запуск активен" : formatDateTime(entry.savedAt)}
-                </span>
-              </button>
-            ))
-        ) : (
-          <p className="muted">Сохранённые исследования появятся здесь после первого запуска.</p>
-        )}
-      </div>
-    </section>
-  );
-}
-
-function ProviderSettings({
-  providers,
-  selectedProviderId,
-  providerDraft,
-  providerModels,
-  providerModelDraft,
-  onSelectProvider,
-  onChangeDraft,
-  onChangeModel,
-  onSaveProvider,
-  onRemoveProvider,
-}: {
-  providers: ProviderRecord[];
-  selectedProviderId: string;
-  providerDraft: ProviderDraft;
-  providerModels: ProviderModelRecord[];
-  providerModelDraft: string;
-  onSelectProvider: (providerId: string) => void;
-  onChangeDraft: (value: ProviderDraft) => void;
-  onChangeModel: (modelId: string) => void;
-  onSaveProvider: () => void;
-  onRemoveProvider: (providerId: string) => void;
-}) {
-  return (
-    <section className="sidebar-card">
-      <div className="section-head">
-        <div>
-          <p className="section-kicker">Среда ИИ</p>
-          <h2>Провайдер и модель</h2>
-        </div>
-        <span className="section-caption">{providers.length || 0}</span>
-      </div>
-
-      <div className="stack">
-        <label className="field">
-          <span>Активный провайдер</span>
-          <select value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)}>
-            <option value="">Не выбран</option>
-            {safeList(providers).map((provider) => (
-              <option key={provider.id} value={provider.id}>
-                {provider.name}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="field">
-          <span>Название провайдера</span>
-          <input
-            value={providerDraft.name}
-            onChange={(event) =>
-              onChangeDraft({
-                ...providerDraft,
-                name: event.target.value,
-              })
-            }
-            placeholder="rout.my"
-          />
-        </label>
-
-        <label className="field">
-          <span>Base URL</span>
-          <input
-            value={providerDraft.baseUrl}
-            onChange={(event) =>
-              onChangeDraft({
-                ...providerDraft,
-                baseUrl: event.target.value,
-              })
-            }
-            placeholder="https://api.rout.my/v1"
-          />
-        </label>
-
-        <label className="field">
-          <span>Модель для запуска</span>
-          <select value={providerModelDraft} onChange={(event) => onChangeModel(event.target.value)}>
-            {safeList(providerModels).map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.label}
-              </option>
-            ))}
-            {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
-          </select>
-        </label>
-
-        <label className="field">
-          <span>API ключ</span>
-          <input
-            type="password"
-            value={providerDraft.apiKey}
-            onChange={(event) =>
-              onChangeDraft({
-                ...providerDraft,
-                apiKey: event.target.value,
-              })
-            }
-            placeholder="sk-..."
-          />
-        </label>
-
-        <div className="action-row">
-          <button type="button" className="primary-button" onClick={onSaveProvider}>
-            Сохранить
-          </button>
-        </div>
-
-        <div className="stack compact-stack">
-          {safeList(providers).map((provider) => (
-            <div key={provider.id} className="provider-card">
-              <strong>
-                {provider.name}
-                {provider.isCurrent ? " / активный" : ""}
-              </strong>
-              <span>{provider.baseUrl}</span>
-              <span>Ключ: {provider.apiKeyMasked || "Не задан"}</span>
-              <div className="action-row">
-                <button type="button" className="ghost-button" onClick={() => onSelectProvider(provider.id)} disabled={provider.isCurrent}>
-                  Сделать активным
-                </button>
-                <button type="button" className="ghost-button danger-button" onClick={() => onRemoveProvider(provider.id)}>
-                  Удалить
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function IntroMessage() {
-  return (
-    <div className="message assistant-message">
-      <div className="message-badge">Client</div>
-      <div className="message-card">
-        <h3>Простой диалог с инженерной глубиной внутри</h3>
-        <p>
-          Напиши задачу так, как написал бы её разработчику. Система сама создаст внутренний run, соберёт structural
-          context, выполнит research, impact, context build и planner, а потом покажет результат в этом же диалоге.
-        </p>
-      </div>
-    </div>
-  );
-}
-
 function UserTaskMessage({ task, projectPath }: { task: string; projectPath: string }) {
   return (
     <div className="message user-message">
@@ -614,31 +379,6 @@ function AssistantRunMessage({
           </>
         ) : null}
       </div>
-    </div>
-  );
-}
-
-function EmptyState({ project }: { project: ProjectInfo | null }) {
-  return (
-    <div className="empty-state">
-      <h3>Что уже можно тестировать через фронт</h3>
-      <div className="empty-grid">
-        <div className="empty-card">
-          <strong>Структурные вопросы</strong>
-          <span>Например: как устроен модуль авторизации, где находятся маршруты, что затрагивает конкретный flow.</span>
-        </div>
-        <div className="empty-card">
-          <strong>Infrastructure / storage</strong>
-          <span>Например: где хранятся SSH подключения, какие конфиги используются, как устроены интеграции.</span>
-        </div>
-        <div className="empty-card">
-          <strong>Inventory</strong>
-          <span>Например: сколько языков локализации есть в проекте, какие миграции связаны с доменом, какие зоны меняются чаще.</span>
-        </div>
-      </div>
-      <p className="muted">
-        Сейчас выбран проект: <strong>{safeText(project?.name, "не выбран")}</strong>. После запуска результаты появятся в этом диалоге, а глубинные артефакты откроются справа.
-      </p>
     </div>
   );
 }
@@ -1381,7 +1121,6 @@ export function App() {
   const [runStatus, setRunStatus] = useState<PipelineRunStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PipelineRunResult | null>(null);
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<string>("");
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -1455,7 +1194,6 @@ export function App() {
         setProject(data);
         setProjectPath(data.rootPath);
         setResult((current) => current ?? data.latestRun ?? null);
-        setSelectedRunId((current) => current ?? data.latestRun?.runId ?? null);
         setSelectedTask((current) => current || latestEntry?.task || "");
         setProviders(providerData.providers);
         setProviderModels(providerData.models);
@@ -1502,7 +1240,6 @@ export function App() {
 
       startTransition(() => {
         setRunStatus(accepted);
-        setSelectedRunId(accepted.runId);
         setSelectedTask(task);
         setActiveRunId(accepted.runId);
         setInspectorOpen(false);
@@ -1571,28 +1308,6 @@ export function App() {
       }
 
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
-    }
-  }
-
-  async function openSavedRun(runId: string) {
-    setError(null);
-
-    try {
-      const params = new URLSearchParams({
-        projectPath,
-        runId,
-      });
-      const data = await fetchJsonWithTimeout<PipelineRunResult>(`${API_BASE_URL}/api/runs/selected?${params.toString()}`);
-      const historyEntry = project?.recentRuns.find((entry) => entry.runId === runId) ?? null;
-
-      startTransition(() => {
-        setResult(data);
-        setSelectedRunId(runId);
-        setSelectedTask(historyEntry?.task ?? selectedTask);
-        setInspectorOpen(false);
-      });
-    } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сохранённый run.");
     }
   }
 
@@ -1704,38 +1419,13 @@ export function App() {
 
   return (
     <main className="app-shell">
-      <aside className="app-sidebar">
-        <SidebarProjectCard project={project} loading={loading} onRefresh={() => void loadProject()} />
-        <SidebarRuns project={project} selectedRunId={selectedRunId} activeRunId={activeRunId} onOpenRun={(runId) => void openSavedRun(runId)} />
-        <ProviderSettings
-          providers={providers}
-          selectedProviderId={selectedProviderId}
-          providerDraft={providerDraft}
-          providerModels={providerModels}
-          providerModelDraft={providerModelDraft}
-          onSelectProvider={(providerId) => void selectProvider(providerId)}
-          onChangeDraft={setProviderDraft}
-          onChangeModel={setProviderModelDraft}
-          onSaveProvider={() => void saveProvider()}
-          onRemoveProvider={(providerId) => void removeProvider(providerId)}
-        />
-      </aside>
-
-      <section className="chat-shell">
+      <section className="chat-shell chat-shell-full">
         <header className="chat-header">
           <div>
-            <p className="section-kicker">Client MVP / Slice 1</p>
-            <h1>Инженерный чат с внутренним pipeline</h1>
-            <p className="chat-subtitle">
-              Снаружи это простой диалог. Внутри каждый запрос становится воспроизводимым run с research, impact,
-              context и planner.
-            </p>
+            <h1>Чат по проекту</h1>
           </div>
 
           <div className="header-actions">
-            <button type="button" className="ghost-button" onClick={() => openInspector("overview")} disabled={!result}>
-              Inspector
-            </button>
             {running ? (
               <button type="button" className="ghost-button danger-button" onClick={resetStuckRun}>
                 Сбросить зависший run
@@ -1744,48 +1434,48 @@ export function App() {
           </div>
         </header>
 
-        <div className="chat-body">
-          <IntroMessage />
+        <section className="runtime-bar">
+          <label className="field">
+            <span>Проект</span>
+            <input value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="/path/to/project" />
+          </label>
 
+          <label className="field">
+            <span>Провайдер</span>
+            <select value={selectedProviderId} onChange={(event) => void selectProvider(event.target.value)}>
+              <option value="">Не выбран</option>
+              {safeList(providers).map((provider) => (
+                <option key={provider.id} value={provider.id}>
+                  {provider.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field">
+            <span>Модель</span>
+            <select value={providerModelDraft} onChange={(event) => setProviderModelDraft(event.target.value)}>
+              {safeList(providerModels).map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.label}
+                </option>
+              ))}
+              {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
+            </select>
+          </label>
+
+          <button type="button" className="ghost-button runtime-refresh" onClick={() => void loadProject(projectPath)}>
+            Обновить
+          </button>
+        </section>
+
+        <div className="chat-body">
           {selectedTask ? <UserTaskMessage task={selectedTask} projectPath={projectPath} /> : null}
 
           <AssistantRunMessage runStatus={runStatus} result={result} onOpenInspector={openInspector} />
-
-          {!selectedTask && !running && !result ? <EmptyState project={project} /> : null}
         </div>
 
         <form className="composer" onSubmit={runPipeline}>
-          <div className="composer-runtime">
-            <label className="field">
-              <span>Путь к проекту</span>
-              <input value={projectPath} onChange={(event) => setProjectPath(event.target.value)} />
-            </label>
-
-            <label className="field">
-              <span>Провайдер</span>
-              <select value={selectedProviderId} onChange={(event) => void selectProvider(event.target.value)}>
-                <option value="">Не выбран</option>
-                {safeList(providers).map((provider) => (
-                  <option key={provider.id} value={provider.id}>
-                    {provider.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="field">
-              <span>Модель</span>
-              <select value={providerModelDraft} onChange={(event) => setProviderModelDraft(event.target.value)}>
-                {safeList(providerModels).map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.label}
-                  </option>
-                ))}
-                {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
-              </select>
-            </label>
-          </div>
-
           <div className="composer-box">
             <textarea
               value={task}

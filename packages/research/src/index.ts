@@ -225,7 +225,8 @@ export function runResearch(input: ResearchInput): ResearchReport {
   const routing = routeResearch(tokens);
   const broadFocus = routing.intentClass === "broad-unknown";
   const infrastructureFocus = isInfrastructureQuestion(tokens);
-  const localizationFocus = isLocalizationQuestion(tokens);
+  const localizationInventoryFocus = isLocalizationInventoryQuestion(tokens);
+  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(tokens);
   const configFocus = isConfigQuestion(tokens);
   const fileEvidence: ScoredReference[] = [];
   const symbolEvidence: ScoredReference[] = [];
@@ -251,7 +252,8 @@ export function runResearch(input: ResearchInput): ResearchReport {
       getModuleBoost(file.relativePath, moduleIntents) +
       getGraphProfileFileBoost(file.relativePath, graphSeedFilePaths, graphSeedLabels, routing.queryProfileKey) +
       getInfrastructureFileBoost(file, infrastructureFocus, tokens) +
-      getLocalizationFileBoost(file, localizationFocus, tokens) +
+      getLocalizationFileBoost(file, localizationInventoryFocus, tokens) +
+      getLocaleRuntimeFileBoost(file, localizationBehaviorFocus, tokens) +
       getConfigFileBoost(file, configFocus, tokens);
 
     if (score <= 0) {
@@ -276,7 +278,8 @@ export function runResearch(input: ResearchInput): ResearchReport {
       getGraphProfileSymbolBoost(symbol, graphSeedFilePaths, graphSeedNodeIds, graphSeedLabels, routing.queryProfileKey) +
       getSymbolKindBoost(symbol.kind, functionalFocus, tokens) +
       getInfrastructureSymbolBoost(symbol, infrastructureFocus, tokens) +
-      getLocalizationSymbolBoost(symbol, localizationFocus, tokens) +
+      getLocalizationSymbolBoost(symbol, localizationInventoryFocus, tokens) +
+      getLocaleRuntimeSymbolBoost(symbol, localizationBehaviorFocus, tokens) +
       getConfigSymbolBoost(symbol, configFocus, tokens);
 
     if (score <= 0) {
@@ -300,7 +303,8 @@ export function runResearch(input: ResearchInput): ResearchReport {
       (graphSeedNodeIds.has(routeNode.id) ? 30 : 0) +
       (functionalFocus ? 36 : 12) +
       getInfrastructureRoutePenalty(routeNode.filePath ?? "", infrastructureFocus) +
-      getLocalizationRoutePenalty(routeNode.filePath ?? "", localizationFocus) +
+      getLocalizationRoutePenalty(routeNode.filePath ?? "", localizationInventoryFocus) +
+      getLocaleRuntimeRouteBoost(routeNode.filePath ?? "", localizationBehaviorFocus) +
       getConfigRoutePenalty(routeNode.filePath ?? "", configFocus);
 
     if (score <= 0) {
@@ -385,7 +389,15 @@ export function runResearch(input: ResearchInput): ResearchReport {
 }
 
 function routeResearch(tokens: string[]): ResearchRoutingDecision {
-  if (isLocalizationQuestion(tokens)) {
+  if (isLocalizationBehaviorQuestion(tokens)) {
+    return {
+      intentClass: "functional-flow",
+      strategyKey: "graph-functional-entrypoints",
+      queryProfileKey: "entrypoint-traversal",
+    };
+  }
+
+  if (isLocalizationInventoryQuestion(tokens)) {
     return {
       intentClass: "inventory-localization",
       strategyKey: "graph-localization-inventory",
@@ -443,7 +455,8 @@ function buildFunctionalSummary(
   dataSources: string[],
 ): string {
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationFocus = isLocalizationQuestion(expandTaskTokens(input.task));
+  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
+  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
   const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
   const moduleText = affectedModules.length ? affectedModules.join(", ") : "неопределённых зонах";
@@ -459,7 +472,11 @@ function buildFunctionalSummary(
     return `По текущему исследованию задача "${input.task}" сформулирована слишком широко, поэтому система перешла в broad repository scan вместо узкого доменного обхода. Обнаружены наиболее заметные зоны проекта: ${moduleText}. Стартовые structural anchors: ${entryPointText}. Первичные сущности верхнего уровня: ${entityText}. Подтверждённый общий signal: ${sideEffectText}. Основной источник сведений: ${dataSourceText}. Для точного ответа желательно сузить вопрос до конкретного модуля, потока или подсистемы.`;
   }
 
-  if (localizationFocus) {
+  if (localizationBehaviorFocus) {
+    return `По текущему исследованию задача "${input.task}" относится к runtime-поведению локализации, а не к inventory переводов. Основные точки входа: ${entryPointText}. Вероятные сущности, влияющие на выбор локали: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных для выбора локали: ${dataSourceText}. Система должна проверять middleware, request headers, config fallback и места, где locale устанавливается в жизненном цикле запроса.`;
+  }
+
+  if (localizationInventoryFocus) {
     const localeCodes = detectLocalizationCodes(input);
     return `По текущему исследованию задача "${input.task}" больше всего связана с ${moduleText}. В проекте обнаружено ${localeCodes.length} языков локализации: ${localeCodes.join(", ") || "не удалось определить"}. Основные точки хранения: ${entryPointText}. Ключевые сущности локализации: ${entityText}. Главный подтверждённый i18n signal: ${sideEffectText}. Основной источник локализационных данных: ${dataSourceText}.`;
   }
@@ -494,7 +511,8 @@ function buildFindings(
   const moduleRelationSummary =
     dominantModule !== "не определён" ? getModuleRelationSummary(input.graph, dominantModule).slice(0, 3) : [];
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationFocus = isLocalizationQuestion(expandTaskTokens(input.task));
+  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
+  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
   const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
 
@@ -509,7 +527,22 @@ function buildFindings(
     ];
   }
 
-  if (localizationFocus) {
+  if (localizationBehaviorFocus) {
+    return [
+      `Самые сильные structural anchors для runtime-вопроса о локали: ${topLabels.join(", ")}.`,
+      "Вопрос распознан как поведение запроса, поэтому research ищет не только translation-файлы, а middleware, request lifecycle, headers и config fallback.",
+      moduleIntents[0]
+        ? `Доменные эвристики отдали приоритет модулю "${moduleIntents[0].module}", но ответ должен подтверждаться runtime-цепочкой выбора locale.`
+        : "Доменные эвристики не смогли уверенно выделить одну runtime-зону выбора locale.",
+      moduleRelationSummary.length > 0
+        ? `Graph показал соседние модульные связи для "${dominantModule}": ${moduleRelationSummary
+            .map((item) => `${item.direction === "outgoing" ? "зависит от" : "используется модулем"} ${item.targetLabel}`)
+            .join(", ")}.`
+        : "Graph пока не дал выраженных межмодульных связей для runtime-зоны локализации.",
+    ];
+  }
+
+  if (localizationInventoryFocus) {
     const localeCodes = detectLocalizationCodes(input);
     return [
       `Самые сильные структурные опоры для локализационного вопроса: ${topLabels.join(", ")}.`,
@@ -615,7 +648,8 @@ function buildUnknowns(
 
 function detectModuleIntents(input: ResearchInput, tokens: string[]): ModuleIntentMatch[] {
   const infrastructureFocus = isInfrastructureQuestion(tokens);
-  const localizationFocus = isLocalizationQuestion(tokens);
+  const localizationInventoryFocus = isLocalizationInventoryQuestion(tokens);
+  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(tokens);
   const configFocus = isConfigQuestion(tokens);
   const symbolHaystacks = new Map<string, string>();
 
@@ -663,16 +697,27 @@ function detectModuleIntents(input: ResearchInput, tokens: string[]): ModuleInte
         fileScore += 16;
       }
 
-      if (localizationFocus && profile.key === "localization" && isLocalizationPath(pathText)) {
+      if (localizationInventoryFocus && profile.key === "localization" && isLocalizationPath(pathText)) {
         fileScore += 48;
       }
 
-      if (localizationFocus && profile.key === "localization" && (pathMatches > 0 || symbolMatches > 0)) {
+      if (localizationInventoryFocus && profile.key === "localization" && (pathMatches > 0 || symbolMatches > 0)) {
         fileScore += 24;
       }
 
-      if (localizationFocus && profile.key !== "localization" && (pathText.includes("/routes/") || pathText.includes("/controllers/") || pathText.includes("/auth/"))) {
+      if (localizationInventoryFocus && profile.key !== "localization" && (pathText.includes("/routes/") || pathText.includes("/controllers/") || pathText.includes("/auth/"))) {
         fileScore -= 30;
+      }
+
+      if (localizationBehaviorFocus && profile.key === "localization" && (pathMatches > 0 || symbolMatches > 0)) {
+        fileScore += 12;
+      }
+
+      if (
+        localizationBehaviorFocus
+        && (pathText.includes("/middleware/") || pathText.includes("/http/") || pathText.includes("/requests/") || pathText.includes("/config/"))
+      ) {
+        fileScore += 20;
       }
 
       if (configFocus && profile.key === "config" && isConfigPath(pathText)) {
@@ -751,7 +796,7 @@ function detectEntryPoints(
     return deriveBroadEntryPoints(input, topFiles).slice(0, 6);
   }
 
-  if (isLocalizationQuestion(expandTaskTokens(input.task))) {
+  if (isLocalizationInventoryQuestion(expandTaskTokens(input.task))) {
     return detectLocalizationEntryPoints(input).slice(0, 6);
   }
 
@@ -838,11 +883,12 @@ function detectEntryPoints(
 
 function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNodes: GraphState["nodes"]): string[] {
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationFocus = isLocalizationQuestion(expandTaskTokens(input.task));
+  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
+  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
   const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
 
-  if (localizationFocus) {
+  if (localizationInventoryFocus) {
     const localeCodes = detectLocalizationCodes(input);
     const localizationFiles = input.workspace.files
       .filter((file) => isLocalizationPath(file.relativePath.toLowerCase()))
@@ -850,6 +896,29 @@ function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNod
       .slice(0, 4);
 
     return [...localeCodes, ...localizationFiles].slice(0, 8);
+  }
+
+  if (localizationBehaviorFocus) {
+    return codeNodes
+      .filter((node) => {
+        const label = node.label.toLowerCase();
+        const filePath = (node.filePath ?? "").toLowerCase();
+
+        return (
+          topFiles.includes(node.filePath ?? "")
+          || label.includes("locale")
+          || label.includes("lang")
+          || label.includes("language")
+          || label.includes("middleware")
+          || label.includes("header")
+          || filePath.includes("/middleware/")
+          || filePath.includes("/http/")
+          || filePath.includes("/config/")
+        );
+      })
+      .map((node) => node.label)
+      .filter((value, index, list) => list.indexOf(value) === index)
+      .slice(0, 8);
   }
 
   if (configFocus) {
@@ -893,7 +962,8 @@ function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNod
 function detectSideEffects(input: ResearchInput): string[] {
   const effects = new Set<string>();
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationFocus = isLocalizationQuestion(expandTaskTokens(input.task));
+  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
+  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
 
   for (const file of input.workspace.files) {
@@ -939,12 +1009,24 @@ function detectSideEffects(input: ResearchInput): string[] {
       effects.add("есть настройка SSH port forwarding или tunnel-конфигурации");
     }
 
-    if (localizationFocus && isLocalizationPath(file.relativePath.toLowerCase())) {
+    if (localizationInventoryFocus && isLocalizationPath(file.relativePath.toLowerCase())) {
       effects.add("локализация хранится как набор translation-файлов, сгруппированных по языковым директориям");
     }
 
-    if (localizationFocus && (content.includes("__(") || content.includes("trans(") || content.includes("validation") || content.includes("passwords"))) {
+    if (localizationInventoryFocus && (content.includes("__(") || content.includes("trans(") || content.includes("validation") || content.includes("passwords"))) {
       effects.add("приложение использует translation keys и словари сообщений для UI, валидации и системных текстов");
+    }
+
+    if (localizationBehaviorFocus && (content.includes("setlocale") || content.includes("app()->setlocale") || content.includes("set_locale") || content.includes("setlanguage"))) {
+      effects.add("есть runtime-логика явной установки locale внутри запроса или middleware");
+    }
+
+    if (localizationBehaviorFocus && (content.includes("x-lang") || content.includes("accept-language") || content.includes("request->header") || content.includes("headers->get"))) {
+      effects.add("локаль может определяться через входящий header запроса или middleware, читающее язык из request");
+    }
+
+    if (localizationBehaviorFocus && (content.includes("middleware") || file.relativePath.toLowerCase().includes("/middleware/"))) {
+      effects.add("часть поведения локализации, вероятно, находится в middleware или раннем HTTP-пайплайне");
     }
 
     if (configFocus && isConfigPath(file.relativePath.toLowerCase())) {
@@ -956,7 +1038,7 @@ function detectSideEffects(input: ResearchInput): string[] {
     }
   }
 
-  if (localizationFocus) {
+  if (localizationInventoryFocus || localizationBehaviorFocus) {
     return prioritizeLocalizationEffects([...effects]).slice(0, 6);
   }
 
@@ -974,7 +1056,8 @@ function detectSideEffects(input: ResearchInput): string[] {
 function detectDataSources(input: ResearchInput): string[] {
   const sources = new Set<string>();
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationFocus = isLocalizationQuestion(expandTaskTokens(input.task));
+  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
+  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
 
   for (const file of input.workspace.files) {
@@ -1028,12 +1111,20 @@ function detectDataSources(input: ResearchInput): string[] {
       sources.add("структура серверного подключения хранится в модельном и табличном слое приложения");
     }
 
-    if (localizationFocus && isLocalizationPath(file.relativePath.toLowerCase())) {
+    if (localizationInventoryFocus && isLocalizationPath(file.relativePath.toLowerCase())) {
       sources.add("локализационные данные определяются по каталогам и translation-файлам внутри lang/locales/i18n-структуры");
     }
 
-    if (localizationFocus && (content.includes("__(") || content.includes("trans("))) {
+    if (localizationInventoryFocus && (content.includes("__(") || content.includes("trans("))) {
       sources.add("часть локализационных ключей используется через translation helper-функции приложения");
+    }
+
+    if (localizationBehaviorFocus && (content.includes("env(") || content.includes("config(") || file.relativePath.toLowerCase().includes("/config/"))) {
+      sources.add("fallback locale и языковые правила могут подтягиваться из config/env-слоя приложения");
+    }
+
+    if (localizationBehaviorFocus && (content.includes("request->header") || content.includes("x-lang") || content.includes("accept-language"))) {
+      sources.add("часть выбора локали может зависеть от данных входящего HTTP-запроса");
     }
 
     if (configFocus && isConfigPath(file.relativePath.toLowerCase())) {
@@ -1045,7 +1136,7 @@ function detectDataSources(input: ResearchInput): string[] {
     }
   }
 
-  if (localizationFocus) {
+  if (localizationInventoryFocus || localizationBehaviorFocus) {
     return prioritizeLocalizationSources([...sources]).slice(0, 6);
   }
 
@@ -1115,7 +1206,7 @@ function isInfrastructureQuestion(tokens: string[]): boolean {
   );
 }
 
-function isLocalizationQuestion(tokens: string[]): boolean {
+function isLocalizationInventoryQuestion(tokens: string[]): boolean {
   return tokens.some((token) =>
     [
       "localization",
@@ -1140,6 +1231,43 @@ function isLocalizationQuestion(tokens: string[]): boolean {
       "локалей",
     ].includes(token),
   );
+}
+
+function isLocalizationBehaviorQuestion(tokens: string[]): boolean {
+  const hasLocalizationSignal = isLocalizationInventoryQuestion(tokens);
+  const hasBehaviorSignal = tokens.some((token) =>
+    [
+      "how",
+      "work",
+      "works",
+      "flow",
+      "behavior",
+      "behaviour",
+      "request",
+      "response",
+      "header",
+      "headers",
+      "middleware",
+      "default",
+      "fallback",
+      "выбирается",
+      "выбора",
+      "определяется",
+      "определение",
+      "работает",
+      "как",
+      "почему",
+      "ответ",
+      "ответа",
+      "заголовок",
+      "заголовки",
+      "мидлвар",
+      "middleware",
+      "дефолт",
+    ].includes(token),
+  );
+
+  return hasLocalizationSignal && hasBehaviorSignal;
 }
 
 function isConfigQuestion(tokens: string[]): boolean {
@@ -1570,6 +1698,112 @@ function getLocalizationRoutePenalty(filePath: string, localizationFocus: boolea
   }
 
   return isLocalizationPath(filePath.toLowerCase()) ? 8 : -42;
+}
+
+function getLocaleRuntimeFileBoost(
+  file: WorkspaceSnapshot["files"][number],
+  localizationBehaviorFocus: boolean,
+  tokens: string[],
+): number {
+  if (!localizationBehaviorFocus) {
+    return 0;
+  }
+
+  const pathText = file.relativePath.toLowerCase();
+  const contentText = file.content.slice(0, 4000).toLowerCase();
+  let score = 0;
+
+  if (pathText.includes("/middleware/") || pathText.includes("/http/") || pathText.includes("/requests/")) {
+    score += 34;
+  }
+
+  if (pathText.includes("/config/")) {
+    score += 26;
+  }
+
+  if (pathText.includes("/lang/") || pathText.includes("/translations/")) {
+    score -= 18;
+  }
+
+  if (contentText.includes("x-lang") || contentText.includes("accept-language")) {
+    score += 42;
+  }
+
+  if (contentText.includes("request->header") || contentText.includes("header(") || contentText.includes("headers->get")) {
+    score += 28;
+  }
+
+  if (contentText.includes("setlocale") || contentText.includes("app()->setlocale") || contentText.includes("set_locale")) {
+    score += 36;
+  }
+
+  if (contentText.includes("config(") || contentText.includes("env(") || contentText.includes("fallback_locale") || contentText.includes("default_locale")) {
+    score += 18;
+  }
+
+  if (tokens.some((token) => pathText.includes(token) || contentText.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getLocaleRuntimeSymbolBoost(
+  symbol: IndexSymbol,
+  localizationBehaviorFocus: boolean,
+  tokens: string[],
+): number {
+  if (!localizationBehaviorFocus) {
+    return 0;
+  }
+
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  const filePath = symbol.filePath.toLowerCase();
+  let score = 0;
+
+  if (filePath.includes("/middleware/") || filePath.includes("/http/") || filePath.includes("/config/")) {
+    score += 18;
+  }
+
+  if (label.includes("locale") || label.includes("lang") || label.includes("language")) {
+    score += 18;
+  }
+
+  if (label.includes("middleware") || label.includes("header") || label.includes("request")) {
+    score += 16;
+  }
+
+  if (symbol.kind === "middleware" || symbol.kind === "method") {
+    score += 12;
+  }
+
+  if (isLocalizationPath(filePath)) {
+    score -= 14;
+  }
+
+  if (tokens.some((token) => label.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getLocaleRuntimeRouteBoost(filePath: string, localizationBehaviorFocus: boolean): number {
+  if (!localizationBehaviorFocus) {
+    return 0;
+  }
+
+  const normalized = filePath.toLowerCase();
+
+  if (normalized.includes("/middleware/") || normalized.includes("/http/")) {
+    return 12;
+  }
+
+  if (isLocalizationPath(normalized)) {
+    return -24;
+  }
+
+  return 0;
 }
 
 function getConfigFileBoost(

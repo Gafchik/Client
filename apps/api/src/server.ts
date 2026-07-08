@@ -18,34 +18,42 @@ app
   });
 
 function loadLocalEnv(): void {
-  const envPath = path.resolve(process.cwd(), ".env");
+  const envCandidates = [
+    path.resolve(process.cwd(), ".env"),
+    path.resolve(process.cwd(), "..", ".env"),
+    path.resolve(process.cwd(), "..", "..", ".env"),
+  ];
 
-  if (!existsSync(envPath)) {
+  for (const envPath of envCandidates) {
+    if (!existsSync(envPath)) {
+      continue;
+    }
+
+    const content = readFileSync(envPath, "utf8");
+
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+
+      const separatorIndex = line.indexOf("=");
+
+      if (separatorIndex <= 0) {
+        continue;
+      }
+
+      const key = line.slice(0, separatorIndex).trim();
+      const value = line.slice(separatorIndex + 1).trim().replace(/^['"]|['"]$/g, "");
+
+      if (!key) {
+        continue;
+      }
+
+      process.env[key] = value;
+    }
+
     return;
-  }
-
-  const content = readFileSync(envPath, "utf8");
-
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-
-    const separatorIndex = line.indexOf("=");
-
-    if (separatorIndex <= 0) {
-      continue;
-    }
-
-    const key = line.slice(0, separatorIndex).trim();
-    const value = line.slice(separatorIndex + 1).trim().replace(/^['"]|['"]$/g, "");
-
-    if (!key) {
-      continue;
-    }
-
-    process.env[key] = value;
   }
 }

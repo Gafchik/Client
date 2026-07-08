@@ -36,9 +36,7 @@ button {
 
 .app-shell {
   min-height: 100vh;
-  display: grid;
-  grid-template-columns: 340px minmax(0, 1fr);
-  gap: 24px;
+  display: block;
   padding: 24px;
 }
 
@@ -144,10 +142,16 @@ button {
 }
 
 .chat-shell {
+  max-width: 1180px;
+  margin: 0 auto;
   min-width: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 20px;
+}
+
+.chat-shell-full {
+  max-width: 1180px;
 }
 
 .chat-header {
@@ -169,7 +173,6 @@ button {
 .header-actions,
 .action-row,
 .composer-actions,
-.composer-runtime,
 .mini-stats,
 .chip-row,
 .result-quick-grid,
@@ -186,6 +189,43 @@ button {
   gap: 16px;
   align-content: start;
   padding-right: 4px;
+}
+
+.runtime-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(180px, 0.8fr) minmax(220px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  padding: 18px;
+  border-radius: 24px;
+  backdrop-filter: blur(12px);
+  background: rgba(255, 252, 247, 0.84);
+  border: 1px solid rgba(29, 36, 51, 0.08);
+  box-shadow: 0 18px 50px rgba(47, 56, 77, 0.08);
+}
+
+.runtime-refresh {
+  align-self: stretch;
+}
+
+.runtime-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  color: #5b667f;
+  font-size: 0.94rem;
+  padding: 0 4px;
+}
+
+.runtime-meta span {
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(29, 36, 51, 0.05);
+}
+
+.runtime-inline-button {
+  padding: 8px 12px;
 }
 
 .message {
@@ -354,11 +394,6 @@ button {
   padding: 18px;
   display: grid;
   gap: 16px;
-}
-
-.composer-runtime {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .field {
@@ -549,23 +584,14 @@ button {
 }
 
 @media (max-width: 1280px) {
-  .app-shell {
-    grid-template-columns: 300px minmax(0, 1fr);
+  .runtime-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(180px, 0.7fr);
   }
 }
 
 @media (max-width: 1080px) {
   .app-shell {
-    grid-template-columns: 1fr;
     padding: 18px;
-  }
-
-  .app-sidebar {
-    order: 2;
-  }
-
-  .chat-shell {
-    order: 1;
   }
 
   .message,
@@ -582,7 +608,7 @@ button {
 }
 
 @media (max-width: 880px) {
-  .composer-runtime,
+  .runtime-bar,
   .inline-highlights,
   .result-quick-grid,
   .empty-grid {
