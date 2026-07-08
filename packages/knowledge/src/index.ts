@@ -11,6 +11,7 @@ import {
   type KnowledgeCatalogEntry,
   type KnowledgeSaveResult,
   type PipelineRunResult,
+  type ProviderRuntimeConfig,
   type ResearchReport,
   type WorkspaceSnapshot,
 } from "@client/shared";
@@ -20,6 +21,7 @@ interface SaveKnowledgeInput {
   task: string;
   appRootPath: string;
   workspace: WorkspaceSnapshot;
+  provider: ProviderRuntimeConfig;
   index: IndexResult;
   graph: GraphState;
   research: ResearchReport;
@@ -47,6 +49,7 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       rootPath: input.workspace.rootPath,
       summary: input.workspace.summary,
     },
+    provider: input.provider,
     index: {
       manifest: input.index.manifest,
       stats: input.index.stats,
@@ -138,6 +141,7 @@ function normalizePipelineRunArtifact(
     !artifact.runId ||
     !artifact.project ||
     !artifact.workspace ||
+    !artifact.provider ||
     !artifact.index ||
     !artifact.graph ||
     !artifact.research ||
@@ -197,11 +201,15 @@ function normalizePipelineRunArtifact(
     runId: artifact.runId,
     project: artifact.project,
     workspace: artifact.workspace,
+    provider: artifact.provider,
     index: artifact.index,
     graph: artifact.graph,
     stages,
     research: {
       ...artifact.research,
+      intentClass: artifact.research.intentClass ?? "broad-unknown",
+      strategyKey: artifact.research.strategyKey ?? "broad-repository-scan",
+      queryProfileKey: artifact.research.queryProfileKey ?? "broad-scan",
       functionalSummary: artifact.research.functionalSummary ?? "Функциональная сводка отсутствовала в старом артефакте.",
       dominantModule: artifact.research.dominantModule ?? "не определён",
       moduleIntents: artifact.research.moduleIntents ?? [],

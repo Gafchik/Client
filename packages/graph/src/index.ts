@@ -1,6 +1,7 @@
 import {
   type GraphNodeKind,
   type GraphRelationType,
+  type ResearchQueryProfileKey,
   stableId,
   type GraphEdge,
   type GraphNode,
@@ -530,6 +531,132 @@ export function getSymbolDependents(graph: GraphState, symbolId: string): GraphN
     ["IMPORTS", "REFERENCES", "CALLS", "USES", "IMPLEMENTS", "EXTENDS", "READS", "WRITES", "CREATES"],
     "incoming",
   );
+}
+
+export function getFunctionalEntryPointSet(graph: GraphState, moduleLabel?: string): GraphNode[] {
+  const routes = moduleLabel ? getRoutesForModule(graph, moduleLabel) : getRouteNodes(graph);
+  const nodeIds = new Set<string>(routes.map((node) => node.id));
+
+  for (const route of routes) {
+    for (const neighbor of getEntryPointNeighbors(graph, route.id)) {
+      nodeIds.add(neighbor.id);
+    }
+  }
+
+  if (moduleLabel) {
+    const moduleSubgraph = getModuleSubgraph(graph, moduleLabel)
+      .filter((node) => node.kind !== "project" && node.kind !== "repository")
+      .slice(0, 24);
+
+    for (const node of moduleSubgraph) {
+      nodeIds.add(node.id);
+    }
+  }
+
+  return graph.nodes.filter((node) => nodeIds.has(node.id));
+}
+
+export function getStorageTopologyNodes(graph: GraphState): GraphNode[] {
+  const nodeIds = new Set<string>();
+
+  for (const node of graph.nodes) {
+    const label = node.label.toLowerCase();
+    const filePath = node.filePath?.toLowerCase() ?? "";
+
+    if (
+      label.includes("server")
+      || label.includes("credential")
+      || label.includes("vault")
+      || label.includes("password")
+      || label.includes("passphrase")
+      || label.includes("private_key")
+      || label.includes("forwarding")
+      || filePath.includes("/servers/")
+      || filePath.includes("servercredential")
+      || filePath.includes("forwardingport")
+      || filePath.includes("/vault/")
+      || filePath.includes("/migrations/")
+    ) {
+      nodeIds.add(node.id);
+    }
+  }
+
+  for (const nodeId of [...nodeIds]) {
+    for (const neighbor of getStructuralNeighbors(
+      graph,
+      nodeId,
+      ["BELONGS_TO", "CONTAINS", "USES", "REFERENCES", "READS", "WRITES", "CREATES"],
+      "both",
+    )) {
+      nodeIds.add(neighbor.id);
+    }
+  }
+
+  return graph.nodes.filter((node) => nodeIds.has(node.id));
+}
+
+export function getLocalizationInventoryNodes(graph: GraphState): GraphNode[] {
+  return graph.nodes.filter((node) => {
+    const label = node.label.toLowerCase();
+    const filePath = node.filePath?.toLowerCase() ?? "";
+
+    return (
+      label.includes("localization")
+      || label.includes("translation")
+      || label.includes("locale")
+      || filePath.startsWith("lang/")
+      || filePath.includes("/lang/")
+      || filePath.includes("/locales/")
+      || filePath.includes("/i18n/")
+    );
+  });
+}
+
+export function getConfigInventoryNodes(graph: GraphState): GraphNode[] {
+  return graph.nodes.filter((node) => {
+    const label = node.label.toLowerCase();
+    const filePath = node.filePath?.toLowerCase() ?? "";
+
+    return (
+      label.includes("config")
+      || label.includes("env")
+      || label.includes("settings")
+      || filePath.startsWith("config/")
+      || filePath.includes("/config/")
+      || filePath.endsWith(".env")
+      || filePath.includes("/env.")
+    );
+  });
+}
+
+export function getBroadScanSeeds(graph: GraphState): GraphNode[] {
+  const modules = getNodesByKind(graph, "module").slice(0, 12);
+  const routes = getRouteNodes(graph).slice(0, 8);
+  const files = getFileNodes(graph).slice(0, 12);
+  const seedIds = new Set<string>([...modules, ...routes, ...files].map((node) => node.id));
+
+  return graph.nodes.filter((node) => seedIds.has(node.id));
+}
+
+export function getNodesForQueryProfile(
+  graph: GraphState,
+  queryProfileKey: ResearchQueryProfileKey,
+  options?: { moduleLabel?: string },
+): GraphNode[] {
+  switch (queryProfileKey) {
+    case "entrypoint-traversal":
+      return getFunctionalEntryPointSet(graph, options?.moduleLabel);
+    case "storage-topology":
+      return getStorageTopologyNodes(graph);
+    case "localization-inventory":
+      return getLocalizationInventoryNodes(graph);
+    case "config-inventory":
+      return getConfigInventoryNodes(graph);
+    case "broad-scan":
+      return getBroadScanSeeds(graph);
+    default:
+      return [];
+  }
 }
 
 function getModuleLabel(filePath: string): string {

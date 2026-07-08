@@ -32,7 +32,7 @@ export function buildExecutionPlan(input: BuildPlanInput): ExecutionPlan {
   const validationScope = input.impact.validationScope.slice(0, 8);
   const planningGroups = buildPlanningGroups(targetFiles, targetModules);
   const dependencyChains = buildDependencyChains(input.graph, planningGroups, targetModules);
-  const requiresHybridFlow = shouldUseHybridStrategy(targetFiles, input.impact.risks, dependencyChains);
+  const requiresHybridFlow = shouldUseHybridStrategy(input, planningGroups, targetFiles, input.impact.risks, dependencyChains);
   const planningNotes = buildPlanningNotes(input, targetModules, targetFiles, entryPoints, validationScope, dependencyChains);
   const steps = buildPlanSteps(input, planningGroups, targetModules, targetFiles, entryPoints, validationScope, dependencyChains, requiresHybridFlow);
 
@@ -336,12 +336,12 @@ function buildModuleDependencyChains(graph: GraphState, targetModules: string[])
   return uniqueDependencies(chains);
 }
 
-function shouldUseHybridStrategy(targetFiles: string[], risks: string[], dependencyChains: PlanDependency[]): boolean {
-  if (risks.length >= 2) {
+function shouldUseHybridStrategyBase(targetFiles: string[], risks: string[], dependencyChains: PlanDependency[]): boolean {
+  if (targetFiles.length <= 1) {
     return false;
   }
 
-  if (targetFiles.length <= 1) {
+  if (risks.length >= 2) {
     return false;
   }
 
@@ -352,6 +352,36 @@ function shouldUseHybridStrategy(targetFiles: string[], risks: string[], depende
   }
 
   return true;
+}
+
+function shouldUseHybridStrategy(
+  input: BuildPlanInput,
+  planningGroups: PlanningGroup[],
+  targetFiles: string[],
+  risks: string[],
+  dependencyChains: PlanDependency[],
+): boolean {
+  if (input.research.queryProfileKey === "storage-topology") {
+    return false;
+  }
+
+  if (input.research.queryProfileKey === "config-inventory") {
+    return false;
+  }
+
+  if (input.research.queryProfileKey === "localization-inventory") {
+    return false;
+  }
+
+  if (input.research.queryProfileKey === "broad-scan") {
+    return false;
+  }
+
+  if (planningGroups.length <= 1) {
+    return false;
+  }
+
+  return shouldUseHybridStrategyBase(targetFiles, risks, dependencyChains);
 }
 
 function buildPlanSummary(
@@ -373,6 +403,7 @@ function buildPlanningNotes(
   dependencyChains: PlanDependency[],
 ): string[] {
   const notes = [
+    `Профиль исследования: ${input.research.queryProfileKey}.`,
     targetModules.length
       ? `Главная зона планирования: ${targetModules.join(", ")}.`
       : "Главная зона планирования не выделена явно, поэтому план опирается на file-level scope.",
@@ -389,6 +420,22 @@ function buildPlanningNotes(
       ? `Graph подтвердил цепочки зависимостей: ${dependencyChains.slice(0, 3).map((item) => `${item.from} -> ${item.to}`).join(", ")}.`
       : "Graph не подтвердил жёсткие цепочки зависимостей внутри текущего scope, поэтому допустим более свободный порядок workstreams.",
   ];
+
+  if (input.research.queryProfileKey === "storage-topology") {
+    notes.push("Storage-topology профиль требует консервативного порядка: schema/model/repository/request зоны должны подтверждаться перед execution.");
+  }
+
+  if (input.research.queryProfileKey === "config-inventory") {
+    notes.push("Config-inventory профиль должен оставаться обзорным и не превращаться в параллельные runtime workstreams без дополнительного уточнения задачи.");
+  }
+
+  if (input.research.queryProfileKey === "localization-inventory") {
+    notes.push("Localization-inventory профиль должен группировать изменения по translation каталогам и избегать лишнего runtime sequencing.");
+  }
+
+  if (input.research.queryProfileKey === "broad-scan") {
+    notes.push("Broad-scan профиль требует дополнительного narrowing: execution нельзя начинать до уточнения целевой функциональной или инфраструктурной зоны.");
+  }
 
   if (input.impact.risks.length > 0) {
     notes.push(`Ключевые риски: ${input.impact.risks.slice(0, 2).join(" ")}`);
@@ -474,6 +521,22 @@ function derivePlanningGroupLabel(filePath: string, targetModules: string[]): st
     return semanticPrefix ? `${semanticPrefix}-models` : matchedModule ? `${matchedModule}:models` : "models";
   }
 
+  if (normalized.includes("/repositories/") || normalized.includes("/repository/")) {
+    return semanticPrefix ? `${semanticPrefix}-repositories` : matchedModule ? `${matchedModule}:repositories` : "repositories";
+  }
+
+  if (normalized.includes("/migrations/")) {
+    return semanticPrefix ? `${semanticPrefix}-migrations` : matchedModule ? `${matchedModule}:migrations` : "migrations";
+  }
+
+  if (normalized.startsWith("config/") || normalized.includes("/config/") || normalized.endsWith(".env") || normalized.includes(".env.")) {
+    return semanticPrefix ? `${semanticPrefix}-config` : matchedModule ? `${matchedModule}:config` : "config";
+  }
+
+  if (normalized.startsWith("lang/") || normalized.includes("/lang/") || normalized.includes("/locales/") || normalized.includes("/i18n/")) {
+    return semanticPrefix ? `${semanticPrefix}-localization` : matchedModule ? `${matchedModule}:localization` : "localization";
+  }
+
   if (normalized.includes("/enums/")) {
     return semanticPrefix ? `${semanticPrefix}-enums` : matchedModule ? `${matchedModule}:enums` : "enums";
   }
@@ -537,6 +600,33 @@ function deriveSemanticPrefix(filePath: string, matchedModule: string | undefine
 
   if (normalized.includes("/user")) {
     return "user";
+  }
+
+  if (
+    normalized.includes("/servers/")
+    || normalized.includes("/models/server")
+    || normalized.includes("servercredential")
+    || normalized.includes("forwardingport")
+  ) {
+    return "servers";
+  }
+
+  if (
+    normalized.includes("/vault/")
+    || normalized.includes("/models/password")
+    || normalized.includes("credential")
+    || normalized.includes("private_key")
+    || normalized.includes("passphrase")
+  ) {
+    return "vault";
+  }
+
+  if (normalized.startsWith("config/") || normalized.includes("/config/") || normalized.endsWith(".env") || normalized.includes(".env.")) {
+    return "config";
+  }
+
+  if (normalized.startsWith("lang/") || normalized.includes("/lang/") || normalized.includes("/locales/") || normalized.includes("/i18n/")) {
+    return "localization";
   }
 
   return matchedModule ?? null;

@@ -14,8 +14,14 @@ interface ProjectInfo {
 }
 
 type ArtifactTab = "research" | "impact" | "index" | "knowledge";
+type ProviderDraft = {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+};
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
+const PROVIDER_STORAGE_KEY = "client.provider-config";
 
 function hasRunArtifacts(result: PipelineRunResult | null): result is PipelineRunResult {
   return Boolean(result?.runId && result?.project && result?.research && result?.impact);
@@ -159,6 +165,18 @@ function ResearchArtifact({ result }: { result: PipelineRunResult }) {
           <span>{safeText(result.research?.summary)}</span>
         </div>
         <div className="list-item">
+          <strong>Класс вопроса</strong>
+          <span>{safeText(result.research?.intentClass, "Не определён")}</span>
+        </div>
+        <div className="list-item">
+          <strong>Стратегия исследования</strong>
+          <span>{safeText(result.research?.strategyKey, "Не определена")}</span>
+        </div>
+        <div className="list-item">
+          <strong>Профиль обхода</strong>
+          <span>{safeText(result.research?.queryProfileKey, "Не определён")}</span>
+        </div>
+        <div className="list-item">
           <strong>Приоритетный модуль</strong>
           <span>{safeText(result.research?.dominantModule, "Не определён")}</span>
         </div>
@@ -294,6 +312,18 @@ function KnowledgeArtifact({ result }: { result: PipelineRunResult }) {
   return (
     <div className="stack">
       <div className="list">
+        <div className="list-item">
+          <strong>Base URL провайдера</strong>
+          <span>{safeText(result.provider?.baseUrl, "Не задан")}</span>
+        </div>
+        <div className="list-item">
+          <strong>Модель</strong>
+          <span>{safeText(result.provider?.model, "Не задана")}</span>
+        </div>
+        <div className="list-item">
+          <strong>API ключ</strong>
+          <span>{safeText(result.provider?.apiKeyMasked, "Не задан")}</span>
+        </div>
         <div className="list-item">
           <strong>Путь хранения</strong>
           <span>{safeText(result.knowledge?.storagePath)}</span>
@@ -751,6 +781,11 @@ export function App() {
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [task, setTask] = useState("Построй структурный отчёт по текущему проекту и покажи ключевые зависимости.");
   const [projectPath, setProjectPath] = useState("");
+  const [providerDraft, setProviderDraft] = useState<ProviderDraft>({
+    baseUrl: "",
+    model: "",
+    apiKey: "",
+  });
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -761,6 +796,30 @@ export function App() {
   useEffect(() => {
     void loadProject();
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(PROVIDER_STORAGE_KEY);
+
+      if (!raw) {
+        return;
+      }
+
+      const parsed = JSON.parse(raw) as Partial<ProviderDraft>;
+
+      setProviderDraft({
+        baseUrl: parsed.baseUrl ?? "",
+        model: parsed.model ?? "",
+        apiKey: parsed.apiKey ?? "",
+      });
+    } catch {
+      // ignore broken local storage payload
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(PROVIDER_STORAGE_KEY, JSON.stringify(providerDraft));
+  }, [providerDraft]);
 
   async function loadProject(nextProjectPath?: string) {
     setLoading(true);
@@ -804,6 +863,9 @@ export function App() {
         body: JSON.stringify({
           task,
           projectPath,
+          providerBaseUrl: providerDraft.baseUrl,
+          providerModel: providerDraft.model,
+          providerApiKey: providerDraft.apiKey,
         }),
       });
 
@@ -895,6 +957,51 @@ export function App() {
           <label>
             <span>Путь к проекту</span>
             <input value={projectPath} onChange={(event) => setProjectPath(event.target.value)} />
+          </label>
+
+          <div className="provider-grid">
+            <label>
+              <span>Base URL провайдера ИИ</span>
+              <input
+                value={providerDraft.baseUrl}
+                onChange={(event) =>
+                  setProviderDraft((current) => ({
+                    ...current,
+                    baseUrl: event.target.value,
+                  }))
+                }
+                placeholder="https://api.openai.com/v1"
+              />
+            </label>
+
+            <label>
+              <span>Название модели</span>
+              <input
+                value={providerDraft.model}
+                onChange={(event) =>
+                  setProviderDraft((current) => ({
+                    ...current,
+                    model: event.target.value,
+                  }))
+                }
+                placeholder="gpt-5"
+              />
+            </label>
+          </div>
+
+          <label>
+            <span>API ключ</span>
+            <input
+              type="password"
+              value={providerDraft.apiKey}
+              onChange={(event) =>
+                setProviderDraft((current) => ({
+                  ...current,
+                  apiKey: event.target.value,
+                }))
+              }
+              placeholder="sk-..."
+            />
           </label>
 
           <label>

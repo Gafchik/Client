@@ -14,6 +14,11 @@
   - `Impact`
   - `Knowledge`
 - Русскоязычный операторский интерфейс для первого контура.
+- В операторском интерфейсе добавлен runtime-config слой для будущего AI provider integration:
+  - `Base URL провайдера`
+  - `Название модели`
+  - `API ключ`
+  - значения проходят через UI, API и knowledge artifacts как будущий execution/provider runtime input.
 - Центральное хранение артефактов внутри проекта `client`, а не внутри внешних тестируемых репозиториев.
 - Сохранение истории запусков по каждому анализируемому проекту.
 - Просмотр сохранённых запусков в UI.
@@ -29,6 +34,11 @@
   - нерелевантные test/docs/config candidates штрафуются, если задача их явно не требует;
   - context builder начал собирать пакет вокруг focus zones и functional groups, а не только вокруг отдельных файлов и evidence-совпадений;
   - добавлена pruning-логика для focus zones, чтобы слабые соседние домены не загрязняли контекст без прямого подтверждения entry points и file scope.
+  - добавлен баланс между functional facts и structural anchors, чтобы контекст не превращался в чисто текстовое summary без route/controller/request/file опор;
+  - добавлено обязательное покрытие active focus zones хотя бы одной сильной структурной опорой на зону;
+  - добавлены ограничения на переизбыток фрагментов из одной зоны и на слабые кандидаты вне focus zones.
+  - добавлен query-profile-aware ranking для `entrypoint-traversal`, `storage-topology`, `localization-inventory`, `config-inventory`, `broad-scan`;
+  - context package теперь умеет жёстче отбрасывать нерелевантные runtime/controller/config/localization файлы в зависимости от типа вопроса.
 - Planner MVP с детерминированным `Execution Plan`.
 - Planner evolution pass:
   - plan стал учитывать `dominantModule`, `entryPoints`, `affectedFiles`, `validationScope`;
@@ -39,19 +49,29 @@
   - planner начал группировать workstreams в более инженерно полезные зоны (`routes`, `controllers`, `services`, `models`, `requests`, `enums`) вместо избыточной дробности по отдельным файлам;
   - planner начал нормализовать названия workstreams и удалять лишний шум из dependency chains для лучшей читаемости operator-facing плана;
   - planner начал протягивать semantic prefixes через связанные auth/web-login файлы, чтобы workstreams были ближе к реальным functional zones.
+  - planner стал учитывать `queryProfileKey` при выборе execution strategy и больше не предлагает лишний hybrid flow для storage/config/localization/broad сценариев;
+  - planner начал выделять дополнительные workstream-группы для `repositories`, `migrations`, `config`, `localization`, `servers`, `vault`.
 - Impact evolution pass:
   - impact начал расширять scope через file dependencies/dependents, а не только через прямых соседей evidence-узлов.
+  - impact стал query-profile-aware: functional, storage, localization, config и broad вопросы теперь расширяют scope по разным правилам;
+  - risk markers начали учитывать тип вопроса, а inventory-вопросы перестали принудительно раздуваться до runtime-like blast radius.
 - Safe execution preview без реальной модификации проекта.
 - Functional Research MVP:
   - `Research Report` теперь включает functional summary;
   - выделяются entry points, primary entities, side effects и data sources;
   - functional facts прокидываются в `Context Package` и отображаются в UI.
+  - research-side фильтрация affected modules стала строже и перестала без прямого подтверждения затягивать соседние домены вроде `billing` в auth-сценарии.
+  - добавлены отдельные research-режимы для `infrastructure/storage`, `inventory/localization` и `inventory/config-env`, чтобы система умела не только объяснять flow, но и отвечать на вопросы о хранении, конфигурации и структурном составе проекта.
+  - добавлен явный `intent -> strategy -> query profile` routing layer внутри Research;
+  - добавлен `broad-unknown` fallback, чтобы слишком широкие вопросы не маскировались под точный auth-flow и вместо этого переводились в broad repository scan с пониженной уверенностью.
 - Graph core evolution pass:
   - runtime graph расширен до `repository/module/folder/file/code nodes`;
   - добавлены типизированные code nodes вместо одного обобщённого `symbol`;
   - появились derived module relations и graph query helpers под будущий persistent graph storage;
   - graph начал различать richer structural semantics: `CALLS`, `USES`, `EXTENDS`, `IMPLEMENTS`, а не только плоские `REFERENCES`;
   - query layer теперь умеет отдавать module dependency neighbors, file dependencies/dependents, symbol dependencies/dependents, entry-point neighbors и relation summaries для downstream-модулей.
+  - добавлен profile-driven graph query слой для `entrypoint-traversal`, `storage-topology`, `localization-inventory`, `config-inventory`, `broad-scan`;
+  - Research теперь использует эти graph seed-наборы не только как metadata-label, а как реальный источник initial focus и structural boosting при сборе evidence.
 - Performance-pass для больших проектов:
   - лёгкий project overview scan без чтения содержимого файлов;
   - исключение тяжёлых директорий вроде `vendor`;
@@ -95,10 +115,16 @@
 - Graph уже ближе к канонической модели из доки, но persistent storage, snapshot/version layer и полноценный query engine ещё не реализованы.
 - Research и Impact пока rule-based и deterministic; functional understanding уже начато эвристиками, но ещё не опирается на полноценную semantic model.
 - Research уже начал использовать graph-derived entry points и module relation summaries, но всё ещё остаётся эвристическим и требует дальнейшего углубления semantic layer.
+- Research теперь частично graph-profile-driven на уровне seed selection, но всё ещё нуждается в более глубоком semantic traversal и снижении шума внутри близких доменов.
+- Research уже уверенно различает несколько классов вопросов (`functional`, `infrastructure`, `localization`, `config/env`), но всё ещё нуждается в дальнейшем semantic routing и лучшей защите от остаточного шума внутри близких доменных зон.
 - Context Builder уже использует priority-based ranking и explainable selection, но пока без model-aware tokenization и без полноценного semantic reranking.
 - Context Builder стал zone-aware и лучше отражает functional grouping, но пока без model-aware tokenization и без полноценного semantic reranking.
+- Context Builder уже умеет удерживать баланс между summary и structural anchors, но пока не строит model-specific chunk shapes и не использует semantic deduplication на уровне смысла.
+- Context Builder теперь учитывает query profile Research как фильтр против нерелевантных файлов, но всё ещё нуждается в semantic chunking и в более точном token budgeting под конкретные модели.
 - Planner теперь строит richer graph-backed deterministic plan, но всё ещё без полноценного execution runtime, rollback orchestration и live replanning.
+- Planner уже чувствителен к типу исследовательского профиля, но ещё не использует формальный rollback-plan и pre-execution blocking rules по confidence/unknowns.
 - Execution layer пока представлен только safe preview, без фактической мутации файлов.
+- Provider runtime config уже собирается и сохраняется вместе с запуском, но фактический live-вызов модели ещё не подключён.
 - История запусков пока строится из локально сохранённых JSON-артефактов.
 - Фронт теперь защищён от полного белого экрана и от большинства partial-data сбоев на уровне отдельных виджетов, но всё ещё требует дальнейшего hardening UI-flow.
 
@@ -114,16 +140,29 @@
 - хранить историю запусков в одном месте;
 - поддерживать проектно-изолированную историю run-артефактов.
 
+## Матрица тестирования
+
+Для ручной проверки качества `Research -> Impact -> Context -> Plan` добавлена единая матрица сценариев:
+
+`/Users/evgenii/Desktop/client/docs/state/test-scenarios.md`
+
+Она нужна, чтобы:
+
+- не придумывать тестовые запросы заново;
+- проверять прогресс по одним и тем же кейсам;
+- видеть, какие классы вопросов уже проходят (`green`), а какие ещё слабы (`yellow` / `red`).
+
 ## Ближайший следующий шаг
 
 Следующий этап после текущего MVP expansion pass:
 
-- начать отдельный evolution pass по Planner;
-- подготовить controlled execution runtime вместо одного preview-слоя.
-- углубить planner до dependency-aware и graph-backed sequencing на уровне реальных structural relations.
-- продолжить углубление planner от первых file/symbol-backed chains к более плотному route/controller/service/request sequencing перед controlled execution runtime.
+- начать controlled execution runtime вместо одного preview-слоя;
+- добавить deterministic scope guard и write boundary перед фактической мутацией файлов;
+- подготовить post-change reindex, graph refresh и knowledge refresh orchestration;
 - усилить data-shape validation между API, сохранёнными артефактами и UI.
 - углубить functional research, чтобы feature-level understanding было точнее и менее эвристическим.
 - добавить model-aware token budgeting и semantic reranking в Context Builder.
+- углубить Context Builder до graph-backed dependency expansion внутри query profile, а не только path/rule-based ranking.
 - продолжить graph-core evolution до уровня, удобного для переноса в БД.
 - продолжить graph-core evolution до richer relation semantics, snapshot/version layer и query surface, пригодных для будущего DB-backed graph storage.
+- продолжить перенос Research с file/content heuristics на более явный graph-first traversal и query-profile-specific expansion.

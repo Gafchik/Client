@@ -1,4 +1,12 @@
-import { getFileDependencies, getFileDependents, getIncomingNeighbors, getModuleRelations, getOutgoingNeighbors } from "@client/graph";
+import {
+  getFileDependencies,
+  getFileDependents,
+  getIncomingNeighbors,
+  getModuleRelations,
+  getNodesForQueryProfile,
+  getOutgoingNeighbors,
+  getStructuralNeighbors,
+} from "@client/graph";
 import { clamp, type GraphState, type ImpactReport, type ResearchReport } from "@client/shared";
 
 interface ImpactInput {
@@ -9,10 +17,17 @@ interface ImpactInput {
 
 export function analyzeImpact(input: ImpactInput): ImpactReport {
   const evidenceIds = input.research.evidence.map((item) => item.id);
-  const startingPoints = evidenceIds.slice(0, 6);
+  const profileSeedNodes = getNodesForQueryProfile(
+    input.graph,
+    input.research.queryProfileKey,
+    input.research.dominantModule !== "не определён" ? { moduleLabel: input.research.dominantModule } : undefined,
+  );
+  const startingPoints = uniqueStrings([...evidenceIds.slice(0, 6), ...profileSeedNodes.slice(0, 8).map((node) => node.id)]).slice(0, 10);
   const affectedFiles = new Set<string>();
   const affectedSymbols = new Set<string>();
   const affectedModules = new Set<string>();
+  const infrastructureFocus =
+    input.research.queryProfileKey === "storage-topology" || isInfrastructureQuestion(input.research.task);
 
   for (const nodeId of startingPoints) {
     const node = input.graph.nodes.find((candidate) => candidate.id === nodeId);
@@ -76,9 +91,32 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
     }
   }
 
+  switch (input.research.queryProfileKey) {
+    case "entrypoint-traversal":
+      expandEntrypointImpact(input.graph, startingPoints, affectedFiles, affectedModules, affectedSymbols);
+      break;
+    case "storage-topology":
+      expandInfrastructureImpact(input.graph, input.research, affectedFiles, affectedModules, affectedSymbols);
+      break;
+    case "localization-inventory":
+      expandInventoryImpact(input.graph, affectedFiles, affectedModules, affectedSymbols, isLocalizationPath);
+      break;
+    case "config-inventory":
+      expandInventoryImpact(input.graph, affectedFiles, affectedModules, affectedSymbols, isConfigPath);
+      break;
+    case "broad-scan":
+      expandBroadImpact(input.graph, input.research, affectedFiles, affectedModules, affectedSymbols);
+      break;
+    default:
+      if (infrastructureFocus) {
+        expandInfrastructureImpact(input.graph, input.research, affectedFiles, affectedModules, affectedSymbols);
+      }
+      break;
+  }
+
   const fileList = [...affectedFiles].sort();
   const symbolList = [...affectedSymbols, ...affectedModules].sort();
-  const risks = buildRisks(fileList, symbolList);
+  const risks = buildRisks(fileList, symbolList, input.research);
   const validationScope = buildValidationScope(fileList);
   const confidence = computeConfidence(input.research.confidence, fileList.length, risks.length);
 
@@ -95,6 +133,27 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
     validationScope,
     confidence,
   };
+}
+
+function expandEntrypointImpact(
+  graph: GraphState,
+  startingPoints: string[],
+  affectedFiles: Set<string>,
+  affectedModules: Set<string>,
+  affectedSymbols: Set<string>,
+): void {
+  for (const nodeId of startingPoints) {
+    for (const neighbor of getStructuralNeighbors(graph, nodeId, ["CALLS", "USES", "REFERENCES", "BELONGS_TO"], "both")) {
+      if (neighbor.filePath) {
+        affectedFiles.add(neighbor.filePath);
+        affectedModules.add(neighbor.filePath.split("/")[0] || "root");
+      }
+
+      if (isGraphCodeNode(neighbor.kind)) {
+        affectedSymbols.add(neighbor.label);
+      }
+    }
+  }
 }
 
 function expandFileImpact(
@@ -118,7 +177,119 @@ function expandFileImpact(
   }
 }
 
-function buildRisks(files: string[], symbols: string[]): string[] {
+function expandInventoryImpact(
+  graph: GraphState,
+  affectedFiles: Set<string>,
+  affectedModules: Set<string>,
+  affectedSymbols: Set<string>,
+  matcher: (filePath: string) => boolean,
+): void {
+  for (const node of graph.nodes) {
+    if (!node.filePath || !matcher(node.filePath.toLowerCase())) {
+      continue;
+    }
+
+    affectedFiles.add(node.filePath);
+    affectedModules.add(node.filePath.split("/")[0] || "root");
+
+    if (isGraphCodeNode(node.kind)) {
+      affectedSymbols.add(node.label);
+    }
+  }
+}
+
+function expandInfrastructureImpact(
+  graph: GraphState,
+  research: ResearchReport,
+  affectedFiles: Set<string>,
+  affectedModules: Set<string>,
+  affectedSymbols: Set<string>,
+): void {
+  const focusTerms = extractInfrastructureTerms(research);
+
+  for (const node of graph.nodes) {
+    const filePath = node.filePath?.toLowerCase() ?? "";
+    const label = node.label.toLowerCase();
+
+    if (!filePath) {
+      continue;
+    }
+
+    let score = 0;
+
+    if (filePath.includes("/models/") || filePath.includes("/entities/")) {
+      score += 2;
+    }
+
+    if (filePath.includes("/repositories/") || filePath.includes("/repository/")) {
+      score += 2;
+    }
+
+    if (filePath.includes("/migrations/")) {
+      score += 3;
+    }
+
+    if (filePath.includes("/requests/")) {
+      score += 2;
+    }
+
+    if (filePath.includes("/config/") || filePath.endsWith(".env") || filePath.includes(".env.")) {
+      score += 2;
+    }
+
+    if (filePath.includes("credential") || filePath.includes("secret") || filePath.includes("vault")) {
+      score += 3;
+    }
+
+    if (filePath.includes("server") || filePath.includes("connection") || filePath.includes("forwarding")) {
+      score += 3;
+    }
+
+    if (focusTerms.some((term) => filePath.includes(term) || label.includes(term))) {
+      score += 3;
+    }
+
+    if (score < 4) {
+      continue;
+    }
+
+    affectedFiles.add(node.filePath!);
+    affectedModules.add(node.filePath!.split("/")[0] || "root");
+
+    if (isGraphCodeNode(node.kind)) {
+      affectedSymbols.add(node.label);
+    }
+  }
+}
+
+function expandBroadImpact(
+  graph: GraphState,
+  research: ResearchReport,
+  affectedFiles: Set<string>,
+  affectedModules: Set<string>,
+  affectedSymbols: Set<string>,
+): void {
+  const topModules = research.affectedModules.slice(0, 4);
+
+  for (const node of graph.nodes) {
+    if (!node.filePath) {
+      continue;
+    }
+
+    if (!topModules.some((moduleLabel) => node.filePath?.toLowerCase().includes(moduleLabel.toLowerCase()))) {
+      continue;
+    }
+
+    affectedFiles.add(node.filePath);
+    affectedModules.add(node.filePath.split("/")[0] || "root");
+
+    if (isGraphCodeNode(node.kind)) {
+      affectedSymbols.add(node.label);
+    }
+  }
+}
+
+function buildRisks(files: string[], symbols: string[], research: ResearchReport): string[] {
   const risks: string[] = [];
 
   if (files.some((file) => file.startsWith("packages/shared"))) {
@@ -135,6 +306,18 @@ function buildRisks(files: string[], symbols: string[]): string[] {
 
   if (files.length >= 8 || symbols.length >= 12) {
     risks.push("Радиус затрагивания достаточно широкий, поэтому регрессионные проверки должны покрывать несколько зон проекта.");
+  }
+
+  if (research.queryProfileKey === "broad-scan") {
+    risks.push("Вопрос остаётся широким, поэтому impact scope требует дополнительного human narrowing перед execution.");
+  }
+
+  if (research.queryProfileKey === "config-inventory") {
+    risks.push("Изменения в config/env зоне могут скрыто влиять на несколько runtime-сценариев даже при компактном file scope.");
+  }
+
+  if (research.queryProfileKey === "localization-inventory") {
+    risks.push("Локализационный scope требует проверки полноты языковых каталогов и согласованности translation keys.");
   }
 
   if (risks.length === 0) {
@@ -165,4 +348,88 @@ function computeConfidence(researchConfidence: number, affectedFileCount: number
 
 function isGraphCodeNode(kind: GraphState["nodes"][number]["kind"]): boolean {
   return ["class", "interface", "enum", "function", "method", "route", "middleware"].includes(kind);
+}
+
+function isInfrastructureQuestion(task: string): boolean {
+  const normalized = task.toLowerCase();
+
+  return [
+    "ssh",
+    "sftp",
+    "ftp",
+    "server",
+    "servers",
+    "connection",
+    "connections",
+    "credential",
+    "credentials",
+    "host",
+    "hostname",
+    "port",
+    "private key",
+    "private_key",
+    "passphrase",
+    "vault",
+    "сервер",
+    "подключение",
+    "подключения",
+    "соединение",
+    "соединения",
+    "хост",
+    "порт",
+    "пароль",
+    "ключ",
+  ].some((token) => normalized.includes(token));
+}
+
+function extractInfrastructureTerms(research: ResearchReport): string[] {
+  const values = [
+    research.task,
+    research.functionalSummary,
+    ...research.affectedModules,
+    ...research.entryPoints,
+    ...research.primaryEntities,
+    ...research.references,
+  ].join(" ").toLowerCase();
+
+  const terms = [
+    "server",
+    "servers",
+    "credential",
+    "vault",
+    "password",
+    "private_key",
+    "private",
+    "passphrase",
+    "forwarding",
+    "host",
+    "port",
+    "connection",
+    "ssh",
+    "sftp",
+  ];
+
+  return terms.filter((term) => values.includes(term));
+}
+
+function isLocalizationPath(filePath: string): boolean {
+  return (
+    filePath.startsWith("lang/")
+    || filePath.includes("/lang/")
+    || filePath.includes("/locales/")
+    || filePath.includes("/i18n/")
+  );
+}
+
+function isConfigPath(filePath: string): boolean {
+  return (
+    filePath.startsWith("config/")
+    || filePath.includes("/config/")
+    || filePath.endsWith(".env")
+    || filePath.includes(".env.")
+  );
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return values.filter((value, index) => Boolean(value) && values.indexOf(value) === index);
 }

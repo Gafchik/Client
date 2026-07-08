@@ -14,6 +14,9 @@ import { openWorkspace, scanWorkspaceOverview } from "@client/workspace";
 interface PipelineRunRequest {
   task?: string;
   projectPath?: string;
+  providerBaseUrl?: string;
+  providerModel?: string;
+  providerApiKey?: string;
 }
 
 export function createApp() {
@@ -86,6 +89,9 @@ export function createApp() {
     }
 
     const projectPath = request.body.projectPath?.trim() || appRootPath;
+    const providerBaseUrl = request.body.providerBaseUrl?.trim() || "";
+    const providerModel = request.body.providerModel?.trim() || "";
+    const providerApiKey = request.body.providerApiKey?.trim() || "";
     const runId = stableId(["run", projectPath, task, Date.now()]);
     const workspaceStartedAt = new Date().toISOString();
     const workspace = await openWorkspace(projectPath);
@@ -208,6 +214,11 @@ export function createApp() {
       task,
       appRootPath,
       workspace,
+      provider: {
+        baseUrl: providerBaseUrl,
+        model: providerModel,
+        apiKeyMasked: maskApiKey(providerApiKey),
+      },
       index,
       graph,
       research,
@@ -238,6 +249,11 @@ export function createApp() {
         ignoredPaths: workspace.ignoredPaths,
         diagnostics: workspace.diagnostics,
       },
+      provider: {
+        baseUrl: providerBaseUrl,
+        model: providerModel,
+        apiKeyMasked: maskApiKey(providerApiKey),
+      },
       index: {
         manifest: index.manifest,
         stats: index.stats,
@@ -259,4 +275,16 @@ export function createApp() {
   });
 
   return app;
+}
+
+function maskApiKey(value: string): string {
+  if (!value) {
+    return "";
+  }
+
+  if (value.length <= 8) {
+    return "*".repeat(value.length);
+  }
+
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }

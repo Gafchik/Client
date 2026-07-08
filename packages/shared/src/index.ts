@@ -194,10 +194,34 @@ export interface ModuleIntentMatch {
   matchedFiles: string[];
 }
 
+export type ResearchIntentClass =
+  | "functional-flow"
+  | "infrastructure-storage"
+  | "inventory-localization"
+  | "inventory-config"
+  | "broad-unknown";
+
+export type ResearchStrategyKey =
+  | "graph-functional-entrypoints"
+  | "graph-storage-structure"
+  | "graph-localization-inventory"
+  | "graph-config-inventory"
+  | "broad-repository-scan";
+
+export type ResearchQueryProfileKey =
+  | "entrypoint-traversal"
+  | "storage-topology"
+  | "localization-inventory"
+  | "config-inventory"
+  | "broad-scan";
+
 export interface ResearchReport {
   runId: string;
   task: string;
   summary: string;
+  intentClass: ResearchIntentClass;
+  strategyKey: ResearchStrategyKey;
+  queryProfileKey: ResearchQueryProfileKey;
   functionalSummary: string;
   dominantModule: string;
   moduleIntents: ModuleIntentMatch[];
@@ -331,6 +355,12 @@ export interface PipelineWorkspaceDetails {
   diagnostics: string[];
 }
 
+export interface ProviderRuntimeConfig {
+  baseUrl: string;
+  model: string;
+  apiKeyMasked: string;
+}
+
 export interface PipelineRunResult {
   runId: string;
   project: {
@@ -339,6 +369,7 @@ export interface PipelineRunResult {
     summary: WorkspaceSummary;
   };
   workspace: PipelineWorkspaceDetails;
+  provider: ProviderRuntimeConfig;
   index: {
     manifest: IndexManifest;
     stats: IndexResult["stats"];
