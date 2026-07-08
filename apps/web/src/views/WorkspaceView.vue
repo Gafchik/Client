@@ -17,6 +17,7 @@ import type {
 } from "../types";
 import MissionCard from "../components/workspace/MissionCard.vue";
 import MissionComposer from "../components/workspace/MissionComposer.vue";
+import KnowledgeGraphModal from "../components/workspace/KnowledgeGraphModal.vue";
 import WorkspaceInspector from "../components/workspace/WorkspaceInspector.vue";
 import WorkspaceSidebar from "../components/workspace/WorkspaceSidebar.vue";
 import type { InspectorTab, LiveActivityItem, MissionHistoryItem, PipelineStage, TimelineEvent } from "../components/workspace/types";
@@ -58,6 +59,7 @@ const state = reactive({
   previewOpen: false,
   previewResult: null as CompileResult | null,
   previewTask: "",
+  composerError: "",
   resyncBusy: false,
   resyncRunningModalOpen: false,
   resyncSummaryModalOpen: false,
@@ -66,6 +68,12 @@ const state = reactive({
   resyncHistory: [] as ResyncHistoryItem[],
   resyncResult: null as ResyncResult | null,
   resyncStages: [] as ResyncStage[],
+  resyncError: "",
+  graphModalOpen: false,
+  graphLoading: false,
+  graphError: "",
+  graphEntry: null as ProjectMemoryEntry | null,
+  activeResyncRunId: "",
   selectedResyncHistoryId: "",
   missions: [] as MissionHistoryItem[],
 });
@@ -344,10 +352,13 @@ function mergeRunIntoMission(run: RunItem) {
 async function loadChats() {
   if (!state.selectedProjectId) {
     state.chats = [];
+    state.selectedChatId = "";
     return;
   }
   state.chats = (await api.chats(state.selectedProjectId)).chats;
-  if (!state.selectedChatId && state.chats.length) state.selectedChatId = state.chats[0].id;
+  if (!state.chats.some((chat) => chat.id === state.selectedChatId)) {
+    state.selectedChatId = state.chats[0]?.id || "";
+  }
 }
 
 async function ensureChatId() {
@@ -374,9 +385,51 @@ async function loadProjectMemory() {
   state.projectMemory = (await api.projectMemory(state.selectedProjectId)).entries;
 }
 
+async function loadKnowledgeGraph() {
+  if (!state.selectedProjectId) {
+    state.graphEntry = null;
+    return;
+  }
+  state.graphLoading = true;
+  state.graphError = "";
+  try {
+    const response = await api.projectKnowledgeGraph(state.selectedProjectId);
+    state.graphEntry = response.entry || null;
+  } catch (error) {
+    state.graphError = error instanceof Error ? error.message : "Не удалось загрузить граф проекта";
+  } finally {
+    state.graphLoading = false;
+  }
+}
+
+async function openProjectMap() {
+  state.graphModalOpen = true;
+  await loadKnowledgeGraph();
+}
+
+function closeProjectMap() {
+  state.graphModalOpen = false;
+}
+
+async function refreshProjectMap() {
+  await loadKnowledgeGraph();
+}
+
 async function loadRuns() {
   const response = await api.runs();
-  state.runs = response.runs;
+  state.runs = state.selectedProjectId
+    ? response.runs.filter((run) => run.projectId === state.selectedProjectId)
+    : response.runs;
+
+  state.missions = state.missions.filter((mission) => {
+    if (!mission.runId) return false;
+    return state.runs.some((run) => run.id === mission.runId);
+  });
+
+  if (state.selectedMissionId && !state.missions.some((m) => m.id === state.selectedMissionId)) {
+    state.selectedMissionId = "";
+  }
+
   for (const run of response.runs) {
     if (state.selectedProjectId && run.projectId && run.projectId !== state.selectedProjectId) continue;
     mergeRunIntoMission(run);
@@ -413,29 +466,34 @@ function openResyncHistory() {
 async function runProjectResync() {
   if (!state.selectedProjectId || state.resyncBusy) return;
 
+  const projectId = state.selectedProjectId;
   state.resyncBusy = true;
   state.resyncRunningModalOpen = true;
   state.resyncSummaryModalOpen = false;
+  state.resyncError = "";
   state.resyncResult = null;
+  state.activeResyncRunId = "";
   state.resyncStages = [
     { key: "scan", title: "Сканирование проекта...", status: "active", durationMs: 0 },
     { key: "detect", title: "Определение изменений...", status: "pending", durationMs: 0 },
-    { key: "kg", title: "Обновление графа знаний...", status: "pending", durationMs: 0 },
-    { key: "relations", title: "Перестроение связей...", status: "pending", durationMs: 0 },
-    { key: "docs", title: "Обновление документации...", status: "pending", durationMs: 0 },
+    { key: "knowledge_graph", title: "Обновление графа знаний...", status: "pending", durationMs: 0 },
+    { key: "relationships", title: "Перестроение связей...", status: "pending", durationMs: 0 },
+    { key: "documentation", title: "Обновление документации...", status: "pending", durationMs: 0 },
     { key: "memory", title: "Оптимизация памяти...", status: "pending", durationMs: 0 },
     { key: "coverage", title: "Пересчёт покрытия...", status: "pending", durationMs: 0 },
     { key: "validation", title: "Финальная валидация...", status: "pending", durationMs: 0 },
-    { key: "completed", title: "Завершено.", status: "pending", durationMs: 0 },
+    { key: "optimize", title: "Оптимизация индексов...", status: "pending", durationMs: 0 },
   ];
 
   try {
-    const response = await api.resyncProject(state.selectedProjectId);
+    const response = await api.resyncProject(projectId);
     state.resyncResult = response.result;
+    state.activeResyncRunId = response.result.runId;
     state.resyncStages = response.result.stages;
 
     await Promise.all([
       loadProjectMemory(),
+      loadKnowledgeGraph(),
       loadRuns(),
       loadChats(),
       loadResyncStatus(),
@@ -446,6 +504,7 @@ async function runProjectResync() {
     state.resyncSummaryModalOpen = true;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Синхронизация не удалась";
+    state.resyncError = message;
     state.resyncStages = state.resyncStages.map((stage, index) =>
       index === state.resyncStages.findIndex((x) => x.status === "active")
         ? { ...stage, status: "error", message }
@@ -454,6 +513,7 @@ async function runProjectResync() {
   } finally {
     state.resyncBusy = false;
     state.resyncRunningModalOpen = false;
+    state.activeResyncRunId = "";
   }
 }
 
@@ -495,7 +555,7 @@ function stopPolling() {
 
 function startSocket() {
   const target = API_BASE || window.location.origin;
-  ws = io(target, { transports: ["websocket"] });
+  ws = io(target, { transports: ["websocket"], path: "/ws/socket.io" });
 
   ws.on("connect", () => {
     if (state.selectedProjectId) ws?.emit("join:project", { projectId: state.selectedProjectId });
@@ -504,6 +564,35 @@ function startSocket() {
 
   ws.onAny((eventName: string, payload: any) => {
     if (!payload || typeof payload !== "object") return;
+
+    if (eventName === "project:resync:stage") {
+      const stage = payload.stage as ResyncStage | undefined;
+      const runId = String(payload.runId || "");
+      if (!stage || !runId) return;
+      if (state.activeResyncRunId && state.activeResyncRunId !== runId) return;
+      state.activeResyncRunId = runId;
+
+      const idx = state.resyncStages.findIndex((item) => item.key === stage.key);
+      if (idx >= 0) {
+        state.resyncStages[idx] = { ...state.resyncStages[idx], ...stage };
+      } else {
+        state.resyncStages.push(stage);
+      }
+      return;
+    }
+
+    if (eventName === "project:resync:completed") {
+      const runId = String(payload.runId || "");
+      if (state.activeResyncRunId && runId && state.activeResyncRunId !== runId) return;
+      if (payload.stages && Array.isArray(payload.stages)) {
+        state.resyncStages = payload.stages;
+      }
+      if (payload.summary) {
+        state.resyncResult = payload as ResyncResult;
+      }
+      return;
+    }
+
     const runId = payload.runId || payload.id;
     if (!runId) return;
     const mission = state.missions.find((m) => m.runId === runId);
@@ -525,12 +614,12 @@ function stopSocket() {
 function handleComposerKeydown(event: KeyboardEvent) {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
     event.preventDefault();
-    void quickBuild();
+    void submitChatMessage("build");
     return;
   }
   if (event.shiftKey && event.key === "Enter") {
     event.preventDefault();
-    void quickAsk();
+    void submitChatMessage("ask");
   }
 }
 function useTemplate(tpl: string) {
@@ -552,6 +641,7 @@ function composedTask() {
 async function handlePreview() {
   const task = composedTask();
   if (!task || !state.selectedProjectId) return;
+  state.composerError = "";
   state.compileBusy = true;
   try {
     const chatId = await ensureChatId();
@@ -575,6 +665,7 @@ async function handleCompileFromPreview() {
   if (!state.previewResult || !state.selectedProjectId) return;
   const task = state.previewTask.trim();
   if (!task) return;
+  state.composerError = "";
   state.compileBusy = true;
   try {
     const chatId = await ensureChatId();
@@ -645,12 +736,51 @@ async function handleCompileFromPreview() {
 }
 
 async function quickBuild() {
-  state.missionMode = "build";
-  await handlePreview();
+  await submitChatMessage("build");
 }
 async function quickAsk() {
-  state.missionMode = "ask";
-  await handlePreview();
+  await submitChatMessage("ask");
+}
+
+async function submitChatMessage(mode: "build" | "ask") {
+  const content = composedTask().trim();
+  if (!content || !state.selectedProjectId) return;
+
+  state.missionMode = mode;
+  state.composerError = "";
+  state.compileBusy = true;
+
+  try {
+    const chatId = await ensureChatId();
+    if (!chatId) throw new Error("Не удалось создать чат для выбранного проекта");
+
+    const response = await api.sendChatMessage(
+      chatId,
+      content,
+      state.selectedTeamId || undefined,
+      state.selectedProjectId || undefined,
+    );
+
+    await Promise.all([loadChats(), loadRuns(), loadProjectMemory()]);
+
+    if (response.autoRunId) {
+      const run = state.runs.find((item) => item.id === response.autoRunId);
+      if (run) {
+        mergeRunIntoMission(run);
+        state.selectedMissionId = `run:${run.id}`;
+      }
+    }
+
+    state.previewOpen = false;
+    state.previewResult = null;
+    state.previewTask = "";
+    state.composer = "";
+    state.attachedContext = [];
+  } catch (error) {
+    state.composerError = error instanceof Error ? error.message : "Не удалось отправить сообщение в чат";
+  } finally {
+    state.compileBusy = false;
+  }
 }
 
 onMounted(async () => {
@@ -700,7 +830,35 @@ watch(
   async (next, prev) => {
     if (ws && prev) ws.emit("leave:project", { projectId: prev });
     if (ws && next) ws.emit("join:project", { projectId: next });
+    state.resyncBusy = false;
+    state.resyncRunningModalOpen = false;
+    state.selectedChatId = "";
+    state.selectedMissionId = "";
+    state.missions = [];
+    state.composerError = "";
+    state.resyncError = "";
+    state.graphModalOpen = false;
+    state.graphEntry = null;
+    state.graphError = "";
+    state.resyncResult = null;
+    state.resyncStages = [];
+    state.activeResyncRunId = "";
+    state.resyncSummaryModalOpen = false;
+    state.resyncHistoryModalOpen = false;
     await Promise.all([loadChats(), loadProjectMemory(), loadRuns(), loadResyncStatus(), loadResyncHistory()]);
+  },
+);
+
+watch(
+  () => state.selectedTeamId,
+  () => {
+    state.selectedChatId = "";
+    state.selectedMissionId = "";
+    state.missions = [];
+    state.composerError = "";
+    state.graphModalOpen = false;
+    state.graphEntry = null;
+    state.graphError = "";
   },
 );
 
@@ -733,6 +891,7 @@ watch(
       :resync-status="state.resyncStatus"
       :resync-history="state.resyncHistory"
       :resync-busy="state.resyncBusy"
+      :resync-error="state.resyncError"
       :format-date-time="formatDateTime"
       :format-duration="formatDuration"
       @update:selected-project-id="state.selectedProjectId = $event"
@@ -740,6 +899,7 @@ watch(
       @update:mission-mode="state.missionMode = $event"
       @update:search="state.search = $event"
       @select-mission="state.selectedMissionId = $event"
+      @open-project-map="openProjectMap"
       @resync-project="runProjectResync"
       @open-resync-history="openResyncHistory"
     />
@@ -748,6 +908,7 @@ watch(
       <MissionComposer
         :composer="state.composer"
         :compile-busy="state.compileBusy"
+        :error="state.composerError"
         :quick-templates="quickTemplates"
         :suggested-context="suggestedContext"
         :attached-context="state.attachedContext"
@@ -778,6 +939,16 @@ watch(
     </main>
 
     <WorkspaceInspector :mission="selectedMission" :tab="state.inspectorTab" @update:tab="state.inspectorTab = $event" />
+
+    <KnowledgeGraphModal
+      :open="state.graphModalOpen"
+      :loading="state.graphLoading"
+      :error="state.graphError"
+      :entry="state.graphEntry"
+      @close="closeProjectMap"
+      @refresh="refreshProjectMap"
+      @resync="runProjectResync"
+    />
 
     <div v-if="state.previewOpen && state.previewResult" class="preview-backdrop">
       <div class="preview-modal">
@@ -858,8 +1029,8 @@ watch(
           <div class="metric"><span>Обновлено документации</span><strong>{{ state.resyncResult.summary.updatedDocumentation }}</strong></div>
           <div class="metric"><span>Обновлено решений</span><strong>{{ state.resyncResult.summary.updatedArchitecturalDecisions }}</strong></div>
           <div class="metric"><span>Обновлено записей памяти</span><strong>{{ state.resyncResult.summary.updatedMemoryEntries }}</strong></div>
-          <div class="metric"><span>Покрытие до</span><strong>{{ Math.round(state.resyncResult.summary.coverageBefore * 100) }}%</strong></div>
-          <div class="metric"><span>Покрытие после</span><strong>{{ Math.round(state.resyncResult.summary.coverageAfter * 100) }}%</strong></div>
+          <div class="metric"><span>Покрытие до</span><strong>{{ Math.round(state.resyncResult.summary.coverageBefore) }}%</strong></div>
+          <div class="metric"><span>Покрытие после</span><strong>{{ Math.round(state.resyncResult.summary.coverageAfter) }}%</strong></div>
           <div class="metric"><span>Время выполнения</span><strong>{{ formatMs(state.resyncResult.summary.durationMs) }}</strong></div>
           <div class="metric"><span>Целостность памяти</span><strong>{{ state.resyncResult.summary.memoryIntegrity }}</strong></div>
         </div>
@@ -892,7 +1063,7 @@ watch(
             <ul>
               <li>Изменено файлов: {{ selectedResyncHistoryEntry.changedFiles }}</li>
               <li>Обновлено сущностей: {{ selectedResyncHistoryEntry.updatedEntities }}</li>
-              <li>Покрытие: {{ Math.round(selectedResyncHistoryEntry.coverageBefore * 100) }}% → {{ Math.round(selectedResyncHistoryEntry.coverageAfter * 100) }}%</li>
+              <li>Покрытие: {{ Math.round(selectedResyncHistoryEntry.coverageBefore) }}% → {{ Math.round(selectedResyncHistoryEntry.coverageAfter) }}%</li>
               <li>Целостность памяти: {{ selectedResyncHistoryEntry.memoryIntegrity }}</li>
             </ul>
           </section>

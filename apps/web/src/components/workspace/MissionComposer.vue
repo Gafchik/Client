@@ -2,6 +2,7 @@
 const props = defineProps<{
   composer: string;
   compileBusy: boolean;
+  error?: string;
   quickTemplates: string[];
   suggestedContext: string[];
   attachedContext: string[];
@@ -68,6 +69,7 @@ function setRef(el: Element | null) {
       <button class="btn primary" :disabled="compileBusy || !composer.trim()" @click="emit('build')">Сборка</button>
       <button class="btn ask" :disabled="compileBusy || !composer.trim()" @click="emit('ask')">Вопрос</button>
     </div>
+    <p v-if="error" class="composer-error">{{ error }}</p>
   </section>
 </template>
 
@@ -175,5 +177,12 @@ function setRef(el: Element | null) {
   background: rgba(59, 130, 246, 0.2);
   border-color: rgba(96, 165, 250, 0.45);
   color: #93c5fd;
+}
+
+.composer-error {
+  margin: 10px 0 0;
+  color: #fca5a5;
+  font-size: 12px;
+  line-height: 1.4;
 }
 </style>

@@ -6,6 +6,7 @@ import { KnowledgeEngineService } from "./services/knowledge-engine.service.js";
 import { ImpactAnalyzerService } from "./services/impact-analyzer.service.js";
 import { ContextOptimizerService } from "./services/context-optimizer.service.js";
 import { ExecutionPlannerService } from "./services/execution-planner.service.js";
+import { TaskPreparationService } from "./services/task-preparation.service.js";
 import { ProjectsModule } from "../projects/projects.module.js";
 import { TeamsModule } from "../teams/teams.module.js";
 import { RunsModule } from "../runs/runs.module.js";
@@ -20,8 +21,8 @@ import { RunsModule } from "../runs/runs.module.js";
     ImpactAnalyzerService,
     ContextOptimizerService,
     ExecutionPlannerService,
+    TaskPreparationService,
   ],
   exports: [CompilerService],
 })
 export class CompilerModule {}
-

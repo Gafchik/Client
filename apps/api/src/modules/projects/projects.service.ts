@@ -19,6 +19,7 @@ import { SaveProjectDto } from "./dto/save-project.dto.js";
 type ResyncStageKey =
   | "scan"
   | "detect"
+  | "research"
   | "knowledge_graph"
   | "relationships"
   | "documentation"
@@ -93,6 +94,13 @@ export class ProjectsService {
   private readonly scanIgnoreDirs = new Set([
     ".git",
     "node_modules",
+    "vendor",
+    "bower_components",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".cache",
+    ".turbo",
     "dist",
     "build",
     ".next",
@@ -121,6 +129,17 @@ export class ProjectsService {
     ".html",
     ".xml",
     ".env",
+  ]);
+
+  private readonly dependencyScanExtensions = new Set([
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".vue",
+    ".php",
   ]);
 
   async list() {
@@ -636,6 +655,7 @@ export class ProjectsService {
     return [
       { key: "scan", title: "Scanning Project...", status: "pending", durationMs: 0 },
       { key: "detect", title: "Detecting Changes...", status: "pending", durationMs: 0 },
+      { key: "research", title: "Deep Code Research...", status: "pending", durationMs: 0 },
       { key: "knowledge_graph", title: "Updating Knowledge Graph...", status: "pending", durationMs: 0 },
       { key: "relationships", title: "Rebuilding Relationships...", status: "pending", durationMs: 0 },
       { key: "documentation", title: "Refreshing Documentation...", status: "pending", durationMs: 0 },
@@ -654,6 +674,7 @@ export class ProjectsService {
 
   private listProjectFiles(projectLocalPath: string): Array<{ path: string; size: number; mtimeMs: number; ext: string }> {
     const out: Array<{ path: string; size: number; mtimeMs: number; ext: string }> = [];
+    const ignoredDirNames = new Set(Array.from(this.scanIgnoreDirs).map((name) => String(name || "").toLowerCase()));
 
     const walk = (absDir: string) => {
       let entries: fs.Dirent[] = [];
@@ -664,14 +685,17 @@ export class ProjectsService {
       }
       for (const entry of entries) {
         const abs = path.join(absDir, entry.name);
+        const entryNameLower = String(entry.name || "").toLowerCase();
         if (entry.isDirectory()) {
-          if (this.scanIgnoreDirs.has(entry.name)) continue;
+          if (ignoredDirNames.has(entryNameLower)) continue;
           walk(abs);
           continue;
         }
         if (!entry.isFile()) continue;
         const rel = path.relative(projectLocalPath, abs).replace(/\\/g, "/");
         if (!rel || rel.startsWith("..")) continue;
+        const relSegments = rel.split("/").map((segment) => String(segment || "").toLowerCase());
+        if (relSegments.some((segment) => ignoredDirNames.has(segment))) continue;
         const ext = path.extname(entry.name).toLowerCase();
         if (!this.scanExtensions.has(ext) && !entry.name.startsWith(".env")) continue;
         try {
@@ -767,6 +791,376 @@ export class ProjectsService {
     };
   }
 
+  private readProjectFileText(
+    projectLocalPath: string,
+    relativePath: string,
+    maxBytes = 256 * 1024,
+  ): string {
+    try {
+      const abs = path.resolve(projectLocalPath, relativePath);
+      const stat = fs.statSync(abs);
+      if (!stat.isFile() || stat.size > maxBytes) return "";
+      return fs.readFileSync(abs, "utf8");
+    } catch {
+      return "";
+    }
+  }
+
+  private extractDependencySpecifiers(content: string): string[] {
+    if (!content) return [];
+    const specs = new Set<string>();
+    const push = (value: string) => {
+      const cleaned = String(value || "").trim();
+      if (!cleaned || cleaned.length > 400) return;
+      specs.add(cleaned);
+    };
+
+    const patterns: RegExp[] = [
+      /import\s+[^"'`]*?\s+from\s+["'`]([^"'`]+)["'`]/g,
+      /import\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g,
+      /export\s+[^"'`]*?\s+from\s+["'`]([^"'`]+)["'`]/g,
+      /require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g,
+      /(?:include|include_once|require|require_once)\s*\(?\s*["'`]([^"'`]+)["'`]\s*\)?/g,
+    ];
+    for (const pattern of patterns) {
+      let match: RegExpExecArray | null = null;
+      while ((match = pattern.exec(content)) !== null) {
+        push(match[1] || "");
+      }
+    }
+
+    return Array.from(specs);
+  }
+
+  private resolveDependencySpecifier(
+    projectLocalPath: string,
+    sourceFilePath: string,
+    specifier: string,
+    knownFiles: Set<string>,
+  ): string | null {
+    const raw = String(specifier || "").trim().replace(/\\/g, "/");
+    if (!raw) return null;
+    if (/^(node:|https?:|data:|@?[\w-]+$)/i.test(raw)) return null;
+
+    let relBase = "";
+    if (raw.startsWith("./") || raw.startsWith("../")) {
+      const sourceDirAbs = path.resolve(projectLocalPath, path.dirname(sourceFilePath));
+      const targetAbs = path.resolve(sourceDirAbs, raw);
+      relBase = path.relative(projectLocalPath, targetAbs).replace(/\\/g, "/");
+    } else if (raw.startsWith("~/") || raw.startsWith("@/") || raw.startsWith("#/")) {
+      relBase = raw.slice(2);
+    } else if (raw.startsWith("/")) {
+      relBase = raw.slice(1);
+    } else if (raw.startsWith("src/") || raw.startsWith("apps/")) {
+      relBase = raw;
+    } else {
+      return null;
+    }
+
+    relBase = relBase.replace(/\\/g, "/").replace(/^\.?\//, "");
+    if (!relBase || relBase.startsWith("..")) return null;
+
+    const candidates = new Set<string>();
+    const ext = path.extname(relBase).toLowerCase();
+    if (ext) {
+      candidates.add(relBase);
+    } else {
+      candidates.add(relBase);
+      for (const candidateExt of this.dependencyScanExtensions) {
+        candidates.add(`${relBase}${candidateExt}`);
+      }
+      for (const candidateExt of this.dependencyScanExtensions) {
+        candidates.add(`${relBase}/index${candidateExt}`);
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (knownFiles.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  private normalizeToken(value: string): string {
+    return String(value || "")
+      .trim()
+      .replace(/[<>{}()[\],;:'"`]/g, "")
+      .replace(/\s+/g, "");
+  }
+
+  private extractCodeSymbols(content: string): Array<{ name: string; kind: string }> {
+    if (!content) return [];
+    const found = new Map<string, { name: string; kind: string }>();
+    const push = (name: string, kind: string) => {
+      const normalized = this.normalizeToken(name);
+      if (!normalized || normalized.length < 2 || normalized.length > 120) return;
+      const key = `${kind}:${normalized}`;
+      if (!found.has(key)) found.set(key, { name: normalized, kind });
+    };
+
+    const patterns: Array<{ kind: string; regex: RegExp }> = [
+      { kind: "class", regex: /(?:^|\s)class\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+      { kind: "interface", regex: /(?:^|\s)interface\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+      { kind: "enum", regex: /(?:^|\s)enum\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+      { kind: "type", regex: /(?:^|\s)type\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/g },
+      { kind: "function", regex: /(?:^|\s)function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g },
+      { kind: "method", regex: /(?:public|private|protected|static|async|\s)+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*[{=>]/g },
+      { kind: "const", regex: /(?:^|\s)const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/g },
+    ];
+
+    for (const { kind, regex } of patterns) {
+      let match: RegExpExecArray | null = null;
+      while ((match = regex.exec(content)) !== null) {
+        push(match[1] || "", kind);
+      }
+    }
+
+    return Array.from(found.values()).slice(0, 400);
+  }
+
+  private extractFileLogicSignals(content: string): {
+    callTargets: string[];
+    extendsTargets: string[];
+    implementsTargets: string[];
+    createsTargets: string[];
+    emitsEvents: string[];
+    listensEvents: string[];
+    readsTargets: string[];
+    writesTargets: string[];
+    validatesTargets: string[];
+    rendersTargets: string[];
+  } {
+    const collect = (regex: RegExp, max = 200) => {
+      const out = new Set<string>();
+      let match: RegExpExecArray | null = null;
+      while ((match = regex.exec(content)) !== null && out.size < max) {
+        const token = this.normalizeToken(match[1] || "");
+        if (token) out.add(token);
+      }
+      return Array.from(out);
+    };
+
+    const callTargets = collect(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g, 250)
+      .filter((name) => !["if", "for", "while", "switch", "return", "catch", "function", "typeof", "new"].includes(name));
+
+    const extendsTargets = collect(/\bextends\s+([A-Za-z_][A-Za-z0-9_]*)/g, 80);
+    const implementsTargets = collect(/\bimplements\s+([A-Za-z_][A-Za-z0-9_,\s]*)/g, 120)
+      .flatMap((row) => row.split(",").map((item) => this.normalizeToken(item)).filter(Boolean));
+    const createsTargets = collect(/\bnew\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g, 200);
+    const emitsEvents = collect(/\b(?:emit|dispatch|broadcast)\s*\(\s*["'`]([^"'`]+)["'`]/g, 200);
+    const listensEvents = collect(/\b(?:on|addEventListener|subscribe|listen)\s*\(\s*["'`]([^"'`]+)["'`]/g, 200);
+    const readsTargets = collect(/\b(?:get|find|load|read|select|query)\s*([A-Za-z_][A-Za-z0-9_]*)?\s*\(/g, 200);
+    const writesTargets = collect(/\b(?:set|save|create|update|delete|insert|write)\s*([A-Za-z_][A-Za-z0-9_]*)?\s*\(/g, 200);
+    const validatesTargets = collect(/\b(?:validate|assert|ensure|guard)\s*([A-Za-z_][A-Za-z0-9_]*)?\s*\(/g, 200);
+    const rendersTargets = collect(/\b(?:render|mount|hydrate)\s*([A-Za-z_][A-Za-z0-9_]*)?\s*\(/g, 120);
+
+    return {
+      callTargets,
+      extendsTargets,
+      implementsTargets,
+      createsTargets,
+      emitsEvents,
+      listensEvents,
+      readsTargets,
+      writesTargets,
+      validatesTargets,
+      rendersTargets,
+    };
+  }
+
+  private buildDeepResearchGraph(
+    projectLocalPath: string,
+    files: Array<{ path: string; size: number; mtimeMs: number; ext: string }>,
+    graph: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const knownFiles = new Set(files.map((file) => file.path));
+    const fileToModule = new Map<string, string>();
+    for (const file of files) {
+      const top = file.path.split("/")[0] || "root";
+      fileToModule.set(file.path, `module:${top}`);
+    }
+
+    const symbolIndex = new Map<string, { id: string; filePath: string; kind: string; name: string }>();
+    const symbols: Array<Record<string, unknown>> = [];
+    const relationKeys = new Set<string>();
+    const callGraph: Array<Record<string, unknown>> = [];
+    const relationStats = new Map<string, number>();
+    const enrichedRelations: Array<Record<string, unknown>> = Array.isArray((graph as any).relations)
+      ? [ ...((graph as any).relations as Array<Record<string, unknown>>) ]
+      : [];
+    for (const relation of enrichedRelations) {
+      const type = String((relation as any)?.type || "related_to");
+      relationStats.set(type, (relationStats.get(type) || 0) + 1);
+      relationKeys.add(`${String((relation as any)?.from || "")}|${type}|${String((relation as any)?.to || "")}`);
+    }
+
+    const pushRelation = (from: string, type: string, to: string, reason: string) => {
+      if (!from || !to) return;
+      const key = `${from}|${type}|${to}`;
+      if (relationKeys.has(key)) return;
+      relationKeys.add(key);
+      enrichedRelations.push({ from, type, to, reason });
+      relationStats.set(type, (relationStats.get(type) || 0) + 1);
+    };
+
+    const fileLogic: Array<Record<string, unknown>> = [];
+    const fileById = new Map(files.map((file) => [`file:${file.path}`, file.path]));
+    const unknowns = new Set(Array.isArray((graph as any).unknowns) ? ((graph as any).unknowns as unknown[]).map((x) => String(x || "")).filter(Boolean) : []);
+
+    for (const file of files) {
+      if (!this.dependencyScanExtensions.has(file.ext)) continue;
+      const content = this.readProjectFileText(projectLocalPath, file.path);
+      if (!content) continue;
+
+      const fileId = `file:${file.path}`;
+      const symbolsInFile = this.extractCodeSymbols(content);
+      for (const symbol of symbolsInFile) {
+        const symbolId = `symbol:${file.path}:${symbol.kind}:${symbol.name}`;
+        symbols.push({
+          id: symbolId,
+          name: symbol.name,
+          kind: `Symbol:${symbol.kind}`,
+          location: file.path,
+          file: file.path,
+          symbolKind: symbol.kind,
+        });
+        symbolIndex.set(symbol.name, { id: symbolId, filePath: file.path, kind: symbol.kind, name: symbol.name });
+        pushRelation(fileId, "contains", symbolId, "File contains symbol");
+        const moduleId = fileToModule.get(file.path);
+        if (moduleId) pushRelation(moduleId, "contains", symbolId, "Module contains symbol");
+      }
+
+      const logic = this.extractFileLogicSignals(content);
+      fileLogic.push({
+        fileId,
+        file: file.path,
+        ...logic,
+      });
+
+      for (const target of logic.extendsTargets) {
+        const symbol = symbolIndex.get(target);
+        if (symbol) pushRelation(fileId, "extends", symbol.id, `Extends ${target}`);
+        else if (target) unknowns.add(`${file.path}:extends:${target}`);
+      }
+      for (const target of logic.implementsTargets) {
+        const symbol = symbolIndex.get(target);
+        if (symbol) pushRelation(fileId, "implements", symbol.id, `Implements ${target}`);
+        else if (target) unknowns.add(`${file.path}:implements:${target}`);
+      }
+      for (const target of logic.createsTargets) {
+        const symbol = symbolIndex.get(target);
+        if (symbol) pushRelation(fileId, "creates", symbol.id, `Creates ${target}`);
+      }
+      for (const eventName of logic.emitsEvents) {
+        const eventId = `event:${eventName}`;
+        pushRelation(fileId, "emits", eventId, `Emits event ${eventName}`);
+      }
+      for (const eventName of logic.listensEvents) {
+        const eventId = `event:${eventName}`;
+        pushRelation(fileId, "listens", eventId, `Listens event ${eventName}`);
+      }
+      for (const target of logic.readsTargets) {
+        if (target) pushRelation(fileId, "reads", `symbol-ref:${target}`, `Reads ${target}`);
+      }
+      for (const target of logic.writesTargets) {
+        if (target) pushRelation(fileId, "writes", `symbol-ref:${target}`, `Writes ${target}`);
+      }
+      for (const target of logic.validatesTargets) {
+        if (target) pushRelation(fileId, "validates", `symbol-ref:${target}`, `Validates ${target}`);
+      }
+      for (const target of logic.rendersTargets) {
+        if (target) pushRelation(fileId, "renders", `symbol-ref:${target}`, `Renders ${target}`);
+      }
+      for (const call of logic.callTargets) {
+        const targetSymbol = symbolIndex.get(call);
+        if (targetSymbol) {
+          pushRelation(fileId, "calls", targetSymbol.id, `Calls ${call}`);
+          callGraph.push({
+            from: file.path,
+            to: targetSymbol.filePath,
+            callee: call,
+            targetSymbolId: targetSymbol.id,
+          });
+          if (targetSymbol.filePath !== file.path) {
+            pushRelation(fileId, "uses", `file:${targetSymbol.filePath}`, `Uses ${call} from ${targetSymbol.filePath}`);
+          }
+        }
+      }
+    }
+
+    const reusedSymbols = new Map<string, Set<string>>();
+    for (const item of callGraph) {
+      const key = String(item.targetSymbolId || "");
+      if (!key) continue;
+      if (!reusedSymbols.has(key)) reusedSymbols.set(key, new Set());
+      reusedSymbols.get(key)!.add(String(item.from || ""));
+    }
+
+    const symbolUsage: Array<Record<string, unknown>> = [];
+    for (const [symbolId, callers] of reusedSymbols) {
+      symbolUsage.push({
+        symbolId,
+        reuseCount: callers.size,
+        reusedByFiles: Array.from(callers).sort(),
+      });
+    }
+
+    const fileCallStats = new Map<string, { incoming: number; outgoing: number }>();
+    for (const file of files) fileCallStats.set(file.path, { incoming: 0, outgoing: 0 });
+    for (const edge of callGraph) {
+      const from = String(edge.from || "");
+      const to = String(edge.to || "");
+      if (fileCallStats.has(from)) fileCallStats.get(from)!.outgoing += 1;
+      if (fileCallStats.has(to)) fileCallStats.get(to)!.incoming += 1;
+    }
+
+    const hotFiles = Array.from(fileCallStats.entries())
+      .map(([file, stat]) => ({ file, incomingCalls: stat.incoming, outgoingCalls: stat.outgoing, score: stat.incoming * 2 + stat.outgoing }))
+      .sort((a, b) => b.score - a.score || b.incomingCalls - a.incomingCalls)
+      .slice(0, 120);
+
+    const deepStats = {
+      filesAnalyzed: fileLogic.length,
+      symbolsExtracted: symbols.length,
+      callEdges: callGraph.length,
+      relationByType: Object.fromEntries(Array.from(relationStats.entries()).sort((a, b) => b[1] - a[1])),
+      hotFiles,
+      generatedAt: new Date().toISOString(),
+    };
+
+    const relationIndexByFrom: Record<string, Array<{ to: string; type: string }>> = {};
+    const relationIndexByTo: Record<string, Array<{ from: string; type: string }>> = {};
+    for (const relation of enrichedRelations) {
+      const from = String((relation as any).from || "");
+      const to = String((relation as any).to || "");
+      const type = String((relation as any).type || "related_to");
+      if (!from || !to) continue;
+      if (!relationIndexByFrom[from]) relationIndexByFrom[from] = [];
+      if (!relationIndexByTo[to]) relationIndexByTo[to] = [];
+      relationIndexByFrom[from].push({ to, type });
+      relationIndexByTo[to].push({ from, type });
+    }
+
+    return {
+      ...graph,
+      relations: enrichedRelations,
+      symbols,
+      callGraph,
+      fileLogic,
+      symbolUsage,
+      indexes: {
+        ...(graph as any).indexes,
+        callsFromFile: relationIndexByFrom,
+        callsToFile: relationIndexByTo,
+      },
+      analytics: {
+        ...((graph as any).analytics || {}),
+        deepCodeResearch: deepStats,
+      },
+      unknowns: Array.from(unknowns),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
   private buildGraphFromFiles(
     projectLocalPath: string,
     files: Array<{ path: string; size: number; mtimeMs: number; ext: string }>,
@@ -779,6 +1173,16 @@ export class ProjectsService {
     const frontendMap: Array<Record<string, unknown>> = [];
     const dataModels: Array<Record<string, unknown>> = [];
     const adrs: Array<Record<string, unknown>> = [];
+    const relationKeys = new Set<string>();
+    const unknownSpecifiers = new Set<string>();
+    const knownFiles = new Set(files.map((file) => file.path));
+
+    const pushRelation = (from: string, type: string, to: string, reason: string) => {
+      const key = `${from}|${type}|${to}`;
+      if (relationKeys.has(key)) return;
+      relationKeys.add(key);
+      relations.push({ from, type, to, reason });
+    };
 
     for (const file of files) {
       const top = file.path.split("/")[0] || "root";
@@ -811,13 +1215,10 @@ export class ProjectsService {
         location: file.path,
         module: top,
       });
-      relations.push({ from: moduleId, type: "contains", to: fileId, reason: "File belongs to top-level module" });
+      pushRelation(moduleId, "contains", fileId, "File belongs to top-level module");
 
       if (lowered.includes("/views/") || lowered.includes("/features/") || lowered.includes("feature")) {
         features.push({ id: `feature:${file.path}`, name: path.basename(file.path), files: [file.path] });
-      }
-      if (kind === "API") {
-        apiMap.push({ method: "AUTO", url: `/${file.path.replace(/\.[^.]+$/, "")}`, source: file.path });
       }
       if (kind === "Component") {
         frontendMap.push({ route: file.path, page: path.basename(file.path), source: file.path });
@@ -827,6 +1228,41 @@ export class ProjectsService {
       }
       if (lowered.includes("adr") || lowered.includes("decision")) {
         adrs.push({ id: `adr:${file.path}`, title: path.basename(file.path), location: file.path });
+      }
+
+      if (this.dependencyScanExtensions.has(file.ext)) {
+        const content = this.readProjectFileText(projectLocalPath, file.path);
+        const specifiers = this.extractDependencySpecifiers(content);
+        for (const specifier of specifiers) {
+          const resolved = this.resolveDependencySpecifier(projectLocalPath, file.path, specifier, knownFiles);
+          if (resolved) {
+            const targetFileId = `file:${resolved}`;
+            if (targetFileId !== fileId) {
+              pushRelation(fileId, "depends_on", targetFileId, `Code dependency: ${specifier}`);
+            }
+          } else if (
+            (specifier.startsWith(".") || specifier.startsWith("@/") || specifier.startsWith("~/") || specifier.startsWith("#/") || specifier.startsWith("/"))
+            && unknownSpecifiers.size < 300
+          ) {
+            unknownSpecifiers.add(`${file.path} -> ${specifier}`);
+          }
+        }
+
+        const apiDecorators = content.matchAll(/@(Get|Post|Put|Patch|Delete)\s*\(\s*["'`]([^"'`]*)["'`]\s*\)/g);
+        let apiDetected = false;
+        for (const match of apiDecorators) {
+          apiDetected = true;
+          apiMap.push({
+            method: String(match[1] || "AUTO").toUpperCase(),
+            url: String(match[2] || "/"),
+            source: file.path,
+          });
+        }
+        if (!apiDetected && kind === "API") {
+          apiMap.push({ method: "AUTO", url: `/${file.path.replace(/\.[^.]+$/, "")}`, source: file.path });
+        }
+      } else if (kind === "API") {
+        apiMap.push({ method: "AUTO", url: `/${file.path.replace(/\.[^.]+$/, "")}`, source: file.path });
       }
     }
 
@@ -855,7 +1291,7 @@ export class ProjectsService {
       adrs,
       entityIndex: entities,
       coverage,
-      unknowns: [],
+      unknowns: Array.from(unknownSpecifiers),
     };
   }
 
@@ -938,12 +1374,11 @@ export class ProjectsService {
     const changeDetection = await runStage("detect", async () => this.detectIncrementalChanges(project.localPath, previousGitHead));
 
     const digest = this.computeProjectDigest(files);
-    const fullRescan = changeDetection.strategy !== "git-incremental";
-    const changedFiles = fullRescan
-      ? files.map((file) => file.path)
-      : changeDetection.changedFiles;
+    const changedFiles = files.map((file) => file.path);
+    const fullRescan = true;
 
-    const graph = await runStage("knowledge_graph", async () => this.buildGraphFromFiles(project.localPath, files));
+    const baseGraph = await runStage("knowledge_graph", async () => this.buildGraphFromFiles(project.localPath, files));
+    const graph = await runStage("research", async () => this.buildDeepResearchGraph(project.localPath, files, baseGraph as Record<string, unknown>));
 
     const knowledgeEntry = await runStage("relationships", async () => this.saveMemory({
       id: existingKg?.id,
@@ -1001,7 +1436,7 @@ export class ProjectsService {
         details: JSON.stringify({
           strategy: fullRescan ? "full" : "git-incremental",
           gitHead: changeDetection.gitHead,
-          changedFiles: changeDetection.changedFiles.length,
+          changedFiles: changedFiles.length,
         }, null, 2),
         tags: ["decisions", "resync"],
         sourceRunId: runId,
@@ -1071,8 +1506,8 @@ export class ProjectsService {
     const summary = {
       scannedFiles: files.length,
       changedFiles: changedFiles.length,
-      newFiles: fullRescan ? 0 : changeDetection.newFiles.length,
-      deletedFiles: fullRescan ? 0 : changeDetection.deletedFiles.length,
+      newFiles: changeDetection.newFiles.length,
+      deletedFiles: changeDetection.deletedFiles.length,
       newEntities: Array.isArray((knowledgeEntry.graph as Record<string, any>)?.entityIndex)
         ? ((knowledgeEntry.graph as Record<string, any>).entityIndex as unknown[]).length
         : 0,
@@ -1089,7 +1524,7 @@ export class ProjectsService {
       coverageAfter,
       durationMs,
       memoryIntegrity: validation.ok ? "ok" : "warning",
-      alreadySynchronized: Boolean(!fullRescan && !changeDetection.changedFiles.length && !changeDetection.newFiles.length && !changeDetection.deletedFiles.length),
+      alreadySynchronized: false,
     };
 
     const historyEntry = await this.saveMemory({
@@ -1169,17 +1604,17 @@ export class ProjectsService {
     const lastDigest = String(graphData?.meta?.digest || "");
     const lastGitHead = String(graphData?.meta?.gitHead || "") || null;
 
-    const files = this.listProjectFiles(project.localPath);
+    const files = await this.listProjectFiles(project.localPath);
     const digest = this.computeProjectDigest(files);
     const changedByDigest = lastDigest !== digest;
-    const incremental = this.detectIncrementalChanges(project.localPath, lastGitHead);
+    const incremental = await this.detectIncrementalChanges(project.localPath, lastGitHead);
     const changedFiles = incremental.strategy === "git-incremental"
       ? incremental.changedFiles
       : changedByDigest
         ? files.map((file) => file.path)
         : [];
 
-    const coverage = Number(graphData?.summary?.coverageAfter || 0);
+    const coverage = Number(graphData?.summary?.coverageAfter || graphData?.summary?.coverageBefore || 0);
     const outdated = changedByDigest || changedFiles.length > 0;
 
     return {

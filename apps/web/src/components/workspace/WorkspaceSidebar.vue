@@ -14,6 +14,7 @@ const props = defineProps<{
   resyncStatus: ResyncStatus | null;
   resyncHistory: ResyncHistoryItem[];
   resyncBusy: boolean;
+  resyncError?: string;
   formatDateTime: (value?: string) => string;
   formatDuration: (sec?: number) => string;
 }>();
@@ -24,6 +25,7 @@ const emit = defineEmits<{
   (e: "update:missionMode", value: "build" | "ask"): void;
   (e: "update:search", value: string): void;
   (e: "select-mission", missionId: string): void;
+  (e: "open-project-map"): void;
   (e: "resync-project"): void;
   (e: "open-resync-history"): void;
 }>();
@@ -62,6 +64,10 @@ const emit = defineEmits<{
       <button class="switch-btn" :class="{ active: missionMode === 'ask' }" @click="emit('update:missionMode', 'ask')">Вопрос</button>
     </div>
 
+    <div class="left-block">
+      <button class="map-btn" :disabled="!selectedProjectId" @click="emit('open-project-map')">🗺 Карта проекта</button>
+    </div>
+
     <div class="resync-card" :class="resyncStatus?.status || 'synchronized'">
       <div class="row between">
         <strong>Статус знаний</strong>
@@ -73,11 +79,12 @@ const emit = defineEmits<{
         Знания устарели. С момента последней синхронизации изменилось файлов: {{ resyncStatus.changedFiles }}.
       </p>
       <p v-else class="resync-note">
-        Знания синхронизированы. Покрытие: {{ Math.round((resyncStatus?.coverage || 0) * 100) }}%
+        Знания синхронизированы. Покрытие: {{ Math.round(resyncStatus?.coverage || 0) }}%
       </p>
       <button class="resync-btn" :disabled="resyncBusy || !selectedProjectId" @click="emit('resync-project')">
         {{ resyncBusy ? "Синхронизация выполняется..." : "🔄 Resync Project" }}
       </button>
+      <p v-if="resyncError" class="resync-error">{{ resyncError }}</p>
       <button class="resync-history-link" :disabled="!resyncHistory.length" @click="emit('open-resync-history')">
         История синхронизаций ({{ resyncHistory.length }})
       </button>
@@ -204,6 +211,16 @@ input {
   color: #6ee7b7;
 }
 
+.map-btn {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  background: rgba(59, 130, 246, 0.16);
+  color: #bfdbfe;
+  font-weight: 700;
+  padding: 9px 10px;
+}
+
 .resync-card {
   margin-bottom: 12px;
   padding: 10px;
@@ -267,6 +284,13 @@ input {
   color: #93c5fd;
   border-radius: 10px;
   padding: 8px 10px;
+}
+
+.resync-error {
+  margin: 8px 0 0;
+  color: #fca5a5;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .history-title {

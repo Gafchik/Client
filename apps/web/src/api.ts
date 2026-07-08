@@ -81,6 +81,8 @@ export const api = {
     }),
   projectMemory: (projectId: string) =>
     request<{ entries: ProjectMemoryEntry[] }>(`/projects/${projectId}/memory`),
+  projectKnowledgeGraph: (projectId: string) =>
+    request<{ entry: ProjectMemoryEntry | null }>(`/projects/${projectId}/memory/knowledge-graph`),
   saveProjectMemory: (entry: Partial<ProjectMemoryEntry>) =>
     request<{ entry: ProjectMemoryEntry }>("/projects/memory", {
       method: "POST",
