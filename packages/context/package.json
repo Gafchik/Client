@@ -1,0 +1,12 @@
+{
+  "name": "@client/context",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@client/shared": "0.1.0"
+  }
+}

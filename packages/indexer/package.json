@@ -1,0 +1,13 @@
+{
+  "name": "@client/indexer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@client/shared": "0.1.0",
+    "typescript": "^5.8.3"
+  }
+}

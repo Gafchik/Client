@@ -6,6 +6,7 @@ dist/
 build/
 coverage/
 .turbo/
+.client/
 
 .env
 .env.local

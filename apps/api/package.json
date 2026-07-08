@@ -1,0 +1,25 @@
+{
+  "name": "@client/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "npm run typecheck"
+  },
+  "dependencies": {
+    "@client/context": "0.1.0",
+    "@client/graph": "0.1.0",
+    "@client/impact-analysis": "0.1.0",
+    "@client/indexer": "0.1.0",
+    "@client/knowledge": "0.1.0",
+    "@client/planner": "0.1.0",
+    "@client/research": "0.1.0",
+    "@client/shared": "0.1.0",
+    "@client/workspace": "0.1.0",
+    "@fastify/cors": "^11.1.0",
+    "fastify": "^5.4.0"
+  }
+}
