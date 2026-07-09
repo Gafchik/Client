@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadKnowledgeCatalog, loadLatestBackgroundRunArtifact, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
@@ -222,7 +222,7 @@ export function createApp() {
     const overview = await scanWorkspaceOverview(projectPath);
     const recentRuns = await loadKnowledgeCatalog(appRootPath, overview.rootPath);
     const latestRun = await loadLatestPipelineRunArtifact(appRootPath, overview.rootPath);
-    const latestBackgroundRun = await loadLatestBackgroundRunArtifact(appRootPath, overview.rootPath);
+    const latestBackgroundRun = await loadLatestBackgroundRunCatalogEntry(appRootPath, overview.rootPath);
     const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
       includePaths: [],
       maxFiles: 0,
@@ -233,7 +233,7 @@ export function createApp() {
       projectId: overview.projectId,
       projectRootPath: overview.rootPath,
       repository,
-      latestRun: latestBackgroundRun,
+      latestRunId: latestBackgroundRun?.runId ?? null,
       baselineRun: baselineSelection.run,
       baselineSource: baselineSelection.source,
     });
@@ -330,16 +330,56 @@ export function createApp() {
       });
     }
 
-    const projectRecord = request.body.projectId?.trim() ? await getProjectById(request.body.projectId.trim()) : null;
+    const explicitProjectPath = request.body.projectPath?.trim() || "";
+    const explicitProviderBaseUrl = request.body.providerBaseUrl?.trim() || "";
+    const explicitProviderModel = request.body.providerModel?.trim() || "";
+    const explicitProviderApiKey = request.body.providerApiKey?.trim() || "";
+
+    let projectRecord = null;
+
+    if (request.body.projectId?.trim()) {
+      try {
+        projectRecord = await getProjectById(request.body.projectId.trim());
+      } catch (error) {
+        if (!explicitProjectPath) {
+          request.log.error(error);
+          return reply.code(500).send({
+            message: "Не удалось загрузить проект из хранилища.",
+          });
+        }
+      }
+    }
+
     const projectPath = request.body.projectPath?.trim() || projectRecord?.paths[0]?.rootPath || appRootPath;
-    const currentProvider = await getCurrentProvider();
-    const selectedProvider = request.body.providerId?.trim() ? await setCurrentProvider(request.body.providerId.trim()) : null;
-    const effectiveProvider = request.body.providerId?.trim()
-      ? await getCurrentProvider()
-      : currentProvider;
-    const providerBaseUrl = request.body.providerBaseUrl?.trim() || effectiveProvider?.baseUrl || defaultProviderBaseUrl;
-    const providerModel = request.body.providerModel?.trim() || defaultProviderModel;
-    const providerApiKey = request.body.providerApiKey?.trim() || effectiveProvider?.apiKey || defaultProviderApiKey;
+    let currentProvider = null;
+    let selectedProvider = null;
+    let effectiveProvider = null;
+
+    const needsProviderStoreLookup =
+      (!explicitProviderBaseUrl || !explicitProviderApiKey)
+      || Boolean(request.body.providerId?.trim());
+
+    if (needsProviderStoreLookup) {
+      try {
+        currentProvider = await getCurrentProvider();
+        selectedProvider = request.body.providerId?.trim() ? await setCurrentProvider(request.body.providerId.trim()) : null;
+        effectiveProvider = request.body.providerId?.trim()
+          ? await getCurrentProvider()
+          : currentProvider;
+        void selectedProvider;
+      } catch (error) {
+        if (!explicitProviderBaseUrl || !explicitProviderApiKey) {
+          request.log.error(error);
+          return reply.code(500).send({
+            message: "Не удалось загрузить AI provider из хранилища.",
+          });
+        }
+      }
+    }
+
+    const providerBaseUrl = explicitProviderBaseUrl || effectiveProvider?.baseUrl || defaultProviderBaseUrl;
+    const providerModel = explicitProviderModel || defaultProviderModel;
+    const providerApiKey = explicitProviderApiKey || effectiveProvider?.apiKey || defaultProviderApiKey;
     const mode: PipelineRunMode = request.body.hardResync
       ? "hard-resync"
       : request.body.forceRefresh
@@ -384,7 +424,6 @@ export function createApp() {
       }
     }
 
-    void selectedProvider;
     const runId = stableId(["run", mode, projectPath, normalizedTask, Date.now()]);
     const acceptedStatus = enqueuePipelineRun({
       runId,

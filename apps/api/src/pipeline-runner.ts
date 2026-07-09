@@ -5,7 +5,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunArtifact, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunCatalogEntry, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -13,6 +13,7 @@ import {
   type IncrementalIndexPlan,
   normalizePath,
   stableId,
+  tokenize,
   type GraphInvalidationPlan,
   type PipelinePartialArtifacts,
   type PipelineRunMode,
@@ -269,12 +270,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const projectId = overview.projectId;
   const baselineSelection = await loadBestBaselineRunArtifact(appRootPath, projectRootPath, repository);
   const previousRun = isHardResync ? null : baselineSelection.run;
-  const latestRun = await loadLatestBackgroundRunArtifact(appRootPath, projectRootPath);
+  const latestBackgroundEntry = await loadLatestBackgroundRunCatalogEntry(appRootPath, projectRootPath);
   const backgroundState = buildBackgroundProjectState({
     projectId,
     projectRootPath,
     repository,
-    latestRun,
+    latestRunId: latestBackgroundEntry?.runId ?? null,
     baselineRun: previousRun,
     baselineSource: baselineSelection.source,
   });
@@ -681,6 +682,13 @@ function buildQuestionWorkspacePlan(
   workspace: Awaited<ReturnType<typeof openWorkspace>>,
   previousRun?: PipelineRunResult | null,
 ): QuestionWorkspacePlan {
+  const previousIndex = previousRun?.runtimeCache?.index;
+  const availableRelativePaths = Array.from(
+    new Set([
+      ...workspace.files.map((file) => file.relativePath),
+      ...(previousIndex?.files.map((file) => normalizePath(file.filePath)) ?? []),
+    ]),
+  );
   const gitScopedPaths = deriveRepositoryScopedPaths(repository, workspace);
   const normalizedTask = task.toLowerCase();
   const billingRollbackFocus =
@@ -690,14 +698,24 @@ function buildQuestionWorkspacePlan(
     || normalizedTask.includes("дженер")
     || normalizedTask.includes("billhistory")
     || normalizedTask.includes("истори");
-  const taskTokens = normalizedTask
-    .split(/[^a-z0-9а-яё_/-]+/i)
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 3);
+  const taskTokens = Array.from(
+    new Set([
+      ...tokenize(task),
+      ...task
+        .split(/[^A-Za-z0-9_/-]+/)
+        .filter(Boolean)
+        .flatMap((token) =>
+          token
+            .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+            .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+            .split(/[^A-Za-z0-9а-яё]+/i)
+            .map((part) => part.trim().toLowerCase())
+            .filter((part) => part.length >= 2),
+        ),
+    ]),
+  ).filter((token) => token.length >= 3);
   const previousGraph = previousRun?.runtimeCache?.graph;
-  const previousIndex = previousRun?.runtimeCache?.index;
-  const tokenMatchedPaths = workspace.files
-    .map((file) => file.relativePath)
+  const tokenMatchedPaths = availableRelativePaths
     .filter((relativePath) => {
       const lowerPath = relativePath.toLowerCase();
       return taskTokens.some((token) => lowerPath.includes(token));
@@ -765,8 +783,7 @@ function buildQuestionWorkspacePlan(
   const hasRepositoryScopedSeed = gitScopedPaths.length >= 2;
   const shouldUseStructuralFallback = !hasStrongGraphSeed && !hasRepositoryScopedSeed;
   const fallbackStructuralPaths = shouldUseStructuralFallback
-    ? workspace.files
-        .map((file) => file.relativePath)
+    ? availableRelativePaths
         .filter((relativePath) => {
           const lowerPath = relativePath.toLowerCase();
           return (
@@ -783,8 +800,7 @@ function buildQuestionWorkspacePlan(
         .slice(0, 120)
     : [];
   const billingRollbackPaths = billingRollbackFocus
-    ? workspace.files
-        .map((file) => file.relativePath)
+    ? availableRelativePaths
         .filter((relativePath) => {
           const lowerPath = relativePath.toLowerCase();
           return (
@@ -795,13 +811,37 @@ function buildQuestionWorkspacePlan(
             || lowerPath.includes("/containers/billing/bill/models/bill.php")
             || lowerPath.includes("/ship/parents/models/billmodel.php")
             || lowerPath.includes("/containers/billing/billhistory/")
+            || lowerPath.includes("/containers/billing/bill/support/billhistorydocumentsyncresolver.php")
+            || lowerPath.includes("/containers/billing/billhistory/actions/createbillhistoryaction.php")
           );
         })
         .slice(0, 40)
     : [];
+  const localizationRuntimeFocus =
+    normalizedTask.includes("locale")
+    || normalizedTask.includes("localization")
+    || normalizedTask.includes("локал")
+    || normalizedTask.includes("язык")
+    || normalizedTask.includes("header")
+    || normalizedTask.includes("заголов")
+    || normalizedTask.includes("middleware");
+  const localizationRuntimePaths = localizationRuntimeFocus
+    ? availableRelativePaths
+        .filter((relativePath) => {
+          const lowerPath = relativePath.toLowerCase();
+          return (
+            lowerPath.includes("/middleware/localemiddleware.php")
+            || lowerPath.endsWith("/bootstrap/app.php")
+            || lowerPath.includes("/enums/localeenum.php")
+            || lowerPath.endsWith("/config/app.php")
+          );
+        })
+        .slice(0, 20)
+    : [];
 
   const primaryPaths = Array.from(
     new Set([
+      ...localizationRuntimePaths,
       ...billingRollbackPaths,
       ...gitScopedPaths,
       ...previousSymbolMatchedPaths,

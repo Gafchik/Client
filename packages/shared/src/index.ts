@@ -524,6 +524,11 @@ export interface KnowledgeCatalogEntry {
   savedAt: string;
   storagePath: string;
   summary: string;
+  mode?: PipelineRunMode;
+  repositoryId?: string;
+  branch?: string;
+  headCommit?: string;
+  headFingerprint?: string;
 }
 
 export interface KnowledgeSaveResult {

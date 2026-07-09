@@ -147,6 +147,11 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
     savedAt,
     storagePath,
     summary: input.research.summary,
+    mode: input.mode,
+    repositoryId: input.repository.repositoryId,
+    branch: input.repository.branch,
+    headCommit: input.repository.headCommit,
+    headFingerprint: input.repository.headFingerprint,
   };
   const nextCatalog = [nextEntry, ...catalog.filter((entry) => entry.runId !== input.runId)].slice(0, 20);
   await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
@@ -199,8 +204,22 @@ export async function loadLatestBackgroundRunArtifact(
   appRootPath: string,
   projectRootPath: string,
 ): Promise<PipelineRunResult | null> {
-  const artifacts = await loadAllPipelineRunArtifacts(appRootPath, projectRootPath);
-  return artifacts.find((artifact) => artifact.mode === "background-sync") ?? null;
+  const catalog = await loadKnowledgeCatalog(appRootPath, projectRootPath);
+  const latestBackground = catalog.find((entry) => entry.mode === "background-sync");
+
+  if (!latestBackground) {
+    return null;
+  }
+
+  return loadPipelineRunArtifact(appRootPath, projectRootPath, latestBackground.runId);
+}
+
+export async function loadLatestBackgroundRunCatalogEntry(
+  appRootPath: string,
+  projectRootPath: string,
+): Promise<KnowledgeCatalogEntry | null> {
+  const catalog = await loadKnowledgeCatalog(appRootPath, projectRootPath);
+  return catalog.find((entry) => entry.mode === "background-sync") ?? null;
 }
 
 export async function loadAllPipelineRunArtifacts(
@@ -223,52 +242,70 @@ export async function loadBestBaselineRunArtifact(
   run: PipelineRunResult | null;
   source: BackgroundProjectState["baselineSource"];
 }> {
-  const artifacts = (await loadAllPipelineRunArtifacts(appRootPath, projectRootPath))
-    .filter((artifact) => artifact.mode === "background-sync");
+  const catalog = (await loadKnowledgeCatalog(appRootPath, projectRootPath))
+    .filter((entry) => entry.mode === "background-sync");
 
-  if (artifacts.length === 0) {
+  if (catalog.length === 0) {
     return { run: null, source: "none" };
   }
 
-  const exactHead = artifacts.find((artifact) =>
-    artifact.repository.repositoryId === repository.repositoryId
-    && artifact.repository.headCommit === repository.headCommit,
+  const exactHead = catalog.find((entry) =>
+    entry.repositoryId === repository.repositoryId
+    && entry.headCommit === repository.headCommit,
   );
 
   if (exactHead) {
-    return { run: exactHead, source: "exact-head" };
+    return {
+      run: await loadPipelineRunArtifact(appRootPath, projectRootPath, exactHead.runId),
+      source: "exact-head",
+    };
   }
 
-  const mergeBase = artifacts.find((artifact) =>
-    artifact.repository.repositoryId === repository.repositoryId
-    && artifact.repository.headCommit === repository.mergeBase,
+  const mergeBase = catalog.find((entry) =>
+    entry.repositoryId === repository.repositoryId
+    && entry.headCommit === repository.mergeBase,
   );
 
   if (mergeBase) {
-    return { run: mergeBase, source: "merge-base" };
+    return {
+      run: await loadPipelineRunArtifact(appRootPath, projectRootPath, mergeBase.runId),
+      source: "merge-base",
+    };
   }
 
-  const recentBranch = artifacts.find((artifact) =>
-    artifact.repository.repositoryId === repository.repositoryId
-    && artifact.repository.branch === repository.branch,
+  const recentBranch = catalog.find((entry) =>
+    entry.repositoryId === repository.repositoryId
+    && entry.branch === repository.branch,
   );
 
   if (recentBranch) {
-    return { run: recentBranch, source: "recent-branch" };
+    return {
+      run: await loadPipelineRunArtifact(appRootPath, projectRootPath, recentBranch.runId),
+      source: "recent-branch",
+    };
   }
 
-  return { run: artifacts[0] ?? null, source: "recent-branch" };
+  const latestBackground = catalog[0] ?? null;
+
+  if (!latestBackground) {
+    return { run: null, source: "none" };
+  }
+
+  return {
+    run: await loadPipelineRunArtifact(appRootPath, projectRootPath, latestBackground.runId),
+    source: "recent-branch",
+  };
 }
 
 export function buildBackgroundProjectState(input: {
   projectId: string;
   projectRootPath: string;
   repository: RepositorySnapshot;
-  latestRun: PipelineRunResult | null;
+  latestRunId?: string | null;
   baselineRun: PipelineRunResult | null;
   baselineSource: BackgroundProjectState["baselineSource"];
 }): BackgroundProjectState {
-  const latestRunId = input.latestRun?.runId;
+  const latestRunId = input.latestRunId ?? undefined;
   const baselineRunId = input.baselineRun?.runId;
   const baselineHeadCommit = input.baselineRun?.repository.headCommit;
   const exactHeadMatch = input.baselineRun?.repository.headFingerprint === input.repository.headFingerprint;

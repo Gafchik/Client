@@ -4,6 +4,7 @@ import path from "node:path";
 import { normalizePath, stableId, type RepositoryChangedFile, type RepositorySnapshot, type WorkspaceSnapshot } from "@client/shared";
 
 const execFileAsync = promisify(execFile);
+const GIT_COMMAND_TIMEOUT_MS = 5_000;
 
 export async function inspectRepository(workspace: WorkspaceSnapshot): Promise<RepositorySnapshot> {
   const scannedAt = new Date().toISOString();
@@ -101,6 +102,7 @@ async function runGit(
       cwd,
       encoding: "utf8",
       maxBuffer: 1024 * 1024 * 8,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
     });
 
     return {
@@ -245,6 +247,10 @@ function collectDiagnostics(input: {
 
   if (!input.status.ok) {
     diagnostics.push("Не удалось прочитать git status. Working tree signals могут быть неполными.");
+  }
+
+  if ([input.upstream.stderr, input.mergeBase.stderr, input.status.stderr].some((message) => message.includes("timed out"))) {
+    diagnostics.push("Одна или несколько git-команд превысили timeout. Repository snapshot построен в деградированном режиме, чтобы не блокировать question-run.");
   }
 
   if (input.changedFiles.some((file) => isConflictStatus(file))) {

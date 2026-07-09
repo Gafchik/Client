@@ -536,6 +536,14 @@ function routeResearch(tokens: string[]): ResearchRoutingDecision {
     };
   }
 
+  if (isBillingRollbackQuestion(tokens)) {
+    return {
+      intentClass: "functional-flow",
+      strategyKey: "graph-functional-entrypoints",
+      queryProfileKey: "entrypoint-traversal",
+    };
+  }
+
   if (isLocalizationInventoryQuestion(tokens)) {
     return {
       intentClass: "inventory-localization",
@@ -961,12 +969,16 @@ function detectEntryPoints(
   routeNodes: GraphState["nodes"],
   dominantModule: string,
 ): string[] {
-  if (routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown") {
-    return deriveBroadEntryPoints(input, topFiles).slice(0, 6);
-  }
-
   if (isLocalizationBehaviorQuestion(expandTaskTokens(input.task))) {
     return detectLocalizationRuntimeEntryPoints(input).slice(0, 6);
+  }
+
+  if (isBillingRollbackQuestion(expandTaskTokens(input.task))) {
+    return detectBillingEntryPoints(input).slice(0, 6);
+  }
+
+  if (routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown") {
+    return deriveBroadEntryPoints(input, topFiles).slice(0, 6);
   }
 
   if (isLocalizationInventoryQuestion(expandTaskTokens(input.task))) {
@@ -975,10 +987,6 @@ function detectEntryPoints(
 
   if (isConfigQuestion(expandTaskTokens(input.task))) {
     return detectConfigEntryPoints(input).slice(0, 6);
-  }
-
-  if (isBillingRollbackQuestion(expandTaskTokens(input.task))) {
-    return detectBillingEntryPoints(input).slice(0, 6);
   }
 
   const ranked = new Map<string, number>();
@@ -1468,6 +1476,19 @@ function expandTaskTokens(task: string): string[] {
   const baseTokens = tokenize(task);
   const expanded = new Set(baseTokens);
 
+  for (const rawToken of task.split(/[^A-Za-z0-9_/-]+/).filter(Boolean)) {
+    const splitTokens = rawToken
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+      .split(/[^A-Za-z0-9а-яё]+/i)
+      .map((token) => token.trim().toLowerCase())
+      .filter((token) => token.length >= 2);
+
+    for (const token of splitTokens) {
+      expanded.add(token);
+    }
+  }
+
   for (const token of baseTokens) {
     for (const profile of INTENT_PROFILES) {
       if (profile.aliases.some((alias) => token.includes(alias) || alias.includes(token))) {
@@ -1563,8 +1584,15 @@ function isLocalizationBehaviorQuestion(tokens: string[]): boolean {
       "middleware",
       "default",
       "fallback",
+      "where",
+      "set",
+      "sets",
       "выбирается",
       "выбора",
+      "где",
+      "задается",
+      "задаётся",
+      "устанавливается",
       "определяется",
       "определение",
       "работает",
@@ -2276,6 +2304,10 @@ function getBillingRollbackFileBoost(
     score += 48;
   }
 
+  if (pathText.includes("/billing/bill/ui/api/controllers/") || pathText.includes("/billing/bill/ui/api/routes/")) {
+    score += 52;
+  }
+
   if (pathText.includes("billhistory") || pathText.includes("togeneratedbillaction") || pathText.includes("todraftbillaction")) {
     score += 34;
   }
@@ -2290,6 +2322,14 @@ function getBillingRollbackFileBoost(
 
   if (pathText.includes("/biller/")) {
     score -= 42;
+  }
+
+  if (pathText.includes("/acunotes/") || pathText.includes("/appointmenthistory/")) {
+    score -= 48;
+  }
+
+  if (pathText.includes("/data/migrations/") || pathText.includes("migration")) {
+    score -= 56;
   }
 
   if (pathText.includes("export") || pathText.includes("analytics") || pathText.includes("collection")) {
@@ -2352,6 +2392,10 @@ function getBillingRollbackSymbolBoost(
     score += 28;
   }
 
+  if (filePath.includes("/billing/bill/ui/api/controllers/") || filePath.includes("/billing/bill/ui/api/routes/")) {
+    score += 34;
+  }
+
   if (label.includes("bill") || label.includes("history") || label.includes("rollback") || label.includes("generated")) {
     score += 18;
   }
@@ -2376,6 +2420,14 @@ function getBillingRollbackSymbolBoost(
     score -= 38;
   }
 
+  if (filePath.includes("/acunotes/") || filePath.includes("/appointmenthistory/")) {
+    score -= 44;
+  }
+
+  if (filePath.includes("/data/migrations/") || filePath.includes("migration")) {
+    score -= 54;
+  }
+
   if (label.includes("export") || label.includes("analytics") || label.includes("collection")) {
     score -= 34;
   }
@@ -2397,6 +2449,14 @@ function getBillingRollbackRouteBoost(filePath: string, billingRollbackFocus: bo
   }
 
   const normalized = filePath.toLowerCase();
+  if (normalized.includes("/billing/bill/ui/api/routes/")) {
+    return 42;
+  }
+
+  if (normalized.includes("/biller/") || normalized.includes("/acunotes/")) {
+    return -36;
+  }
+
   return normalized.includes("/billing/") || normalized.includes("/routes/") ? 16 : 0;
 }
 
@@ -2414,6 +2474,10 @@ function getRuntimeBillingGraphFileBoost(
 
   if (normalized.includes("/containers/billing/bill/")) {
     score += 34;
+  }
+
+  if (normalized.includes("/billing/bill/ui/api/controllers/") || normalized.includes("/billing/bill/ui/api/routes/")) {
+    score += 44;
   }
 
   for (const edge of runtimeBillingEdges) {
@@ -2468,6 +2532,14 @@ function getRuntimeBillingGraphFileBoost(
     score -= 44;
   }
 
+  if (normalized.includes("/acunotes/") || normalized.includes("/appointmenthistory/")) {
+    score -= 48;
+  }
+
+  if (normalized.includes("/data/migrations/") || normalized.includes("migration")) {
+    score -= 60;
+  }
+
   if (normalized.includes("export") || normalized.includes("analytics") || normalized.includes("collection")) {
     score -= 38;
   }
@@ -2496,6 +2568,10 @@ function getRuntimeBillingGraphSymbolBoost(
     score += 28;
   }
 
+  if (symbol.filePath.toLowerCase().includes("/billing/bill/ui/api/controllers/") || symbol.filePath.toLowerCase().includes("/billing/bill/ui/api/routes/")) {
+    score += 32;
+  }
+
   if (label.includes("bill") || label.includes("rollback") || label.includes("history") || label.includes("generated")) {
     score += 18;
   }
@@ -2514,6 +2590,14 @@ function getRuntimeBillingGraphSymbolBoost(
 
   if (symbol.filePath.toLowerCase().includes("/biller/")) {
     score -= 40;
+  }
+
+  if (symbol.filePath.toLowerCase().includes("/acunotes/") || symbol.filePath.toLowerCase().includes("/appointmenthistory/")) {
+    score -= 44;
+  }
+
+  if (symbol.filePath.toLowerCase().includes("/data/migrations/") || symbol.filePath.toLowerCase().includes("migration")) {
+    score -= 56;
   }
 
   if (label.includes("export") || label.includes("analytics") || label.includes("collection")) {
@@ -2912,7 +2996,7 @@ function detectLocalizationRuntimeEntryPoints(input: ResearchInput): string[] {
       score -= 20;
     }
 
-    if (content.includes("x-lang") || content.includes("accept-language")) {
+    if (content.includes("x-locale") || content.includes("x-lang") || content.includes("accept-language")) {
       score += 28;
     }
 
@@ -2998,10 +3082,16 @@ function detectBillingEntryPoints(input: ResearchInput): string[] {
       score += 8;
     }
 
+    if (normalized.includes("routeprovider")) {
+      score += normalized.includes("/billing/bill/ui/api/routes/") ? 24 : 10;
+    }
+
+    if (normalized.includes("billcontroller")) {
+      score += 28;
+    }
+
     if (
-      normalized.includes("billcontroller")
-      || normalized.includes("routeprovider")
-      || normalized.includes("togeneratedbillaction")
+      normalized.includes("togeneratedbillaction")
       || normalized.includes("todraftbillaction")
     ) {
       score += 14;

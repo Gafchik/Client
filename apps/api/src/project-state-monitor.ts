@@ -1,4 +1,4 @@
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunArtifact } from "@client/knowledge";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunCatalogEntry } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type BackgroundProjectState } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
@@ -92,12 +92,12 @@ async function observeProjectPath(
     });
     const repository = await inspectRepository(workspace);
     const baselineSelection = await loadBestBaselineRunArtifact(config.appRootPath, overview.rootPath, repository);
-    const latestBackgroundRun = await loadLatestBackgroundRunArtifact(config.appRootPath, overview.rootPath);
+    const latestBackgroundRun = await loadLatestBackgroundRunCatalogEntry(config.appRootPath, overview.rootPath);
     const backgroundState = buildBackgroundProjectState({
       projectId: overview.projectId,
       projectRootPath: overview.rootPath,
       repository,
-      latestRun: latestBackgroundRun,
+      latestRunId: latestBackgroundRun?.runId ?? null,
       baselineRun: baselineSelection.run,
       baselineSource: baselineSelection.source,
     });
