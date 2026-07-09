@@ -1,19 +1,24 @@
 import {
+  getBillingRuntimeNodes,
   getCodeNodes,
   getEntryPointNeighbors,
+  getLocalizationRuntimeNodes,
   getModuleRelationSummary,
   getModuleRelations,
   getNodesForQueryProfile,
   getNodesByKind,
   getRouteNodes,
   getRoutesForModule,
+  getRuntimeSemanticEdges,
 } from "@client/graph";
 import {
+  type BackgroundProjectState,
   clamp,
   deriveLocalizationBucket,
   deriveStructuralModuleLabel,
   isConfigPath,
   isLocalizationPath,
+  type RepositorySnapshot,
   scoreText,
   tokenize,
   type GraphState,
@@ -34,6 +39,8 @@ interface ResearchInput {
   workspace: WorkspaceSnapshot;
   index: IndexResult;
   graph: GraphState;
+  repository?: RepositorySnapshot;
+  backgroundState?: BackgroundProjectState;
 }
 
 interface IntentProfile {
@@ -227,6 +234,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
   const infrastructureFocus = isInfrastructureQuestion(tokens);
   const localizationInventoryFocus = isLocalizationInventoryQuestion(tokens);
   const localizationBehaviorFocus = isLocalizationBehaviorQuestion(tokens);
+  const billingRollbackFocus = isBillingRollbackQuestion(tokens);
   const configFocus = isConfigQuestion(tokens);
   const fileEvidence: ScoredReference[] = [];
   const symbolEvidence: ScoredReference[] = [];
@@ -241,9 +249,30 @@ export function runResearch(input: ResearchInput): ResearchReport {
     routing.queryProfileKey,
     dominantModule !== "не определён" ? { moduleLabel: dominantModule } : undefined,
   );
+  const runtimeLocaleNodes = localizationBehaviorFocus ? getLocalizationRuntimeNodes(input.graph) : [];
+  const runtimeLocaleNodeIds = new Set(runtimeLocaleNodes.map((node) => node.id));
+  const runtimeLocaleFilePaths = new Set(runtimeLocaleNodes.map((node) => node.filePath).filter((value): value is string => Boolean(value)));
+  const runtimeLocaleEdges = localizationBehaviorFocus
+    ? [
+        ...getRuntimeSemanticEdges(input.graph, "locale-set"),
+        ...getRuntimeSemanticEdges(input.graph, "request-header"),
+        ...getRuntimeSemanticEdges(input.graph, "locale-config"),
+      ]
+    : [];
+  const runtimeBillingNodes = billingRollbackFocus ? getBillingRuntimeNodes(input.graph) : [];
+  const runtimeBillingNodeIds = new Set(runtimeBillingNodes.map((node) => node.id));
+  const runtimeBillingFilePaths = new Set(runtimeBillingNodes.map((node) => node.filePath).filter((value): value is string => Boolean(value)));
+  const runtimeBillingEdges = billingRollbackFocus
+    ? [
+        ...getRuntimeSemanticEdges(input.graph, "bill-history-read"),
+        ...getRuntimeSemanticEdges(input.graph, "bill-history-write"),
+        ...getRuntimeSemanticEdges(input.graph, "bill-rollback-guard"),
+      ]
+    : [];
   const graphSeedFilePaths = new Set(graphSeedNodes.map((node) => node.filePath).filter((value): value is string => Boolean(value)));
   const graphSeedNodeIds = new Set(graphSeedNodes.map((node) => node.id));
   const graphSeedLabels = graphSeedNodes.map((node) => node.label.toLowerCase());
+  const strongGraphSeed = graphSeedNodes.length >= 4;
 
   for (const file of input.workspace.files) {
     const score =
@@ -251,9 +280,12 @@ export function runResearch(input: ResearchInput): ResearchReport {
       scoreText(file.content.slice(0, 4000), tokens) +
       getModuleBoost(file.relativePath, moduleIntents) +
       getGraphProfileFileBoost(file.relativePath, graphSeedFilePaths, graphSeedLabels, routing.queryProfileKey) +
+      getRuntimeLocaleGraphFileBoost(file.relativePath, runtimeLocaleFilePaths, runtimeLocaleEdges) +
+      getRuntimeBillingGraphFileBoost(file.relativePath, runtimeBillingFilePaths, runtimeBillingEdges) +
       getInfrastructureFileBoost(file, infrastructureFocus, tokens) +
       getLocalizationFileBoost(file, localizationInventoryFocus, tokens) +
       getLocaleRuntimeFileBoost(file, localizationBehaviorFocus, tokens) +
+      getBillingRollbackFileBoost(file, billingRollbackFocus, tokens) +
       getConfigFileBoost(file, configFocus, tokens);
 
     if (score <= 0) {
@@ -266,6 +298,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
       score,
       reason: buildFileReason(file.relativePath, moduleIntents),
       filePath: file.relativePath,
+      origin: "structural",
     });
   }
 
@@ -276,10 +309,13 @@ export function runResearch(input: ResearchInput): ResearchReport {
       scoreText(symbol.filePath, tokens) * 3 +
       getModuleBoost(symbol.filePath, moduleIntents) +
       getGraphProfileSymbolBoost(symbol, graphSeedFilePaths, graphSeedNodeIds, graphSeedLabels, routing.queryProfileKey) +
+      getRuntimeLocaleGraphSymbolBoost(symbol, runtimeLocaleNodeIds, runtimeLocaleFilePaths, runtimeLocaleEdges) +
+      getRuntimeBillingGraphSymbolBoost(symbol, runtimeBillingNodeIds, runtimeBillingFilePaths, runtimeBillingEdges) +
       getSymbolKindBoost(symbol.kind, functionalFocus, tokens) +
       getInfrastructureSymbolBoost(symbol, infrastructureFocus, tokens) +
       getLocalizationSymbolBoost(symbol, localizationInventoryFocus, tokens) +
       getLocaleRuntimeSymbolBoost(symbol, localizationBehaviorFocus, tokens) +
+      getBillingRollbackSymbolBoost(symbol, billingRollbackFocus, tokens) +
       getConfigSymbolBoost(symbol, configFocus, tokens);
 
     if (score <= 0) {
@@ -292,6 +328,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
       score,
       reason: buildSymbolReason(symbol.filePath, moduleIntents),
       filePath: symbol.filePath,
+      origin: "structural",
     });
   }
 
@@ -305,6 +342,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
       getInfrastructureRoutePenalty(routeNode.filePath ?? "", infrastructureFocus) +
       getLocalizationRoutePenalty(routeNode.filePath ?? "", localizationInventoryFocus) +
       getLocaleRuntimeRouteBoost(routeNode.filePath ?? "", localizationBehaviorFocus) +
+      getBillingRollbackRouteBoost(routeNode.filePath ?? "", billingRollbackFocus) +
       getConfigRoutePenalty(routeNode.filePath ?? "", configFocus);
 
     if (score <= 0) {
@@ -316,6 +354,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
       label: routeNode.label,
       score,
       reason: "Route-узел выбран через graph как прямая точка входа для функционального сценария.",
+      origin: "structural",
     };
 
     if (routeNode.filePath) {
@@ -337,10 +376,14 @@ export function runResearch(input: ResearchInput): ResearchReport {
       label: moduleNode.label,
       score,
       reason: "Module-узел совпал с задачей и был поднят из graph как доменная зона ответственности.",
+      origin: "structural",
     });
   }
 
-  const evidence = [...fileEvidence, ...symbolEvidence].sort((left, right) => right.score - left.score).slice(0, 12);
+  const evidence = [...fileEvidence, ...symbolEvidence]
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 12)
+    .map((item) => classifyReferenceOrigin(item, input));
   const topFiles = evidence.filter((item) => item.filePath).map((item) => item.filePath as string);
   const moduleRelations = dominantModule !== "не определён" ? getModuleRelations(input.graph, dominantModule) : [];
   const dominantModuleNodeId = findModuleNodeId(input.graph, dominantModule);
@@ -358,9 +401,12 @@ export function runResearch(input: ResearchInput): ResearchReport {
   const dataSources = detectDataSources(input);
   const affectedModules = deriveAffectedModules(moduleIntents, dominantModule, graphRelatedModules, topFiles, entryPoints);
   const functionalSummary = buildFunctionalSummary(input, affectedModules, dominantModule, moduleIntents, entryPoints, primaryEntities, sideEffects, dataSources);
-  const findings = buildFindings(input, evidence, moduleIntents, dominantModule);
-  const unknowns = buildUnknowns(input, evidence, moduleIntents, entryPoints, sideEffects, dataSources);
+  const findings = buildFindings(input, evidence, moduleIntents, dominantModule, strongGraphSeed);
+  const baselineFindings = buildBaselineFindings(input, evidence, strongGraphSeed);
+  const overlayFindings = buildOverlayFindings(input, evidence);
+  const unknowns = buildUnknowns(input, evidence, moduleIntents, entryPoints, sideEffects, dataSources, strongGraphSeed);
   const confidence = computeConfidence(input, evidence, unknowns);
+  const evidenceSummary = buildEvidenceSummary(evidence);
 
   return {
     runId: input.runId,
@@ -380,12 +426,105 @@ export function runResearch(input: ResearchInput): ResearchReport {
     sideEffects,
     dataSources,
     findings,
+    baselineFindings,
+    overlayFindings,
     evidence,
+    evidenceSummary,
     affectedModules,
     unknowns,
     confidence,
     references: evidence.map((item) => item.filePath ?? item.label),
   };
+}
+
+function classifyReferenceOrigin(item: ScoredReference, input: ResearchInput): ScoredReference {
+  if (!item.filePath) {
+    return {
+      ...item,
+      origin: "structural",
+      originDetails: "Узел получен из graph/symbol слоя без прямой привязки к изменённому файлу.",
+    };
+  }
+
+  const normalizedPath = item.filePath.replaceAll("\\", "/");
+  const changedFiles = input.repository?.changedFiles ?? [];
+  const changedEntry = changedFiles.find((entry) =>
+    entry.path.replaceAll("\\", "/") === normalizedPath || entry.previousPath?.replaceAll("\\", "/") === normalizedPath,
+  );
+
+  if (changedEntry) {
+    return {
+      ...item,
+      origin: "overlay",
+      originDetails: `Факт подтверждён локальным worktree overlay: файл изменён (${changedEntry.changeType}, ${changedEntry.scope}).`,
+    };
+  }
+
+  return {
+    ...item,
+    origin: "baseline",
+    originDetails: input.backgroundState?.baselineExactForHead
+      ? "Факт подтверждён committed baseline для текущего HEAD."
+      : "Факт подтверждён доступным committed baseline ветки/merge-base.",
+  };
+}
+
+function buildEvidenceSummary(evidence: ScoredReference[]): ResearchReport["evidenceSummary"] {
+  const baselineCount = evidence.filter((item) => item.origin === "baseline").length;
+  const overlayCount = evidence.filter((item) => item.origin === "overlay").length;
+  const structuralCount = evidence.filter((item) => item.origin === "structural").length;
+
+  return {
+    baselineCount,
+    overlayCount,
+    structuralCount,
+    overlayInfluenced: overlayCount > 0,
+  };
+}
+
+function buildBaselineFindings(
+  input: ResearchInput,
+  evidence: ScoredReference[],
+  strongGraphSeed: boolean,
+): string[] {
+  const baselineEvidence = evidence.filter((item) => item.origin === "baseline");
+
+  if (baselineEvidence.length === 0) {
+    return input.backgroundState?.freshness === "missing"
+      ? ["Для текущего branch/head ещё нет готового committed baseline, поэтому baseline-backed факты пока отсутствуют."]
+      : ["Committed baseline не дал прямых file-backed подтверждений по этому вопросу."]
+  }
+
+  const topBaseline = baselineEvidence.slice(0, 3).map((item) => item.filePath ?? item.label);
+  const findings = [
+    `Committed baseline подтвердил ключевые опоры: ${topBaseline.join(", ")}.`,
+  ];
+
+  findings.push(
+    strongGraphSeed
+      ? "Основная часть ответа опирается на уже собранный graph-first baseline, а не на широкий question-time обход."
+      : "Baseline использован частично: graph seed был недостаточно плотным, поэтому понадобилось дополнительное structural narrowing.",
+  );
+
+  return findings;
+}
+
+function buildOverlayFindings(input: ResearchInput, evidence: ScoredReference[]): string[] {
+  const overlayEvidence = evidence.filter((item) => item.origin === "overlay");
+
+  if (overlayEvidence.length === 0) {
+    return input.backgroundState?.hasLocalChanges
+      ? ["Локальные изменения есть, но они не попали в top evidence текущего ответа."]
+      : [];
+  }
+
+  return [
+    `Локальный worktree overlay повлиял на ответ: подтверждения найдены в ${overlayEvidence
+      .slice(0, 4)
+      .map((item) => item.filePath ?? item.label)
+      .join(", ")}.`,
+    "Эти факты существуют только в текущем незакоммиченном состоянии рабочей директории и не входят в committed baseline.",
+  ];
 }
 
 function routeResearch(tokens: string[]): ResearchRoutingDecision {
@@ -457,6 +596,7 @@ function buildFunctionalSummary(
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
   const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
   const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
+  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
   const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
   const moduleText = affectedModules.length ? affectedModules.join(", ") : "неопределённых зонах";
@@ -474,6 +614,10 @@ function buildFunctionalSummary(
 
   if (localizationBehaviorFocus) {
     return `По текущему исследованию задача "${input.task}" относится к runtime-поведению локализации, а не к inventory переводов. Основные точки входа: ${entryPointText}. Вероятные сущности, влияющие на выбор локали: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных для выбора локали: ${dataSourceText}. Система должна проверять middleware, request headers, config fallback и места, где locale устанавливается в жизненном цикле запроса.`;
+  }
+
+  if (billingRollbackFocus) {
+    return `По текущему исследованию задача "${input.task}" относится к runtime-поведению rollback bill и проверкам истории статусов. Основные точки входа: ${entryPointText}. Ключевые сущности перехода: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных для решения о rollback: ${dataSourceText}. Система должна проверять controller/action flow, bill history relations, вычисляемые rollback guards и создание новых BillHistory при смене статуса.`;
   }
 
   if (localizationInventoryFocus) {
@@ -499,6 +643,7 @@ function buildFindings(
   evidence: ScoredReference[],
   moduleIntents: ModuleIntentMatch[],
   dominantModule: string,
+  strongGraphSeed: boolean,
 ): string[] {
   if (evidence.length === 0) {
     return [
@@ -513,6 +658,7 @@ function buildFindings(
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
   const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
   const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
+  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
   const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
 
@@ -539,6 +685,21 @@ function buildFindings(
             .map((item) => `${item.direction === "outgoing" ? "зависит от" : "используется модулем"} ${item.targetLabel}`)
             .join(", ")}.`
         : "Graph пока не дал выраженных межмодульных связей для runtime-зоны локализации.",
+    ];
+  }
+
+  if (billingRollbackFocus) {
+    return [
+      `Самые сильные structural anchors для rollback/history вопроса: ${topLabels.join(", ")}.`,
+      "Вопрос распознан как runtime-поведение billing rollback, поэтому research ищет не только status enum, но и controller endpoints, rollback actions, bill history relations и guards по истории.",
+      moduleIntents[0]
+        ? `Доменные эвристики отдали приоритет модулю "${moduleIntents[0].module}", но ответ должен подтверждаться реальной цепочкой rollbackGenerated/rollbackDraft и BillHistory.`
+        : "Доменные эвристики не смогли уверенно выделить billing-зону rollback без дополнительных сигналов.",
+      moduleRelationSummary.length > 0
+        ? `Graph показал соседние модульные связи для "${dominantModule}": ${moduleRelationSummary
+            .map((item) => `${item.direction === "outgoing" ? "зависит от" : "используется модулем"} ${item.targetLabel}`)
+            .join(", ")}.`
+        : "Graph пока не дал выраженных межмодульных связей для runtime-зоны billing rollback.",
     ];
   }
 
@@ -595,6 +756,9 @@ function buildFindings(
     moduleIntents[0]
       ? `Доменные эвристики отдали приоритет модулю "${moduleIntents[0].module}" на основе терминов задачи и профильных файлов.`
       : "Доменные эвристики не смогли уверенно выделить один функциональный модуль.",
+    strongGraphSeed
+      ? "Question-time research стартовал от уже подтверждённого graph seed и сузил рабочую зону без широкого fallback-сканирования."
+      : "Question-time research частично использовал structural fallback, потому что graph seed оказался недостаточно плотным.",
     moduleRelationSummary.length > 0
       ? `Graph показал соседние модульные связи для "${dominantModule}": ${moduleRelationSummary
           .map((item) => `${item.direction === "outgoing" ? "зависит от" : "используется модулем"} ${item.targetLabel}`)
@@ -612,6 +776,7 @@ function buildUnknowns(
   entryPoints: string[],
   sideEffects: string[],
   dataSources: string[],
+  strongGraphSeed: boolean,
 ): string[] {
   const unknowns: string[] = [];
 
@@ -641,6 +806,10 @@ function buildUnknowns(
 
   if (dataSources.length === 0) {
     unknowns.push("Источники данных не выделены уверенно, поэтому часть функционального понимания остаётся неполной.");
+  }
+
+  if (!strongGraphSeed) {
+    unknowns.push("Graph seed для вопроса оказался недостаточно плотным, поэтому часть рабочей зоны была добрана через structural fallback.");
   }
 
   return unknowns;
@@ -796,12 +965,20 @@ function detectEntryPoints(
     return deriveBroadEntryPoints(input, topFiles).slice(0, 6);
   }
 
+  if (isLocalizationBehaviorQuestion(expandTaskTokens(input.task))) {
+    return detectLocalizationRuntimeEntryPoints(input).slice(0, 6);
+  }
+
   if (isLocalizationInventoryQuestion(expandTaskTokens(input.task))) {
     return detectLocalizationEntryPoints(input).slice(0, 6);
   }
 
   if (isConfigQuestion(expandTaskTokens(input.task))) {
     return detectConfigEntryPoints(input).slice(0, 6);
+  }
+
+  if (isBillingRollbackQuestion(expandTaskTokens(input.task))) {
+    return detectBillingEntryPoints(input).slice(0, 6);
   }
 
   const ranked = new Map<string, number>();
@@ -885,6 +1062,7 @@ function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNod
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
   const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
   const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
+  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
   const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
 
@@ -900,23 +1078,112 @@ function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNod
 
   if (localizationBehaviorFocus) {
     return codeNodes
-      .filter((node) => {
+      .map((node) => {
         const label = node.label.toLowerCase();
         const filePath = (node.filePath ?? "").toLowerCase();
+        let score = 0;
 
-        return (
-          topFiles.includes(node.filePath ?? "")
-          || label.includes("locale")
-          || label.includes("lang")
-          || label.includes("language")
-          || label.includes("middleware")
-          || label.includes("header")
-          || filePath.includes("/middleware/")
-          || filePath.includes("/http/")
-          || filePath.includes("/config/")
-        );
+        if (topFiles.includes(node.filePath ?? "")) {
+          score += 30;
+        }
+
+        if (filePath.includes("/middleware/") || filePath.includes("/http/")) {
+          score += 28;
+        }
+
+        if (filePath.includes("/config/")) {
+          score += 18;
+        }
+
+        if (label.includes("locale") || label.includes("language")) {
+          score += 24;
+        }
+
+        if (label.includes("middleware") || label.includes("header") || label.includes("request")) {
+          score += 20;
+        }
+
+        if (node.kind === "middleware") {
+          score += 22;
+        }
+
+        if (node.kind === "method") {
+          score += 10;
+        }
+
+        if (filePath.includes("/lang/") || filePath.includes("/translations/") || filePath.includes("/localization/")) {
+          score -= 30;
+        }
+
+        if (label === "locale" || label.endsWith(".locale")) {
+          score += 12;
+        }
+
+        return { label: node.label, score };
       })
-      .map((node) => node.label)
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score || left.label.localeCompare(right.label))
+      .map((item) => item.label)
+      .filter((value, index, list) => list.indexOf(value) === index)
+      .slice(0, 8);
+  }
+
+  if (billingRollbackFocus) {
+    return codeNodes
+      .map((node) => {
+        const label = node.label.toLowerCase();
+        const filePath = (node.filePath ?? "").toLowerCase();
+        let score = 0;
+
+        if (topFiles.includes(node.filePath ?? "")) {
+          score += 28;
+        }
+
+        if (filePath.includes("/containers/billing/bill/") || filePath.includes("/billing/")) {
+          score += 24;
+        }
+
+        if (label.includes("billcontroller")) {
+          score += 36;
+        }
+
+        if (label.includes("rollbackgenerated") || label.includes("rollbackdraft")) {
+          score += 34;
+        }
+
+        if (label.includes("togeneratedbillaction") || label.includes("todraftbillaction")) {
+          score += 38;
+        }
+
+        if (label.includes("billhistory") || label.includes("createbillhistoryaction")) {
+          score += 30;
+        }
+
+        if (label.includes("latestbillhistory") || label.includes("billspecifichistories")) {
+          score += 26;
+        }
+
+        if (label.includes("generated") || label.includes("rollback") || label.includes("history")) {
+          score += 16;
+        }
+
+        if (node.kind === "method" || node.kind === "class" || node.kind === "route") {
+          score += 8;
+        }
+
+        if (filePath.includes("/biller/")) {
+          score -= 36;
+        }
+
+        if (label.includes("export") || label.includes("analytics") || label.includes("collection")) {
+          score -= 30;
+        }
+
+        return { label: node.label, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score || left.label.localeCompare(right.label))
+      .map((item) => item.label)
       .filter((value, index, list) => list.indexOf(value) === index)
       .slice(0, 8);
   }
@@ -964,6 +1231,7 @@ function detectSideEffects(input: ResearchInput): string[] {
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
   const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
   const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
+  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
 
   for (const file of input.workspace.files) {
@@ -1025,8 +1293,24 @@ function detectSideEffects(input: ResearchInput): string[] {
       effects.add("локаль может определяться через входящий header запроса или middleware, читающее язык из request");
     }
 
+    if (localizationBehaviorFocus && (content.includes("fallback_locale") || content.includes("default_locale") || content.includes("config('app.locale") || content.includes("config(\"app.locale"))) {
+      effects.add("при отсутствии явного language signal используется config-driven fallback locale");
+    }
+
     if (localizationBehaviorFocus && (content.includes("middleware") || file.relativePath.toLowerCase().includes("/middleware/"))) {
       effects.add("часть поведения локализации, вероятно, находится в middleware или раннем HTTP-пайплайне");
+    }
+
+    if (billingRollbackFocus && (content.includes("createbillhistoryaction") || content.includes("billhistories()->create") || content.includes("billhistorycreated::dispatch"))) {
+      effects.add("rollback и смена bill статуса сопровождаются созданием или обновлением записей BillHistory");
+    }
+
+    if (billingRollbackFocus && (content.includes("was_been_rollback_to_generated") || content.includes("billspecifichistories") || content.includes("latestbillhistory"))) {
+      effects.add("решение о rollback и связанных ограничениях опирается на историю статусов bill");
+    }
+
+    if (billingRollbackFocus && (content.includes("rollbackgenerated") || content.includes("rollbackdraft") || content.includes("togeneratedbillaction") || content.includes("todraftbillaction"))) {
+      effects.add("в billing есть явный rollback flow через controller/action слой для draft и generated статусов");
     }
 
     if (configFocus && isConfigPath(file.relativePath.toLowerCase())) {
@@ -1038,8 +1322,16 @@ function detectSideEffects(input: ResearchInput): string[] {
     }
   }
 
-  if (localizationInventoryFocus || localizationBehaviorFocus) {
+  if (localizationBehaviorFocus) {
+    return prioritizeLocalizationRuntimeEffects([...effects]).slice(0, 6);
+  }
+
+  if (localizationInventoryFocus) {
     return prioritizeLocalizationEffects([...effects]).slice(0, 6);
+  }
+
+  if (billingRollbackFocus) {
+    return prioritizeBillingEffects([...effects]).slice(0, 6);
   }
 
   if (configFocus) {
@@ -1058,6 +1350,7 @@ function detectDataSources(input: ResearchInput): string[] {
   const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
   const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
   const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
+  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
   const configFocus = isConfigQuestion(expandTaskTokens(input.task));
 
   for (const file of input.workspace.files) {
@@ -1127,6 +1420,18 @@ function detectDataSources(input: ResearchInput): string[] {
       sources.add("часть выбора локали может зависеть от данных входящего HTTP-запроса");
     }
 
+    if (billingRollbackFocus && (content.includes("billhistory") || content.includes("billspecifichistories") || content.includes("latesteffectivebillstatushistory"))) {
+      sources.add("решение о rollback bill и текущем статусе опирается на BillHistory и связанные model relations");
+    }
+
+    if (billingRollbackFocus && (content.includes("bill_status_id") || content.includes("billstatusenum::generated_status") || content.includes("billstatus::getstatusbyname"))) {
+      sources.add("смена rollback статуса использует BillStatus и status enum/lookup слой");
+    }
+
+    if (billingRollbackFocus && (content.includes("hasmany(billhistory::class)") || content.includes("morphmany(billhistory::class)") || content.includes("billhistories()->create"))) {
+      sources.add("история статусов хранится и обновляется через ORM-связи Bill/BillModel -> BillHistory");
+    }
+
     if (configFocus && isConfigPath(file.relativePath.toLowerCase())) {
       sources.add("конфигурационные данные определяются через config-файлы проекта");
     }
@@ -1136,8 +1441,16 @@ function detectDataSources(input: ResearchInput): string[] {
     }
   }
 
-  if (localizationInventoryFocus || localizationBehaviorFocus) {
+  if (localizationBehaviorFocus) {
+    return prioritizeLocalizationRuntimeSources([...sources]).slice(0, 6);
+  }
+
+  if (localizationInventoryFocus) {
     return prioritizeLocalizationSources([...sources]).slice(0, 6);
+  }
+
+  if (billingRollbackFocus) {
+    return prioritizeBillingSources([...sources]).slice(0, 6);
   }
 
   if (configFocus) {
@@ -1268,6 +1581,52 @@ function isLocalizationBehaviorQuestion(tokens: string[]): boolean {
   );
 
   return hasLocalizationSignal && hasBehaviorSignal;
+}
+
+function isBillingRollbackQuestion(tokens: string[]): boolean {
+  const hasBillingSignal = tokens.some((token) =>
+    [
+      "bill",
+      "billing",
+      "generated",
+      "draft",
+      "status",
+      "history",
+      "rollback",
+      "rollbackgenerated",
+      "rollbackdraft",
+      "billhistory",
+      "билл",
+      "билинг",
+      "статус",
+      "история",
+      "откат",
+      "ролбек",
+    ].includes(token),
+  );
+  const hasBehaviorSignal = tokens.some((token) =>
+    [
+      "how",
+      "work",
+      "works",
+      "flow",
+      "behavior",
+      "why",
+      "check",
+      "guard",
+      "работает",
+      "как",
+      "почему",
+      "проверяется",
+      "проверка",
+      "нельзя",
+      "можно",
+      "откат",
+      "ролбек",
+    ].includes(token),
+  );
+
+  return hasBillingSignal && hasBehaviorSignal;
 }
 
 function isConfigQuestion(tokens: string[]): boolean {
@@ -1806,6 +2165,384 @@ function getLocaleRuntimeRouteBoost(filePath: string, localizationBehaviorFocus:
   return 0;
 }
 
+function getRuntimeLocaleGraphFileBoost(
+  filePath: string,
+  runtimeLocaleFilePaths: Set<string>,
+  runtimeLocaleEdges: GraphState["edges"],
+): number {
+  const normalized = filePath.toLowerCase();
+  let score = 0;
+
+  if (runtimeLocaleFilePaths.has(filePath)) {
+    score += 28;
+  }
+
+  for (const edge of runtimeLocaleEdges) {
+    const semantic = String(edge.metadata?.semantic ?? "").toLowerCase();
+    const header = String(edge.metadata?.header ?? "").toLowerCase();
+    const configKey = String(edge.metadata?.configKey ?? "").toLowerCase();
+    const sourceFilePath = String(edge.metadata?.sourceFilePath ?? "");
+
+    if (sourceFilePath !== filePath) {
+      continue;
+    }
+
+    if (semantic === "locale-set") {
+      score += 42;
+    }
+
+    if (semantic === "request-header" && (header.includes("locale") || header.includes("lang"))) {
+      score += 38;
+    }
+
+    if (semantic === "locale-config" || configKey.includes("locale")) {
+      score += 26;
+    }
+  }
+
+  if (normalized.includes("localemiddleware")) {
+    score += 50;
+  }
+
+  if (normalized.endsWith("config/app.php")) {
+    score += 36;
+  }
+
+  return score;
+}
+
+function getRuntimeLocaleGraphSymbolBoost(
+  symbol: IndexSymbol,
+  runtimeLocaleNodeIds: Set<string>,
+  runtimeLocaleFilePaths: Set<string>,
+  runtimeLocaleEdges: GraphState["edges"],
+): number {
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  let score = 0;
+
+  if (runtimeLocaleNodeIds.has(symbol.id)) {
+    score += 32;
+  }
+
+  if (runtimeLocaleFilePaths.has(symbol.filePath)) {
+    score += 20;
+  }
+
+  if (label.includes("locale") || label.includes("language")) {
+    score += 18;
+  }
+
+  for (const edge of runtimeLocaleEdges) {
+    if (edge.sourceId !== symbol.id) {
+      continue;
+    }
+
+    const semantic = String(edge.metadata?.semantic ?? "").toLowerCase();
+
+    if (semantic === "locale-set") {
+      score += 36;
+    }
+
+    if (semantic === "request-header") {
+      score += 24;
+    }
+
+    if (semantic === "locale-config") {
+      score += 18;
+    }
+  }
+
+  return score;
+}
+
+function getBillingRollbackFileBoost(
+  file: WorkspaceSnapshot["files"][number],
+  billingRollbackFocus: boolean,
+  tokens: string[],
+): number {
+  if (!billingRollbackFocus) {
+    return 0;
+  }
+
+  const pathText = file.relativePath.toLowerCase();
+  const contentText = file.content.slice(0, 4000).toLowerCase();
+  let score = 0;
+
+  if (pathText.includes("/billing/")) {
+    score += 28;
+  }
+
+  if (pathText.includes("/containers/billing/bill/")) {
+    score += 48;
+  }
+
+  if (pathText.includes("billhistory") || pathText.includes("togeneratedbillaction") || pathText.includes("todraftbillaction")) {
+    score += 34;
+  }
+
+  if (pathText.includes("billcontroller.php")) {
+    score += 56;
+  }
+
+  if (pathText.includes("/ui/api/routes/routeprovider.php")) {
+    score += 34;
+  }
+
+  if (pathText.includes("/biller/")) {
+    score -= 42;
+  }
+
+  if (pathText.includes("export") || pathText.includes("analytics") || pathText.includes("collection")) {
+    score -= 36;
+  }
+
+  if (contentText.includes("was_been_rollback_to_generated")) {
+    score += 54;
+  }
+
+  if (contentText.includes("billspecifichistories") || contentText.includes("latestbillhistory") || contentText.includes("latesteffectivebillstatushistory")) {
+    score += 30;
+  }
+
+  if (contentText.includes("createbillhistoryaction") || contentText.includes("billhistories()->create")) {
+    score += 32;
+  }
+
+  if (contentText.includes("rollbackgenerated") || contentText.includes("rollbackdraft")) {
+    score += 24;
+  }
+
+  if (contentText.includes("togeneratedbillaction") || contentText.includes("todraftbillaction")) {
+    score += 52;
+  }
+
+  if (contentText.includes("createbillhistoryaction")) {
+    score += 32;
+  }
+
+  if (contentText.includes("v1/billing/bill") || contentText.includes("/rollback/generated")) {
+    score += 44;
+  }
+
+  if (tokens.some((token) => pathText.includes(token) || contentText.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getBillingRollbackSymbolBoost(
+  symbol: IndexSymbol,
+  billingRollbackFocus: boolean,
+  tokens: string[],
+): number {
+  if (!billingRollbackFocus) {
+    return 0;
+  }
+
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  const filePath = symbol.filePath.toLowerCase();
+  let score = 0;
+
+  if (filePath.includes("/billing/")) {
+    score += 18;
+  }
+
+  if (filePath.includes("/containers/billing/bill/")) {
+    score += 28;
+  }
+
+  if (label.includes("bill") || label.includes("history") || label.includes("rollback") || label.includes("generated")) {
+    score += 18;
+  }
+
+  if (label.includes("rollbackgenerated") || label.includes("rollbackdraft")) {
+    score += 30;
+  }
+
+  if (label.includes("billcontroller")) {
+    score += 44;
+  }
+
+  if (label.includes("togeneratedbillaction") || label.includes("todraftbillaction")) {
+    score += 52;
+  }
+
+  if (label.includes("createbillhistoryaction") || label.includes("latestbillhistory") || label.includes("billspecifichistories")) {
+    score += 36;
+  }
+
+  if (filePath.includes("/biller/")) {
+    score -= 38;
+  }
+
+  if (label.includes("export") || label.includes("analytics") || label.includes("collection")) {
+    score -= 34;
+  }
+
+  if (symbol.kind === "method" || symbol.kind === "class") {
+    score += 12;
+  }
+
+  if (tokens.some((token) => label.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getBillingRollbackRouteBoost(filePath: string, billingRollbackFocus: boolean): number {
+  if (!billingRollbackFocus) {
+    return 0;
+  }
+
+  const normalized = filePath.toLowerCase();
+  return normalized.includes("/billing/") || normalized.includes("/routes/") ? 16 : 0;
+}
+
+function getRuntimeBillingGraphFileBoost(
+  filePath: string,
+  runtimeBillingFilePaths: Set<string>,
+  runtimeBillingEdges: GraphState["edges"],
+): number {
+  const normalized = filePath.toLowerCase();
+  let score = 0;
+
+  if (runtimeBillingFilePaths.has(filePath)) {
+    score += 28;
+  }
+
+  if (normalized.includes("/containers/billing/bill/")) {
+    score += 34;
+  }
+
+  for (const edge of runtimeBillingEdges) {
+    const semantic = String(edge.metadata?.semantic ?? "").toLowerCase();
+    const relation = String(edge.metadata?.relation ?? "").toLowerCase();
+    const guard = String(edge.metadata?.guard ?? "").toLowerCase();
+    const operation = String(edge.metadata?.operation ?? "").toLowerCase();
+    const sourceFilePath = String(edge.metadata?.sourceFilePath ?? "");
+
+    if (sourceFilePath !== filePath) {
+      continue;
+    }
+
+    if (semantic === "bill-history-read") {
+      score += 34;
+    }
+
+    if (semantic === "bill-history-write") {
+      score += 40;
+    }
+
+    if (semantic === "bill-rollback-guard") {
+      score += 42;
+    }
+
+    if (relation.includes("history")) {
+      score += 16;
+    }
+
+    if (guard.includes("rollback") || guard.includes("generated")) {
+      score += 18;
+    }
+
+    if (operation.includes("history")) {
+      score += 14;
+    }
+  }
+
+  if (normalized.includes("billcontroller.php")) {
+    score += 30;
+  }
+
+  if (normalized.includes("togeneratedbillaction") || normalized.includes("todraftbillaction")) {
+    score += 42;
+  }
+
+  if (normalized.includes("billmodel.php") || normalized.endsWith("/bill.php")) {
+    score += 20;
+  }
+
+  if (normalized.includes("/biller/")) {
+    score -= 44;
+  }
+
+  if (normalized.includes("export") || normalized.includes("analytics") || normalized.includes("collection")) {
+    score -= 38;
+  }
+
+  return score;
+}
+
+function getRuntimeBillingGraphSymbolBoost(
+  symbol: IndexSymbol,
+  runtimeBillingNodeIds: Set<string>,
+  runtimeBillingFilePaths: Set<string>,
+  runtimeBillingEdges: GraphState["edges"],
+): number {
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  let score = 0;
+
+  if (runtimeBillingNodeIds.has(symbol.id)) {
+    score += 32;
+  }
+
+  if (runtimeBillingFilePaths.has(symbol.filePath)) {
+    score += 20;
+  }
+
+  if (symbol.filePath.toLowerCase().includes("/containers/billing/bill/")) {
+    score += 28;
+  }
+
+  if (label.includes("bill") || label.includes("rollback") || label.includes("history") || label.includes("generated")) {
+    score += 18;
+  }
+
+  if (label.includes("billcontroller")) {
+    score += 40;
+  }
+
+  if (label.includes("togeneratedbillaction") || label.includes("todraftbillaction")) {
+    score += 46;
+  }
+
+  if (label.includes("createbillhistoryaction") || label.includes("latestbillhistory") || label.includes("billspecifichistories")) {
+    score += 34;
+  }
+
+  if (symbol.filePath.toLowerCase().includes("/biller/")) {
+    score -= 40;
+  }
+
+  if (label.includes("export") || label.includes("analytics") || label.includes("collection")) {
+    score -= 30;
+  }
+
+  for (const edge of runtimeBillingEdges) {
+    if (edge.sourceId !== symbol.id) {
+      continue;
+    }
+
+    const semantic = String(edge.metadata?.semantic ?? "").toLowerCase();
+
+    if (semantic === "bill-history-read") {
+      score += 24;
+    }
+
+    if (semantic === "bill-history-write") {
+      score += 28;
+    }
+
+    if (semantic === "bill-rollback-guard") {
+      score += 30;
+    }
+  }
+
+  return score;
+}
+
 function getConfigFileBoost(
   file: WorkspaceSnapshot["files"][number],
   configFocus: boolean,
@@ -1906,10 +2643,52 @@ function prioritizeLocalizationEffects(effects: string[]): string[] {
   return [...effects].sort((left, right) => getPreferredOrder(left, preferred) - getPreferredOrder(right, preferred));
 }
 
+function prioritizeLocalizationRuntimeEffects(effects: string[]): string[] {
+  const preferred = [
+    "локаль может определяться через входящий header запроса или middleware, читающее язык из request",
+    "есть runtime-логика явной установки locale внутри запроса или middleware",
+    "при отсутствии явного language signal используется config-driven fallback locale",
+    "часть поведения локализации, вероятно, находится в middleware или раннем HTTP-пайплайне",
+  ];
+
+  return [...effects].sort((left, right) => getPreferredOrder(left, preferred) - getPreferredOrder(right, preferred));
+}
+
 function prioritizeLocalizationSources(sources: string[]): string[] {
   const preferred = [
     "локализационные данные определяются по каталогам и translation-файлам внутри lang/locales/i18n-структуры",
     "часть локализационных ключей используется через translation helper-функции приложения",
+  ];
+
+  return [...sources].sort((left, right) => getPreferredOrder(left, preferred) - getPreferredOrder(right, preferred));
+}
+
+function prioritizeLocalizationRuntimeSources(sources: string[]): string[] {
+  const preferred = [
+    "часть выбора локали может зависеть от данных входящего HTTP-запроса",
+    "fallback locale и языковые правила могут подтягиваться из config/env-слоя приложения",
+    "данные поступают из базы данных или ORM-слоя",
+    "используются файлы и конфигурационные артефакты как источник данных",
+  ];
+
+  return [...sources].sort((left, right) => getPreferredOrder(left, preferred) - getPreferredOrder(right, preferred));
+}
+
+function prioritizeBillingEffects(effects: string[]): string[] {
+  const preferred = [
+    "решение о rollback и связанных ограничениях опирается на историю статусов bill",
+    "rollback и смена bill статуса сопровождаются созданием или обновлением записей BillHistory",
+    "в billing есть явный rollback flow через controller/action слой для draft и generated статусов",
+  ];
+
+  return [...effects].sort((left, right) => getPreferredOrder(left, preferred) - getPreferredOrder(right, preferred));
+}
+
+function prioritizeBillingSources(sources: string[]): string[] {
+  const preferred = [
+    "решение о rollback bill и текущем статусе опирается на BillHistory и связанные model relations",
+    "история статусов хранится и обновляется через ORM-связи Bill/BillModel -> BillHistory",
+    "смена rollback статуса использует BillStatus и status enum/lookup слой",
   ];
 
   return [...sources].sort((left, right) => getPreferredOrder(left, preferred) - getPreferredOrder(right, preferred));
@@ -2105,6 +2884,154 @@ function detectLocalizationEntryPoints(input: ResearchInput): string[] {
   }
 
   return [...directories, ...files].slice(0, 8);
+}
+
+function detectLocalizationRuntimeEntryPoints(input: ResearchInput): string[] {
+  const ranked = new Map<string, number>();
+  const runtimeNodes = getLocalizationRuntimeNodes(input.graph);
+  const runtimeEdges = [
+    ...getRuntimeSemanticEdges(input.graph, "locale-set"),
+    ...getRuntimeSemanticEdges(input.graph, "request-header"),
+    ...getRuntimeSemanticEdges(input.graph, "locale-config"),
+  ];
+
+  for (const file of input.workspace.files) {
+    const normalized = file.relativePath.toLowerCase();
+    const content = file.content.toLowerCase();
+    let score = 0;
+
+    if (normalized.includes("/middleware/") || normalized.includes("/http/")) {
+      score += 18;
+    }
+
+    if (normalized.includes("/config/")) {
+      score += 14;
+    }
+
+    if (normalized.includes("/lang/") || normalized.includes("/translations/") || normalized.includes("/localization/")) {
+      score -= 20;
+    }
+
+    if (content.includes("x-lang") || content.includes("accept-language")) {
+      score += 28;
+    }
+
+    if (content.includes("request->header") || content.includes("headers->get") || content.includes("header(")) {
+      score += 18;
+    }
+
+    if (content.includes("setlocale") || content.includes("app()->setlocale") || content.includes("set_locale")) {
+      score += 22;
+    }
+
+    if (content.includes("fallback_locale") || content.includes("default_locale") || content.includes("config('app.locale") || content.includes("config(\"app.locale")) {
+      score += 18;
+    }
+
+    if (score > 0) {
+      ranked.set(file.relativePath, score);
+    }
+  }
+
+  for (const node of runtimeNodes) {
+    const key = node.filePath ? `${node.filePath}#${node.label}` : node.label;
+    let score = 20;
+    const label = node.label.toLowerCase();
+    const filePath = (node.filePath ?? "").toLowerCase();
+
+    if (label.includes("locale") || label.includes("language")) {
+      score += 16;
+    }
+
+    if (label.includes("middleware") || filePath.includes("/middleware/")) {
+      score += 14;
+    }
+
+    if (filePath.includes("/config/")) {
+      score += 10;
+    }
+
+    ranked.set(key, (ranked.get(key) ?? 0) + score);
+  }
+
+  for (const edge of runtimeEdges) {
+    const sourceFilePath = String(edge.metadata?.sourceFilePath ?? "");
+    const semantic = String(edge.metadata?.semantic ?? "").toLowerCase();
+    const header = String(edge.metadata?.header ?? "").toLowerCase();
+    const configKey = String(edge.metadata?.configKey ?? "").toLowerCase();
+
+    if (!sourceFilePath) {
+      continue;
+    }
+
+    let score = 18;
+
+    if (semantic === "request-header") {
+      score += header.includes("lang") || header.includes("locale") ? 18 : 10;
+    }
+
+    if (semantic === "locale-set") {
+      score += 20;
+    }
+
+    if (semantic === "locale-config") {
+      score += configKey.includes("locale") ? 16 : 8;
+    }
+
+    ranked.set(sourceFilePath, (ranked.get(sourceFilePath) ?? 0) + score);
+  }
+
+  return [...ranked.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 8)
+    .map(([label]) => label);
+}
+
+function detectBillingEntryPoints(input: ResearchInput): string[] {
+  const ranked = new Map<string, number>();
+
+  for (const file of input.workspace.files) {
+    const normalized = file.relativePath.toLowerCase();
+    let score = 0;
+
+    if (normalized.includes("/billing/")) {
+      score += 8;
+    }
+
+    if (
+      normalized.includes("billcontroller")
+      || normalized.includes("routeprovider")
+      || normalized.includes("togeneratedbillaction")
+      || normalized.includes("todraftbillaction")
+    ) {
+      score += 14;
+    }
+
+    if (normalized.includes("billhistory") || normalized.includes("billmodel") || normalized.endsWith("/bill.php")) {
+      score += 10;
+    }
+
+    if (score > 0) {
+      ranked.set(file.relativePath, score);
+    }
+  }
+
+  for (const routeNode of getRouteNodes(input.graph)) {
+    const label = routeNode.label.toLowerCase();
+
+    if (label.includes("rollback") || label.includes("bill")) {
+      const routeTargets = getEntryPointNeighbors(input.graph, routeNode.id)
+        .map((neighbor) => neighbor.label)
+        .slice(0, 2);
+      const routeLabel = routeTargets.length > 0 ? `${routeNode.label} -> ${routeTargets.join(", ")}` : routeNode.label;
+      ranked.set(routeLabel, (ranked.get(routeLabel) ?? 0) + 24);
+    }
+  }
+
+  return [...ranked.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 6)
+    .map(([label]) => label);
 }
 
 function detectLocalizationCodes(input: ResearchInput): string[] {

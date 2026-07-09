@@ -1,4 +1,5 @@
 import {
+  type BackgroundProjectState,
   stableId,
   type AnswerEvidenceHighlight,
   type AnswerMode,
@@ -30,6 +31,7 @@ interface BuildAnswerInput {
   plan: ExecutionPlan;
   preview: ExecutionPreview;
   runtime: ControlledExecutionRuntime;
+  backgroundState?: BackgroundProjectState;
 }
 
 interface ProviderChatResponse {
@@ -69,8 +71,10 @@ export function buildControlledExecutionRuntime(input: BuildControlledRuntimeInp
 
 export async function buildAnswerPackage(input: BuildAnswerInput): Promise<AnswerPackage> {
   const fallback = buildDeterministicAnswer(input);
+  const evidenceLocked = shouldForceEvidenceLockedMode(input);
   const canUseProvider =
-    input.providerBaseUrl.trim().length > 0
+    !evidenceLocked
+    && input.providerBaseUrl.trim().length > 0
     && input.providerModel.trim().length > 0
     && input.providerApiKey.trim().length > 0;
 
@@ -80,16 +84,20 @@ export async function buildAnswerPackage(input: BuildAnswerInput): Promise<Answe
 
   try {
     const llmAnswer = await synthesizeAnswerWithProvider(input, fallback);
+    const validated = validateProviderAnswer(llmAnswer, input, fallback);
     const warnings = [
       ...fallback.warnings,
-      ...llmAnswer.warnings,
+      ...validated.warnings,
     ].slice(0, 4);
 
     return {
       ...fallback,
-      summary: llmAnswer.summary,
-      explanation: llmAnswer.explanation,
-      nextActions: llmAnswer.nextActions.length ? llmAnswer.nextActions : fallback.nextActions,
+      summary: validated.summary,
+      explanation: validated.explanation,
+      confirmedFacts: fallback.confirmedFacts,
+      unconfirmedFacts: fallback.unconfirmedFacts,
+      manualChecks: fallback.manualChecks,
+      nextActions: validated.nextActions.length ? validated.nextActions : fallback.nextActions,
       warnings,
       synthesis: "llm",
       providerUsed: {
@@ -239,6 +247,9 @@ function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
   const warnings = buildWarnings(input);
   const unknowns = input.research.unknowns.slice(0, 4);
   const nextActions = buildNextActions(input, answerMode);
+  const confirmedFacts = buildConfirmedFacts(input, evidenceHighlights);
+  const unconfirmedFacts = buildUnconfirmedFacts(input, unknowns);
+  const manualChecks = buildManualChecks(input, nextActions, warnings);
   const explanation = buildDeterministicExplanation(input, answerMode, evidenceHighlights, unknowns);
 
   return {
@@ -248,6 +259,9 @@ function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
     summary: buildDeterministicSummary(input, answerMode),
     explanation,
     evidenceHighlights,
+    confirmedFacts,
+    unconfirmedFacts,
+    manualChecks,
     confidence: computeAnswerConfidence(input),
     unknowns,
     warnings,
@@ -381,7 +395,25 @@ function resolveAnswerMode(input: BuildAnswerInput): AnswerMode {
   return "direct-answer";
 }
 
+function shouldForceEvidenceLockedMode(input: BuildAnswerInput): boolean {
+  const diagnosticMode = looksLikeDiagnosticTask(input.task);
+  const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
+  const billingRollback = input.research.functionalSummary.toLowerCase().includes("rollback bill")
+    || input.research.functionalSummary.toLowerCase().includes("истории статусов");
+  const hasUnknowns = input.research.unknowns.length > 0;
+  const lowStructuralCoverage = input.research.evidence.length < 3;
+
+  return diagnosticMode || localeBehavior || billingRollback || hasUnknowns || lowStructuralCoverage;
+}
+
 function computeAnswerConfidence(input: BuildAnswerInput): number {
+  const freshnessPenalty =
+    input.backgroundState?.freshness === "stale"
+      ? 8
+      : input.backgroundState?.freshness === "missing"
+        ? 14
+        : 0;
+
   return Math.max(
     15,
     Math.min(
@@ -392,15 +424,23 @@ function computeAnswerConfidence(input: BuildAnswerInput): number {
           + input.impact.confidence
           + Math.min(input.context.confidence, 100)
         ) / 3,
-      ),
+      ) - freshnessPenalty,
     ),
   );
 }
 
 function buildEvidenceHighlights(input: BuildAnswerInput): AnswerEvidenceHighlight[] {
   const highlights: AnswerEvidenceHighlight[] = [];
+  const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
+  const billingRollback = input.research.functionalSummary.toLowerCase().includes("rollback bill")
+    || input.research.functionalSummary.toLowerCase().includes("истории статусов");
+  const prioritizedEvidence = localeBehavior
+    ? [...input.research.evidence].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left))
+    : billingRollback
+      ? [...input.research.evidence].sort((left, right) => getBillingEvidenceWeight(right) - getBillingEvidenceWeight(left))
+      : input.research.evidence;
 
-  for (const item of input.research.evidence.slice(0, 3)) {
+  for (const item of prioritizedEvidence.slice(0, 4)) {
     highlights.push({
       label: item.label,
       detail: item.reason,
@@ -417,8 +457,72 @@ function buildEvidenceHighlights(input: BuildAnswerInput): AnswerEvidenceHighlig
   return highlights.slice(0, 4);
 }
 
+function getLocaleEvidenceWeight(item: ResearchReport["evidence"][number]): number {
+  const label = item.label.toLowerCase();
+  const filePath = (item.filePath ?? "").toLowerCase();
+  let score = item.score;
+
+  if (label.includes("locale")) {
+    score += 80;
+  }
+
+  if (filePath.includes("/middleware/")) {
+    score += 70;
+  }
+
+  if (filePath.endsWith("config/app.php")) {
+    score += 60;
+  }
+
+  if (label.includes("x-locale") || label.includes("x-lang")) {
+    score += 90;
+  }
+
+  return score;
+}
+
+function getBillingEvidenceWeight(item: ResearchReport["evidence"][number]): number {
+  const label = item.label.toLowerCase();
+  const filePath = (item.filePath ?? "").toLowerCase();
+  let score = item.score;
+
+  if (label.includes("rollbackgenerated") || label.includes("rollbackdraft")) {
+    score += 100;
+  }
+
+  if (filePath.includes("billcontroller.php")) {
+    score += 80;
+  }
+
+  if (filePath.includes("togeneratedbillaction") || filePath.includes("todraftbillaction")) {
+    score += 90;
+  }
+
+  if (filePath.includes("billmodel.php") || filePath.endsWith("/bill.php")) {
+    score += 60;
+  }
+
+  if (label.includes("billhistory") || filePath.includes("billhistory")) {
+    score += 70;
+  }
+
+  if (label.includes("was_been_rollback_to_generated")) {
+    score += 110;
+  }
+
+  return score;
+}
+
 function buildWarnings(input: BuildAnswerInput): string[] {
   const warnings: string[] = [];
+
+  if (input.backgroundState?.freshness === "stale") {
+    warnings.push("Ответ построен поверх не полностью свежего baseline и текущего branch/worktree overlay. Для максимальной точности желательно обновить фон.");
+  }
+
+  if (input.backgroundState?.freshness === "missing") {
+    warnings.push("Для текущего branch/worktree состояния ещё нет готового baseline, поэтому ответ собран в режиме первого прохода.");
+  }
 
   if (input.research.unknowns.length > 0) {
     warnings.push("Ответ опирается на неполный набор данных, часть unknowns остаётся открытой.");
@@ -432,11 +536,19 @@ function buildWarnings(input: BuildAnswerInput): string[] {
     warnings.push("Запрос слишком широкий, поэтому вывод может быть менее точным, чем у узкосфокусированного вопроса.");
   }
 
+  if (shouldForceEvidenceLockedMode(input)) {
+    warnings.push("Ответ зафиксирован в evidence-locked режиме: недоказанные гипотезы намеренно не выдаются как факты.");
+  }
+
   return warnings.slice(0, 3);
 }
 
 function buildNextActions(input: BuildAnswerInput, mode: AnswerMode): string[] {
   const actions: string[] = [];
+
+  if (input.backgroundState?.freshness === "stale" || input.backgroundState?.freshness === "missing") {
+    actions.push("Если вопрос критичен по точности, сначала запусти принудительный пересбор branch-aware фона.");
+  }
 
   if (mode === "plan-summary-answer") {
     actions.push("Открой план, чтобы посмотреть порядок шагов и scope изменений.");
@@ -466,11 +578,15 @@ function buildDeterministicSummary(input: BuildAnswerInput, mode: AnswerMode): s
     return input.plan.summary;
   }
 
-  if (input.research.functionalSummary.trim().length > 0) {
-    return input.research.functionalSummary;
+  if (shouldForceEvidenceLockedMode(input)) {
+    return buildEvidenceLockedSummary(input);
   }
 
-  return input.research.summary;
+  if (input.research.functionalSummary.trim().length > 0) {
+    return `${input.research.functionalSummary} ${buildFreshnessSuffix(input)}`.trim();
+  }
+
+  return `${input.research.summary} ${buildFreshnessSuffix(input)}`.trim();
 }
 
 function buildDeterministicExplanation(
@@ -479,6 +595,10 @@ function buildDeterministicExplanation(
   evidenceHighlights: AnswerEvidenceHighlight[],
   unknowns: string[],
 ): string {
+  if (shouldForceEvidenceLockedMode(input)) {
+    return buildEvidenceLockedExplanation(input, evidenceHighlights, unknowns);
+  }
+
   const parts: string[] = [];
 
   if (mode === "plan-summary-answer") {
@@ -486,6 +606,20 @@ function buildDeterministicExplanation(
     parts.push(`План затрагивает ${input.plan.targetFiles.length} файлов и ${input.plan.targetModules.length} модулей.`);
   } else {
     parts.push(input.research.summary);
+    const freshnessExplanation = buildFreshnessExplanation(input);
+    const provenanceExplanation = buildEvidenceProvenanceExplanation(input.research);
+
+    if (freshnessExplanation) {
+      parts.push(freshnessExplanation);
+    }
+
+    if (provenanceExplanation) {
+      parts.push(provenanceExplanation);
+    }
+
+    if (input.research.functionalSummary.trim().length > 0) {
+      parts.push(input.research.functionalSummary);
+    }
 
     if (input.research.entryPoints.length > 0) {
       parts.push(`Ключевые точки входа: ${input.research.entryPoints.slice(0, 4).join(", ")}.`);
@@ -507,6 +641,203 @@ function buildDeterministicExplanation(
   return parts.join(" ");
 }
 
+function buildConfirmedFacts(
+  input: BuildAnswerInput,
+  evidenceHighlights: AnswerEvidenceHighlight[],
+): string[] {
+  const facts = [
+    ...collectRuntimeFacts(input),
+    ...evidenceHighlights.map((item) => `${item.label}: ${item.detail}`),
+  ];
+
+  return [...new Set(facts.filter(Boolean))].slice(0, 4);
+}
+
+function buildUnconfirmedFacts(
+  input: BuildAnswerInput,
+  unknowns: string[],
+): string[] {
+  const items = [...unknowns];
+
+  if (input.backgroundState?.freshness === "missing") {
+    items.unshift("Для текущего branch/head ещё нет готового committed baseline, поэтому часть вывода подтверждена слабее обычного.");
+  }
+
+  if (input.backgroundState?.freshness === "stale") {
+    items.unshift("Текущий ответ опирается на не полностью свежий baseline, поэтому часть состояния могла уже измениться.");
+  }
+
+  return [...new Set(items.filter(Boolean))].slice(0, 4);
+}
+
+function buildManualChecks(
+  input: BuildAnswerInput,
+  nextActions: string[],
+  warnings: string[],
+): string[] {
+  const checks = [...nextActions];
+
+  if (input.research.entryPoints.length > 0) {
+    checks.push(`Проверь вручную точки входа: ${input.research.entryPoints.slice(0, 3).join(", ")}.`);
+  }
+
+  if (input.backgroundState?.hasLocalChanges) {
+    checks.push("Сверь локальный незакоммиченный worktree с baseline, если ответ влияет на активную разработку.");
+  }
+
+  if (warnings.some((item) => item.toLowerCase().includes("baseline"))) {
+    checks.push("Если нужна максимальная точность, сначала дождись или запусти обновление branch-aware background sync.");
+  }
+
+  return [...new Set(checks.filter(Boolean))].slice(0, 4);
+}
+
+function buildEvidenceLockedSummary(input: BuildAnswerInput): string {
+  const topEvidence = input.research.evidence[0];
+
+  if (topEvidence?.filePath) {
+    return `Наиболее сильное подтверждение сейчас находится в ${topEvidence.filePath}. ${buildFreshnessSuffix(input)}`.trim();
+  }
+
+  return `Ответ ограничен только подтвержденными структурными и runtime-сигналами текущего запуска. ${buildFreshnessSuffix(input)}`.trim();
+}
+
+function buildEvidenceLockedExplanation(
+  input: BuildAnswerInput,
+  evidenceHighlights: AnswerEvidenceHighlight[],
+  unknowns: string[],
+): string {
+  const parts: string[] = [];
+  const runtimeFacts = collectRuntimeFacts(input);
+  const freshnessExplanation = buildFreshnessExplanation(input);
+
+  if (runtimeFacts.length > 0) {
+    parts.push(`Подтвержденные факты: ${runtimeFacts.join(" ")}`);
+  } else {
+    parts.push("Система не нашла достаточно прямых runtime-фактов, поэтому ответ ограничен структурными подтверждениями.");
+  }
+
+  if (freshnessExplanation) {
+    parts.push(freshnessExplanation);
+  }
+
+  if (input.research.entryPoints.length > 0) {
+    parts.push(`Ключевые точки входа: ${input.research.entryPoints.slice(0, 4).join(", ")}.`);
+  }
+
+  if (evidenceHighlights.length > 0) {
+    parts.push(`Подтверждения: ${evidenceHighlights.map((item) => `${item.label} — ${item.detail}`).join(" | ")}.`);
+  }
+
+  if (unknowns.length > 0) {
+    parts.push(`Недостаточно подтверждено: ${unknowns.slice(0, 2).join(" | ")}.`);
+  }
+
+  parts.push("Недоказанные предположения намеренно не включены в ответ.");
+
+  return parts.join(" ");
+}
+
+function buildFreshnessSuffix(input: BuildAnswerInput): string {
+  if (!input.backgroundState) {
+    return "";
+  }
+
+  if (input.backgroundState.freshness === "fresh") {
+    return input.backgroundState.hasLocalChanges
+      ? "Ответ опирается на актуальный committed baseline текущей ветки и локальный worktree overlay."
+      : "Ответ опирается на актуальный committed baseline текущей ветки.";
+  }
+
+  if (input.backgroundState.freshness === "stale") {
+    return "Ответ опирается на предыдущий committed baseline и текущий overlay изменений.";
+  }
+
+  if (input.backgroundState.freshness === "missing") {
+    return "Ответ собран без заранее подготовленного baseline для этого состояния ветки.";
+  }
+
+  return "";
+}
+
+function buildFreshnessExplanation(input: BuildAnswerInput): string {
+  if (!input.backgroundState) {
+    return "";
+  }
+
+  if (input.backgroundState.freshness === "fresh") {
+    return input.backgroundState.hasLocalChanges
+      ? `Состояние branch/head синхронизировано по committed baseline, а текущие незакоммиченные изменения учитываются через worktree overlay (${input.backgroundState.changedFileCount} файлов).`
+      : `Состояние branch/head синхронизировано: baseline source ${input.backgroundState.baselineSource}, локальный worktree чист.`;
+  }
+
+  if (input.backgroundState.freshness === "stale") {
+    return `Состояние branch/head не полностью синхронизировано: используется baseline source ${input.backgroundState.baselineSource} и overlay для ${input.backgroundState.changedFileCount} изменённых файлов.`;
+  }
+
+  if (input.backgroundState.freshness === "missing") {
+    return `Для этого branch/head ещё нет подготовленного committed baseline, поэтому запуск работает как первый проход и одновременно формирует знания для следующих вопросов.`;
+  }
+
+  return "";
+}
+
+function buildEvidenceProvenanceExplanation(research: ResearchReport): string {
+  const { baselineCount, overlayCount, structuralCount, overlayInfluenced } = research.evidenceSummary;
+  const parts = [`По происхождению фактов: baseline ${baselineCount}, overlay ${overlayCount}, structural ${structuralCount}.`];
+
+  if (overlayInfluenced) {
+    parts.push("Локальные незакоммиченные изменения materially влияют на часть вывода и отделены от committed baseline.");
+  } else {
+    parts.push("Ключевой вывод опирается прежде всего на committed baseline и graph-first структурные связи.");
+  }
+
+  return parts.join(" ");
+}
+
+function collectRuntimeFacts(input: BuildAnswerInput): string[] {
+  const facts: string[] = [];
+  const evidenceText = input.research.evidence
+    .map((item) => `${item.label} ${item.reason} ${item.filePath ?? ""}`.toLowerCase())
+    .join(" ");
+  const findingsText = input.research.findings.join(" ").toLowerCase();
+  const dataSourcesText = input.research.dataSources.join(" ").toLowerCase();
+
+  if (evidenceText.includes("localemiddleware") || findingsText.includes("localemiddleware")) {
+    facts.push("Выбор локали подтвержден через `LocaleMiddleware`.");
+  }
+
+  if (evidenceText.includes("x-locale") || dataSourcesText.includes("http-запроса")) {
+    facts.push("Есть подтверждение, что локаль зависит от входящего HTTP-запроса и его заголовков.");
+  }
+
+  if (dataSourcesText.includes("fallback locale") || evidenceText.includes("config/app.php")) {
+    facts.push("Есть подтверждение, что fallback локали читается из config/env-слоя.");
+  }
+
+  if (evidenceText.includes("setlocale") || findingsText.includes("locale")) {
+    facts.push("Есть подтверждение явной установки locale в runtime-потоке.");
+  }
+
+  if (evidenceText.includes("rollbackgenerated") || findingsText.includes("rollbackgenerated")) {
+    facts.push("Откат bill в generated подтвержден через отдельный controller/action flow `rollbackGenerated -> ToGeneratedBillAction`.");
+  }
+
+  if (evidenceText.includes("billspecifichistories") || evidenceText.includes("latestbillhistory") || dataSourcesText.includes("billhistory")) {
+    facts.push("Есть подтверждение, что проверки rollback и связанных ограничений опираются на BillHistory и relations модели bill.");
+  }
+
+  if (evidenceText.includes("was_been_rollback_to_generated") || findingsText.includes("историю статусов")) {
+    facts.push("Есть подтверждение вычисляемого guard-флага `was_been_rollback_to_generated`, который использует историю generated-статусов.");
+  }
+
+  if (evidenceText.includes("createbillhistoryaction") || evidenceText.includes("billhistorycreated::dispatch")) {
+    facts.push("Есть подтверждение, что смена статуса создает новую запись BillHistory через `CreateBillHistoryAction`.");
+  }
+
+  return facts.slice(0, 4);
+}
+
 function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): string {
   return [
     `Запрос пользователя: ${input.task}`,
@@ -516,6 +847,9 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
     `Entry points: ${input.research.entryPoints.slice(0, 6).join(", ") || "нет данных"}`,
     `Data sources: ${input.research.dataSources.slice(0, 6).join(", ") || "нет данных"}`,
     `Findings: ${input.research.findings.slice(0, 8).join(" | ") || "нет данных"}`,
+    `Baseline findings: ${input.research.baselineFindings.slice(0, 6).join(" | ") || "нет данных"}`,
+    `Overlay findings: ${input.research.overlayFindings.slice(0, 4).join(" | ") || "нет данных"}`,
+    `Evidence provenance: baseline=${input.research.evidenceSummary.baselineCount}, overlay=${input.research.evidenceSummary.overlayCount}, structural=${input.research.evidenceSummary.structuralCount}`,
     `Unknowns: ${input.research.unknowns.slice(0, 4).join(" | ") || "нет данных"}`,
     `Impact summary: ${input.impact.summary}`,
     `Impact risks: ${input.impact.risks.slice(0, 5).join(" | ") || "нет данных"}`,
@@ -523,8 +857,67 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
     `Plan summary: ${input.plan.summary}`,
     `Execution preview: ${input.preview.summary}`,
     `Fallback summary: ${fallback.summary}`,
-    "Сформируй короткий пользовательский ответ по-русски. Не упоминай названия внутренних артефактов как основной результат. Не выдумывай то, чего нет в данных.",
+    "Сформируй короткий пользовательский ответ по-русски.",
+    "Разрешено использовать только факты, которые прямо подтверждены переданными evidence, findings, data sources и entry points.",
+    "Если факт опирается только на локальный незакоммиченный overlay, это нужно явно обозначить и не выдавать как committed baseline проекта.",
+    "Запрещено добавлять типичные догадки про Laravel, middleware order, session, cookie, query params, kernel registration или другие детали, если они не подтверждены во входных данных.",
+    "Если чего-то не хватает для уверенного вывода, прямо скажи, что это не подтверждено текущими данными.",
+    "Не упоминай названия внутренних артефактов как основной результат. Не выдумывай то, чего нет в данных.",
   ].join("\n");
+}
+
+function validateProviderAnswer(
+  answer: {
+    summary: string;
+    explanation: string;
+    nextActions: string[];
+    warnings: string[];
+  },
+  input: BuildAnswerInput,
+  fallback: AnswerPackage,
+): {
+  summary: string;
+  explanation: string;
+  nextActions: string[];
+  warnings: string[];
+} {
+  const combined = `${answer.summary} ${answer.explanation}`.toLowerCase();
+  const evidenceCorpus = [
+    input.research.summary,
+    input.research.functionalSummary,
+    ...input.research.findings,
+    ...input.research.dataSources,
+    ...input.research.entryPoints,
+    ...input.research.evidence.map((item) => `${item.label} ${item.reason} ${item.filePath ?? ""}`),
+  ]
+    .join(" ")
+    .toLowerCase();
+  const hallucinationSignals = [
+    "session",
+    "cookie",
+    "query-параметр",
+    "query param",
+    "kernel.php",
+    "app/http/kernel.php",
+    "accept-language",
+    "redis lock",
+    "queue retry",
+    "transaction retry",
+  ].filter((token) => combined.includes(token) && !evidenceCorpus.includes(token));
+
+  if (hallucinationSignals.length > 0) {
+    return {
+      summary: fallback.summary,
+      explanation: fallback.explanation,
+      nextActions: fallback.nextActions,
+      warnings: [
+        ...fallback.warnings,
+        "LLM-ответ отклонён, потому что содержал недоказанные детали вне текущего evidence.",
+      ].slice(0, 4),
+    };
+  }
+
+  return answer;
 }
 
 function looksLikeDiagnosticTask(task: string): boolean {

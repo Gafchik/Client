@@ -326,6 +326,9 @@ Planner нужен в случаях, когда пользователь спр
 - `summary` — основной человеческий ответ;
 - `explanation` — развёрнутая версия ответа;
 - `evidenceHighlights`;
+- `confirmedFacts` — компактный список того, что подтверждено evidence и runtime/graph-backed сигналами;
+- `unconfirmedFacts` — компактный список того, что не подтверждено или ограничено unknowns/freshness;
+- `manualChecks` — что стоит проверить руками в коде, runtime или Git/worktree состоянии;
 - `confidence`;
 - `unknowns`;
 - `warnings`;
@@ -341,6 +344,9 @@ Planner нужен в случаях, когда пользователь спр
 - короткий понятный ответ;
 - при необходимости 2-5 ключевых bullets;
 - optional explanation;
+- optional блок `Подтверждено`;
+- optional блок `Не подтверждено`;
+- optional блок `Проверить вручную`;
 - optional warning;
 - optional "что дальше";
 - optional CTA:

@@ -4,6 +4,8 @@
 - [Indexer](/Users/evgenii/Desktop/client/docs/modules/indexer.md)
 - [Graph](/Users/evgenii/Desktop/client/docs/modules/graph.md)
 - [Repository Git Intelligence](/Users/evgenii/Desktop/client/docs/modules/repository-git.md)
+- [Branch-Aware Background Intelligence](/Users/evgenii/Desktop/client/docs/modules/branch-aware-intelligence.md)
+- [Project Intelligence Runtime](/Users/evgenii/Desktop/client/docs/modules/project-intelligence-runtime.md)
 - [Research Engine](/Users/evgenii/Desktop/client/docs/modules/research.md)
 - [Impact Analysis](/Users/evgenii/Desktop/client/docs/modules/impact-analysis.md)
 - [Context Builder](/Users/evgenii/Desktop/client/docs/modules/context-builder.md)

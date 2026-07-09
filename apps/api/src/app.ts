@@ -1,19 +1,36 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { loadKnowledgeCatalog, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
-import { normalizePath, stableId, type PipelineRunStatus, type ProviderCatalogResponse } from "@client/shared";
-import { scanWorkspaceOverview } from "@client/workspace";
-import { bootstrapPipelineRunStatuses, enqueuePipelineRun, loadPipelineRunStatus } from "./pipeline-runner.js";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadKnowledgeCatalog, loadLatestBackgroundRunArtifact, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { inspectRepository } from "@client/repository-git";
+import { normalizePath, stableId, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse } from "@client/shared";
+import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
+import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus } from "./pipeline-runner.js";
+import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
+import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider } from "./provider-store.js";
 
 interface PipelineRunRequest {
   task?: string;
   projectPath?: string;
+  projectId?: string;
   providerBaseUrl?: string;
   providerModel?: string;
   providerApiKey?: string;
   providerId?: string;
+  forceRefresh?: boolean;
+  hardResync?: boolean;
+}
+
+interface BackgroundBaselineInfo {
+  sameHeadRunId?: string;
+  sameHeadRunStatus?: PipelineRunStatus["status"];
+  baselineRunId?: string;
+  latestBackgroundRunId?: string;
+  baselineExactForHead: boolean;
+  hasLocalOverlay: boolean;
+  localOverlayChangeCount: number;
+  backgroundSyncRecommended: boolean;
 }
 
 interface SaveProviderRequest {
@@ -23,6 +40,17 @@ interface SaveProviderRequest {
   apiKey?: string;
   isActive?: boolean;
   isCurrent?: boolean;
+}
+
+interface SaveProjectRequest {
+  id?: string;
+  name?: string;
+  description?: string;
+  paths?: Array<{
+    id?: string;
+    name?: string;
+    rootPath?: string;
+  }>;
 }
 
 export function createApp() {
@@ -36,12 +64,25 @@ export function createApp() {
 
   app.register(cors, {
     origin: true,
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   });
 
   void bootstrapPipelineRunStatuses(appRootPath);
 
   app.addHook("onReady", async () => {
     await initializeProviderStore();
+    await initializeProjectStore();
+    startProjectStateMonitor({
+      appRootPath,
+      providerBaseUrl: defaultProviderBaseUrl,
+      providerModel: defaultProviderModel,
+      providerApiKey: defaultProviderApiKey,
+    });
+  });
+
+  app.addHook("onClose", async () => {
+    stopProjectStateMonitor();
   });
 
   app.get("/api/health", async () => {
@@ -107,22 +148,125 @@ export function createApp() {
     return { ok: true };
   });
 
+  app.get("/api/projects", async () => {
+    const projects = await listProjects();
+
+    return {
+      projects,
+    } satisfies ProjectCatalogResponse;
+  });
+
+  app.post<{ Body: SaveProjectRequest }>("/api/projects", async (request, reply) => {
+    const name = request.body.name?.trim();
+    const paths = Array.isArray(request.body.paths) ? request.body.paths : [];
+
+    if (!name) {
+      return reply.code(400).send({
+        message: "Нужно указать имя проекта.",
+      });
+    }
+
+    if (!paths.length) {
+      return reply.code(400).send({
+        message: "Нужно добавить хотя бы один путь проекта.",
+      });
+    }
+
+    try {
+      const project = await saveProject({
+        ...(request.body.id?.trim() ? { id: request.body.id.trim() } : {}),
+        name,
+        description: request.body.description?.trim() || "",
+        paths: paths.map((item) => ({
+          ...(item.id?.trim() ? { id: item.id.trim() } : {}),
+          name: item.name?.trim() || "",
+          rootPath: item.rootPath?.trim() || "",
+        })),
+      });
+
+      return reply.code(200).send(project);
+    } catch (error) {
+      return reply.code(400).send({
+        message: error instanceof Error ? error.message : "Не удалось сохранить проект.",
+      });
+    }
+  });
+
+  app.delete<{ Params: { id: string } }>("/api/projects/:id", async (request, reply) => {
+    const deleted = await deleteProject(request.params.id);
+
+    if (!deleted) {
+      return reply.code(404).send({
+        message: "Проект не найден.",
+      });
+    }
+
+    return { ok: true };
+  });
+
   app.get<{
     Querystring: {
+      projectId?: string;
       projectPath?: string;
     };
-  }>("/api/project", async (request) => {
-    const projectPath = request.query.projectPath?.trim() || appRootPath;
+  }>("/api/project", async (request, reply) => {
+    const projectRecord = request.query.projectId?.trim() ? await getProjectById(request.query.projectId.trim()) : null;
+    const projectPath = request.query.projectPath?.trim() || projectRecord?.paths[0]?.rootPath || appRootPath;
+
+    if (request.query.projectId?.trim() && !projectRecord) {
+      return reply.code(404).send({
+        message: "Проект не найден.",
+      });
+    }
+
     const overview = await scanWorkspaceOverview(projectPath);
     const recentRuns = await loadKnowledgeCatalog(appRootPath, overview.rootPath);
     const latestRun = await loadLatestPipelineRunArtifact(appRootPath, overview.rootPath);
+    const latestBackgroundRun = await loadLatestBackgroundRunArtifact(appRootPath, overview.rootPath);
+    const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
+      includePaths: [],
+      maxFiles: 0,
+    });
+    const repository = await inspectRepository(repositoryWorkspace);
+    const baselineSelection = await loadBestBaselineRunArtifact(appRootPath, overview.rootPath, repository);
+    const backgroundState = buildBackgroundProjectState({
+      projectId: overview.projectId,
+      projectRootPath: overview.rootPath,
+      repository,
+      latestRun: latestBackgroundRun,
+      baselineRun: baselineSelection.run,
+      baselineSource: baselineSelection.source,
+    });
+    const activeBackgroundRun = findActivePipelineRun(projectPath, "background-sync");
+    const sameHeadRun = findPipelineRunByRepositoryHead({
+      projectPath,
+      mode: "background-sync",
+      headFingerprint: repository.headFingerprint,
+    });
 
     return {
+      projectRecord,
       name: overview.projectName,
       rootPath: overview.rootPath,
       summary: overview.summary,
       recentRuns,
       latestRun,
+      repository,
+      backgroundState,
+      activeBackgroundRun,
+      baselineInfo: {
+        ...(sameHeadRun ? { sameHeadRunId: sameHeadRun.runId, sameHeadRunStatus: sameHeadRun.status } : {}),
+        ...(backgroundState.baselineRunId ? { baselineRunId: backgroundState.baselineRunId } : {}),
+        ...(backgroundState.latestRunId ? { latestBackgroundRunId: backgroundState.latestRunId } : {}),
+        baselineExactForHead: backgroundState.baselineExactForHead,
+        hasLocalOverlay: backgroundState.hasLocalChanges,
+        localOverlayChangeCount: backgroundState.changedFileCount,
+        backgroundSyncRecommended:
+          !backgroundState.baselineExactForHead
+          && !backgroundState.hasLocalChanges
+          && sameHeadRun?.status !== "queued"
+          && sameHeadRun?.status !== "running",
+      } satisfies BackgroundBaselineInfo,
     };
   });
 
@@ -186,7 +330,8 @@ export function createApp() {
       });
     }
 
-    const projectPath = request.body.projectPath?.trim() || appRootPath;
+    const projectRecord = request.body.projectId?.trim() ? await getProjectById(request.body.projectId.trim()) : null;
+    const projectPath = request.body.projectPath?.trim() || projectRecord?.paths[0]?.rootPath || appRootPath;
     const currentProvider = await getCurrentProvider();
     const selectedProvider = request.body.providerId?.trim() ? await setCurrentProvider(request.body.providerId.trim()) : null;
     const effectiveProvider = request.body.providerId?.trim()
@@ -195,12 +340,56 @@ export function createApp() {
     const providerBaseUrl = request.body.providerBaseUrl?.trim() || effectiveProvider?.baseUrl || defaultProviderBaseUrl;
     const providerModel = request.body.providerModel?.trim() || defaultProviderModel;
     const providerApiKey = request.body.providerApiKey?.trim() || effectiveProvider?.apiKey || defaultProviderApiKey;
+    const mode: PipelineRunMode = request.body.hardResync
+      ? "hard-resync"
+      : request.body.forceRefresh
+        ? "background-sync"
+        : "question-run";
+    const normalizedTask = request.body.hardResync
+      ? `Операторский хард ресинк project intelligence.\n\nОригинальная задача: ${task}`
+      : request.body.forceRefresh
+      ? `Принудительно пересобери branch-aware project intelligence.\n\nОригинальная задача: ${task}`
+      : task;
+
+    if (mode === "background-sync") {
+      const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
+        includePaths: [],
+        maxFiles: 0,
+      });
+      const repository = await inspectRepository(repositoryWorkspace);
+
+      if (repository.isDirty) {
+        return reply.code(409).send({
+          message: "Фоновый sync собирает committed baseline и не запускается при локальных незакоммиченных изменениях. Для текущих правок используй обычный вопрос в чате или сначала зафиксируй/stash изменения.",
+        });
+      }
+
+      const sameHeadActiveRun = findPipelineRunByRepositoryHead({
+        projectPath,
+        mode: "background-sync",
+        headFingerprint: repository.headFingerprint,
+        statuses: ["queued", "running"],
+      });
+
+      if (sameHeadActiveRun) {
+        return reply.code(202).send(sameHeadActiveRun);
+      }
+    }
+
+    if (mode === "hard-resync") {
+      const sameHardResyncRun = findActivePipelineRun(projectPath, "hard-resync");
+
+      if (sameHardResyncRun) {
+        return reply.code(202).send(sameHardResyncRun);
+      }
+    }
 
     void selectedProvider;
-    const runId = stableId(["run", projectPath, task, Date.now()]);
+    const runId = stableId(["run", mode, projectPath, normalizedTask, Date.now()]);
     const acceptedStatus = enqueuePipelineRun({
       runId,
-      task,
+      mode,
+      task: normalizedTask,
       projectPath,
       providerBaseUrl,
       providerModel,

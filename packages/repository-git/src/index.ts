@@ -45,8 +45,12 @@ export async function inspectRepository(workspace: WorkspaceSnapshot): Promise<R
     rootPath: normalizedRoot,
     branch: branchValue,
     headCommit: headValue,
+    headFingerprint: buildHeadFingerprint(normalizedRoot, branchValue, headValue, mergeBaseValue),
     mergeBase: mergeBaseValue,
     upstream: upstreamValue,
+    stateFingerprint: buildRepositoryStateFingerprint(normalizedRoot, branchValue, headValue, mergeBaseValue, changedFiles),
+    worktreeFingerprint: buildWorktreeFingerprint(changedFiles),
+    branchFingerprint: stableId(["branch", normalizedRoot, branchValue, mergeBaseValue]),
     isGitRepository: true,
     isDirty: changedFiles.length > 0,
     isDetachedHead: branchValue === "HEAD",
@@ -265,8 +269,12 @@ function buildFallbackSnapshot(workspace: WorkspaceSnapshot, scannedAt: string):
     rootPath: workspace.rootPath,
     branch: "",
     headCommit: "",
+    headFingerprint: stableId(["head", workspace.rootPath, "nogit"]),
     mergeBase: "",
     upstream: "",
+    stateFingerprint: stableId(["repository-state", workspace.rootPath, "nogit"]),
+    worktreeFingerprint: stableId(["worktree", workspace.rootPath, "clean"]),
+    branchFingerprint: stableId(["branch", workspace.rootPath, "nogit"]),
     isGitRepository: false,
     isDirty: false,
     isDetachedHead: false,
@@ -289,6 +297,50 @@ function buildFallbackSnapshot(workspace: WorkspaceSnapshot, scannedAt: string):
 function normalizeGitValue(value: string, fallback: string): string {
   const trimmed = value.trim();
   return trimmed.length ? trimmed : fallback;
+}
+
+function buildWorktreeFingerprint(changedFiles: RepositoryChangedFile[]): string {
+  if (changedFiles.length === 0) {
+    return stableId(["worktree", "clean"]);
+  }
+
+  const parts = changedFiles
+    .map((file) => `${file.scope}:${file.changeType}:${file.previousPath ?? ""}:${file.path}`)
+    .sort();
+
+  return stableId(["worktree", ...parts]);
+}
+
+function buildRepositoryStateFingerprint(
+  rootPath: string,
+  branch: string,
+  headCommit: string,
+  mergeBase: string,
+  changedFiles: RepositoryChangedFile[],
+): string {
+  return stableId([
+    "repository-state",
+    rootPath,
+    branch,
+    headCommit,
+    mergeBase,
+    buildWorktreeFingerprint(changedFiles),
+  ]);
+}
+
+function buildHeadFingerprint(
+  rootPath: string,
+  branch: string,
+  headCommit: string,
+  mergeBase: string,
+): string {
+  return stableId([
+    "head",
+    rootPath,
+    branch,
+    headCommit,
+    mergeBase,
+  ]);
 }
 
 export function deriveRepositoryScopedPaths(repository: RepositorySnapshot, workspace: WorkspaceSnapshot): string[] {

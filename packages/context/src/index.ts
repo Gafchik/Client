@@ -70,7 +70,11 @@ export function buildContextPackage(input: BuildContextInput): ContextPackage {
       score: 0,
       priority: evidence.filePath ? "high" : "supporting",
       tokenEstimate: estimateTokens(excerpt ?? evidence.label),
-      reason: evidence.reason,
+      reason: evidence.origin === "overlay"
+        ? `${evidence.reason} Источник: локальный worktree overlay.`
+        : evidence.origin === "baseline"
+          ? `${evidence.reason} Источник: committed baseline.`
+          : `${evidence.reason} Источник: structural graph/symbol layer.`,
     };
 
     if (evidence.filePath) {
@@ -217,6 +221,8 @@ export function buildContextPackage(input: BuildContextInput): ContextPackage {
       "В контекст попадают только релевантные файлы, символы и functional zones.",
       "Функциональные факты о назначении, точках входа, side effects и focus zones добавляются раньше вторичных деталей.",
       "Приоритет получают прямые evidence из research, файлы из impact и зоны, подтверждённые graph/planner.",
+      "Committed baseline-backed факты приоритетнее overlay-фактов, если вопрос не требует локально незакоммиченных изменений.",
+      "Overlay-факты добавляются явно и отдельно, чтобы LLM не смешивала локальную разработку с каноническим baseline проекта.",
       "Под test/docs/config-файлы применяется штраф, если задача явно не требует их анализа.",
       "Query profile Research ограничивает попадание нерелевантных файлов из соседних доменов и инвентарных зон.",
       "Контекст ограничивается token budget и не включает лишние фрагменты.",
@@ -812,6 +818,13 @@ function getQueryProfileMismatchReason(candidate: ContextCandidate, input: Build
 
 function scoreEntrypointContext(filePath: string, text: string): number {
   let score = 0;
+  const billingRollbackFocus =
+    text.includes("rollbackgenerated")
+    || text.includes("rollbackdraft")
+    || text.includes("togeneratedbillaction")
+    || text.includes("todraftbillaction")
+    || text.includes("billhistory")
+    || text.includes("was_been_rollback_to_generated");
 
   if (filePath.includes("/routes/")) {
     score += 28;
@@ -833,12 +846,40 @@ function scoreEntrypointContext(filePath: string, text: string): number {
     score += 10;
   }
 
+  if (billingRollbackFocus && filePath.includes("/containers/billing/bill/")) {
+    score += 40;
+  }
+
+  if (billingRollbackFocus && filePath.includes("billcontroller.php")) {
+    score += 56;
+  }
+
+  if (billingRollbackFocus && (filePath.includes("togeneratedbillaction") || filePath.includes("todraftbillaction"))) {
+    score += 52;
+  }
+
+  if (billingRollbackFocus && (filePath.includes("billhistory") || filePath.includes("bill.php") || filePath.includes("billmodel.php"))) {
+    score += 34;
+  }
+
+  if (billingRollbackFocus && filePath.includes("/biller/")) {
+    score -= 46;
+  }
+
+  if (billingRollbackFocus && (filePath.includes("export") || filePath.includes("analytics") || filePath.includes("collection"))) {
+    score -= 36;
+  }
+
   if (filePath.includes("/lang/") || filePath.includes("/config/")) {
     score -= 12;
   }
 
   if (text.includes("route") || text.includes("controller") || text.includes("login") || text.includes("auth")) {
     score += 12;
+  }
+
+  if (billingRollbackFocus && (text.includes("rollbackgenerated") || text.includes("billhistory") || text.includes("latestbillhistory"))) {
+    score += 26;
   }
 
   return score;

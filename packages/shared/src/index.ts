@@ -198,8 +198,12 @@ export interface RepositorySnapshot {
   rootPath: string;
   branch: string;
   headCommit: string;
+  headFingerprint: string;
   mergeBase: string;
   upstream: string;
+  stateFingerprint: string;
+  worktreeFingerprint: string;
+  branchFingerprint: string;
   isGitRepository: boolean;
   isDirty: boolean;
   isDetachedHead: boolean;
@@ -216,6 +220,34 @@ export interface RepositorySnapshot {
     renamedCount: number;
   };
   scannedAt: string;
+}
+
+export interface BackgroundProjectState {
+  stateId: string;
+  projectId: string;
+  projectRootPath: string;
+  repositoryId: string;
+  branch: string;
+  headCommit: string;
+  headFingerprint: string;
+  mergeBase: string;
+  branchFingerprint: string;
+  worktreeFingerprint: string;
+  stateFingerprint: string;
+  latestRunId?: string;
+  baselineRunId?: string;
+  baselineHeadCommit?: string;
+  baselineSource: "exact-head" | "merge-base" | "recent-branch" | "none";
+  baselineExactForHead: boolean;
+  freshness: "fresh" | "stale" | "missing";
+  syncStatus: "ready" | "syncing" | "degraded";
+  worktreeStatus: "clean" | "overlay" | "conflict";
+  hasLocalChanges: boolean;
+  changedFileCount: number;
+  reusableFileCount: number;
+  invalidatedFileCount: number;
+  refreshedAt: string;
+  diagnostics: string[];
 }
 
 export interface GraphNode {
@@ -288,6 +320,8 @@ export interface ScoredReference {
   score: number;
   reason: string;
   filePath?: string;
+  origin: "baseline" | "overlay" | "structural";
+  originDetails?: string;
 }
 
 export interface ModuleIntentMatch {
@@ -333,7 +367,15 @@ export interface ResearchReport {
   sideEffects: string[];
   dataSources: string[];
   findings: string[];
+  baselineFindings: string[];
+  overlayFindings: string[];
   evidence: ScoredReference[];
+  evidenceSummary: {
+    baselineCount: number;
+    overlayCount: number;
+    structuralCount: number;
+    overlayInfluenced: boolean;
+  };
   affectedModules: string[];
   unknowns: string[];
   confidence: number;
@@ -460,6 +502,9 @@ export interface AnswerPackage {
   summary: string;
   explanation: string;
   evidenceHighlights: AnswerEvidenceHighlight[];
+  confirmedFacts: string[];
+  unconfirmedFacts: string[];
+  manualChecks: string[];
   confidence: number;
   unknowns: string[];
   warnings: string[];
@@ -536,8 +581,33 @@ export interface ProviderCatalogResponse {
   recommendedModelId?: string;
 }
 
+export interface ProjectPathRecord {
+  id: string;
+  projectId: string;
+  name: string;
+  rootPath: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  description: string;
+  createdAt: string;
+  updatedAt: string;
+  paths: ProjectPathRecord[];
+}
+
+export interface ProjectCatalogResponse {
+  projects: ProjectRecord[];
+}
+
+export type PipelineRunMode = "background-sync" | "question-run" | "hard-resync";
+
 export interface PipelineRunResult {
   runId: string;
+  mode: PipelineRunMode;
   project: {
     name: string;
     rootPath: string;
@@ -565,6 +635,7 @@ export interface PipelineRunResult {
   executionRuntime: ControlledExecutionRuntime;
   answer: AnswerPackage;
   knowledge: KnowledgeSaveResult;
+  backgroundState?: BackgroundProjectState;
   runtimeCache?: PipelineRuntimeCache;
 }
 
@@ -578,6 +649,7 @@ export interface PipelinePartialArtifacts {
   repository?: RepositorySnapshot;
   index?: PipelineRunResult["index"];
   graph?: PipelineRunResult["graph"];
+  backgroundState?: BackgroundProjectState;
   incrementalIndex?: IncrementalIndexPlan;
   graphInvalidation?: GraphInvalidationPlan;
   research?: ResearchReport;
@@ -591,6 +663,7 @@ export interface PipelinePartialArtifacts {
 
 export interface PipelineRunStatus {
   runId: string;
+  mode: PipelineRunMode;
   task: string;
   projectPath: string;
   status: "queued" | "running" | "completed" | "failed";

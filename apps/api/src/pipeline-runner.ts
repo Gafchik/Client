@@ -5,7 +5,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { loadLatestPipelineRunArtifact, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunArtifact, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -15,6 +15,7 @@ import {
   stableId,
   type GraphInvalidationPlan,
   type PipelinePartialArtifacts,
+  type PipelineRunMode,
   type PipelineRunResult,
   type PipelineRunStatus,
   type PipelineStage,
@@ -23,12 +24,19 @@ import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@c
 
 export interface PipelineExecutionRequest {
   runId: string;
+  mode: PipelineRunMode;
   task: string;
   projectPath: string;
   providerBaseUrl: string;
   providerModel: string;
   providerApiKey: string;
   appRootPath: string;
+}
+
+interface QuestionWorkspacePlan {
+  paths: string[];
+  mode: "baseline-graph-first" | "baseline-discovery-slice" | "repository-scoped" | "structural-fallback" | "empty";
+  summary: string;
 }
 
 const runStore = new Map<string, PipelineRunStatus>();
@@ -39,6 +47,7 @@ export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineR
   const createdAt = new Date().toISOString();
   const initialStatus: PipelineRunStatus = {
     runId: request.runId,
+    mode: request.mode,
     task: request.task,
     projectPath: normalizePath(path.resolve(request.projectPath)),
     status: "queued",
@@ -64,6 +73,59 @@ export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineR
 
 export function getPipelineRunStatus(runId: string): PipelineRunStatus | null {
   return runStore.get(runId) ?? null;
+}
+
+export function findActivePipelineRun(projectPath: string, mode: PipelineRunMode): PipelineRunStatus | null {
+  const normalizedProjectPath = normalizePath(path.resolve(projectPath));
+  const candidates = Array.from(runStore.values())
+    .filter((status) =>
+      status.projectPath === normalizedProjectPath
+      && status.mode === mode
+      && (status.status === "queued" || status.status === "running"),
+    )
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+  return candidates[0] ?? null;
+}
+
+export function findPipelineRunByRepositoryState(input: {
+  projectPath: string;
+  mode: PipelineRunMode;
+  stateFingerprint: string;
+  statuses?: PipelineRunStatus["status"][];
+}): PipelineRunStatus | null {
+  const normalizedProjectPath = normalizePath(path.resolve(input.projectPath));
+  const allowedStatuses = input.statuses ?? ["queued", "running", "completed"];
+  const candidates = Array.from(runStore.values())
+    .filter((status) =>
+      status.projectPath === normalizedProjectPath
+      && status.mode === input.mode
+      && allowedStatuses.includes(status.status)
+      && resolveRunStateFingerprint(status) === input.stateFingerprint,
+    )
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+  return candidates[0] ?? null;
+}
+
+export function findPipelineRunByRepositoryHead(input: {
+  projectPath: string;
+  mode: PipelineRunMode;
+  headFingerprint: string;
+  statuses?: PipelineRunStatus["status"][];
+}): PipelineRunStatus | null {
+  const normalizedProjectPath = normalizePath(path.resolve(input.projectPath));
+  const allowedStatuses = input.statuses ?? ["queued", "running", "completed"];
+  const candidates = Array.from(runStore.values())
+    .filter((status) =>
+      status.projectPath === normalizedProjectPath
+      && status.mode === input.mode
+      && allowedStatuses.includes(status.status)
+      && resolveRunHeadFingerprint(status) === input.headFingerprint,
+    )
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+  return candidates[0] ?? null;
 }
 
 export async function loadPipelineRunStatus(appRootPath: string, runId: string): Promise<PipelineRunStatus | null> {
@@ -181,13 +243,19 @@ async function executePipelineRun(request: PipelineExecutionRequest): Promise<vo
 }
 
 async function buildPipelineRunResult(request: PipelineExecutionRequest): Promise<PipelineRunResult> {
-  const { runId, task, projectPath, providerBaseUrl, providerModel, providerApiKey, appRootPath } = request;
+  const { runId, mode, task, projectPath, providerBaseUrl, providerModel, providerApiKey, appRootPath } = request;
   const overview = await scanWorkspaceOverview(projectPath);
+  const largeRepositoryProfile = overview.summary.profile === "large-repository";
+  const isQuestionRun = mode === "question-run";
+  const isHardResync = mode === "hard-resync";
 
   const workspaceStartedAt = startStage(runId, "workspace");
-  const initialWorkspace = await openWorkspace(projectPath);
+  const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
+    includePaths: [],
+    maxFiles: 0,
+  });
   const repositoryStartedAt = startStage(runId, "repository");
-  const repository = await inspectRepository(initialWorkspace);
+  const repository = await inspectRepository(repositoryWorkspace);
   completeStage(
     runId,
     "repository",
@@ -197,24 +265,56 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       : "Git-репозиторий не обнаружен, historical repository intelligence недоступен.",
   );
 
-  const selectiveCandidatePaths = buildSelectiveCandidatePaths(task, repository, initialWorkspace);
-  const shouldUseSelectiveWorkspace = shouldPreferSelectiveWorkspace(repository, initialWorkspace) && selectiveCandidatePaths.length > 0;
+  const projectRootPath = overview.rootPath;
+  const projectId = overview.projectId;
+  const baselineSelection = await loadBestBaselineRunArtifact(appRootPath, projectRootPath, repository);
+  const previousRun = isHardResync ? null : baselineSelection.run;
+  const latestRun = await loadLatestBackgroundRunArtifact(appRootPath, projectRootPath);
+  const backgroundState = buildBackgroundProjectState({
+    projectId,
+    projectRootPath,
+    repository,
+    latestRun,
+    baselineRun: previousRun,
+    baselineSource: baselineSelection.source,
+  });
+
+  const baselineWorkspace = previousRun ? await openWorkspaceSelective(projectPath, {
+    includePaths: [],
+    maxFiles: 0,
+  }) : null;
+  const questionWorkspacePlan = buildQuestionWorkspacePlan(task, repository, baselineWorkspace ?? repositoryWorkspace, previousRun);
+  const selectiveCandidatePaths = questionWorkspacePlan.paths;
+  const shouldPreferSelectiveQuestionWorkspace =
+    isQuestionRun && selectiveCandidatePaths.length > 0;
+  const shouldUseSelectiveWorkspace =
+    !isHardResync
+    && (shouldPreferSelectiveWorkspace(repository, baselineWorkspace ?? repositoryWorkspace) || shouldPreferSelectiveQuestionWorkspace)
+    && selectiveCandidatePaths.length > 0;
   const workspace = shouldUseSelectiveWorkspace
     ? await openWorkspaceSelective(projectPath, {
         includePaths: selectiveCandidatePaths,
-        maxFiles: 250,
+        maxFiles: isQuestionRun
+          ? questionWorkspacePlan.mode === "baseline-discovery-slice"
+            ? 90
+            : 120
+          : 250,
       })
-    : initialWorkspace;
-  const largeRepositoryProfile = overview.summary.profile === "large-repository";
+    : await openWorkspace(projectPath);
+
   completeStage(
     runId,
     "workspace",
     workspaceStartedAt,
-    largeRepositoryProfile
-      ? shouldUseSelectiveWorkspace
-        ? `Открыто ${workspace.summary.indexedFiles} индексируемых файлов. Large-repository режим переключён в selective fast-first scan.`
-        : `Открыто ${workspace.summary.indexedFiles} индексируемых файлов. Активирован large-repository профиль для fast-first pipeline.`
-      : `Открыто ${workspace.summary.indexedFiles} индексируемых файлов.`,
+    isQuestionRun && shouldUseSelectiveWorkspace
+      ? `Открыт lightweight workspace overlay: ${workspace.summary.indexedFiles} файлов. ${questionWorkspacePlan.summary}`
+      : isHardResync
+        ? `Открыт полный workspace для операторского хард ресинка: ${workspace.summary.indexedFiles} индексируемых файлов без selective reuse.`
+        : largeRepositoryProfile
+        ? shouldUseSelectiveWorkspace
+          ? `Открыто ${workspace.summary.indexedFiles} индексируемых файлов. Large-repository режим переключён в selective fast-first scan.`
+          : `Открыто ${workspace.summary.indexedFiles} индексируемых файлов. Активирован large-repository профиль для fast-first pipeline.`
+        : `Открыто ${workspace.summary.indexedFiles} индексируемых файлов.`,
   );
   updatePartialArtifacts(runId, {
     workspace: {
@@ -223,9 +323,8 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       diagnostics: workspace.diagnostics,
     },
     repository,
+    backgroundState,
   });
-
-  const previousRun = await loadLatestPipelineRunArtifact(appRootPath, workspace.rootPath);
   const incrementalIndex = buildIncrementalIndexPlan(previousRun, repository, selectiveCandidatePaths, shouldUseSelectiveWorkspace);
   const graphInvalidation = buildGraphInvalidationPlan(previousRun, repository, workspace.rootPath);
   updatePartialArtifacts(runId, {
@@ -233,19 +332,34 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     graphInvalidation,
   });
 
+  const canUseLightweightQuestionFlow =
+    isQuestionRun
+    && Boolean(previousRun?.runtimeCache?.index)
+    && Boolean(previousRun?.runtimeCache?.graph)
+    && backgroundState.freshness !== "missing";
   const indexStartedAt = startStage(runId, "index");
-  const index = await runFullIndex(workspace, {
-    previousRun,
-    changedPaths: incrementalIndex.changedPaths,
-    deletedPaths: incrementalIndex.deletedPaths,
-  });
+  const index = canUseLightweightQuestionFlow
+    ? await runFullIndex(workspace, {
+        previousRun,
+        changedPaths: incrementalIndex.changedPaths,
+        deletedPaths: incrementalIndex.deletedPaths,
+      })
+    : await runFullIndex(workspace, {
+        previousRun,
+        changedPaths: incrementalIndex.changedPaths,
+        deletedPaths: incrementalIndex.deletedPaths,
+      });
   completeStage(
     runId,
     "index",
     indexStartedAt,
-    largeRepositoryProfile && index.manifest.mode === "selective"
-      ? `Построен selective index: ${index.manifest.symbolCount} символов, ${index.manifest.relationCount} связей, reused files ${index.manifest.reusedFileCount}.`
-      : `Построен index: ${index.manifest.symbolCount} символов, ${index.manifest.relationCount} связей, reused files ${index.manifest.reusedFileCount}.`,
+    canUseLightweightQuestionFlow
+      ? `Построен lightweight question index overlay: ${index.manifest.symbolCount} символов, reused files ${index.manifest.reusedFileCount}. Режим graph-first reuse активен.`
+      : isHardResync
+        ? `Построен полный index для хард ресинка: ${index.manifest.symbolCount} символов, ${index.manifest.relationCount} связей, reused files ${index.manifest.reusedFileCount}.`
+      : largeRepositoryProfile && index.manifest.mode === "selective"
+        ? `Построен selective index: ${index.manifest.symbolCount} символов, ${index.manifest.relationCount} связей, reused files ${index.manifest.reusedFileCount}.`
+        : `Построен index: ${index.manifest.symbolCount} символов, ${index.manifest.relationCount} связей, reused files ${index.manifest.reusedFileCount}.`,
   );
   updatePartialArtifacts(runId, {
     index: {
@@ -274,8 +388,15 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     workspace,
     index,
     graph,
+    repository,
+    backgroundState,
   });
-  completeStage(runId, "research", researchStartedAt, `Подготовлено ${research.evidence.length} опорных ссылок с уверенностью ${research.confidence}%.`);
+  completeStage(
+    runId,
+    "research",
+    researchStartedAt,
+    `Подготовлено ${research.evidence.length} опорных ссылок с уверенностью ${research.confidence}%: baseline ${research.evidenceSummary.baselineCount}, overlay ${research.evidenceSummary.overlayCount}, structural ${research.evidenceSummary.structuralCount}.`,
+  );
   updatePartialArtifacts(runId, {
     research,
   });
@@ -343,15 +464,16 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const answer = await buildAnswerPackage({
     runId,
     task,
-    providerBaseUrl,
-    providerModel,
-    providerApiKey,
+    providerBaseUrl: isQuestionRun ? providerBaseUrl : "",
+    providerModel: isQuestionRun ? providerModel : "",
+    providerApiKey: isQuestionRun ? providerApiKey : "",
     research,
     impact,
     context,
     plan,
     preview: executionPreview,
     runtime: executionRuntime,
+    backgroundState,
   });
   completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);
   updatePartialArtifacts(runId, {
@@ -361,14 +483,16 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const knowledgeStartedAt = startStage(runId, "knowledge");
   const knowledge = await saveKnowledgeArtifacts({
     runId,
+    mode,
     task,
     appRootPath,
     workspace,
     repository,
+    backgroundState,
     provider: {
-      baseUrl: providerBaseUrl,
-      model: providerModel,
-      apiKeyMasked: maskApiKey(providerApiKey),
+      baseUrl: isQuestionRun ? providerBaseUrl : "",
+      model: isQuestionRun ? providerModel : "",
+      apiKeyMasked: isQuestionRun ? maskApiKey(providerApiKey) : "",
     },
     index,
     incrementalIndex,
@@ -386,6 +510,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
   return {
     runId,
+    mode,
     project: {
       name: workspace.projectName,
       rootPath: workspace.rootPath,
@@ -398,9 +523,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     },
     repository,
     provider: {
-      baseUrl: providerBaseUrl,
-      model: providerModel,
-      apiKeyMasked: maskApiKey(providerApiKey),
+      baseUrl: isQuestionRun ? providerBaseUrl : "",
+      model: isQuestionRun ? providerModel : "",
+      apiKeyMasked: isQuestionRun ? maskApiKey(providerApiKey) : "",
     },
     index: {
       manifest: index.manifest,
@@ -421,6 +546,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     executionRuntime,
     answer,
     knowledge,
+    backgroundState,
     runtimeCache: {
       index,
       graph,
@@ -455,6 +581,24 @@ function createPendingStage(key: PipelineStage["key"], label: string, now: strin
     completedAt: now,
     details: "Ожидает выполнения.",
   };
+}
+
+function resolveRunStateFingerprint(status: PipelineRunStatus): string | null {
+  return (
+    status.result?.repository.stateFingerprint
+    ?? status.partialArtifacts?.backgroundState?.stateFingerprint
+    ?? status.partialArtifacts?.repository?.stateFingerprint
+    ?? null
+  );
+}
+
+function resolveRunHeadFingerprint(status: PipelineRunStatus): string | null {
+  return (
+    status.result?.repository.headFingerprint
+    ?? status.partialArtifacts?.backgroundState?.headFingerprint
+    ?? status.partialArtifacts?.repository?.headFingerprint
+    ?? null
+  );
 }
 
 function markRunRunning(runId: string): void {
@@ -531,25 +675,78 @@ function getCompletedStages(runId: string): PipelineStage[] {
   return runStore.get(runId)?.stages ?? createInitialStages();
 }
 
-function buildSelectiveCandidatePaths(
+function buildQuestionWorkspacePlan(
   task: string,
   repository: PipelineRunResult["repository"],
   workspace: Awaited<ReturnType<typeof openWorkspace>>,
-): string[] {
+  previousRun?: PipelineRunResult | null,
+): QuestionWorkspacePlan {
   const gitScopedPaths = deriveRepositoryScopedPaths(repository, workspace);
   const normalizedTask = task.toLowerCase();
+  const billingRollbackFocus =
+    normalizedTask.includes("rollback")
+    || normalizedTask.includes("ролбек")
+    || normalizedTask.includes("generated")
+    || normalizedTask.includes("дженер")
+    || normalizedTask.includes("billhistory")
+    || normalizedTask.includes("истори");
   const taskTokens = normalizedTask
     .split(/[^a-z0-9а-яё_/-]+/i)
     .map((token) => token.trim())
     .filter((token) => token.length >= 3);
+  const previousGraph = previousRun?.runtimeCache?.graph;
+  const previousIndex = previousRun?.runtimeCache?.index;
   const tokenMatchedPaths = workspace.files
     .map((file) => file.relativePath)
     .filter((relativePath) => {
       const lowerPath = relativePath.toLowerCase();
       return taskTokens.some((token) => lowerPath.includes(token));
     });
-  const fallbackStructuralPaths = workspace.files
-    .map((file) => file.relativePath)
+  const previousIndexPaths = previousIndex?.files
+    .map((file) => normalizePath(file.filePath))
+    .filter((relativePath) => {
+      const lowerPath = relativePath.toLowerCase();
+      return taskTokens.some((token) => lowerPath.includes(token));
+    }) ?? [];
+  const previousSymbolMatchedPaths = previousIndex?.symbols
+    .filter((symbol) => {
+      const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+      const filePath = normalizePath(symbol.filePath).toLowerCase();
+      return taskTokens.some((token) => label.includes(token) || filePath.includes(token));
+    })
+    .map((symbol) => normalizePath(symbol.filePath)) ?? [];
+  const graphMatchedPaths = previousGraph?.nodes
+    .map((node) => ({
+      filePath: normalizePath(node.filePath ?? ""),
+      label: node.label.toLowerCase(),
+    }))
+    .filter((item) =>
+      item.filePath
+      && taskTokens.some((token) => item.filePath.includes(token) || item.label.includes(token)),
+    )
+    .map((item) => item.filePath) ?? [];
+  const graphNeighborPaths = previousGraph
+    ? Array.from(
+        new Set(
+          previousGraph.edges.flatMap((edge) => {
+            const source = previousGraph.nodes.find((node) => node.id === edge.sourceId);
+            const target = previousGraph.nodes.find((node) => node.id === edge.targetId);
+            const sourcePath = normalizePath(source?.filePath ?? "");
+            const targetPath = normalizePath(target?.filePath ?? "");
+            const sourceMatched = sourcePath && graphMatchedPaths.includes(sourcePath);
+            const targetMatched = targetPath && graphMatchedPaths.includes(targetPath);
+
+            if (!sourceMatched && !targetMatched) {
+              return [];
+            }
+
+            return [sourcePath, targetPath].filter(Boolean);
+          }),
+        ),
+      )
+    : [];
+  const baselineDiscoveryPaths = previousIndex?.files
+    .map((file) => normalizePath(file.filePath))
     .filter((relativePath) => {
       const lowerPath = relativePath.toLowerCase();
       return (
@@ -560,11 +757,101 @@ function buildSelectiveCandidatePaths(
         || lowerPath.includes("/services/")
         || lowerPath.includes("/repositories/")
         || lowerPath.includes("/models/")
+        || lowerPath.includes("/middlewares/")
       );
     })
-    .slice(0, 120);
+    .slice(0, 90) ?? [];
+  const hasStrongGraphSeed = graphMatchedPaths.length >= 3 || graphNeighborPaths.length >= 6;
+  const hasRepositoryScopedSeed = gitScopedPaths.length >= 2;
+  const shouldUseStructuralFallback = !hasStrongGraphSeed && !hasRepositoryScopedSeed;
+  const fallbackStructuralPaths = shouldUseStructuralFallback
+    ? workspace.files
+        .map((file) => file.relativePath)
+        .filter((relativePath) => {
+          const lowerPath = relativePath.toLowerCase();
+          return (
+            lowerPath.startsWith("routes/")
+            || lowerPath.startsWith("config/")
+            || lowerPath.startsWith("database/")
+            || lowerPath.includes("/controllers/")
+            || lowerPath.includes("/services/")
+            || lowerPath.includes("/repositories/")
+            || lowerPath.includes("/models/")
+            || lowerPath.includes("/middlewares/")
+          );
+        })
+        .slice(0, 120)
+    : [];
+  const billingRollbackPaths = billingRollbackFocus
+    ? workspace.files
+        .map((file) => file.relativePath)
+        .filter((relativePath) => {
+          const lowerPath = relativePath.toLowerCase();
+          return (
+            lowerPath.includes("/containers/billing/bill/ui/api/routes/routeprovider.php")
+            || lowerPath.includes("/containers/billing/bill/ui/api/controllers/billcontroller.php")
+            || lowerPath.includes("/containers/billing/bill/actions/togeneratedbillaction.php")
+            || lowerPath.includes("/containers/billing/bill/actions/todraftbillaction.php")
+            || lowerPath.includes("/containers/billing/bill/models/bill.php")
+            || lowerPath.includes("/ship/parents/models/billmodel.php")
+            || lowerPath.includes("/containers/billing/billhistory/")
+          );
+        })
+        .slice(0, 40)
+    : [];
 
-  return Array.from(new Set([...gitScopedPaths, ...tokenMatchedPaths, ...fallbackStructuralPaths])).slice(0, 250);
+  const primaryPaths = Array.from(
+    new Set([
+      ...billingRollbackPaths,
+      ...gitScopedPaths,
+      ...previousSymbolMatchedPaths,
+      ...graphMatchedPaths,
+      ...graphNeighborPaths,
+      ...tokenMatchedPaths,
+      ...previousIndexPaths,
+    ]),
+  ).slice(0, 250);
+
+  if (primaryPaths.length > 0) {
+    const mode = hasStrongGraphSeed
+      ? "baseline-graph-first"
+      : hasRepositoryScopedSeed
+        ? "repository-scoped"
+        : "structural-fallback";
+
+    return {
+      paths: primaryPaths,
+      mode,
+      summary:
+        mode === "baseline-graph-first"
+          ? "Question-run стартовал от baseline graph/index cache и открыл только task-relevant, graph-neighbor и overlay-пути."
+          : mode === "repository-scoped"
+            ? "Question-run использовал Git changed set и baseline cache как основной seed вместо широкого сканирования."
+            : "Question-run нашёл ограниченный набор task-specific путей и избежал полного сканирования.",
+    };
+  }
+
+  if (baselineDiscoveryPaths.length > 0) {
+    return {
+      paths: baselineDiscoveryPaths,
+      mode: "baseline-discovery-slice",
+      summary: "Прямой graph/task seed оказался слабым, поэтому открыт небольшой baseline discovery slice из routes/config/controllers/services/models вместо полного сканирования проекта.",
+    };
+  }
+
+  if (fallbackStructuralPaths.length > 0) {
+    return {
+      paths: Array.from(new Set(fallbackStructuralPaths)).slice(0, 120),
+      mode: "structural-fallback",
+      summary: "Baseline cache недоступен или слишком слаб, поэтому выполнен ограниченный structural fallback slice.",
+    };
+  }
+
+  return {
+    paths: [],
+    mode: "empty",
+    summary: "Question-run не смог безопасно построить selective slice и будет вынужден открыть полный workspace.",
+  };
 }
 
 function maskApiKey(value: string): string {

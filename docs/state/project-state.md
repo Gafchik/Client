@@ -1,6 +1,6 @@
 # Project State
 
-**Дата обновления:** 2026-07-08  
+**Дата обновления:** 2026-07-09  
 **Текущий этап:** MVP / Slice 1
 
 ## Что уже реализовано
@@ -179,13 +179,152 @@
   - на основном экране оставлены только выбор проекта, выбор провайдера, выбор модели и чат;
   - operator-facing сводки, подсказки и вторичные панели убраны с главной поверхности;
   - инженерные артефакты остаются доступны через `Inspector` как secondary/debug surface.
+- Branch-aware background intelligence переведён из чистой архитектурной идеи в рабочий MVP-слой:
+  - `RepositorySnapshot` теперь содержит `stateFingerprint`, `worktreeFingerprint`, `branchFingerprint`;
+  - knowledge-артефакты и `PipelineRunResult` умеют хранить `backgroundState`;
+  - API `/api/project` теперь возвращает текущее Git-состояние и рассчитанное branch-aware состояние проекта;
+  - UI показывает текущую ветку, short HEAD, freshness, sync status, changed file count и baseline source;
+  - добавлена кнопка принудительной пересборки branch-aware project intelligence;
+  - чат теперь явно коммуницирует, что ответ строится поверх уже собранного понимания проекта, а не как “пустой” stateless запуск.
+- GUI разделён на отдельные пользовательские страницы:
+  - `Чат` для общения с проектом;
+  - `Провайдеры` для CRUD управления LLM/runtime providers;
+  - `Проекты` для CRUD управления проектами.
+- Введена постоянная модель `Project` с несколькими именованными путями:
+  - один проект может содержать несколько `project paths`;
+  - каждый путь имеет собственное имя (`backend`, `frontend`, `billing` и т.д.);
+  - API и UI уже поддерживают хранение и редактирование такой структуры;
+  - чат умеет выбирать сохранённый проект из списка и выбирать конкретный path-контур из выпадающего списка;
+  - backend теперь уважает явно выбранный `projectPath`, а не молча подменяет его первым путём проекта.
+- Pipeline разделён на два режима исполнения:
+  - `background-sync` для отдельной фоновой пересборки project intelligence;
+  - `question-run` для ответа на вопрос поверх последнего baseline и текущего branch/worktree состояния.
+- Chat UX начал отходить от full-research-per-question модели:
+  - обычный вопрос запускается как `question-run`;
+  - принудительная пересборка запускается как отдельный `background-sync`;
+  - интерфейс помечает, когда фон устарел или отсутствует, и рекомендует обновить baseline вместо скрытого полного перезапуска.
+- `question-run` получил первый реальный lightweight execution path:
+  - repository snapshot теперь может строиться без полного открытия проекта;
+  - candidate paths для вопроса собираются из Git changed set, task tokens и baseline runtime cache;
+  - для вопроса используется узкий workspace overlay по релевантным путям, если это безопасно;
+  - это уменьшает объём повторного чтения проекта до запуска research/context/answer слоёв.
+- Добавлен первый авто-режим фоновой синхронизации:
+  - `/api/project` теперь сообщает о текущем `activeBackgroundRun`, если пересборка уже идёт;
+  - фронт автоматически запускает `background-sync`, когда baseline устарел или отсутствует;
+  - пользователь видит в чате живой статус фоновой пересборки и Git-aware состояние проекта.
+- Auto background sync усилен branch/worktree-aware дедупликацией:
+  - backend теперь умеет сопоставлять `background-sync` с конкретным `repository.stateFingerprint`;
+  - если для того же exact branch/worktree состояния уже существует `queued` или `running` фоновый sync, новый sync не создаётся;
+  - `/api/project` теперь возвращает `baselineInfo`, чтобы UI понимал, есть ли уже готовый baseline именно для текущего Git state;
+  - чат показывает не только freshness, но и readiness baseline для exact state, чтобы оператор видел, нужен ли реальный пересбор или система уже может безопасно переиспользовать имеющееся понимание проекта.
+- Knowledge artifact compatibility выровнен с branch-aware runtime:
+  - `saveKnowledgeArtifacts()` теперь сохраняет полный `project` и `knowledge` блоки в том же формате, который ожидает loader;
+  - `loadPipelineRunArtifact()` умеет восстановить `project` и `knowledge` даже для старых укороченных артефактов;
+  - это устраняет ситуацию, когда `recentRuns` видны в UI, но `latestRun` не поднимается обратно в `/api/project`;
+  - baseline/runtime reuse слой снова может опираться на сохранённый последний run как на нормальный источник истины, а не только на catalog metadata.
 - Research усилен для behavioral-вопросов о локализации:
   - вопросы вида `как выбирается локаль ответа` больше не должны маршрутизироваться как простой localization inventory;
   - введено разделение между `inventory-localization` и runtime-поведением локали;
   - research теперь поднимает сигналы `middleware`, `request headers`, `config/env fallback`, `locale setup`.
+  - runtime extraction усилен отдельно от inventory extraction:
+    - `entryPoints` теперь приоритизируют middleware, HTTP/request слой, config locale fallback и runtime locale setters;
+    - `primaryEntities` теперь штрафуют plain `lang/*` и translation-only файлы, если вопрос относится к поведению запроса;
+    - `sideEffects` и `dataSources` теперь сначала объясняют request-header -> locale-set -> config fallback chain, а не список translation directories.
 - Backend env bootstrap усилен:
   - API теперь ищет `.env` не только в текущем рабочем каталоге, но и выше по дереву;
   - это устраняет падение backend при запуске из workspace-подпакета, когда иначе выбиралась дефолтная БД `client` вместо `ai_agent_team`.
+- Answer Engine переведён в evidence-locked режим для чувствительных diagnostic/runtime сценариев:
+  - live LLM synthesis теперь получает более жёсткий prompt contract и запрет на недоказанные framework-guess факты;
+  - введена post-validation проверка LLM-ответа против evidence corpus;
+  - при выходе модели за рамки доказанных данных система откатывается к deterministic fallback answer;
+  - пользовательский ответ теперь честно фиксирует только подтверждённые runtime-факты и явно помечает, что недоказанные гипотезы исключены.
+- Semantic coverage расширен на Magenda billing rollback/history сценарии:
+  - indexer теперь извлекает PHP runtime-сигналы для `BillHistory` чтения, `CreateBillHistoryAction` записи и `was_been_rollback_to_generated` / rollback guards;
+  - graph получил billing runtime node discovery поверх semantic edges `bill-history-read`, `bill-history-write`, `bill-rollback-guard`;
+  - research начал отдельно усиливать billing rollback questions, поднимая `BillController`, `ToGeneratedBillAction`, `ToDraftBillAction`, `BillModel` и `Bill` как evidence-first anchors;
+  - billing rollback extraction стал строже против шумных соседних файлов:
+    - `entryPoints` и `primaryEntities` теперь сильнее приоритизируют `rollbackGenerated`, `BillController`, `ToGeneratedBillAction`, `BillHistory`, history relations и rollback guards;
+    - `biller/export/analytics/collection` зоны дополнительно штрафуются, если они не подтверждают rollback/history flow напрямую;
+    - runtime summary теперь должен оставаться на controller/action/history цепочке вместо broad generated-scan.
+  - answer synthesis теперь умеет выдавать deterministic evidence-locked ответ по rollback/generated/history вопросам без доменных догадок.
+- Billing rollback ranking усилен против Magenda-specific шума:
+  - research и context теперь сильнее поднимают `v1/billing/bill/{bill}/rollback/generated`, `BillController@rollbackGenerated`, `ToGeneratedBillAction`, `BillHistory`, `latestBillHistory`, `billSpecificHistories`, `CreateBillHistoryAction`;
+  - для rollback/history вопросов добавлены явные штрафы к `Biller*`, export, analytics и collection-зонам, если они не подтверждают сам rollback flow;
+  - цель этого шага: answer-first UX должен начинаться с реальной controller/action/history цепочки rollback bill, а не с соседних billing admin/export сущностей.
+- Lightweight question overlay усилен для billing rollback сценариев:
+  - `question-run` теперь принудительно добавляет в selective candidate set ключевые billing rollback файлы:
+    `Bill RouteProvider`, `BillController`, `ToGeneratedBillAction`, `ToDraftBillAction`, `Bill`, `BillModel`, `BillHistory`;
+  - это нужно, чтобы overlay не сужался только до `generated`-совпадений в action/CLI файлах и не терял реальный HTTP entrypoint `v1/billing/bill/{bill}/rollback/generated`.
+- Зафиксирован следующий архитектурный шаг для масштабирования продукта:
+  - добавлена cross-cutting спецификация `docs/modules/branch-aware-intelligence.md`;
+  - в ней формализована модель `baseline snapshot + branch overlay + worktree overlay`;
+  - закреплено, что вопрос пользователя не должен запускать full research проекта, а должен работать поверх уже подготовленного branch-aware state;
+  - закреплены `Repository State Identity`, hash strategy, graph shard reuse, research slice reuse и branch-scoped knowledge как целевой operating model.
+- Зафиксирован следующий уровень operating model поверх branch-aware слоя:
+  - добавлена спецификация `docs/modules/project-intelligence-runtime.md`;
+  - в ней формализовано, что проект должен быть изучен заранее через `background sync`, а не в момент каждого вопроса;
+  - жёстко разделены `Baseline Project Map`, `Branch Overlay` и `Worktree Overlay`;
+  - закреплено различие между `Committed State` и `Local Development State`;
+  - зафиксирована гибридная модель `watcher + polling` для отслеживания branch/worktree изменений;
+- Research / Answer provenance layer усилен:
+  - `ResearchReport` теперь разделяет `baselineFindings`, `overlayFindings` и общее `evidenceSummary`;
+  - каждое ключевое evidence теперь маркируется как `baseline`, `overlay` или `structural`;
+  - question-answer слой начал явно отличать committed baseline факты от локальных незакоммиченных worktree-фактов;
+  - `Inspector -> Research` показывает происхождение фактов, чтобы оператор видел, что относится к канонической карте проекта, а что существует только в локальной разработке;
+  - это приближает систему к целевому режиму: чат отвечает поверх уже собранного понимания проекта и только дозаполняет локальный overlay, а не делает “полный ресерч с нуля” на каждый вопрос.
+- `Question Run` ещё сильнее сдвинут в baseline-first модель:
+  - перед открытием файлов вопрос теперь сначала строит `question workspace plan` из `baseline graph`, `baseline index`, `Git changed set` и task tokens;
+  - если graph/index seed достаточно плотный, чат открывает только `task-relevant + graph-neighbor + overlay` пути;
+  - если seed слабый, система открывает маленький `baseline discovery slice` из `routes/config/controllers/services/models/middlewares`, а не полный проект;
+  - полный workspace остаётся только последним fallback-сценарием;
+  - это ещё сильнее приближает продукт к целевой модели: проект изучается заранее в фоне, а вопрос только навигирует по уже собранной карте и локальному overlay.
+- Answer-first UX усилен provenance-слоем на главном экране:
+  - основной chat-ответ теперь сразу показывает, является ли вывод `Baseline First` или `Baseline + Overlay`;
+  - рядом с ответом отображается компактная provenance summary по `baseline / overlay / structural` фактам;
+  - пользователь больше не обязан открывать `Inspector`, чтобы понять, опирается ли ответ на локальные незакоммиченные изменения;
+  - `Inspector` остаётся deep-debug surface, но базовая честность происхождения ответа вынесена прямо в primary chat UX.
+- Runtime UX усилен состоянием готовности проекта:
+  - в верхней runtime-панели теперь есть отдельный статус готовности `Фон проекта актуален` / `Нужен background sync` / `Ответ будет с локальным overlay`;
+  - тот же смысл дублируется в системной заметке текстом, чтобы пользователь понимал качество текущего ответа ещё до запуска вопроса;
+  - это делает branch-aware operating model видимой с первого взгляда: когда система уже знает проект, когда ей нужен фоновый sync, и когда ответ будет частично опираться на локальную незакоммиченную разработку.
+- Chat UX получил более явный operational loop вокруг background sync:
+  - на главном экране теперь отдельно показывается, идёт ли фоновый sync прямо сейчас, требуется ли он, или baseline уже достаточно хорош для немедленного вопроса;
+  - пользователь видит не только качество текущего baseline, но и состояние самого фонового процесса: `already syncing` / `refresh recommended` / `safe to ask now`;
+  - это уменьшает ощущение “чёрного ящика” и объясняет, когда ждать новый фон, а когда можно спокойно работать поверх уже собранной карты проекта.
+- Answer UX усилен инженерной структурой ответа:
+  - в основном сообщении AI теперь есть отдельные блоки `Подтверждено`, `Не подтверждено` и `Проверить вручную`;
+  - эти блоки строятся из deterministic evidence, unknowns, provenance и operational warnings, а не из свободной генерации;
+  - это делает ответ удобнее для практической инженерной работы: видно, что уже доказано, где есть пробелы и какие проверки стоит сделать руками в коде или runtime.
+- Спецификация `Answer Engine` актуализирована под фактический MVP:
+  - `Answer Package` теперь явно фиксирует `confirmedFacts`, `unconfirmedFacts`, `manualChecks`;
+  - chat-first ответ больше не ограничивается только `summary/explanation/warnings`, а уже отражает инженерную структуру доказанности прямо в основном сообщении;
+  - это выравнивает текущую реализацию с документацией и снижает риск архитектурного дрейфа между spec и кодом.
+  - question pipeline закреплён как lightweight retrieval поверх уже собранной project intelligence, а не как скрытый full research pass.
+- Реализация branch-aware runtime усилена в сторону committed-baseline модели:
+  - `background-sync` теперь рассматривается как источник только committed baseline, а не любого последнего run;
+  - baseline identity переведена на `headFingerprint`, чтобы локальные незакоммиченные изменения не создавали ложные baseline-кандидаты;
+  - dirty worktree больше не должен автоматически запускать committed background sync;
+  - локальные изменения теперь явно трактуются как `worktree overlay`, а не как причина пересобрать baseline;
+  - API получил polling-first `Project State Monitor`, который фоново отслеживает branch/head drift по сохранённым проектам и запускает auto-sync только для чистого `HEAD`;
+  - UI начал отдельно показывать `Worktree` и committed baseline readiness, чтобы оператор видел разницу между фоном проекта и текущей локальной разработкой.
+- Добавлен отдельный операторский режим `hard-resync`:
+  - это ручной full-pass запуск через UI-кнопку `Хард ресинк`;
+  - он не подменяет committed baseline-модель `background-sync`;
+  - в отличие от обычного фонового sync, `hard-resync` может использоваться как страховочный полный ресерч вручную;
+  - `hard-resync` намеренно не зависит от live LLM-вызова и сохраняет артефакты даже без провайдера;
+  - обычный `question-run` остаётся answer-first контуром, а `background-sync` и `hard-resync` — режимами подготовки/переcборки project intelligence.
+- Главная chat-first поверхность очищена от дублирующих rebuild-действий:
+  - `Обновить` оставлен только как refresh текущего project state в UI;
+  - ручной rebuild на главной панели теперь один — `Хард ресинк`;
+  - `background-sync` остаётся внутренним и автоматическим committed-baseline механизмом.
+- `question-run` дополнительно усилен в сторону graph-first retrieval:
+  - selective candidate set теперь опирается не только на task tokens, Git changed set и previous index;
+  - в него начали попадать file paths, подтверждённые предыдущим graph state;
+  - для matched graph-узлов теперь автоматически подтягиваются соседние file-backed узлы, что уменьшает зависимость question path от грубого structural fallback.
+- `question-run` ещё сильнее смещён в сторону baseline-driven narrowing:
+  - structural fallback-paths теперь подключаются только если graph seed и repository-scoped seed оказались слишком слабыми;
+  - при плотном graph seed question runtime должен открывать именно graph-relevant overlay, а не широкий набор типовых директорий;
+  - research report теперь явно сообщает, работал ли вопрос в `graph-first` режиме или был вынужден частично добирать candidate set через fallback.
 
 ## Текущее состояние MVP Slice 1
 
@@ -212,6 +351,12 @@
 19. хранить provider-конфигурации в PostgreSQL и выбирать runtime-модель отдельно от provider-record.
 20. работать через chat-first UX, где сложный pipeline скрыт за простым диалогом, а глубинные артефакты открываются через `Inspector`.
 21. готовить `Answer Package` как отдельный run-артефакт и использовать его как основной пользовательский результат.
+22. хранить и показывать branch-aware background state проекта как часть runtime-контракта между Git, Knowledge, API и UI.
+23. выполнять принудительную пересборку project intelligence из UI без ручного редактирования конфигурации или прямого вызова backend endpoint.
+24. хранить проекты в PostgreSQL как отдельные сущности с `1:N` именованными путями.
+25. управлять проектами и провайдерами через отдельные страницы GUI, а не через перегруженный основной экран чата.
+26. различать `background-sync` и `question-run` как отдельные runtime-режимы в API, knowledge artifacts и UI.
+27. автоматически поднимать фоновую пересборку project intelligence при устаревшем или отсутствующем baseline.
 
 ## Что пока ограничено
 
@@ -236,6 +381,10 @@
 - Planner уже чувствителен к типу исследовательского профиля, но ещё не использует формальный rollback-plan и pre-execution blocking rules по confidence/unknowns.
 - Execution layer теперь имеет safe preview и controlled runtime contract, но всё ещё без фактической мутации файлов.
 - Provider runtime config уже собирается и сохраняется вместе с запуском, но фактический live-вызов модели ещё не подключён.
+- Chat-first UX уже показывает branch-aware readiness проекта, но сами question-time исследования всё ещё запускают полный pipeline run; следующий шаг — отделить background refresh от лёгкого question answering поверх готового state.
+- Проект пока использует первый путь сохранённого `Project` как активный runtime-root для чата; полноценная multi-path orchestration внутри одного общего branch-aware run ещё не реализована.
+- `question-run` уже отделён от `background-sync` по runtime-контракту, но semantic lightweight path пока остаётся MVP-уровня: он всё ещё использует тот же базовый pipeline и пока не заменён полноценным overlay-native research engine.
+- Lightweight question path уже сужает workspace, но `Research`, `Impact` и `Context` всё ещё работают поверх прежних модулей и пока не имеют отдельного overlay-native semantic движка с branch-scoped memory slices.
 - История запусков пока строится из локально сохранённых JSON-артефактов.
 - Фронт уже защищён от полного белого экрана и основных partial-data сбоев, но всё ещё требует дальнейшего hardening:
   - нет автоматического reconnect/backoff policy;

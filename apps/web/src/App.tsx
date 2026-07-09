@@ -1,17 +1,23 @@
 import { startTransition, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import type {
+  BackgroundProjectState,
   ContextCandidate,
   KnowledgeCatalogEntry,
+  ProjectCatalogResponse,
+  ProjectPathRecord,
+  ProjectRecord,
   PipelineRunResult,
   PipelineRunStatus,
   PipelineStage,
   ProviderCatalogResponse,
   ProviderModelRecord,
   ProviderRecord,
+  RepositorySnapshot,
 } from "@client/shared";
 
 interface ProjectInfo {
+  projectRecord?: ProjectRecord | null;
   name: string;
   rootPath: string;
   summary: {
@@ -22,6 +28,19 @@ interface ProjectInfo {
   };
   recentRuns: KnowledgeCatalogEntry[];
   latestRun: PipelineRunResult | null;
+  repository?: RepositorySnapshot | null;
+  backgroundState?: BackgroundProjectState | null;
+  activeBackgroundRun?: PipelineRunStatus | null;
+  baselineInfo?: {
+    sameHeadRunId?: string;
+    sameHeadRunStatus?: PipelineRunStatus["status"];
+    baselineRunId?: string;
+    latestBackgroundRunId?: string;
+    baselineExactForHead: boolean;
+    hasLocalOverlay: boolean;
+    localOverlayChangeCount: number;
+    backgroundSyncRecommended: boolean;
+  } | null;
 }
 
 type ProviderDraft = {
@@ -30,6 +49,21 @@ type ProviderDraft = {
   baseUrl: string;
   apiKey: string;
 };
+
+type ProjectDraftPath = {
+  id: string;
+  name: string;
+  rootPath: string;
+};
+
+type ProjectDraft = {
+  id: string;
+  name: string;
+  description: string;
+  paths: ProjectDraftPath[];
+};
+
+type AppView = "chat" | "providers" | "projects";
 
 type InspectorTab = "overview" | "research" | "impact" | "context" | "plan" | "execution" | "knowledge" | "git" | "diagnostics";
 
@@ -54,9 +88,37 @@ function safeCount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+function buildAnswerProvenanceSummary(result: PipelineRunResult | null): string {
+  if (!hasRunArtifacts(result)) {
+    return "Источник фактов будет показан после завершения run.";
+  }
+
+  const summary = result.research?.evidenceSummary;
+  const baselineCount = safeCount(summary?.baselineCount);
+  const overlayCount = safeCount(summary?.overlayCount);
+  const structuralCount = safeCount(summary?.structuralCount);
+
+  if (overlayCount > 0) {
+    return `Ответ опирается на committed baseline проекта и локальный overlay: baseline ${baselineCount}, overlay ${overlayCount}, structural ${structuralCount}.`;
+  }
+
+  return `Ответ опирается в основном на committed baseline проекта: baseline ${baselineCount}, overlay ${overlayCount}, structural ${structuralCount}.`;
+}
+
+function buildAnswerProvenanceLabel(result: PipelineRunResult | null): string {
+  if (!hasRunArtifacts(result)) {
+    return "Источник фактов недоступен";
+  }
+
+  return safeCount(result.research?.evidenceSummary?.overlayCount) > 0
+    ? "Baseline + Overlay"
+    : "Baseline First";
+}
+
 function normalizeProjectInfo(data: ProjectInfo): ProjectInfo {
   return {
     ...data,
+    projectRecord: data.projectRecord ?? null,
     recentRuns: safeList(data.recentRuns),
     summary: {
       totalFiles: safeCount(data.summary?.totalFiles),
@@ -64,6 +126,154 @@ function normalizeProjectInfo(data: ProjectInfo): ProjectInfo {
       languages: data.summary?.languages ?? {},
       ...(data.summary?.profile ? { profile: data.summary.profile } : {}),
     },
+    latestRun: data.latestRun ?? null,
+    repository: data.repository ?? null,
+    backgroundState: data.backgroundState ?? null,
+    activeBackgroundRun: data.activeBackgroundRun ?? null,
+    baselineInfo: data.baselineInfo ?? null,
+  };
+}
+
+function normalizeProjectCatalog(data: ProjectCatalogResponse): ProjectCatalogResponse {
+  return {
+    projects: safeList(data.projects).map((project) => ({
+      ...project,
+      description: safeText(project.description, ""),
+      paths: safeList(project.paths).map((item) => ({
+        ...item,
+        name: safeText(item.name),
+        rootPath: safeText(item.rootPath),
+      })),
+    })),
+  };
+}
+
+function shortCommit(value: string | undefined | null): string {
+  if (!value) {
+    return "нет";
+  }
+
+  return value.slice(0, 8);
+}
+
+function backgroundFreshnessLabel(value: BackgroundProjectState["freshness"] | undefined): string {
+  switch (value) {
+    case "fresh":
+      return "актуально";
+    case "stale":
+      return "устарело";
+    case "missing":
+      return "не собрано";
+    default:
+      return "неизвестно";
+  }
+}
+
+function backgroundSyncLabel(value: BackgroundProjectState["syncStatus"] | undefined): string {
+  switch (value) {
+    case "ready":
+      return "готово";
+    case "syncing":
+      return "требует обновления";
+    case "degraded":
+      return "ограничено";
+    default:
+      return "неизвестно";
+  }
+}
+
+function worktreeStatusLabel(value: BackgroundProjectState["worktreeStatus"] | undefined): string {
+  switch (value) {
+    case "clean":
+      return "чисто";
+    case "overlay":
+      return "локальный overlay";
+    case "conflict":
+      return "конфликт";
+    default:
+      return "неизвестно";
+  }
+}
+
+function baselineSourceLabel(value: BackgroundProjectState["baselineSource"] | undefined): string {
+  switch (value) {
+    case "exact-head":
+      return "точный HEAD";
+    case "merge-base":
+      return "merge-base";
+    case "recent-branch":
+      return "последний run ветки";
+    case "none":
+      return "без baseline";
+    default:
+      return "неизвестно";
+  }
+}
+
+function projectReadinessState(project: ProjectInfo | null): {
+  tone: "ready" | "warning" | "overlay";
+  title: string;
+  description: string;
+} {
+  if (!project?.backgroundState || !project?.baselineInfo) {
+    return {
+      tone: "warning",
+      title: "Состояние проекта ещё не собрано",
+      description: "Нужно получить repository и background state, прежде чем ответы смогут стабильно опираться на baseline проекта.",
+    };
+  }
+
+  if (project.baselineInfo.backgroundSyncRecommended || project.backgroundState.freshness === "missing") {
+    return {
+      tone: "warning",
+      title: "Нужен background sync",
+      description: "Для текущего branch/head ещё нет актуального committed baseline. Отвечать можно, но качество будет ниже до завершения фоновой пересборки.",
+    };
+  }
+
+  if (project.baselineInfo.hasLocalOverlay || project.backgroundState.worktreeStatus === "overlay") {
+    return {
+      tone: "overlay",
+      title: "Ответ будет с локальным overlay",
+      description: `Committed baseline готов, но есть ${safeCount(project.baselineInfo.localOverlayChangeCount)} локальных изменений. Ответ будет объединять baseline проекта и текущий незакоммиченный worktree.`,
+    };
+  }
+
+  return {
+    tone: "ready",
+    title: "Фон проекта актуален",
+    description: "Для текущего branch/head есть committed baseline, поэтому чат может отвечать поверх уже собранной карты проекта без полного пересбора.",
+  };
+}
+
+function backgroundSyncState(project: ProjectInfo | null): {
+  tone: "running" | "scheduled" | "idle";
+  title: string;
+  description: string;
+} {
+  const activeRun = project?.activeBackgroundRun;
+  const running = activeRun && (activeRun.status === "queued" || activeRun.status === "running");
+
+  if (running) {
+    return {
+      tone: "running",
+      title: "Фоновый sync уже выполняется",
+      description: `${runModeLabel(activeRun.mode)} · ${safeText(activeRun.currentStageLabel, "в очереди")} · статус ${activeRun.status}. Можно ждать завершения или уже задавать вопрос поверх текущего baseline/overlay.`,
+    };
+  }
+
+  if (project?.baselineInfo?.backgroundSyncRecommended) {
+    return {
+      tone: "scheduled",
+      title: "Фон требует обновления",
+      description: "Для текущего branch/head стоит дождаться committed baseline. Авто-sync будет полезен для следующего точного ответа, но вопрос можно задать уже сейчас.",
+    };
+  }
+
+  return {
+    tone: "idle",
+    title: "Можно спрашивать сейчас",
+    description: "Фоновый sync сейчас не нужен: текущий baseline уже пригоден для question-run, а локальные изменения будут учтены через worktree overlay при необходимости.",
   };
 }
 
@@ -98,6 +308,19 @@ function stageStatusLabel(status: PipelineStage["status"]): string {
   }
 }
 
+function runModeLabel(mode: PipelineRunStatus["mode"] | PipelineRunResult["mode"] | undefined): string {
+  switch (mode) {
+    case "background-sync":
+      return "Фоновая пересборка";
+    case "hard-resync":
+      return "Хард ресинк";
+    case "question-run":
+      return "Ответ по проекту";
+    default:
+      return "Run";
+  }
+}
+
 function stageTone(status: PipelineStage["status"]): string {
   switch (status) {
     case "completed":
@@ -119,6 +342,35 @@ function PanelFallback({ title, message }: { title: string; message: string }) {
         <span>{message}</span>
       </div>
     </div>
+  );
+}
+
+function NavigationTabs({
+  activeView,
+  onChange,
+}: {
+  activeView: AppView;
+  onChange: (view: AppView) => void;
+}) {
+  const tabs: Array<{ id: AppView; label: string }> = [
+    { id: "chat", label: "Чат" },
+    { id: "projects", label: "Проекты" },
+    { id: "providers", label: "Провайдеры" },
+  ];
+
+  return (
+    <nav className="top-nav">
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          className={`top-nav-button ${activeView === tab.id ? "top-nav-button-active" : ""}`}
+          onClick={() => onChange(tab.id)}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </nav>
   );
 }
 
@@ -279,7 +531,7 @@ function AssistantRunMessage({
         {running ? (
           <>
             <p className="message-label">Сейчас система думает</p>
-            <h3>{safeText(runStatus?.currentStageLabel, "Готовлю исследование проекта")}</h3>
+            <h3>{runModeLabel(runStatus?.mode)} · {safeText(runStatus?.currentStageLabel, "Готовлю исследование проекта")}</h3>
             <p>
               Run уже создан и выполняется во внутреннем pipeline. Ты видишь наружу только безопасный прогресс, а все
               детальные артефакты можно открыть через Inspector.
@@ -311,6 +563,25 @@ function AssistantRunMessage({
             <h3>{safeText(result.answer?.summary, result.research.summary)}</h3>
             <p>{safeText(result.answer?.explanation, result.research.functionalSummary || "Функциональная картина пока не сформирована.")}</p>
 
+            <div className="provenance-card">
+              <div className="provenance-head">
+                <strong>{buildAnswerProvenanceLabel(result)}</strong>
+                <span>{safeText(result.backgroundState?.worktreeStatus === "overlay" ? "Есть локальные изменения" : "Локальный overlay не влияет")}</span>
+              </div>
+              <p>{buildAnswerProvenanceSummary(result)}</p>
+              <div className="provenance-chips">
+                <span className="provenance-chip">
+                  baseline {safeCount(result.research?.evidenceSummary?.baselineCount)}
+                </span>
+                <span className="provenance-chip">
+                  overlay {safeCount(result.research?.evidenceSummary?.overlayCount)}
+                </span>
+                <span className="provenance-chip">
+                  structural {safeCount(result.research?.evidenceSummary?.structuralCount)}
+                </span>
+              </div>
+            </div>
+
             <div className="list">
               {safeList(result.answer?.evidenceHighlights).length ? (
                 safeList(result.answer?.evidenceHighlights).map((item) => (
@@ -319,6 +590,47 @@ function AssistantRunMessage({
                     <span>{item.detail}</span>
                   </div>
                 ))
+              ) : null}
+            </div>
+
+            <div className="answer-sections">
+              {safeList(result.answer?.confirmedFacts).length ? (
+                <div className="answer-section-card">
+                  <p className="message-label">Подтверждено</p>
+                  <div className="list">
+                    {safeList(result.answer?.confirmedFacts).map((item) => (
+                      <div key={item} className="list-item compact">
+                        <span>{item}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {safeList(result.answer?.unconfirmedFacts).length ? (
+                <div className="answer-section-card">
+                  <p className="message-label">Не подтверждено</p>
+                  <div className="list">
+                    {safeList(result.answer?.unconfirmedFacts).map((item) => (
+                      <div key={item} className="list-item compact">
+                        <span>{item}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {safeList(result.answer?.manualChecks).length ? (
+                <div className="answer-section-card">
+                  <p className="message-label">Проверить вручную</p>
+                  <div className="list">
+                    {safeList(result.answer?.manualChecks).map((item) => (
+                      <div key={item} className="list-item compact">
+                        <span>{item}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               ) : null}
             </div>
 
@@ -462,6 +774,8 @@ function OverviewPanel({ result }: { result: PipelineRunResult | null }) {
 
 function ResearchPanel({ result }: { result: PipelineRunResult | null }) {
   const findings = hasRunArtifacts(result) ? safeList(result.research?.findings) : [];
+  const baselineFindings = hasRunArtifacts(result) ? safeList(result.research?.baselineFindings) : [];
+  const overlayFindings = hasRunArtifacts(result) ? safeList(result.research?.overlayFindings) : [];
   const evidence = hasRunArtifacts(result) ? safeList(result.research?.evidence).slice(0, 6) : [];
   const moduleIntents = hasRunArtifacts(result) ? safeList(result.research?.moduleIntents).slice(0, 3) : [];
   const entryPoints = hasRunArtifacts(result) ? safeList(result.research?.entryPoints).slice(0, 4) : [];
@@ -477,6 +791,14 @@ function ResearchPanel({ result }: { result: PipelineRunResult | null }) {
       {hasRunArtifacts(result) ? (
         <div className="stack">
           <p>{safeText(result.research?.summary)}</p>
+          <div className="list">
+            <div className="list-item">
+              <strong>Происхождение фактов</strong>
+              <span>
+                baseline {safeCount(result.research?.evidenceSummary?.baselineCount)} · overlay {safeCount(result.research?.evidenceSummary?.overlayCount)} · structural {safeCount(result.research?.evidenceSummary?.structuralCount)}
+              </span>
+            </div>
+          </div>
           <div className="list">
             <div className="list-item">
               <strong>Что делает затронутая зона</strong>
@@ -532,12 +854,36 @@ function ResearchPanel({ result }: { result: PipelineRunResult | null }) {
             )}
           </div>
           <div className="list">
+            {baselineFindings.length ? (
+              baselineFindings.map((finding) => (
+                <div key={finding} className="list-item">
+                  <strong>Baseline</strong>
+                  <span>{finding}</span>
+                </div>
+              ))
+            ) : (
+              <PanelFallback title="Baseline facts" message="Для этого запуска отдельные baseline-backed выводы не выделены." />
+            )}
+          </div>
+          <div className="list">
+            {overlayFindings.length ? (
+              overlayFindings.map((finding) => (
+                <div key={finding} className="list-item">
+                  <strong>Overlay</strong>
+                  <span>{finding}</span>
+                </div>
+              ))
+            ) : (
+              <PanelFallback title="Overlay facts" message="Для этого запуска локальный worktree overlay не повлиял на итоговые выводы." />
+            )}
+          </div>
+          <div className="list">
             {evidence.length ? (
               evidence.map((item) => (
                 <div key={item.id} className="list-item">
                   <strong>{item.label}</strong>
                   <span>
-                    оценка {item.score} / {item.reason}
+                    оценка {item.score} / {item.reason} / источник: {item.origin}
                   </span>
                 </div>
               ))
@@ -1103,14 +1449,30 @@ function InspectorDrawer({
 }
 
 export function App() {
+  const [activeView, setActiveView] = useState<AppView>("chat");
   const [project, setProject] = useState<ProjectInfo | null>(null);
+  const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [task, setTask] = useState("Построй структурный отчёт по текущему проекту и покажи ключевые зависимости.");
   const [projectPath, setProjectPath] = useState("");
+  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
+  const [selectedProjectPathId, setSelectedProjectPathId] = useState<string>("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>({
     id: "",
     name: "",
     baseUrl: "",
     apiKey: "",
+  });
+  const [projectDraft, setProjectDraft] = useState<ProjectDraft>({
+    id: "",
+    name: "",
+    description: "",
+    paths: [
+      {
+        id: "",
+        name: "",
+        rootPath: "",
+      },
+    ],
   });
   const [providerModelDraft, setProviderModelDraft] = useState(DEFAULT_MODEL_ID);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -1126,9 +1488,11 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeInspectorTab, setActiveInspectorTab] = useState<InspectorTab>("overview");
   const activeRunIdRef = useRef<string | null>(null);
+  const readiness = projectReadinessState(project);
+  const backgroundSyncStatus = backgroundSyncState(project);
 
   useEffect(() => {
-    void loadProject();
+    void initializeApp();
   }, []);
 
   useEffect(() => {
@@ -1167,48 +1531,156 @@ export function App() {
     activeRunIdRef.current = activeRunId;
   }, [activeRunId]);
 
+  useEffect(() => {
+    if (!project?.backgroundState || !selectedProjectId || running) {
+      return;
+    }
+
+    const needsBackgroundRefresh = Boolean(project.baselineInfo?.backgroundSyncRecommended);
+    const hasActiveBackgroundRun =
+      project.activeBackgroundRun
+      && (project.activeBackgroundRun.status === "queued" || project.activeBackgroundRun.status === "running");
+
+    if (!needsBackgroundRefresh || hasActiveBackgroundRun) {
+      return;
+    }
+
+    void triggerBackgroundSync(true);
+  }, [project?.backgroundState?.stateId, project?.baselineInfo?.backgroundSyncRecommended, project?.activeBackgroundRun?.runId, selectedProjectId, running]);
+
+  useEffect(() => {
+    if (activeView !== "chat") {
+      return;
+    }
+
+    if (!selectedProjectId && !projectPath) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      void loadProject(projectPath, selectedProjectId || undefined);
+    }, 10_000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [activeView, projectPath, selectedProjectId]);
+
+  async function initializeApp() {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const loadedProjects = await loadProjects();
+      await loadProviders();
+      const initialProjectId = loadedProjects[0]?.id ?? "";
+      await loadProject(initialProjectId ? undefined : projectPath, initialProjectId || undefined);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Не удалось инициализировать приложение.");
+      setLoading(false);
+    }
+  }
+
+  async function loadProjects() {
+    const projectCatalog = normalizeProjectCatalog(await fetchJsonWithTimeout<ProjectCatalogResponse>(`${API_BASE_URL}/api/projects`));
+
+    startTransition(() => {
+      setProjects(projectCatalog.projects);
+      setSelectedProjectId((current) => {
+        if (current && projectCatalog.projects.some((projectItem) => projectItem.id === current)) {
+          return current;
+        }
+
+        return projectCatalog.projects[0]?.id ?? "";
+      });
+    });
+
+    return projectCatalog.projects;
+  }
+
+  function resolveSelectedProjectPath(projectItem: ProjectRecord | null | undefined, preferredRootPath?: string): ProjectPathRecord | null {
+    if (!projectItem) {
+      return null;
+    }
+
+    if (preferredRootPath) {
+      const matched = projectItem.paths.find((pathItem) => pathItem.rootPath === preferredRootPath);
+
+      if (matched) {
+        return matched;
+      }
+    }
+
+    if (selectedProjectPathId) {
+      const matched = projectItem.paths.find((pathItem) => pathItem.id === selectedProjectPathId);
+
+      if (matched) {
+        return matched;
+      }
+    }
+
+    return projectItem.paths[0] ?? null;
+  }
+
+  async function loadProviders() {
+    const providerResponse = await fetchJsonWithTimeout<ProviderCatalogResponse>(`${API_BASE_URL}/api/providers`);
+    const providerData = normalizeProviderCatalog(providerResponse);
+
+    startTransition(() => {
+      setProviders(providerData.providers);
+      setProviderModels(providerData.models);
+      setSelectedProviderId(providerData.currentProvider?.id ?? "");
+      setProviderModelDraft(providerData.recommendedModelId ?? DEFAULT_MODEL_ID);
+      const currentProvider = providerData.currentProvider;
+
+      if (currentProvider) {
+        setProviderDraft((current) => ({
+          ...current,
+          id: currentProvider.id,
+          name: currentProvider.name,
+          baseUrl: currentProvider.baseUrl,
+          apiKey: "",
+        }));
+      }
+    });
+
+    return providerData;
+  }
+
   function openInspector(tab: InspectorTab = "overview") {
     setActiveInspectorTab(tab);
     setInspectorOpen(true);
   }
 
-  async function loadProject(nextProjectPath?: string) {
+  async function loadProject(nextProjectPath?: string, nextProjectId?: string) {
     setLoading(true);
     setError(null);
 
     try {
       const params = new URLSearchParams();
+      const requestedProjectId = nextProjectId?.trim() || selectedProjectId.trim();
       const requestedProjectPath = nextProjectPath?.trim() || projectPath.trim();
+
+      if (requestedProjectId) {
+        params.set("projectId", requestedProjectId);
+      }
 
       if (requestedProjectPath) {
         params.set("projectPath", requestedProjectPath);
       }
 
       const projectResponse = await fetchJsonWithTimeout<ProjectInfo>(`${API_BASE_URL}/api/project${params.size ? `?${params.toString()}` : ""}`);
-      const providerResponse = await fetchJsonWithTimeout<ProviderCatalogResponse>(`${API_BASE_URL}/api/providers`);
       const data = normalizeProjectInfo(projectResponse);
-      const providerData = normalizeProviderCatalog(providerResponse);
       const latestEntry = data.latestRun ? safeList(data.recentRuns).find((entry) => entry.runId === data.latestRun?.runId) ?? null : null;
 
       startTransition(() => {
         setProject(data);
+        setSelectedProjectId(data.projectRecord?.id ?? requestedProjectId);
         setProjectPath(data.rootPath);
+        const activePath = resolveSelectedProjectPath(data.projectRecord, data.rootPath);
+        setSelectedProjectPathId(activePath?.id ?? "");
         setResult((current) => current ?? data.latestRun ?? null);
         setSelectedTask((current) => current || latestEntry?.task || "");
-        setProviders(providerData.providers);
-        setProviderModels(providerData.models);
-        setSelectedProviderId(providerData.currentProvider?.id ?? "");
-        setProviderModelDraft(providerData.recommendedModelId ?? DEFAULT_MODEL_ID);
-        const currentProvider = providerData.currentProvider;
-        if (currentProvider) {
-          setProviderDraft((current) => ({
-            ...current,
-            id: currentProvider.id,
-            name: currentProvider.name,
-            baseUrl: currentProvider.baseUrl,
-            apiKey: "",
-          }));
-        }
       });
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сводку по проекту.");
@@ -1219,6 +1691,10 @@ export function App() {
 
   async function runPipeline(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    await submitPipelineRun(false);
+  }
+
+  async function submitPipelineRun(forceRefresh: boolean, hardResync = false) {
     setRunning(true);
     setError(null);
 
@@ -1229,12 +1705,17 @@ export function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          task,
+          task: task.trim() || (hardResync
+            ? "Выполни полный ручной хард ресинк project intelligence."
+            : "Обнови фоновое понимание проекта и подготовь структурный отчёт."),
           projectPath,
+          projectId: selectedProjectId || undefined,
           providerId: selectedProviderId || undefined,
           providerBaseUrl: providerDraft.baseUrl,
           providerModel: providerModelDraft,
           providerApiKey: providerDraft.apiKey,
+          forceRefresh,
+          hardResync,
         }),
       });
 
@@ -1251,6 +1732,62 @@ export function App() {
     } finally {
       setRunning(false);
     }
+  }
+
+  async function triggerBackgroundSync(silent: boolean) {
+    if (!silent) {
+      setRunning(true);
+    }
+
+    try {
+      const accepted = await fetchJsonWithTimeout<PipelineRunStatus>(`${API_BASE_URL}/api/pipeline/run`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          task: "Фоновая пересборка branch-aware project intelligence.",
+          projectPath,
+          projectId: selectedProjectId || undefined,
+          providerId: selectedProviderId || undefined,
+          providerBaseUrl: providerDraft.baseUrl,
+          providerModel: providerModelDraft,
+          providerApiKey: providerDraft.apiKey,
+          forceRefresh: true,
+        }),
+      });
+
+      startTransition(() => {
+        setProject((current) =>
+          current
+            ? {
+                ...current,
+                activeBackgroundRun: accepted,
+              }
+            : current,
+        );
+      });
+
+      if (!silent) {
+        startTransition(() => {
+          setRunStatus(accepted);
+          setActiveRunId(accepted.runId);
+        });
+        await pollPipelineStatus(accepted.runId);
+      }
+    } catch (runError) {
+      if (!silent) {
+        setError(runError instanceof Error ? runError.message : "Не удалось запустить фоновую пересборку.");
+      }
+    } finally {
+      if (!silent) {
+        setRunning(false);
+      }
+    }
+  }
+
+  async function triggerHardResync() {
+    await submitPipelineRun(false, true);
   }
 
   async function pollPipelineStatus(runId: string) {
@@ -1293,10 +1830,13 @@ export function App() {
                         ...safeList(current.recentRuns).filter((entry) => entry.runId !== status.result?.runId),
                       ].slice(0, 20)
                     : current.recentRuns,
+                  repository: status.result?.repository ?? current.repository ?? null,
+                  backgroundState: status.result?.backgroundState ?? current.backgroundState ?? null,
                 }
               : current,
           );
         });
+        await loadProject(status.result.project.rootPath, selectedProjectId || undefined);
         return;
       }
 
@@ -1417,12 +1957,142 @@ export function App() {
     }
   }
 
+  function resetProjectDraft() {
+    setProjectDraft({
+      id: "",
+      name: "",
+      description: "",
+      paths: [
+        {
+          id: "",
+          name: "",
+          rootPath: "",
+        },
+      ],
+    });
+  }
+
+  function startEditProject(projectItem: ProjectRecord) {
+    setProjectDraft({
+      id: projectItem.id,
+      name: projectItem.name,
+      description: projectItem.description ?? "",
+      paths: safeList(projectItem.paths).length
+        ? projectItem.paths.map((pathItem) => ({
+            id: pathItem.id,
+            name: pathItem.name,
+            rootPath: pathItem.rootPath,
+          }))
+        : [
+            {
+              id: "",
+              name: "",
+              rootPath: "",
+            },
+          ],
+    });
+    setActiveView("projects");
+  }
+
+  function updateProjectDraftPath(index: number, patch: Partial<ProjectDraftPath>) {
+    setProjectDraft((current) => ({
+      ...current,
+      paths: current.paths.map((pathItem, pathIndex) =>
+        pathIndex === index
+          ? {
+              ...pathItem,
+              ...patch,
+            }
+          : pathItem,
+      ),
+    }));
+  }
+
+  function addProjectDraftPath() {
+    setProjectDraft((current) => ({
+      ...current,
+      paths: [
+        ...current.paths,
+        {
+          id: "",
+          name: "",
+          rootPath: "",
+        },
+      ],
+    }));
+  }
+
+  function removeProjectDraftPath(index: number) {
+    setProjectDraft((current) => ({
+      ...current,
+      paths: current.paths.length <= 1 ? current.paths : current.paths.filter((_, pathIndex) => pathIndex !== index),
+    }));
+  }
+
+  async function saveProjectDraft() {
+    setError(null);
+
+    try {
+      await fetchJsonWithTimeout<ProjectRecord>(`${API_BASE_URL}/api/projects`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: projectDraft.id || undefined,
+          name: projectDraft.name,
+          description: projectDraft.description,
+          paths: projectDraft.paths,
+        }),
+      });
+
+      const loadedProjects = await loadProjects();
+      const activeProjectId = projectDraft.id || loadedProjects.find((item) => item.name === projectDraft.name)?.id || loadedProjects[0]?.id || "";
+      resetProjectDraft();
+
+      if (activeProjectId) {
+        await loadProject(undefined, activeProjectId);
+      }
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Не удалось сохранить проект.");
+    }
+  }
+
+  async function removeProject(projectId: string) {
+    setError(null);
+
+    try {
+      await fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/projects/${encodeURIComponent(projectId)}`, {
+        method: "DELETE",
+      });
+
+      const loadedProjects = await loadProjects();
+      resetProjectDraft();
+
+      if (loadedProjects[0]?.id) {
+        await loadProject(undefined, loadedProjects[0].id);
+      } else {
+        startTransition(() => {
+          setProject(null);
+          setProjectPath("");
+          setSelectedProjectId("");
+          setSelectedProjectPathId("");
+          setResult(null);
+          setSelectedTask("");
+        });
+      }
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : "Не удалось удалить проект.");
+    }
+  }
+
   return (
     <main className="app-shell">
       <section className="chat-shell chat-shell-full">
         <header className="chat-header">
           <div>
-            <h1>Чат по проекту</h1>
+            <h1>Client</h1>
+            <p className="chat-subtitle">Простой интерфейс сверху, сложная инженерная система внутри.</p>
           </div>
 
           <div className="header-actions">
@@ -1434,76 +2104,399 @@ export function App() {
           </div>
         </header>
 
-        <section className="runtime-bar">
-          <label className="field">
-            <span>Проект</span>
-            <input value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="/path/to/project" />
-          </label>
+        <NavigationTabs activeView={activeView} onChange={setActiveView} />
 
-          <label className="field">
-            <span>Провайдер</span>
-            <select value={selectedProviderId} onChange={(event) => void selectProvider(event.target.value)}>
-              <option value="">Не выбран</option>
-              {safeList(providers).map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.name}
-                </option>
-              ))}
-            </select>
-          </label>
+        {activeView === "chat" ? (
+          <>
+            <section className="runtime-bar">
+              <label className="field">
+                <span>Проект</span>
+                <select
+                  value={selectedProjectId}
+                  onChange={(event) => {
+                    const nextProjectId = event.target.value;
+                    setSelectedProjectId(nextProjectId);
+                    const selectedProject = projects.find((item) => item.id === nextProjectId);
+                    const activePath = selectedProject?.paths[0] ?? null;
+                    setSelectedProjectPathId(activePath?.id ?? "");
+                    setProjectPath(activePath?.rootPath ?? "");
+                    void loadProject(activePath?.rootPath, nextProjectId);
+                  }}
+                >
+                  <option value="">Не выбран</option>
+                  {safeList(projects).map((projectItem) => (
+                    <option key={projectItem.id} value={projectItem.id}>
+                      {projectItem.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
-          <label className="field">
-            <span>Модель</span>
-            <select value={providerModelDraft} onChange={(event) => setProviderModelDraft(event.target.value)}>
-              {safeList(providerModels).map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.label}
-                </option>
-              ))}
-              {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
-            </select>
-          </label>
+              <label className="field">
+                <span>Путь</span>
+                <select
+                  value={selectedProjectPathId}
+                  onChange={(event) => {
+                    const nextPathId = event.target.value;
+                    setSelectedProjectPathId(nextPathId);
+                    const selectedProject = projects.find((item) => item.id === selectedProjectId) ?? null;
+                    const selectedPath = selectedProject?.paths.find((pathItem) => pathItem.id === nextPathId) ?? null;
+                    setProjectPath(selectedPath?.rootPath ?? "");
+                    void loadProject(selectedPath?.rootPath, selectedProjectId || undefined);
+                  }}
+                >
+                  <option value="">Не выбран</option>
+                  {safeList(projects.find((item) => item.id === selectedProjectId)?.paths).map((pathItem) => (
+                    <option key={pathItem.id} value={pathItem.id}>
+                      {pathItem.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
-          <button type="button" className="ghost-button runtime-refresh" onClick={() => void loadProject(projectPath)}>
-            Обновить
-          </button>
-        </section>
+              <label className="field">
+                <span>Провайдер</span>
+                <select value={selectedProviderId} onChange={(event) => void selectProvider(event.target.value)}>
+                  <option value="">Не выбран</option>
+                  {safeList(providers).map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
-        <div className="chat-body">
-          {selectedTask ? <UserTaskMessage task={selectedTask} projectPath={projectPath} /> : null}
+              <label className="field">
+                <span>Модель</span>
+                <select value={providerModelDraft} onChange={(event) => setProviderModelDraft(event.target.value)}>
+                  {safeList(providerModels).map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.label}
+                    </option>
+                  ))}
+                  {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
+                </select>
+              </label>
 
-          <AssistantRunMessage runStatus={runStatus} result={result} onOpenInspector={openInspector} />
-        </div>
+              <button type="button" className="ghost-button runtime-refresh" onClick={() => void loadProject(projectPath, selectedProjectId || undefined)}>
+                Обновить
+              </button>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => void triggerHardResync()}
+                disabled={running || loading}
+              >
+                Хард ресинк
+              </button>
+            </section>
 
-        <form className="composer" onSubmit={runPipeline}>
-          <div className="composer-box">
-            <textarea
-              value={task}
-              onChange={(event) => setTask(event.target.value)}
-              rows={4}
-              placeholder="Напиши инженерную задачу или вопрос по проекту..."
-            />
+            <section className="runtime-bar runtime-bar-secondary">
+              <div className={`runtime-pill runtime-pill-status runtime-pill-status-${readiness.tone}`}>
+                <strong>{readiness.title}</strong>
+                <span>{readiness.description}</span>
+              </div>
+              <div className="runtime-pill">
+                <strong>Ветка</strong>
+                <span>{safeText(project?.repository?.branch, "не определена")}</span>
+              </div>
+              <div className="runtime-pill">
+                <strong>HEAD</strong>
+                <span>{shortCommit(project?.repository?.headCommit)}</span>
+              </div>
+              <div className="runtime-pill">
+                <strong>Состояние проекта</strong>
+                <span>{backgroundSyncLabel(project?.backgroundState?.syncStatus)}</span>
+              </div>
+              <div className="runtime-pill">
+                <strong>Worktree</strong>
+                <span>{worktreeStatusLabel(project?.backgroundState?.worktreeStatus)}</span>
+              </div>
+              <div className="runtime-pill">
+                <strong>Актуальность</strong>
+                <span>{backgroundFreshnessLabel(project?.backgroundState?.freshness)}</span>
+              </div>
+              <div className="runtime-pill">
+                <strong>Изменений</strong>
+                <span>{safeCount(project?.backgroundState?.changedFileCount)}</span>
+              </div>
+              <div className="runtime-pill">
+                <strong>Baseline</strong>
+                <span>{baselineSourceLabel(project?.backgroundState?.baselineSource)}</span>
+              </div>
+            </section>
 
-            <div className="composer-actions">
+            <div className="chat-body">
+              {project?.projectRecord?.paths?.length ? (
+                <div className="system-note">
+                  <strong>Контуры проекта:</strong>{" "}
+                  {project.projectRecord.paths.map((pathItem) => `${pathItem.name}: ${pathItem.rootPath}`).join(" · ")}
+                </div>
+              ) : null}
+
+              {project?.backgroundState ? (
+                <div className="system-note">
+                  <strong>Фоновое понимание проекта:</strong>{" "}
+                  {backgroundSyncLabel(project.backgroundState.syncStatus)}. Ветка{" "}
+                  <strong>{safeText(project.backgroundState.branch, "неизвестно")}</strong>, актуальность{" "}
+                  <strong>{backgroundFreshnessLabel(project.backgroundState.freshness)}</strong>, переиспользуемых файлов{" "}
+                  <strong>{safeCount(project.backgroundState.reusableFileCount)}</strong>, worktree{" "}
+                  <strong>{worktreeStatusLabel(project.backgroundState.worktreeStatus)}</strong>.
+                </div>
+              ) : null}
+
+              <div className={`system-note system-note-${readiness.tone}`}>
+                <strong>{readiness.title}:</strong> {readiness.description}
+              </div>
+
+              <div className={`system-note system-note-sync-${backgroundSyncStatus.tone}`}>
+                <strong>{backgroundSyncStatus.title}:</strong> {backgroundSyncStatus.description}
+              </div>
+
+              {project?.baselineInfo ? (
+                <div className="system-note">
+                  <strong>Готовность baseline:</strong>{" "}
+                  {project.baselineInfo.baselineExactForHead ? "для текущего branch/head уже есть committed baseline" : "для текущего branch/head нужен committed background sync"}
+                  {project.baselineInfo.hasLocalOverlay ? (
+                    <>
+                      {" "}· локальный overlay <strong>{project.baselineInfo.localOverlayChangeCount}</strong> файлов
+                    </>
+                  ) : null}
+                  {project.baselineInfo.sameHeadRunStatus ? (
+                    <>
+                      {" "}· background run <strong>{project.baselineInfo.sameHeadRunStatus}</strong>
+                    </>
+                  ) : null}
+                  {project.baselineInfo.baselineRunId ? (
+                    <>
+                      {" "}· baseline run <strong>{shortCommit(project.baselineInfo.baselineRunId)}</strong>
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {project?.baselineInfo?.backgroundSyncRecommended ? (
+                <div className="system-note">
+                  <strong>Нужно обновить фон:</strong> для текущего branch/head ещё нет актуального committed baseline. Вопрос всё ещё можно задать, но для лучшего качества стоит дождаться фоновой пересборки.
+                </div>
+              ) : null}
+
+              {project?.baselineInfo?.hasLocalOverlay ? (
+                <div className="system-note">
+                  <strong>Локальная разработка учтена отдельно:</strong> незакоммиченные изменения не попадают в committed baseline и будут использованы как worktree overlay для ответа на вопрос.
+                </div>
+              ) : null}
+
+              {selectedTask ? <UserTaskMessage task={selectedTask} projectPath={projectPath} /> : null}
+
+              <AssistantRunMessage runStatus={runStatus} result={result} onOpenInspector={openInspector} />
+            </div>
+
+            <form className="composer" onSubmit={runPipeline}>
+              <div className="composer-box">
+                <textarea
+                  value={task}
+                  onChange={(event) => setTask(event.target.value)}
+                  rows={4}
+                  placeholder="Напиши инженерную задачу или вопрос по проекту..."
+                />
+
+                <div className="composer-actions">
               <div className="composer-meta">
-                <span>Run создаётся автоматически</span>
+                <span>Вопрос идёт поверх уже собранного понимания проекта; полный фон пересобирается отдельно</span>
                 {runStatus ? <span>Текущий этап: {safeText(runStatus.currentStageLabel, "Ожидание")}</span> : null}
               </div>
-              <button type="submit" className="primary-button" disabled={running || loading}>
-                {running ? "Система исследует проект..." : "Запустить исследование"}
-              </button>
-            </div>
-          </div>
+                  <button type="submit" className="primary-button" disabled={running || loading}>
+                    {running ? "Система исследует проект..." : "Запустить исследование"}
+                  </button>
+                </div>
+              </div>
 
-          {runStatus ? (
-            <div className="composer-status">
-              <span>Статус: {runStatus.status}</span>
-              <span>Resume: {runStatus.resumeContext?.canResumeFromStart ? "restart-from-start доступен" : "не требуется"}</span>
-            </div>
-          ) : null}
+              {runStatus ? (
+                <div className="composer-status">
+                  <span>Режим: {runModeLabel(runStatus.mode)}</span>
+                  <span>Статус: {runStatus.status}</span>
+                  <span>Resume: {runStatus.resumeContext?.canResumeFromStart ? "restart-from-start доступен" : "не требуется"}</span>
+                </div>
+              ) : null}
+            </form>
+          </>
+        ) : null}
 
-          {error ? <p className="error">{error}</p> : null}
-        </form>
+        {activeView === "providers" ? (
+          <section className="settings-layout">
+            <article className="settings-card">
+              <div className="section-head">
+                <div>
+                  <p className="section-kicker">Провайдеры</p>
+                  <h2>CRUD провайдеров</h2>
+                </div>
+                <button type="button" className="ghost-button" onClick={() => setProviderDraft({ id: "", name: "", baseUrl: "", apiKey: "" })}>
+                  Новый
+                </button>
+              </div>
+
+              <div className="stack">
+                <label className="field">
+                  <span>Имя</span>
+                  <input value={providerDraft.name} onChange={(event) => setProviderDraft((current) => ({ ...current, name: event.target.value }))} />
+                </label>
+                <label className="field">
+                  <span>Base URL</span>
+                  <input value={providerDraft.baseUrl} onChange={(event) => setProviderDraft((current) => ({ ...current, baseUrl: event.target.value }))} />
+                </label>
+                <label className="field">
+                  <span>API Key</span>
+                  <input value={providerDraft.apiKey} onChange={(event) => setProviderDraft((current) => ({ ...current, apiKey: event.target.value }))} />
+                </label>
+                <div className="action-row">
+                  <button type="button" className="primary-button" onClick={() => void saveProvider()}>
+                    Сохранить провайдера
+                  </button>
+                </div>
+              </div>
+            </article>
+
+            <article className="settings-card">
+              <div className="section-head">
+                <div>
+                  <p className="section-kicker">Список</p>
+                  <h2>Доступные провайдеры</h2>
+                </div>
+              </div>
+              <div className="list">
+                {safeList(providers).map((provider) => (
+                  <div key={provider.id} className="list-item">
+                    <strong>{provider.name}</strong>
+                    <span>{provider.baseUrl}</span>
+                    <span>{provider.isCurrent ? "Текущий" : "Не выбран"}</span>
+                    <div className="action-row">
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() =>
+                          setProviderDraft({
+                            id: provider.id,
+                            name: provider.name,
+                            baseUrl: provider.baseUrl,
+                            apiKey: "",
+                          })
+                        }
+                      >
+                        Редактировать
+                      </button>
+                      <button type="button" className="ghost-button" onClick={() => void selectProvider(provider.id)}>
+                        Выбрать
+                      </button>
+                      <button type="button" className="ghost-button danger-button" onClick={() => void removeProvider(provider.id)}>
+                        Удалить
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </article>
+          </section>
+        ) : null}
+
+        {activeView === "projects" ? (
+          <section className="settings-layout">
+            <article className="settings-card">
+              <div className="section-head">
+                <div>
+                  <p className="section-kicker">Проекты</p>
+                  <h2>Проект с несколькими путями</h2>
+                </div>
+                <button type="button" className="ghost-button" onClick={resetProjectDraft}>
+                  Новый
+                </button>
+              </div>
+
+              <div className="stack">
+                <label className="field">
+                  <span>Имя проекта</span>
+                  <input value={projectDraft.name} onChange={(event) => setProjectDraft((current) => ({ ...current, name: event.target.value }))} />
+                </label>
+                <label className="field">
+                  <span>Описание</span>
+                  <textarea value={projectDraft.description} onChange={(event) => setProjectDraft((current) => ({ ...current, description: event.target.value }))} rows={3} />
+                </label>
+
+                <div className="stack">
+                  {projectDraft.paths.map((pathItem, index) => (
+                    <div key={`${pathItem.id || "draft"}-${index}`} className="path-editor">
+                      <label className="field">
+                        <span>Имя пути</span>
+                        <input value={pathItem.name} onChange={(event) => updateProjectDraftPath(index, { name: event.target.value })} placeholder="backend / frontend / billing" />
+                      </label>
+                      <label className="field">
+                        <span>Путь</span>
+                        <input value={pathItem.rootPath} onChange={(event) => updateProjectDraftPath(index, { rootPath: event.target.value })} placeholder="/Users/.../project" />
+                      </label>
+                      <div className="action-row">
+                        <button type="button" className="ghost-button danger-button" onClick={() => removeProjectDraftPath(index)}>
+                          Удалить путь
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  <div className="action-row">
+                    <button type="button" className="ghost-button" onClick={addProjectDraftPath}>
+                      Добавить путь
+                    </button>
+                  </div>
+                </div>
+
+                <div className="action-row">
+                  <button type="button" className="primary-button" onClick={() => void saveProjectDraft()}>
+                    Сохранить проект
+                  </button>
+                </div>
+              </div>
+            </article>
+
+            <article className="settings-card">
+              <div className="section-head">
+                <div>
+                  <p className="section-kicker">Список</p>
+                  <h2>Сохранённые проекты</h2>
+                </div>
+              </div>
+              <div className="list">
+                {safeList(projects).map((projectItem) => (
+                  <div key={projectItem.id} className="list-item">
+                    <strong>{projectItem.name}</strong>
+                    <span>{projectItem.description || "Без описания"}</span>
+                    <span>{projectItem.paths.map((pathItem: ProjectPathRecord) => `${pathItem.name}: ${pathItem.rootPath}`).join(" · ")}</span>
+                    <div className="action-row">
+                      <button type="button" className="ghost-button" onClick={() => startEditProject(projectItem)}>
+                        Редактировать
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => {
+                          setActiveView("chat");
+                          setSelectedProjectId(projectItem.id);
+                          setSelectedProjectPathId(projectItem.paths[0]?.id ?? "");
+                          setProjectPath(projectItem.paths[0]?.rootPath ?? "");
+                          void loadProject(projectItem.paths[0]?.rootPath, projectItem.id);
+                        }}
+                      >
+                        Открыть в чате
+                      </button>
+                      <button type="button" className="ghost-button danger-button" onClick={() => void removeProject(projectItem.id)}>
+                        Удалить
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </article>
+          </section>
+        ) : null}
+
+        {error ? <p className="error">{error}</p> : null}
       </section>
 
       <InspectorDrawer
