@@ -96,6 +96,50 @@ interface ProviderValidatorResponse {
   rationale?: string;
 }
 
+type ClaimSupportLevel = "strong" | "moderate" | "weak";
+type ClaimStatus = "supported" | "partial" | "rejected";
+type ClaimType = "direct-answer" | "supporting" | "location" | "impact" | "plan" | "limitation";
+
+interface QuestionContract {
+  questionType: string;
+  expectedAnswerShape: "yes-no" | "location" | "flow" | "configuration" | "diagnostic" | "impact" | "plan";
+  proofObligations: string[];
+  requiresImpact: boolean;
+  requiresPlan: boolean;
+}
+
+interface ClaimCandidate {
+  id: string;
+  type: ClaimType;
+  statement: string;
+  evidence: string[];
+  filePaths: string[];
+  supportLevel: ClaimSupportLevel;
+  status: ClaimStatus;
+  caveats: string[];
+}
+
+interface ValidatedClaimSet {
+  directClaim?: ClaimCandidate;
+  supportingClaims: ClaimCandidate[];
+  locationClaims: ClaimCandidate[];
+  impactClaims: ClaimCandidate[];
+  planClaims: ClaimCandidate[];
+  limitationClaims: ClaimCandidate[];
+  rejectedClaims: ClaimCandidate[];
+}
+
+interface AnswerBrief {
+  questionContract: QuestionContract;
+  claimSet: ValidatedClaimSet;
+  directAnswer: string;
+  explanationLead: string;
+  whereToLook: string[];
+  impactLines: string[];
+  planLines: string[];
+  materialUnknowns: string[];
+}
+
 const PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
 const PROVIDER_MAX_ATTEMPTS = 3;
 const PROVIDER_BASE_BACKOFF_MS = 1_200;
@@ -487,6 +531,16 @@ function resolveQuestionType(task: string, research: ResearchReport): string {
   }
 
   if (
+    normalized.includes("конфиг")
+    || normalized.includes("config")
+    || normalized.includes("env")
+    || normalized.includes("locale")
+    || normalized.includes("локал")
+  ) {
+    return "configuration";
+  }
+
+  if (
     normalized.includes("есть")
     || normalized.includes("используется")
     || normalized.includes("подключен")
@@ -518,16 +572,6 @@ function resolveQuestionType(task: string, research: ResearchReport): string {
   }
 
   if (
-    normalized.includes("конфиг")
-    || normalized.includes("config")
-    || normalized.includes("env")
-    || normalized.includes("locale")
-    || normalized.includes("локал")
-  ) {
-    return "configuration";
-  }
-
-  if (
     normalized.includes("что затрон")
     || normalized.includes("impact")
     || normalized.includes("что слом")
@@ -544,6 +588,276 @@ function resolveQuestionType(task: string, research: ResearchReport): string {
   }
 
   return "flow";
+}
+
+function buildQuestionContract(input: BuildAnswerInput): QuestionContract {
+  const questionType = input.validatedAnswerPacket?.questionType ?? resolveQuestionType(input.task, input.research);
+
+  switch (questionType) {
+    case "existence":
+      return {
+        questionType,
+        expectedAnswerShape: "yes-no",
+        proofObligations: [
+          "Нужен direct anchor существования механизма.",
+          "Нужен supporting code location или entry point.",
+        ],
+        requiresImpact: false,
+        requiresPlan: false,
+      };
+    case "location":
+      return {
+        questionType,
+        expectedAnswerShape: "location",
+        proofObligations: [
+          "Нужен exact file/class/method location.",
+          "Нельзя подменять location broad module summary.",
+        ],
+        requiresImpact: false,
+        requiresPlan: false,
+      };
+    case "configuration":
+      return {
+        questionType,
+        expectedAnswerShape: "configuration",
+        proofObligations: [
+          "Нужен runtime/config precedence or fallback source.",
+          "Нужен config or middleware anchor правильного типа.",
+        ],
+        requiresImpact: false,
+        requiresPlan: false,
+      };
+    case "diagnostic":
+      return {
+        questionType,
+        expectedAnswerShape: "diagnostic",
+        proofObligations: [
+          "Нужна supported cause hypothesis или honest limitation.",
+          "Нельзя выдавать adjacency за causality.",
+        ],
+        requiresImpact: true,
+        requiresPlan: false,
+      };
+    case "impact":
+      return {
+        questionType,
+        expectedAnswerShape: "impact",
+        proofObligations: [
+          "Нужен подтвержденный blast radius.",
+          "Нужны concrete affected zones or files.",
+        ],
+        requiresImpact: true,
+        requiresPlan: false,
+      };
+    case "plan":
+      return {
+        questionType,
+        expectedAnswerShape: "plan",
+        proofObligations: [
+          "Нужен подтвержденный scope changes.",
+          "Нужен reproducible step sequence.",
+        ],
+        requiresImpact: true,
+        requiresPlan: true,
+      };
+    default:
+      return {
+        questionType,
+        expectedAnswerShape: "flow",
+        proofObligations: [
+          "Нужен entry point or direct runtime/structural anchor.",
+          "Нужна minimal causal chain.",
+        ],
+        requiresImpact: false,
+        requiresPlan: false,
+      };
+  }
+}
+
+function getPrioritizedEvidence(input: BuildAnswerInput): ResearchReport["evidence"] {
+  const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
+  const billingRollback = input.research.functionalSummary.toLowerCase().includes("rollback bill")
+    || input.research.functionalSummary.toLowerCase().includes("истории статусов");
+
+  if (localeBehavior) {
+    return [...input.research.evidence].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left));
+  }
+
+  if (billingRollback) {
+    return [...input.research.evidence].sort((left, right) => getBillingEvidenceWeight(right) - getBillingEvidenceWeight(left));
+  }
+
+  return input.research.evidence;
+}
+
+function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): ValidatedClaimSet {
+  const strongestEvidence = getPrioritizedEvidence(input)[0];
+  const runtimeFacts = collectRuntimeFacts(input);
+  const caveats = input.validatedAnswerPacket?.mandatoryCaveats.slice(0, 2) ?? [];
+
+  const directClaim: ClaimCandidate | undefined =
+    input.validatedAnswerPacket?.directAnswerAllowed === false
+      ? {
+          id: stableId(["claim", input.runId, "direct-blocked"]),
+          type: "direct-answer",
+          statement: "Текущих подтверждений недостаточно для сильного прямого ответа.",
+          evidence: caveats,
+          filePaths: [],
+          supportLevel: "weak",
+          status: "partial",
+          caveats,
+        }
+      : contract.questionType === "location" && strongestEvidence?.filePath
+        ? {
+            id: stableId(["claim", input.runId, "direct-location"]),
+            type: "direct-answer",
+            statement: `Главная точка для ответа находится в \`${strongestEvidence.filePath}\`.`,
+            evidence: [strongestEvidence.label, strongestEvidence.reason].filter(Boolean),
+            filePaths: [strongestEvidence.filePath],
+            supportLevel: "strong",
+            status: "supported",
+            caveats,
+          }
+        : runtimeFacts[0]
+          ? {
+              id: stableId(["claim", input.runId, "direct-runtime"]),
+              type: "direct-answer",
+              statement: runtimeFacts[0],
+              evidence: runtimeFacts.slice(0, 2),
+              filePaths: strongestEvidence?.filePath ? [strongestEvidence.filePath] : [],
+              supportLevel: "strong",
+              status: "supported",
+              caveats,
+            }
+          : input.research.functionalSummary.trim().length > 0
+            ? {
+                id: stableId(["claim", input.runId, "direct-functional"]),
+                type: "direct-answer",
+                statement: input.research.functionalSummary,
+                evidence: strongestEvidence ? [strongestEvidence.label] : [],
+                filePaths: strongestEvidence?.filePath ? [strongestEvidence.filePath] : [],
+                supportLevel: strongestEvidence ? "moderate" : "weak",
+                status: strongestEvidence ? "supported" : "partial",
+                caveats,
+              }
+            : undefined;
+
+  const supportingClaims = [
+    ...runtimeFacts.slice(1, 3).map((fact, index) => ({
+      id: stableId(["claim", input.runId, "supporting-runtime", index]),
+      type: "supporting" as const,
+      statement: fact,
+      evidence: [fact],
+      filePaths: [],
+      supportLevel: "strong" as const,
+      status: "supported" as const,
+      caveats: [],
+    })),
+    ...input.research.findings.slice(0, 2).map((finding, index) => ({
+      id: stableId(["claim", input.runId, "supporting-finding", index]),
+      type: "supporting" as const,
+      statement: finding,
+      evidence: [finding],
+      filePaths: [],
+      supportLevel: "moderate" as const,
+      status: "supported" as const,
+      caveats: [],
+    })),
+  ].slice(0, 4);
+
+  const locationClaims = getPrioritizedEvidence(input)
+    .filter((item) => Boolean(item.filePath))
+    .slice(0, 4)
+    .map((item, index) => ({
+      id: stableId(["claim", input.runId, "location", index]),
+      type: "location" as const,
+      statement: `${item.label}${item.reason ? ` — ${item.reason}` : ""}`,
+      evidence: [item.label, item.reason].filter(Boolean),
+      filePaths: item.filePath ? [item.filePath] : [],
+      supportLevel: item.score >= 14 ? "strong" as const : "moderate" as const,
+      status: "supported" as const,
+      caveats: [],
+    }));
+
+  const impactClaims = contract.requiresImpact && input.impact.summary.trim().length > 0
+    ? [{
+        id: stableId(["claim", input.runId, "impact-summary"]),
+        type: "impact" as const,
+        statement: input.impact.summary,
+        evidence: input.impact.affectedSymbols.slice(0, 3),
+        filePaths: input.impact.affectedFiles
+          .slice(0, 4)
+          .map((item) => typeof item === "string" ? item : (item as { filePath?: string }).filePath ?? "")
+          .filter(Boolean),
+        supportLevel: input.impact.confidence >= 70 ? "strong" as const : "moderate" as const,
+        status: "supported" as const,
+        caveats: [],
+      }]
+    : [];
+
+  const planClaims = contract.requiresPlan
+    ? input.plan.steps.slice(0, 4).map((step, index) => ({
+        id: stableId(["claim", input.runId, "plan", index]),
+        type: "plan" as const,
+        statement: step.title ?? step.description ?? `Шаг ${index + 1}`,
+        evidence: [input.plan.summary],
+        filePaths: input.plan.targetFiles.slice(index, index + 1),
+        supportLevel: "moderate" as const,
+        status: "supported" as const,
+        caveats: [],
+      }))
+    : [];
+
+  const limitationClaims = input.research.unknowns.slice(0, 3).map((item, index) => ({
+    id: stableId(["claim", input.runId, "limitation", index]),
+    type: "limitation" as const,
+    statement: item,
+    evidence: [item],
+    filePaths: [],
+    supportLevel: "weak" as const,
+    status: "partial" as const,
+    caveats: [],
+  }));
+
+  const rejectedClaims =
+    input.validation?.status === "partial-answer-allowed" || input.validatedAnswerPacket?.directAnswerAllowed === false
+      ? [{
+          id: stableId(["claim", input.runId, "rejected-overclaim"]),
+          type: "limitation" as const,
+          statement: "Сильный окончательный claim намеренно не включён, потому что текущий evidence допускает только ограниченный ответ.",
+          evidence: contract.proofObligations,
+          filePaths: [],
+          supportLevel: "weak" as const,
+          status: "rejected" as const,
+          caveats,
+        }]
+      : [];
+
+  return {
+    ...(directClaim ? { directClaim } : {}),
+    supportingClaims,
+    locationClaims,
+    impactClaims,
+    planClaims,
+    limitationClaims,
+    rejectedClaims,
+  };
+}
+
+function buildAnswerBrief(input: BuildAnswerInput, answerMode: AnswerMode): AnswerBrief {
+  const questionContract = buildQuestionContract(input);
+  const claimSet = buildClaimSet(input, questionContract);
+
+  return {
+    questionContract,
+    claimSet,
+    directAnswer: claimSet.directClaim?.statement ?? "Текущих подтверждений недостаточно для сильного прямого ответа.",
+    explanationLead: claimSet.supportingClaims[0]?.statement ?? (input.research.functionalSummary || input.research.summary),
+    whereToLook: claimSet.locationClaims.flatMap((claim) => claim.filePaths).slice(0, 6),
+    impactLines: claimSet.impactClaims.map((claim) => claim.statement).slice(0, 3),
+    planLines: claimSet.planClaims.map((claim) => claim.statement).slice(0, 4),
+    materialUnknowns: claimSet.limitationClaims.map((claim) => claim.statement).slice(0, 4),
+  };
 }
 
 function computeEvidenceQualityScore(packet: ValidationPacket): number {
@@ -1055,21 +1369,22 @@ function deriveBlockedWriteZones(targetFiles: string[]): string[] {
 
 function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
   const answerMode = resolveAnswerMode(input);
-  const evidenceHighlights = buildEvidenceHighlights(input);
+  const brief = buildAnswerBrief(input, answerMode);
+  const evidenceHighlights = buildEvidenceHighlights(input, brief);
   const warnings = buildWarnings(input);
-  const unknowns = input.research.unknowns.slice(0, 4);
+  const unknowns = brief.materialUnknowns.slice(0, 4);
   const nextActions = buildNextActions(input, answerMode);
-  const confirmedFacts = buildConfirmedFacts(input, evidenceHighlights);
+  const confirmedFacts = buildConfirmedFacts(input, brief, evidenceHighlights);
   const unconfirmedFacts = buildUnconfirmedFacts(input, unknowns);
   const manualChecks = buildManualChecks(input, nextActions, warnings);
-  const explanation = buildDeterministicExplanation(input, answerMode, evidenceHighlights, unknowns);
+  const explanation = buildDeterministicExplanation(input, brief, answerMode, evidenceHighlights, unknowns);
 
   return {
     answerId: stableId(["answer", input.runId]),
     runId: input.runId,
     answerMode,
     ...(input.validatedAnswerPacket?.questionType ? { questionType: input.validatedAnswerPacket.questionType } : {}),
-    summary: buildDeterministicSummary(input, answerMode),
+    summary: buildDeterministicSummary(input, brief, answerMode),
     explanation,
     evidenceHighlights,
     confirmedFacts,
@@ -1105,7 +1420,9 @@ async function synthesizeAnswerWithProvider(
   warnings: string[];
 }> {
   const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
-  const prompt = buildAnswerPrompt(input, fallback);
+  const answerMode = resolveAnswerMode(input);
+  const brief = buildAnswerBrief(input, answerMode);
+  const prompt = buildAnswerPrompt(input, fallback, brief);
   const response = await performProviderRequest(endpoint, input.providerApiKey, {
     model: input.providerModel,
     temperature: 0.2,
@@ -1115,7 +1432,7 @@ async function synthesizeAnswerWithProvider(
         content: [
           "Ты senior software engineer, который разбирается в кодовой базе проекта и помогает коллегам.",
           "",
-          "Твоя задача — дать чёткий, структурированный ответ на вопрос пользователя, опираясь исключительно на переданные тебе артефакты анализа (Research, Impact, Context, Plan).",
+          "Твоя задача — дать чёткий, структурированный ответ на вопрос пользователя, опираясь исключительно на переданные тебе validated claims и supporting materials.",
           "",
           "Правила:",
           "- Не выдумывай факты, которых нет в артефактах.",
@@ -1130,19 +1447,19 @@ async function synthesizeAnswerWithProvider(
           "1-2 предложения по сути вопроса.",
           "",
           "## Как это работает",
-          "Объясни механизм человеческим языком, опираясь на functional summary и findings из Research.",
+          "Объясни механизм человеческим языком, опираясь на подтверждённые claims и их caveats.",
           "",
           "## Где искать код",
           "Конкретные файлы, классы, методы из evidence. Перечисли в формате bullet-списка.",
           "",
           "## Что изменится при модификации",
-          "Опиши impact: какие файлы/модули будут затронуты, какие побочные эффекты возможны.",
+          "Опиши impact только если он реально релевантен вопросу и подтверждён claims.",
           "",
           "## Возможные риски",
           "Перечисли риски из impact-анализа и unknowns из research. Если рисков нет — так и напиши.",
           "",
           "## Рекомендуемый план действий",
-          "Конкретные шаги в порядке выполнения. Если есть готовый execution plan — используй его.",
+          "Конкретные шаги в порядке выполнения. Используй только подтвержденные plan claims.",
           "",
           "Если по какому-то разделу недостаточно данных, напиши: «Недостаточно данных для уверенного вывода по этому разделу.»",
         ].join("\n"),
@@ -1333,16 +1650,9 @@ function computeAnswerConfidence(input: BuildAnswerInput): number {
   );
 }
 
-function buildEvidenceHighlights(input: BuildAnswerInput): AnswerEvidenceHighlight[] {
+function buildEvidenceHighlights(input: BuildAnswerInput, brief?: AnswerBrief): AnswerEvidenceHighlight[] {
   const highlights: AnswerEvidenceHighlight[] = [];
-  const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
-  const billingRollback = input.research.functionalSummary.toLowerCase().includes("rollback bill")
-    || input.research.functionalSummary.toLowerCase().includes("истории статусов");
-  const prioritizedEvidence = localeBehavior
-    ? [...input.research.evidence].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left))
-    : billingRollback
-      ? [...input.research.evidence].sort((left, right) => getBillingEvidenceWeight(right) - getBillingEvidenceWeight(left))
-      : input.research.evidence;
+  const prioritizedEvidence = getPrioritizedEvidence(input);
 
   for (const item of prioritizedEvidence.slice(0, 4)) {
     highlights.push({
@@ -1351,7 +1661,7 @@ function buildEvidenceHighlights(input: BuildAnswerInput): AnswerEvidenceHighlig
     });
   }
 
-  if (input.impact.affectedFiles.length > 0) {
+  if ((brief?.questionContract.requiresImpact ?? false) && input.impact.affectedFiles.length > 0) {
     highlights.push({
       label: "Зона влияния",
       detail: `Подтверждено ${input.impact.affectedFiles.length} затронутых файлов.`,
@@ -1481,7 +1791,7 @@ function buildNextActions(input: BuildAnswerInput, mode: AnswerMode): string[] {
   return actions.slice(0, 3);
 }
 
-function buildDeterministicSummary(input: BuildAnswerInput, mode: AnswerMode): string {
+function buildDeterministicSummary(input: BuildAnswerInput, brief: AnswerBrief, mode: AnswerMode): string {
   if (input.validatedAnswerPacket?.directAnswerAllowed === false) {
     return "Текущих подтверждений недостаточно для сильного прямого ответа, поэтому система ограничивает вывод только тем, что реально доказано.";
   }
@@ -1495,11 +1805,11 @@ function buildDeterministicSummary(input: BuildAnswerInput, mode: AnswerMode): s
   }
 
   if (shouldForceEvidenceLockedMode(input)) {
-    return buildEvidenceLockedSummary(input);
+    return buildEvidenceLockedSummary(input, brief);
   }
 
-  if (input.research.functionalSummary.trim().length > 0) {
-    return `${input.research.functionalSummary} ${buildFreshnessSuffix(input)}`.trim();
+  if (brief.directAnswer.trim().length > 0) {
+    return `${brief.directAnswer} ${buildFreshnessSuffix(input)}`.trim();
   }
 
   return `${input.research.summary} ${buildFreshnessSuffix(input)}`.trim();
@@ -1507,19 +1817,21 @@ function buildDeterministicSummary(input: BuildAnswerInput, mode: AnswerMode): s
 
 function buildDeterministicExplanation(
   input: BuildAnswerInput,
+  brief: AnswerBrief,
   mode: AnswerMode,
   evidenceHighlights: AnswerEvidenceHighlight[],
   unknowns: string[],
 ): string {
   if (shouldForceEvidenceLockedMode(input)) {
-    return buildStructuredFallbackExplanation(input, mode, evidenceHighlights, unknowns, true);
+    return buildStructuredFallbackExplanation(input, brief, mode, evidenceHighlights, unknowns, true);
   }
 
-  return buildStructuredFallbackExplanation(input, mode, evidenceHighlights, unknowns, false);
+  return buildStructuredFallbackExplanation(input, brief, mode, evidenceHighlights, unknowns, false);
 }
 
 function buildStructuredFallbackExplanation(
   input: BuildAnswerInput,
+  brief: AnswerBrief,
   mode: AnswerMode,
   evidenceHighlights: AnswerEvidenceHighlight[],
   unknowns: string[],
@@ -1530,19 +1842,19 @@ function buildStructuredFallbackExplanation(
   const provenanceNote = buildEvidenceProvenanceExplanation(input.research);
 
   // Section: Как это работает
-  const howItWorks = buildHowItWorksSection(input, mode);
+  const howItWorks = buildHowItWorksSection(input, brief, mode);
   if (howItWorks) {
     sections.push(howItWorks);
   }
 
   // Section: Где искать код
-  const whereToLook = buildWhereToLookSection(input, evidenceHighlights);
+  const whereToLook = buildWhereToLookSection(input, brief);
   if (whereToLook) {
     sections.push(whereToLook);
   }
 
   // Section: Что изменится при модификации
-  const impactSection = buildImpactSection(input);
+  const impactSection = buildImpactSection(input, brief);
   if (impactSection) {
     sections.push(impactSection);
   }
@@ -1554,7 +1866,7 @@ function buildStructuredFallbackExplanation(
   }
 
   // Section: Рекомендуемый план действий
-  const planSection = buildPlanSection(input);
+  const planSection = buildPlanSection(input, brief);
   if (planSection) {
     sections.push(planSection);
   }
@@ -1579,15 +1891,24 @@ function buildStructuredFallbackExplanation(
   return sections.join("\n\n");
 }
 
-function buildHowItWorksSection(input: BuildAnswerInput, mode: AnswerMode): string {
+function buildHowItWorksSection(input: BuildAnswerInput, brief: AnswerBrief, mode: AnswerMode): string {
   const parts: string[] = [];
 
   parts.push("## Как это работает");
 
-  if (input.research.functionalSummary.trim().length > 0) {
+  if (brief.explanationLead.trim().length > 0) {
+    parts.push(brief.explanationLead);
+  } else if (input.research.functionalSummary.trim().length > 0) {
     parts.push(input.research.functionalSummary);
   } else {
     parts.push(input.research.summary);
+  }
+
+  if (brief.claimSet.directClaim && brief.claimSet.directClaim.caveats.length > 0) {
+    parts.push(`\nОграничения direct claim:`);
+    for (const caveat of brief.claimSet.directClaim.caveats.slice(0, 2)) {
+      parts.push(`- ${caveat}`);
+    }
   }
 
   if (input.research.entryPoints.length > 0) {
@@ -1618,11 +1939,8 @@ function buildHowItWorksSection(input: BuildAnswerInput, mode: AnswerMode): stri
   return parts.join("\n");
 }
 
-function buildWhereToLookSection(
-  input: BuildAnswerInput,
-  evidenceHighlights: AnswerEvidenceHighlight[],
-): string {
-  const evidence = input.research.evidence.filter((item) => item.filePath).slice(0, 6);
+function buildWhereToLookSection(input: BuildAnswerInput, brief: AnswerBrief): string {
+  const evidence = getPrioritizedEvidence(input).filter((item) => item.filePath).slice(0, 6);
 
   if (evidence.length === 0) {
     return "";
@@ -1638,7 +1956,7 @@ function buildWhereToLookSection(
     }
   }
 
-  if (input.plan.targetFiles.length > 0) {
+  if (brief.questionContract.requiresPlan && input.plan.targetFiles.length > 0) {
     parts.push(`\nЦелевые файлы плана (первые 5 из ${input.plan.targetFiles.length}):`);
     for (const tf of input.plan.targetFiles.slice(0, 5)) {
       parts.push(`- \`${tf}\``);
@@ -1648,10 +1966,14 @@ function buildWhereToLookSection(
   return parts.join("\n");
 }
 
-function buildImpactSection(input: BuildAnswerInput): string {
+function buildImpactSection(input: BuildAnswerInput, brief: AnswerBrief): string {
+  if (!brief.questionContract.requiresImpact && brief.impactLines.length === 0) {
+    return "";
+  }
+
   const parts: string[] = ["## Что изменится при модификации"];
 
-  parts.push(input.impact.summary);
+  parts.push(brief.impactLines[0] ?? input.impact.summary);
 
   if (input.impact.affectedFiles.length > 0) {
     parts.push(`\nЗатронутые файлы (${input.impact.affectedFiles.length}):`);
@@ -1696,10 +2018,22 @@ function buildRisksSection(input: BuildAnswerInput, unknowns: string[]): string 
   return parts.join("\n");
 }
 
-function buildPlanSection(input: BuildAnswerInput): string {
+function buildPlanSection(input: BuildAnswerInput, brief: AnswerBrief): string {
+  if (!brief.questionContract.requiresPlan && brief.planLines.length === 0) {
+    return "";
+  }
+
   const parts: string[] = ["## Рекомендуемый план действий"];
 
-  if (input.plan.steps.length > 0) {
+  if (brief.planLines.length > 0) {
+    for (let i = 0; i < Math.min(brief.planLines.length, 6); i += 1) {
+      const line = brief.planLines[i];
+      if (line === undefined) {
+        continue;
+      }
+      parts.push(`${i + 1}. ${line}`);
+    }
+  } else if (input.plan.steps.length > 0) {
     for (let i = 0; i < Math.min(input.plan.steps.length, 6); i++) {
       const step = input.plan.steps[i];
       if (step === undefined) {
@@ -1721,10 +2055,13 @@ function buildPlanSection(input: BuildAnswerInput): string {
 
 function buildConfirmedFacts(
   input: BuildAnswerInput,
+  brief: AnswerBrief,
   evidenceHighlights: AnswerEvidenceHighlight[],
 ): string[] {
   const facts = [
     ...collectRuntimeFacts(input),
+    brief.directAnswer,
+    ...brief.claimSet.supportingClaims.map((claim) => claim.statement),
     ...evidenceHighlights.map((item) => `${item.label}: ${item.detail}`),
   ];
 
@@ -1770,8 +2107,12 @@ function buildManualChecks(
   return [...new Set(checks.filter(Boolean))].slice(0, 4);
 }
 
-function buildEvidenceLockedSummary(input: BuildAnswerInput): string {
-  const topEvidence = input.research.evidence[0];
+function buildEvidenceLockedSummary(input: BuildAnswerInput, brief: AnswerBrief): string {
+  const topEvidence = getPrioritizedEvidence(input)[0];
+
+  if (brief.directAnswer.trim().length > 0 && !brief.directAnswer.startsWith("Текущих подтверждений недостаточно")) {
+    return `${brief.directAnswer} ${buildFreshnessSuffix(input)}`.trim();
+  }
 
   if (topEvidence?.filePath) {
     return `Наиболее сильное подтверждение сейчас находится в ${topEvidence.filePath}. ${buildFreshnessSuffix(input)}`.trim();
@@ -1916,9 +2257,9 @@ function collectRuntimeFacts(input: BuildAnswerInput): string[] {
   return facts.slice(0, 4);
 }
 
-function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): string {
-  const evidenceList = input.research.evidence.length > 0
-    ? input.research.evidence.slice(0, 8).map((item) =>
+function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, brief: AnswerBrief): string {
+  const evidenceList = getPrioritizedEvidence(input).length > 0
+    ? getPrioritizedEvidence(input).slice(0, 8).map((item) =>
         `- \`${item.filePath ?? "?"}\`: ${item.label} — ${item.reason}`,
       ).join("\n")
     : "(нет evidence)";
@@ -1958,10 +2299,46 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
     "=== ЗАПРОС ПОЛЬЗОВАТЕЛЯ ===",
     input.task,
     "",
-    "=== 1. RESEARCH (что система знает о коде) ===",
-    `Functional summary: ${input.research.functionalSummary || "(нет)"}`,
-    `Суммарный вывод: ${input.research.summary}`,
-    `Confidence: ${input.research.confidence}%`,
+    "=== 1. QUESTION CONTRACT ===",
+    `Question type: ${brief.questionContract.questionType}`,
+    `Expected shape: ${brief.questionContract.expectedAnswerShape}`,
+    `Proof obligations: ${brief.questionContract.proofObligations.join(" | ") || "(нет)"}`,
+    "",
+    "=== 2. VALIDATED CLAIM SET ===",
+    `Direct claim: ${brief.directAnswer}`,
+    `Explanation lead: ${brief.explanationLead}`,
+    "Supporting claims:",
+    brief.claimSet.supportingClaims.length > 0
+      ? brief.claimSet.supportingClaims.slice(0, 4).map((claim) => `- ${claim.statement}`).join("\n")
+      : "(нет)",
+    "",
+    "Location claims:",
+    brief.claimSet.locationClaims.length > 0
+      ? brief.claimSet.locationClaims.slice(0, 4).map((claim) => `- ${claim.filePaths[0] ?? "?"}: ${claim.statement}`).join("\n")
+      : "(нет)",
+    "",
+    "Impact claims:",
+    brief.impactLines.length > 0
+      ? brief.impactLines.map((line) => `- ${line}`).join("\n")
+      : "(нет)",
+    "",
+    "Plan claims:",
+    brief.planLines.length > 0
+      ? brief.planLines.map((line) => `- ${line}`).join("\n")
+      : "(нет)",
+    "",
+    "Rejected or unsafe claims:",
+    brief.claimSet.rejectedClaims.length > 0
+      ? brief.claimSet.rejectedClaims.slice(0, 3).map((claim) => `- ${claim.statement}`).join("\n")
+      : "(нет)",
+    "",
+    "Material unknowns:",
+    brief.materialUnknowns.length > 0
+      ? brief.materialUnknowns.map((item) => `- ${item}`).join("\n")
+      : "(нет)",
+    "",
+    "=== 3. SUPPORTING EVIDENCE ===",
+    evidenceList,
     "",
     "Entry points:",
     input.research.entryPoints.length > 0
@@ -1973,29 +2350,11 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
       ? input.research.dataSources.slice(0, 6).map((ds) => `- ${ds}`).join("\n")
       : "(нет)",
     "",
-    "Key findings:",
-    input.research.findings.length > 0
-      ? input.research.findings.slice(0, 8).map((f) => `- ${f}`).join("\n")
-      : "(нет)",
-    "",
-    "Evidence (файлы и факты):",
-    evidenceList,
-    "",
-    "Baseline findings (committed map):",
-    input.research.baselineFindings.length > 0
-      ? input.research.baselineFindings.slice(0, 6).map((bf) => `- ${bf}`).join("\n")
-      : "(нет отдельных baseline-фактов)",
-    "",
-    "Overlay findings (локальные незакоммиченные изменения):",
-    input.research.overlayFindings.length > 0
-      ? input.research.overlayFindings.slice(0, 4).map((of) => `- ${of}`).join("\n")
-      : "(нет локальных изменений, влияющих на вывод)",
-    "",
     `Provenance: ${provenanceLine}`,
     "",
     `Freshness: ${freshnessLine}`,
     "",
-    "=== 2. IMPACT (что будет затронуто при изменениях) ===",
+    "=== 4. IMPACT (что будет затронуто при изменениях) ===",
     `Impact summary: ${input.impact.summary}`,
     `Affected files: ${input.impact.affectedFiles.length}`,
     input.impact.affectedFiles.length > 0
@@ -2005,7 +2364,7 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
     "Риски:",
     risksLine,
     "",
-    "=== 3. CONTEXT (релевантные фрагменты кода) ===",
+    "=== 5. CONTEXT (релевантные фрагменты кода) ===",
     `Context confidence: ${input.context.confidence}%`,
     `Token budget: ${input.context.tokenBudget}`,
     `Selected chunks: ${input.context.selectedChunks.length}`,
@@ -2016,7 +2375,7 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
       ? `Ranking: ${input.context.rankingSummary}`
       : "",
     "",
-    "=== 4. PLAN (план действий) ===",
+    "=== 6. PLAN (план действий) ===",
     `Plan summary: ${input.plan.summary}`,
     `Target modules: ${input.plan.targetModules.join(", ") || "(нет)"}`,
     `Target files: ${input.plan.targetFiles.length}`,
@@ -2028,7 +2387,7 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
     "Steps:",
     planStepsLine,
     "",
-    "=== 5. EXECUTION PREVIEW ===",
+    "=== 7. EXECUTION PREVIEW ===",
     `Preview summary: ${input.preview.summary}`,
     `Allowed actions: ${input.preview.allowedActions.length}`,
     "",
@@ -2038,7 +2397,7 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): st
     "=== ИНСТРУКЦИЯ ===",
     `Режим ответа: ${fallback.answerMode}`,
     "Сформируй ответ по-русски строго по структуре из system prompt.",
-    "Используй только факты, прямо подтверждённые в секциях выше.",
+    "Используй только claims и факты, прямо подтверждённые в секциях выше.",
     "Если факт только из overlay findings — явно обозначь: «это обнаружено в незакоммиченных изменениях».",
     "Не добавляй типичные догадки про Laravel, middleware order, session, cookie, query params, kernel registration — если они не подтверждены выше.",
     "Если по разделу данных недостаточно — честно напиши об этом.",
@@ -2064,13 +2423,15 @@ function validateProviderAnswer(
   nextActions: string[];
   warnings: string[];
 } {
+  const brief = buildAnswerBrief(input, resolveAnswerMode(input));
   const combined = `${answer.summary} ${answer.explanation}`.toLowerCase();
   const evidenceCorpus = [
-    input.research.summary,
-    input.research.functionalSummary,
-    ...input.research.findings,
-    ...input.research.dataSources,
-    ...input.research.entryPoints,
+    brief.directAnswer,
+    brief.explanationLead,
+    ...brief.claimSet.supportingClaims.map((claim) => claim.statement),
+    ...brief.claimSet.locationClaims.map((claim) => claim.statement),
+    ...brief.impactLines,
+    ...brief.planLines,
     ...input.research.evidence.map((item) => `${item.label} ${item.reason} ${item.filePath ?? ""}`),
   ]
     .join(" ")
@@ -2088,14 +2449,20 @@ function validateProviderAnswer(
     "transaction retry",
   ].filter((token) => combined.includes(token) && !evidenceCorpus.includes(token));
 
-  if (hallucinationSignals.length > 0) {
+  const directClaimMissing =
+    brief.directAnswer.trim().length > 0
+    && !combined.includes(brief.directAnswer.toLowerCase().slice(0, Math.min(40, brief.directAnswer.length)).trim());
+
+  if (hallucinationSignals.length > 0 || directClaimMissing) {
     return {
       summary: fallback.summary,
       explanation: fallback.explanation,
       nextActions: fallback.nextActions,
       warnings: [
         ...fallback.warnings,
-        "LLM-ответ отклонён, потому что содержал недоказанные детали вне текущего evidence.",
+        hallucinationSignals.length > 0
+          ? "LLM-ответ отклонён, потому что содержал недоказанные детали вне текущего evidence."
+          : "LLM-ответ отклонён, потому что сместил direct claim относительно validated claim set.",
       ].slice(0, 4),
     };
   }
