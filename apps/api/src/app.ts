@@ -53,6 +53,25 @@ interface SaveProjectRequest {
   }>;
 }
 
+async function resolveProjectRecord(input: {
+  projectId?: string | undefined;
+  projectPath?: string | undefined;
+}) {
+  const requestedProjectId = input.projectId?.trim() || "";
+  const requestedProjectPath = input.projectPath?.trim() ? normalizePath(path.resolve(input.projectPath.trim())) : "";
+  let projectRecord = requestedProjectId ? await getProjectById(requestedProjectId) : null;
+
+  if (!projectRecord && requestedProjectPath) {
+    const projects = await listProjects();
+
+    projectRecord = projects.find((project) =>
+      project.paths.some((projectPath) => normalizePath(path.resolve(projectPath.rootPath)) === requestedProjectPath),
+    ) ?? null;
+  }
+
+  return projectRecord;
+}
+
 export function createApp() {
   const app = Fastify({
     logger: true,
@@ -210,10 +229,13 @@ export function createApp() {
       projectPath?: string;
     };
   }>("/api/project", async (request, reply) => {
-    const projectRecord = request.query.projectId?.trim() ? await getProjectById(request.query.projectId.trim()) : null;
+    const projectRecord = await resolveProjectRecord({
+      projectId: request.query.projectId,
+      projectPath: request.query.projectPath,
+    });
     const projectPath = request.query.projectPath?.trim() || projectRecord?.paths[0]?.rootPath || appRootPath;
 
-    if (request.query.projectId?.trim() && !projectRecord) {
+    if (request.query.projectId?.trim() && !projectRecord && !request.query.projectPath?.trim()) {
       return reply.code(404).send({
         message: "Проект не найден.",
       });
@@ -339,7 +361,10 @@ export function createApp() {
 
     if (request.body.projectId?.trim()) {
       try {
-        projectRecord = await getProjectById(request.body.projectId.trim());
+        projectRecord = await resolveProjectRecord({
+          projectId: request.body.projectId,
+          projectPath: request.body.projectPath,
+        });
       } catch (error) {
         if (!explicitProjectPath) {
           request.log.error(error);

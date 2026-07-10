@@ -7,6 +7,8 @@ import {
   type ContextPackage,
   type ExecutionPlan,
   type ExecutionPreview,
+  type FocusedResearchRequest,
+  type FocusedResearchResult,
   type GraphState,
   type ImpactReport,
   type IndexResult,
@@ -18,6 +20,9 @@ import {
   type RepositorySnapshot,
   type ResearchReport,
   stableId,
+  type ValidatedAnswerPacket,
+  type ValidationPacket,
+  type ValidationResult,
   type WorkspaceSnapshot,
 } from "@client/shared";
 
@@ -40,6 +45,12 @@ interface SaveKnowledgeInput {
   plan: ExecutionPlan;
   executionPreview: ExecutionPreview;
   executionRuntime: ControlledExecutionRuntime;
+  validation?: ValidationResult;
+  validationHistory?: ValidationResult[];
+  validationPacket?: ValidationPacket;
+  focusedResearchRequests?: FocusedResearchRequest[];
+  focusedResearchResults?: FocusedResearchResult[];
+  validatedAnswerPacket?: ValidatedAnswerPacket;
   answer: AnswerPackage;
 }
 
@@ -70,6 +81,12 @@ interface PersistedPipelineRunArtifact {
   plan?: ExecutionPlan;
   executionPreview?: ExecutionPreview;
   executionRuntime?: ControlledExecutionRuntime;
+  validation?: ValidationResult;
+  validationHistory?: ValidationResult[];
+  validationPacket?: ValidationPacket;
+  focusedResearchRequests?: FocusedResearchRequest[];
+  focusedResearchResults?: FocusedResearchResult[];
+  validatedAnswerPacket?: ValidatedAnswerPacket;
   answer?: AnswerPackage;
   knowledge?: KnowledgeSaveResult;
   runtimeCache?: PipelineRunResult["runtimeCache"];
@@ -131,6 +148,36 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
     plan: input.plan,
     executionPreview: input.executionPreview,
     executionRuntime: input.executionRuntime,
+    ...(input.validation
+      ? {
+          validation: input.validation,
+        }
+      : {}),
+    ...(input.validationHistory
+      ? {
+          validationHistory: input.validationHistory,
+        }
+      : {}),
+    ...(input.validationPacket
+      ? {
+          validationPacket: input.validationPacket,
+        }
+      : {}),
+    ...(input.focusedResearchRequests
+      ? {
+          focusedResearchRequests: input.focusedResearchRequests,
+        }
+      : {}),
+    ...(input.focusedResearchResults
+      ? {
+          focusedResearchResults: input.focusedResearchResults,
+        }
+      : {}),
+    ...(input.validatedAnswerPacket
+      ? {
+          validatedAnswerPacket: input.validatedAnswerPacket,
+        }
+      : {}),
     answer: input.answer,
     knowledge,
     runtimeCache: {
@@ -513,6 +560,36 @@ function normalizePipelineRunArtifact(
     plan,
     executionPreview,
     executionRuntime,
+    ...(artifact.validation
+      ? {
+          validation: artifact.validation,
+        }
+      : {}),
+    ...(artifact.validationHistory
+      ? {
+          validationHistory: artifact.validationHistory,
+        }
+      : {}),
+    ...(artifact.validationPacket
+      ? {
+          validationPacket: artifact.validationPacket,
+        }
+      : {}),
+    ...(artifact.focusedResearchRequests
+      ? {
+          focusedResearchRequests: artifact.focusedResearchRequests,
+        }
+      : {}),
+    ...(artifact.focusedResearchResults
+      ? {
+          focusedResearchResults: artifact.focusedResearchResults,
+        }
+      : {}),
+    ...(artifact.validatedAnswerPacket
+      ? {
+          validatedAnswerPacket: artifact.validatedAnswerPacket,
+        }
+      : {}),
     answer:
       artifact.answer
       ?? {

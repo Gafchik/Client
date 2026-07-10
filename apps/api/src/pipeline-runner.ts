@@ -1,6 +1,12 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { buildAnswerPackage, buildControlledExecutionRuntime } from "@client/ai";
+import {
+  buildAnswerPackage,
+  buildControlledExecutionRuntime,
+  buildValidatedAnswerPacket,
+  buildValidationPacket,
+  validateEvidence,
+} from "@client/ai";
 import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
@@ -11,6 +17,10 @@ import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWo
 import { runResearch } from "@client/research";
 import {
   type IncrementalIndexPlan,
+  type IndexResult,
+  type FocusedResearchRequest,
+  type FocusedResearchResult,
+  type GraphState,
   normalizePath,
   stableId,
   tokenize,
@@ -20,6 +30,9 @@ import {
   type PipelineRunResult,
   type PipelineRunStatus,
   type PipelineStage,
+  type ValidationRecommendedAction,
+  type ValidationRecommendedResearchProfile,
+  type ValidationResult,
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 
@@ -43,6 +56,7 @@ interface QuestionWorkspacePlan {
 const runStore = new Map<string, PipelineRunStatus>();
 const runAppRootStore = new Map<string, string>();
 const PIPELINE_STATUS_RETENTION_MS = 1000 * 60 * 60 * 24 * 3;
+const MAX_VALIDATION_REFINEMENT_ITERATIONS = 2;
 
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => {
@@ -398,7 +412,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   await yieldToEventLoop();
 
   const researchStartedAt = startStage(runId, "research");
-  const research = runResearch({
+  const initialResearch = runResearch({
     runId,
     task,
     workspace,
@@ -411,40 +425,85 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     runId,
     "research",
     researchStartedAt,
-    `Подготовлено ${research.evidence.length} опорных ссылок с уверенностью ${research.confidence}%: baseline ${research.evidenceSummary.baselineCount}, overlay ${research.evidenceSummary.overlayCount}, structural ${research.evidenceSummary.structuralCount}.`,
+    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}.`,
   );
   updatePartialArtifacts(runId, {
-    research,
+    research: initialResearch,
   });
   await yieldToEventLoop();
 
   const impactStartedAt = startStage(runId, "impact");
-  const impact = analyzeImpact({
+  const initialImpact = analyzeImpact({
     runId,
     graph,
-    research,
+    research: initialResearch,
   });
-  completeStage(runId, "impact", impactStartedAt, `Определено ${impact.affectedFiles.length} затронутых файлов и ${impact.risks.length} рисков.`);
+  completeStage(runId, "impact", impactStartedAt, `Определено ${initialImpact.affectedFiles.length} затронутых файлов и ${initialImpact.risks.length} рисков.`);
   updatePartialArtifacts(runId, {
-    impact,
+    impact: initialImpact,
   });
   await yieldToEventLoop();
 
   const contextStartedAt = startStage(runId, "context");
-  const context = buildContextPackage({
+  const initialContext = buildContextPackage({
     runId,
     task,
     workspace,
     index,
     graph,
-    research,
-    impact,
+    research: initialResearch,
+    impact: initialImpact,
   });
-  completeStage(runId, "context", contextStartedAt, `Собран контекстный пакет: ${context.selectedChunks.length} фрагментов при бюджете ${context.tokenBudget}.`);
+  completeStage(runId, "context", contextStartedAt, `Собран контекстный пакет: ${initialContext.selectedChunks.length} фрагментов при бюджете ${initialContext.tokenBudget}.`);
   updatePartialArtifacts(runId, {
-    context,
+    context: initialContext,
   });
   await yieldToEventLoop();
+
+  const validationLoop = await runValidationLoop({
+    runId,
+    task,
+    projectPath,
+    providerBaseUrl: isQuestionRun ? providerBaseUrl : "",
+    providerModel: isQuestionRun ? providerModel : "",
+    providerApiKey: isQuestionRun ? providerApiKey : "",
+    workspace,
+    index,
+    graph,
+    repository,
+    backgroundState,
+    research: initialResearch,
+    impact: initialImpact,
+    context: initialContext,
+    diagnostics: [
+      ...workspace.diagnostics,
+      ...index.diagnostics,
+      ...repository.diagnostics,
+      ...backgroundState.diagnostics,
+    ],
+  });
+  updatePartialArtifacts(runId, {
+    research: validationLoop.research,
+    impact: validationLoop.impact,
+    context: validationLoop.context,
+    validation: validationLoop.validation,
+    validationHistory: validationLoop.validationHistory,
+    validationPacket: validationLoop.validationPacket,
+    focusedResearchRequests: validationLoop.focusedResearchRequests,
+    focusedResearchResults: validationLoop.focusedResearchResults,
+    validatedAnswerPacket: validationLoop.validatedAnswerPacket,
+  });
+  await yieldToEventLoop();
+
+  const research = validationLoop.research;
+  const impact = validationLoop.impact;
+  const context = validationLoop.context;
+  const validation = validationLoop.validation;
+  const validationHistory = validationLoop.validationHistory;
+  const validationPacket = validationLoop.validationPacket;
+  const focusedResearchRequests = validationLoop.focusedResearchRequests;
+  const focusedResearchResults = validationLoop.focusedResearchResults;
+  const validatedAnswerPacket = validationLoop.validatedAnswerPacket;
 
   const planStartedAt = startStage(runId, "plan");
   const plan = buildExecutionPlan({
@@ -496,6 +555,8 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     preview: executionPreview,
     runtime: executionRuntime,
     backgroundState,
+    validation,
+    validatedAnswerPacket,
   });
   completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);
   updatePartialArtifacts(runId, {
@@ -527,6 +588,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     plan,
     executionPreview,
     executionRuntime,
+    validation,
+    validationHistory,
+    validationPacket,
+    focusedResearchRequests,
+    focusedResearchResults,
+    validatedAnswerPacket,
     answer,
   });
   completeStage(runId, "knowledge", knowledgeStartedAt, `Артефакты сохранены в центральное knowledge-хранилище: ${knowledge.artifactCount} групп.`);
@@ -567,6 +634,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     plan,
     executionPreview,
     executionRuntime,
+    ...(validation ? { validation } : {}),
+    ...(validationHistory.length > 0 ? { validationHistory } : {}),
+    ...(validationPacket ? { validationPacket } : {}),
+    ...(focusedResearchRequests.length > 0 ? { focusedResearchRequests } : {}),
+    ...(focusedResearchResults.length > 0 ? { focusedResearchResults } : {}),
+    ...(validatedAnswerPacket ? { validatedAnswerPacket } : {}),
     answer,
     knowledge,
     backgroundState,
@@ -914,6 +987,379 @@ function buildQuestionWorkspacePlan(
     mode: "empty",
     summary: "Question-run не смог безопасно построить selective slice и будет вынужден открыть полный workspace.",
   };
+}
+
+async function runValidationLoop(input: {
+  runId: string;
+  task: string;
+  projectPath: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+  workspace: Awaited<ReturnType<typeof openWorkspace>>;
+  index: IndexResult;
+  graph: GraphState;
+  repository: PipelineRunResult["repository"];
+  backgroundState: NonNullable<PipelineRunResult["backgroundState"]>;
+  research: PipelineRunResult["research"];
+  impact: PipelineRunResult["impact"];
+  context: PipelineRunResult["context"];
+  diagnostics: string[];
+}): Promise<{
+  research: PipelineRunResult["research"];
+  impact: PipelineRunResult["impact"];
+  context: PipelineRunResult["context"];
+  validation: ValidationResult;
+  validationHistory: ValidationResult[];
+  validationPacket: ReturnType<typeof buildValidationPacket>;
+  focusedResearchRequests: FocusedResearchRequest[];
+  focusedResearchResults: FocusedResearchResult[];
+  validatedAnswerPacket: ReturnType<typeof buildValidatedAnswerPacket>;
+}> {
+  let currentResearch = input.research;
+  let currentImpact = input.impact;
+  let currentContext = input.context;
+  const validationHistory: ValidationResult[] = [];
+  const focusedResearchRequests: FocusedResearchRequest[] = [];
+  const focusedResearchResults: FocusedResearchResult[] = [];
+  const priorActions: ValidationRecommendedAction[] = [];
+  let currentPacket = buildValidationPacket({
+    runId: input.runId,
+    task: input.task,
+    research: currentResearch,
+    impact: currentImpact,
+    context: currentContext,
+    graph: input.graph,
+    diagnostics: input.diagnostics,
+    backgroundState: input.backgroundState,
+    iteration: 0,
+    priorActions,
+    remainingIterationBudget: MAX_VALIDATION_REFINEMENT_ITERATIONS,
+  });
+  let currentValidation = await validateEvidence({
+    packet: currentPacket,
+    providerBaseUrl: input.providerBaseUrl,
+    providerModel: input.providerModel,
+    providerApiKey: input.providerApiKey,
+  });
+  validationHistory.push(currentValidation);
+
+  for (let iteration = 1; iteration <= MAX_VALIDATION_REFINEMENT_ITERATIONS; iteration += 1) {
+    if (currentValidation.status !== "needs-focused-research") {
+      break;
+    }
+
+    const request = buildFocusedResearchRequest({
+      runId: input.runId,
+      iteration,
+      task: input.task,
+      projectPath: input.projectPath,
+      validation: currentValidation,
+      workspace: input.workspace,
+      repository: input.repository,
+      currentResearch,
+      currentContext,
+    });
+    focusedResearchRequests.push(request);
+    priorActions.push(...request.actions);
+
+    const refinement = await runFocusedResearch({
+      runId: input.runId,
+      task: input.task,
+      workspace: input.workspace,
+      index: input.index,
+      graph: input.graph,
+      repository: input.repository,
+      backgroundState: input.backgroundState,
+      currentResearch,
+      request,
+    });
+    focusedResearchResults.push(refinement);
+
+    currentResearch = mergeResearchWithFocusedResult(currentResearch, refinement);
+    currentImpact = analyzeImpact({
+      runId: input.runId,
+      graph: input.graph,
+      research: currentResearch,
+    });
+    currentContext = buildContextPackage({
+      runId: input.runId,
+      task: input.task,
+      workspace: input.workspace,
+      index: input.index,
+      graph: input.graph,
+      research: currentResearch,
+      impact: currentImpact,
+    });
+    currentPacket = buildValidationPacket({
+      runId: input.runId,
+      task: input.task,
+      research: currentResearch,
+      impact: currentImpact,
+      context: currentContext,
+      graph: input.graph,
+      diagnostics: [...input.diagnostics, ...refinement.diagnostics],
+      backgroundState: input.backgroundState,
+      iteration,
+      priorActions,
+      remainingIterationBudget: Math.max(0, MAX_VALIDATION_REFINEMENT_ITERATIONS - iteration),
+    });
+    currentValidation = await validateEvidence({
+      packet: currentPacket,
+      providerBaseUrl: input.providerBaseUrl,
+      providerModel: input.providerModel,
+      providerApiKey: input.providerApiKey,
+    });
+    validationHistory.push(currentValidation);
+
+    if (refinement.additionalEvidence.length === 0 && currentValidation.status === "needs-focused-research") {
+      currentValidation = {
+        ...currentValidation,
+        status: currentValidation.directAnswerFeasibility === "partial" ? "partial-answer-allowed" : "insufficient-evidence",
+        recommendedStopReason: "Focused research не дал существенного прироста evidence.",
+      };
+      validationHistory[validationHistory.length - 1] = currentValidation;
+      break;
+    }
+  }
+
+  const validatedAnswerPacket = buildValidatedAnswerPacket({
+    runId: input.runId,
+    questionType: currentPacket.questionType,
+    validation: currentValidation,
+    research: currentResearch,
+  });
+
+  return {
+    research: currentResearch,
+    impact: currentImpact,
+    context: currentContext,
+    validation: currentValidation,
+    validationHistory,
+    validationPacket: currentPacket,
+    focusedResearchRequests,
+    focusedResearchResults,
+    validatedAnswerPacket,
+  };
+}
+
+function buildFocusedResearchRequest(input: {
+  runId: string;
+  iteration: number;
+  task: string;
+  projectPath: string;
+  validation: ValidationResult;
+  workspace: Awaited<ReturnType<typeof openWorkspace>>;
+  repository: PipelineRunResult["repository"];
+  currentResearch: PipelineRunResult["research"];
+  currentContext: PipelineRunResult["context"];
+}): FocusedResearchRequest {
+  const focusPaths = deriveFocusedResearchPaths({
+    workspace: input.workspace,
+    repository: input.repository,
+    actions: input.validation.recommendedActions,
+    task: input.task,
+    research: input.currentResearch,
+  });
+  const profile = input.validation.recommendedResearchProfile ?? "focused-entrypoint-traversal";
+
+  return {
+    requestId: stableId(["focused-research-request", input.runId, input.iteration]),
+    runId: input.runId,
+    iteration: input.iteration,
+    profile,
+    actions: input.validation.recommendedActions.slice(0, 3),
+    focusPaths,
+    targetTokens: tokenize(input.task).slice(0, 12),
+    reason: input.validation.rationale,
+    maxAdditionalFiles: profile === "focused-runtime-check" ? 40 : 60,
+  };
+}
+
+async function runFocusedResearch(input: {
+  runId: string;
+  task: string;
+  workspace: Awaited<ReturnType<typeof openWorkspace>>;
+  index: IndexResult;
+  graph: GraphState;
+  repository: PipelineRunResult["repository"];
+  backgroundState: NonNullable<PipelineRunResult["backgroundState"]>;
+  currentResearch: PipelineRunResult["research"];
+  request: FocusedResearchRequest;
+}): Promise<FocusedResearchResult> {
+  if (input.request.focusPaths.length === 0) {
+    return {
+      requestId: input.request.requestId,
+      runId: input.runId,
+      iteration: input.request.iteration,
+      profile: input.request.profile,
+      actions: input.request.actions,
+      additionalEvidence: [],
+      additionalFindings: [],
+      resolvedContradictions: [],
+      remainingGaps: ["Focused research не нашёл безопасного selective scope."],
+      diagnostics: ["Focused research был пропущен: нечего открывать дополнительно в рамках локального scope."],
+      deltaSummary: "Новые evidence не добавлены.",
+    };
+  }
+
+  const focusedWorkspace = await openWorkspaceSelective(input.workspace.rootPath, {
+    includePaths: input.request.focusPaths,
+    maxFiles: input.request.maxAdditionalFiles,
+  });
+  const focusedIndex = await runFullIndex(focusedWorkspace, {
+    changedPaths: input.request.focusPaths,
+    deletedPaths: [],
+  });
+  const focusedGraph = buildGraph(focusedWorkspace, focusedIndex);
+  const focusedTask = buildFocusedResearchTask(input.task, input.request);
+  const focusedResearch = runResearch({
+    runId: `${input.runId}-focused-${input.request.iteration}`,
+    task: focusedTask,
+    workspace: focusedWorkspace,
+    index: focusedIndex,
+    graph: focusedGraph,
+    repository: input.repository,
+    backgroundState: input.backgroundState,
+  });
+
+  const previousEvidenceIds = new Set(input.currentResearch.evidence.map((item) => `${item.label}::${item.filePath ?? ""}`));
+  const additionalEvidence = focusedResearch.evidence.filter((item) => !previousEvidenceIds.has(`${item.label}::${item.filePath ?? ""}`)).slice(0, 8);
+  const previousFindings = new Set(input.currentResearch.findings);
+  const additionalFindings = focusedResearch.findings.filter((item) => !previousFindings.has(item)).slice(0, 6);
+
+  return {
+    requestId: input.request.requestId,
+    runId: input.runId,
+    iteration: input.request.iteration,
+    profile: input.request.profile,
+    actions: input.request.actions,
+    additionalEvidence,
+    additionalFindings,
+    resolvedContradictions: [],
+    remainingGaps: focusedResearch.unknowns.slice(0, 3),
+    diagnostics: focusedIndex.diagnostics.slice(0, 4),
+    deltaSummary:
+      additionalEvidence.length > 0 || additionalFindings.length > 0
+        ? `Focused research добавил ${additionalEvidence.length} новых evidence и ${additionalFindings.length} новых findings.`
+        : "Focused research не дал заметного прироста evidence.",
+  };
+}
+
+function mergeResearchWithFocusedResult(
+  research: PipelineRunResult["research"],
+  refinement: FocusedResearchResult,
+): PipelineRunResult["research"] {
+  const mergedEvidence = [
+    ...research.evidence,
+    ...refinement.additionalEvidence,
+  ]
+    .sort((left, right) => right.score - left.score)
+    .filter((item, index, array) =>
+      array.findIndex((candidate) => `${candidate.label}::${candidate.filePath ?? ""}` === `${item.label}::${item.filePath ?? ""}`) === index,
+    )
+    .slice(0, 12);
+  const mergedFindings = Array.from(new Set([...research.findings, ...refinement.additionalFindings])).slice(0, 10);
+  const mergedUnknowns = research.unknowns.filter((item) => !refinement.remainingGaps.includes(item));
+
+  return {
+    ...research,
+    findings: mergedFindings,
+    evidence: mergedEvidence,
+    unknowns: mergedUnknowns.length > 0 ? mergedUnknowns : research.unknowns.slice(0, 2),
+    confidence: Math.min(95, research.confidence + (refinement.additionalEvidence.length > 0 ? 8 : 0)),
+    summary:
+      refinement.additionalEvidence.length > 0
+        ? `${research.summary} Focused refinement усилил доказательную базу в релевантной зоне.`
+        : research.summary,
+  };
+}
+
+function deriveFocusedResearchPaths(input: {
+  workspace: Awaited<ReturnType<typeof openWorkspace>>;
+  repository: PipelineRunResult["repository"];
+  actions: ValidationRecommendedAction[];
+  task: string;
+  research: PipelineRunResult["research"];
+}): string[] {
+  const allPaths = input.workspace.files.map((file) => file.relativePath);
+  const taskTokens = tokenize(input.task);
+  const paths = new Set<string>();
+
+  for (const item of input.research.evidence.slice(0, 8)) {
+    if (item.filePath) {
+      paths.add(normalizePath(item.filePath));
+    }
+  }
+
+  for (const changed of input.repository.changedFiles.slice(0, 20)) {
+    paths.add(normalizePath(changed.path));
+  }
+
+  if (input.actions.includes("check-middleware-chain")) {
+    for (const path of allPaths.filter((filePath) => filePath.toLowerCase().includes("middleware")).slice(0, 12)) {
+      paths.add(path);
+    }
+  }
+
+  if (input.actions.includes("check-config-file") || input.actions.includes("check-env-fallback")) {
+    for (const path of allPaths.filter((filePath) => filePath.toLowerCase().includes("config") || filePath.toLowerCase().includes(".env")).slice(0, 12)) {
+      paths.add(path);
+    }
+  }
+
+  if (input.actions.includes("check-oauth-provider-binding")) {
+    for (const path of allPaths.filter((filePath) => {
+      const lower = filePath.toLowerCase();
+      return lower.includes("oauth") || lower.includes("google") || lower.includes("auth");
+    }).slice(0, 16)) {
+      paths.add(path);
+    }
+  }
+
+  if (input.actions.includes("run-entrypoint-traversal") || input.actions.includes("check-route-controller-binding")) {
+    for (const path of allPaths.filter((filePath) => {
+      const lower = filePath.toLowerCase();
+      return lower.startsWith("routes/") || lower.includes("/controllers/") || lower.includes("routeprovider");
+    }).slice(0, 16)) {
+      paths.add(path);
+    }
+  }
+
+  if (input.actions.includes("check-history-guard-flow")) {
+    for (const path of allPaths.filter((filePath) => {
+      const lower = filePath.toLowerCase();
+      return lower.includes("history") || lower.includes("rollback") || lower.includes("bill");
+    }).slice(0, 18)) {
+      paths.add(path);
+    }
+  }
+
+  for (const path of allPaths.filter((filePath) => {
+    const lower = filePath.toLowerCase();
+    return taskTokens.some((token) => lower.includes(token));
+  }).slice(0, 20)) {
+    paths.add(path);
+  }
+
+  return Array.from(paths).slice(0, 50);
+}
+
+function buildFocusedResearchTask(task: string, request: FocusedResearchRequest): string {
+  const actionHints = request.actions.join(", ");
+
+  switch (request.profile) {
+    case "focused-config-check":
+      return `${task}. Фокус проверки: config/env fallback, service bindings. Действия: ${actionHints}.`;
+    case "focused-runtime-check":
+      return `${task}. Фокус проверки: runtime chain, middleware, route/controller/provider flow. Действия: ${actionHints}.`;
+    case "focused-dependency-check":
+      return `${task}. Фокус проверки: dependency expansion и соседние structural anchors. Действия: ${actionHints}.`;
+    case "focused-entrypoint-traversal":
+      return `${task}. Фокус проверки: entry points и их ближайшая функциональная цепочка. Действия: ${actionHints}.`;
+    default:
+      return `${task}. Focused refinement. Действия: ${actionHints}.`;
+  }
 }
 
 function maskApiKey(value: string): string {

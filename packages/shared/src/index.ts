@@ -483,6 +483,183 @@ export interface ControlledExecutionRuntime {
   executionAllowed: false;
 }
 
+export type ValidationStatus =
+  | "ready-for-answer"
+  | "partial-answer-allowed"
+  | "needs-focused-research"
+  | "contradictory-evidence"
+  | "insufficient-evidence"
+  | "validator-unavailable";
+
+export type DirectAnswerFeasibility =
+  | "strong"
+  | "partial"
+  | "blocked";
+
+export type EvidenceSufficiencyLevel =
+  | "sufficient"
+  | "partial"
+  | "insufficient";
+
+export type ContradictionLevel =
+  | "none"
+  | "minor"
+  | "major";
+
+export type ValidationRecommendedAction =
+  | "run-entrypoint-traversal"
+  | "run-reverse-dependency-check"
+  | "run-call-chain-expansion"
+  | "run-inheritance-expansion"
+  | "run-interface-implementation-check"
+  | "check-middleware-chain"
+  | "check-route-controller-binding"
+  | "check-oauth-provider-binding"
+  | "check-runtime-locale-resolution"
+  | "check-history-guard-flow"
+  | "check-config-file"
+  | "check-env-fallback"
+  | "check-service-provider-registration"
+  | "check-framework-binding"
+  | "check-model-relation"
+  | "check-schema-touchpoints"
+  | "check-repository-usage"
+  | "check-db-storage-location"
+  | "narrow-to-entrypoint"
+  | "narrow-to-module"
+  | "narrow-to-runtime-path"
+  | "drop-noisy-neighbor-zone"
+  | "allow-partial-answer"
+  | "stop-with-insufficient-evidence"
+  | "request-background-refresh"
+  | "request-runtime-logs";
+
+export type ValidationRecommendedResearchProfile =
+  | "entrypoint-traversal"
+  | "storage-topology"
+  | "localization-inventory"
+  | "config-inventory"
+  | "broad-scan"
+  | "focused-entrypoint-traversal"
+  | "focused-config-check"
+  | "focused-runtime-check"
+  | "focused-dependency-check"
+  | "focused-entity-check";
+
+export interface ValidationGap {
+  id: string;
+  label: string;
+  severity: "low" | "medium" | "high";
+  reason: string;
+}
+
+export interface ValidationContradiction {
+  id: string;
+  label: string;
+  severity: "low" | "medium" | "high";
+  reason: string;
+}
+
+export interface ValidationPacket {
+  packetId: string;
+  runId: string;
+  iteration: number;
+  task: string;
+  questionType: string;
+  researchSummary: string;
+  functionalSummary: string;
+  researchConfidence: number;
+  impactSummary: string;
+  impactConfidence: number;
+  contextSummary: string;
+  contextConfidence: number;
+  structuralAnchors: string[];
+  evidenceHighlights: Array<{
+    label: string;
+    filePath?: string;
+    reason: string;
+    score: number;
+    origin: ScoredReference["origin"];
+  }>;
+  graphCoverage: {
+    nodeCount: number;
+    edgeCount: number;
+    relevantAnchorCount: number;
+    entryPointCount: number;
+  };
+  diagnostics: string[];
+  backgroundState?: {
+    freshness: BackgroundProjectState["freshness"];
+    baselineSource: BackgroundProjectState["baselineSource"];
+    hasLocalChanges: boolean;
+    changedFileCount: number;
+  };
+  priorActions: ValidationRecommendedAction[];
+  remainingIterationBudget: number;
+}
+
+export interface ValidationResult {
+  validationId: string;
+  runId: string;
+  iteration: number;
+  status: ValidationStatus;
+  readinessScore: number;
+  directAnswerFeasibility: DirectAnswerFeasibility;
+  evidenceSufficiency: EvidenceSufficiencyLevel;
+  contradictionLevel: ContradictionLevel;
+  gaps: ValidationGap[];
+  contradictions: ValidationContradiction[];
+  missingConfirmations: string[];
+  recommendedActions: ValidationRecommendedAction[];
+  recommendedResearchProfile?: ValidationRecommendedResearchProfile;
+  recommendedStopReason?: string;
+  rationale: string;
+}
+
+export interface FocusedResearchRequest {
+  requestId: string;
+  runId: string;
+  iteration: number;
+  profile: ValidationRecommendedResearchProfile;
+  actions: ValidationRecommendedAction[];
+  focusPaths: string[];
+  targetTokens: string[];
+  reason: string;
+  maxAdditionalFiles: number;
+}
+
+export interface FocusedResearchResult {
+  requestId: string;
+  runId: string;
+  iteration: number;
+  profile: ValidationRecommendedResearchProfile;
+  actions: ValidationRecommendedAction[];
+  additionalEvidence: ScoredReference[];
+  additionalFindings: string[];
+  resolvedContradictions: string[];
+  remainingGaps: string[];
+  diagnostics: string[];
+  deltaSummary: string;
+}
+
+export interface ValidatedAnswerPacket {
+  packetId: string;
+  runId: string;
+  questionType: string;
+  validationStatus: ValidationStatus;
+  readinessScore: number;
+  confidenceCeiling: number;
+  directAnswerAllowed: boolean;
+  mandatoryCaveats: string[];
+  validatedEvidence: Array<{
+    label: string;
+    filePath?: string;
+    reason: string;
+    origin: ScoredReference["origin"];
+  }>;
+  validatorRationale: string;
+}
+
 export type AnswerMode =
   | "direct-answer"
   | "diagnostic-answer"
@@ -499,6 +676,7 @@ export interface AnswerPackage {
   answerId: string;
   runId: string;
   answerMode: AnswerMode;
+  questionType?: string;
   summary: string;
   explanation: string;
   evidenceHighlights: AnswerEvidenceHighlight[];
@@ -516,6 +694,8 @@ export interface AnswerPackage {
     model: string;
   };
   synthesis: "llm" | "deterministic-fallback";
+  validation?: ValidationResult;
+  validatedAnswerPacket?: ValidatedAnswerPacket;
 }
 
 export interface KnowledgeCatalogEntry {
@@ -638,6 +818,12 @@ export interface PipelineRunResult {
   plan: ExecutionPlan;
   executionPreview: ExecutionPreview;
   executionRuntime: ControlledExecutionRuntime;
+  validation?: ValidationResult;
+  validationHistory?: ValidationResult[];
+  validationPacket?: ValidationPacket;
+  focusedResearchRequests?: FocusedResearchRequest[];
+  focusedResearchResults?: FocusedResearchResult[];
+  validatedAnswerPacket?: ValidatedAnswerPacket;
   answer: AnswerPackage;
   knowledge: KnowledgeSaveResult;
   backgroundState?: BackgroundProjectState;
@@ -663,6 +849,12 @@ export interface PipelinePartialArtifacts {
   plan?: ExecutionPlan;
   executionPreview?: ExecutionPreview;
   executionRuntime?: ControlledExecutionRuntime;
+  validation?: ValidationResult;
+  validationHistory?: ValidationResult[];
+  validationPacket?: ValidationPacket;
+  focusedResearchRequests?: FocusedResearchRequest[];
+  focusedResearchResults?: FocusedResearchResult[];
+  validatedAnswerPacket?: ValidatedAnswerPacket;
   answer?: AnswerPackage;
 }
 

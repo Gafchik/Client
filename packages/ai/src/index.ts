@@ -1,5 +1,6 @@
 import {
   type BackgroundProjectState,
+  clamp,
   stableId,
   type AnswerEvidenceHighlight,
   type AnswerMode,
@@ -8,8 +9,16 @@ import {
   type ControlledExecutionRuntime,
   type ExecutionPlan,
   type ExecutionPreview,
+  type FocusedResearchRequest,
+  type FocusedResearchResult,
+  type GraphState,
   type ImpactReport,
   type ResearchReport,
+  type ValidatedAnswerPacket,
+  type ValidationPacket,
+  type ValidationRecommendedAction,
+  type ValidationRecommendedResearchProfile,
+  type ValidationResult,
 } from "@client/shared";
 
 interface BuildControlledRuntimeInput {
@@ -32,6 +41,36 @@ interface BuildAnswerInput {
   preview: ExecutionPreview;
   runtime: ControlledExecutionRuntime;
   backgroundState?: BackgroundProjectState;
+  validation?: ValidationResult;
+  validatedAnswerPacket?: ValidatedAnswerPacket;
+}
+
+interface BuildValidationPacketInput {
+  runId: string;
+  task: string;
+  research: ResearchReport;
+  impact: ImpactReport;
+  context: ContextPackage;
+  graph: GraphState;
+  diagnostics: string[];
+  backgroundState?: BackgroundProjectState;
+  iteration: number;
+  priorActions: ValidationRecommendedAction[];
+  remainingIterationBudget: number;
+}
+
+interface ValidateEvidenceInput {
+  packet: ValidationPacket;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}
+
+interface BuildValidatedAnswerPacketInput {
+  runId: string;
+  questionType: string;
+  validation: ValidationResult;
+  research: ResearchReport;
 }
 
 interface ProviderChatResponse {
@@ -42,9 +81,131 @@ interface ProviderChatResponse {
   }>;
 }
 
+interface ProviderValidatorResponse {
+  validationStatus?: ValidationResult["status"];
+  readinessScore?: number;
+  directAnswerFeasibility?: ValidationResult["directAnswerFeasibility"];
+  evidenceSufficiency?: ValidationResult["evidenceSufficiency"];
+  contradictionLevel?: ValidationResult["contradictionLevel"];
+  gapSummary?: string[];
+  contradictions?: string[];
+  missingConfirmations?: string[];
+  recommendedActions?: string[];
+  recommendedResearchProfile?: ValidationRecommendedResearchProfile;
+  recommendedStopReason?: string;
+  rationale?: string;
+}
+
 const PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
 const PROVIDER_MAX_ATTEMPTS = 3;
 const PROVIDER_BASE_BACKOFF_MS = 1_200;
+const VALIDATOR_MAX_ACTIONS = 3;
+const VALIDATOR_HIGH_READINESS = 78;
+const VALIDATOR_PARTIAL_READINESS = 58;
+const VALIDATOR_MAX_GAPS = 4;
+const VALIDATOR_MAX_CONTRADICTIONS = 3;
+
+export function buildValidationPacket(input: BuildValidationPacketInput): ValidationPacket {
+  const questionType = resolveQuestionType(input.task, input.research);
+  const structuralAnchors = Array.from(
+    new Set([
+      ...input.research.entryPoints.slice(0, 5),
+      ...input.research.primaryEntities.slice(0, 5),
+      ...input.research.evidence
+        .slice(0, 6)
+        .map((item) => item.filePath ?? item.label)
+        .filter(Boolean),
+    ]),
+  ).slice(0, 8);
+
+  return {
+    packetId: stableId(["validation-packet", input.runId, input.iteration]),
+    runId: input.runId,
+    iteration: input.iteration,
+    task: input.task,
+    questionType,
+    researchSummary: input.research.summary,
+    functionalSummary: input.research.functionalSummary,
+    researchConfidence: input.research.confidence,
+    impactSummary: input.impact.summary,
+    impactConfidence: input.impact.confidence,
+    contextSummary: input.context.summary,
+    contextConfidence: input.context.confidence,
+    structuralAnchors,
+    evidenceHighlights: input.research.evidence.slice(0, 8).map((item) => ({
+      label: item.label,
+      ...(item.filePath ? { filePath: item.filePath } : {}),
+      reason: item.reason,
+      score: item.score,
+      origin: item.origin,
+    })),
+    graphCoverage: {
+      nodeCount: input.graph.summary.nodeCount,
+      edgeCount: input.graph.summary.edgeCount,
+      relevantAnchorCount: structuralAnchors.length,
+      entryPointCount: input.research.entryPoints.length,
+    },
+    diagnostics: input.diagnostics,
+    ...(input.backgroundState
+      ? {
+          backgroundState: {
+            freshness: input.backgroundState.freshness,
+            baselineSource: input.backgroundState.baselineSource,
+            hasLocalChanges: input.backgroundState.hasLocalChanges,
+            changedFileCount: input.backgroundState.changedFileCount,
+          },
+        }
+      : {}),
+    priorActions: input.priorActions,
+    remainingIterationBudget: input.remainingIterationBudget,
+  };
+}
+
+export async function validateEvidence(input: ValidateEvidenceInput): Promise<ValidationResult> {
+  const fallback = buildDeterministicValidationResult(input.packet);
+  const canUseProvider =
+    input.providerBaseUrl.trim().length > 0
+    && input.providerModel.trim().length > 0
+    && input.providerApiKey.trim().length > 0;
+
+  if (!canUseProvider) {
+    return fallback;
+  }
+
+  try {
+    const candidate = await synthesizeValidationWithProvider(input);
+    return normalizeProviderValidationResult(candidate, input.packet, fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+export function buildValidatedAnswerPacket(input: BuildValidatedAnswerPacketInput): ValidatedAnswerPacket {
+  return {
+    packetId: stableId(["validated-answer-packet", input.runId, input.validation.validationId]),
+    runId: input.runId,
+    questionType: input.questionType,
+    validationStatus: input.validation.status,
+    readinessScore: input.validation.readinessScore,
+    confidenceCeiling: clamp(input.validation.readinessScore, 15, 95),
+    directAnswerAllowed:
+      input.validation.status === "ready-for-answer"
+      || input.validation.status === "partial-answer-allowed",
+    mandatoryCaveats: [
+      ...input.validation.gaps
+        .filter((gap) => gap.severity !== "low")
+        .map((gap) => gap.label),
+      ...input.validation.missingConfirmations.slice(0, 2),
+    ].slice(0, 4),
+    validatedEvidence: input.research.evidence.slice(0, 6).map((item) => ({
+      label: item.label,
+      ...(item.filePath ? { filePath: item.filePath } : {}),
+      reason: item.reason,
+      origin: item.origin,
+    })),
+    validatorRationale: input.validation.rationale,
+  };
+}
 
 export function buildControlledExecutionRuntime(input: BuildControlledRuntimeInput): ControlledExecutionRuntime {
   const allowedWriteFiles = input.plan.targetFiles.slice(0, 12);
@@ -67,6 +228,202 @@ export function buildControlledExecutionRuntime(input: BuildControlledRuntimeInp
     refreshPlan,
     executionAllowed: false,
   };
+}
+
+function buildDeterministicValidationResult(packet: ValidationPacket): ValidationResult {
+  const evidenceQualityScore = computeEvidenceQualityScore(packet);
+  const graphCoverageScore = computeGraphCoverageScore(packet);
+  const diagnosticsPenalty = computeDiagnosticsPenalty(packet.diagnostics);
+  const freshnessPenalty = computeFreshnessPenalty(packet);
+  const contradictionLevel = detectContradictionLevel(packet);
+  const contradictions = buildValidationContradictions(packet, contradictionLevel);
+  const gaps = buildValidationGaps(packet, contradictionLevel);
+  const missingConfirmations = buildMissingConfirmations(packet);
+
+  let readinessScore = clamp(
+    Math.round(
+      evidenceQualityScore
+      + graphCoverageScore
+      - diagnosticsPenalty
+      - freshnessPenalty
+      - (contradictionLevel === "major" ? 18 : contradictionLevel === "minor" ? 8 : 0),
+    ),
+    12,
+    96,
+  );
+
+  const evidenceSufficiency =
+    readinessScore >= VALIDATOR_HIGH_READINESS
+      ? "sufficient"
+      : readinessScore >= VALIDATOR_PARTIAL_READINESS
+        ? "partial"
+        : "insufficient";
+  const directAnswerFeasibility =
+    readinessScore >= VALIDATOR_HIGH_READINESS
+      ? "strong"
+      : readinessScore >= VALIDATOR_PARTIAL_READINESS
+        ? "partial"
+        : "blocked";
+  const recommendedActions = buildRecommendedActions(packet, gaps, contradictionLevel);
+  const recommendedResearchProfile = resolveRecommendedResearchProfile(packet, recommendedActions);
+  const status = resolveValidationStatus({
+    packet,
+    readinessScore,
+    contradictionLevel,
+    evidenceSufficiency,
+    directAnswerFeasibility,
+    recommendedActions,
+  });
+
+  if (status === "ready-for-answer" && packet.questionType === "existence" && packet.evidenceHighlights.length >= 2) {
+    readinessScore = Math.max(readinessScore, 82);
+  }
+
+  return {
+    validationId: stableId(["validation-result", packet.runId, packet.iteration]),
+    runId: packet.runId,
+    iteration: packet.iteration,
+    status,
+    readinessScore,
+    directAnswerFeasibility,
+    evidenceSufficiency,
+    contradictionLevel,
+    gaps: gaps.slice(0, VALIDATOR_MAX_GAPS),
+    contradictions: contradictions.slice(0, VALIDATOR_MAX_CONTRADICTIONS),
+    missingConfirmations: missingConfirmations.slice(0, 4),
+    recommendedActions: recommendedActions.slice(0, VALIDATOR_MAX_ACTIONS),
+    ...(recommendedResearchProfile ? { recommendedResearchProfile } : {}),
+    ...(status === "insufficient-evidence" || status === "validator-unavailable"
+      ? {
+          recommendedStopReason:
+            status === "insufficient-evidence"
+              ? "Focused refinement в рамках доступного бюджета не обещает достаточного усиления evidence."
+              : "Validator недоступен, используется degraded path.",
+        }
+      : {}),
+    rationale: buildValidationRationale(packet, readinessScore, contradictionLevel, gaps, missingConfirmations, status),
+  };
+}
+
+async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): Promise<ProviderValidatorResponse> {
+  const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+  const response = await performProviderRequest(endpoint, input.providerApiKey, {
+    model: input.providerModel,
+    temperature: 0.1,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: [
+          "Ты выступаешь как engineering evidence validator.",
+          "Ты не отвечаешь пользователю и не исследуешь проект самостоятельно.",
+          "Ты оцениваешь только достаточность уже собранных артефактов.",
+          "Research confidence не является истиной, это лишь один из входных сигналов.",
+          "Верни только JSON с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, recommendedResearchProfile, recommendedStopReason, rationale.",
+          "Нельзя придумывать действия вне разрешённого словаря.",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: buildValidationPrompt(input.packet),
+      },
+    ],
+  });
+
+  const payload = (await response.json()) as ProviderChatResponse;
+  const content = extractProviderContent(payload);
+
+  if (!content) {
+    throw new Error("Provider returned empty validator answer");
+  }
+
+  return JSON.parse(content) as ProviderValidatorResponse;
+}
+
+function normalizeProviderValidationResult(
+  candidate: ProviderValidatorResponse,
+  packet: ValidationPacket,
+  fallback: ValidationResult,
+): ValidationResult {
+  const validActions = new Set<ValidationRecommendedAction>([
+    "run-entrypoint-traversal",
+    "run-reverse-dependency-check",
+    "run-call-chain-expansion",
+    "run-inheritance-expansion",
+    "run-interface-implementation-check",
+    "check-middleware-chain",
+    "check-route-controller-binding",
+    "check-oauth-provider-binding",
+    "check-runtime-locale-resolution",
+    "check-history-guard-flow",
+    "check-config-file",
+    "check-env-fallback",
+    "check-service-provider-registration",
+    "check-framework-binding",
+    "check-model-relation",
+    "check-schema-touchpoints",
+    "check-repository-usage",
+    "check-db-storage-location",
+    "narrow-to-entrypoint",
+    "narrow-to-module",
+    "narrow-to-runtime-path",
+    "drop-noisy-neighbor-zone",
+    "allow-partial-answer",
+    "stop-with-insufficient-evidence",
+    "request-background-refresh",
+    "request-runtime-logs",
+  ]);
+  const normalizedActions = (candidate.recommendedActions ?? [])
+    .filter((item): item is ValidationRecommendedAction => validActions.has(item as ValidationRecommendedAction))
+    .slice(0, VALIDATOR_MAX_ACTIONS);
+
+  const next: ValidationResult = {
+    ...fallback,
+    status: isValidationStatus(candidate.validationStatus) ? candidate.validationStatus : fallback.status,
+    readinessScore: clamp(Math.round(candidate.readinessScore ?? fallback.readinessScore), 12, 96),
+    directAnswerFeasibility: isDirectAnswerFeasibility(candidate.directAnswerFeasibility)
+      ? candidate.directAnswerFeasibility
+      : fallback.directAnswerFeasibility,
+    evidenceSufficiency: isEvidenceSufficiency(candidate.evidenceSufficiency)
+      ? candidate.evidenceSufficiency
+      : fallback.evidenceSufficiency,
+    contradictionLevel: isContradictionLevel(candidate.contradictionLevel)
+      ? candidate.contradictionLevel
+      : fallback.contradictionLevel,
+    gaps: (candidate.gapSummary ?? [])
+      .filter(Boolean)
+      .slice(0, VALIDATOR_MAX_GAPS)
+      .map((gap, index) => ({
+        id: stableId(["validation-gap", packet.runId, packet.iteration, index]),
+        label: gap,
+        severity: "medium" as const,
+        reason: gap,
+      })),
+    contradictions: (candidate.contradictions ?? [])
+      .filter(Boolean)
+      .slice(0, VALIDATOR_MAX_CONTRADICTIONS)
+      .map((item, index) => ({
+        id: stableId(["validation-contradiction", packet.runId, packet.iteration, index]),
+        label: item,
+        severity: "medium" as const,
+        reason: item,
+      })),
+    missingConfirmations: (candidate.missingConfirmations ?? []).filter(Boolean).slice(0, 4),
+    recommendedActions: normalizedActions.length > 0 ? normalizedActions : fallback.recommendedActions,
+    ...(candidate.recommendedResearchProfile
+      ? { recommendedResearchProfile: candidate.recommendedResearchProfile }
+      : fallback.recommendedResearchProfile
+        ? { recommendedResearchProfile: fallback.recommendedResearchProfile }
+        : {}),
+    ...(candidate.recommendedStopReason
+      ? { recommendedStopReason: candidate.recommendedStopReason }
+      : fallback.recommendedStopReason
+        ? { recommendedStopReason: fallback.recommendedStopReason }
+        : {}),
+    rationale: candidate.rationale?.trim() || fallback.rationale,
+  };
+
+  return next;
 }
 
 export async function buildAnswerPackage(input: BuildAnswerInput): Promise<AnswerPackage> {
@@ -100,6 +457,8 @@ export async function buildAnswerPackage(input: BuildAnswerInput): Promise<Answe
       nextActions: validated.nextActions.length ? validated.nextActions : fallback.nextActions,
       warnings,
       synthesis: "llm",
+      ...(input.validation ? { validation: input.validation } : {}),
+      ...(input.validatedAnswerPacket ? { validatedAnswerPacket: input.validatedAnswerPacket } : {}),
       providerUsed: {
         baseUrl: input.providerBaseUrl,
         model: input.providerModel,
@@ -114,6 +473,459 @@ export async function buildAnswerPackage(input: BuildAnswerInput): Promise<Answe
       ].slice(0, 4),
     };
   }
+}
+
+function resolveQuestionType(task: string, research: ResearchReport): string {
+  const normalized = task.toLowerCase();
+
+  if (looksLikeChangeTask(task)) {
+    return "plan";
+  }
+
+  if (looksLikeDiagnosticTask(task)) {
+    return "diagnostic";
+  }
+
+  if (
+    normalized.includes("есть")
+    || normalized.includes("используется")
+    || normalized.includes("подключен")
+    || normalized.includes("подключена")
+    || normalized.includes("можно ли")
+    || normalized.includes("is there")
+    || normalized.includes("exists")
+    || normalized.includes("oauth")
+  ) {
+    return "existence";
+  }
+
+  if (
+    normalized.includes("где")
+    || normalized.includes("where")
+    || normalized.includes("хран")
+    || normalized.includes("лежит")
+  ) {
+    return "location";
+  }
+
+  if (
+    normalized.includes("как")
+    || normalized.includes("how")
+    || normalized.includes("flow")
+    || research.queryProfileKey === "entrypoint-traversal"
+  ) {
+    return "flow";
+  }
+
+  if (
+    normalized.includes("конфиг")
+    || normalized.includes("config")
+    || normalized.includes("env")
+    || normalized.includes("locale")
+    || normalized.includes("локал")
+  ) {
+    return "configuration";
+  }
+
+  if (
+    normalized.includes("что затрон")
+    || normalized.includes("impact")
+    || normalized.includes("что слом")
+  ) {
+    return "impact";
+  }
+
+  if (
+    normalized.includes("сравн")
+    || normalized.includes("чем отличается")
+    || normalized.includes("difference")
+  ) {
+    return "compare";
+  }
+
+  return "flow";
+}
+
+function computeEvidenceQualityScore(packet: ValidationPacket): number {
+  const highScoreEvidence = packet.evidenceHighlights.filter((item) => item.score >= 14).length;
+  const fileAnchors = packet.evidenceHighlights.filter((item) => Boolean(item.filePath)).length;
+  const originDiversity = new Set(packet.evidenceHighlights.map((item) => item.origin)).size;
+  const anchorDensity = packet.structuralAnchors.length;
+
+  return (
+    highScoreEvidence * 8
+    + fileAnchors * 3
+    + originDiversity * 4
+    + Math.min(anchorDensity, 6) * 4
+  );
+}
+
+function computeGraphCoverageScore(packet: ValidationPacket): number {
+  return (
+    Math.min(packet.graphCoverage.relevantAnchorCount, 6) * 3
+    + Math.min(packet.graphCoverage.entryPointCount, 4) * 4
+    + (packet.graphCoverage.nodeCount > 0 ? 6 : 0)
+  );
+}
+
+function computeDiagnosticsPenalty(diagnostics: string[]): number {
+  if (diagnostics.length === 0) {
+    return 0;
+  }
+
+  return Math.min(20, diagnostics.length * 4);
+}
+
+function computeFreshnessPenalty(packet: ValidationPacket): number {
+  if (!packet.backgroundState) {
+    return 6;
+  }
+
+  if (packet.backgroundState.freshness === "missing") {
+    return 12;
+  }
+
+  if (packet.backgroundState.freshness === "stale") {
+    return 8;
+  }
+
+  return packet.backgroundState.hasLocalChanges ? 3 : 0;
+}
+
+function detectContradictionLevel(packet: ValidationPacket): ValidationResult["contradictionLevel"] {
+  const contradictionSignals = [
+    packet.researchSummary.toLowerCase().includes("эврист"),
+    packet.researchSummary.toLowerCase().includes("частично"),
+    packet.functionalSummary.toLowerCase().includes("частично"),
+    packet.backgroundState?.hasLocalChanges && packet.backgroundState.changedFileCount > 20,
+    packet.diagnostics.length >= 3,
+  ].filter(Boolean).length;
+
+  if (contradictionSignals >= 3) {
+    return "major";
+  }
+
+  if (contradictionSignals >= 2) {
+    return "minor";
+  }
+
+  return "none";
+}
+
+function buildValidationContradictions(
+  packet: ValidationPacket,
+  level: ValidationResult["contradictionLevel"],
+): ValidationResult["contradictions"] {
+  if (level === "none") {
+    return [];
+  }
+
+  const contradictions: ValidationResult["contradictions"] = [];
+
+  if (packet.backgroundState?.hasLocalChanges && packet.backgroundState.changedFileCount > 20) {
+    contradictions.push({
+      id: stableId(["validation-contradiction", packet.runId, packet.iteration, "overlay"]),
+      label: "Локальный worktree overlay существенно влияет на вывод.",
+      severity: level === "major" ? "high" : "medium",
+      reason: "Изменения в незакоммиченном состоянии могут конкурировать с committed baseline.",
+    });
+  }
+
+  if (packet.diagnostics.length >= 3) {
+    contradictions.push({
+      id: stableId(["validation-contradiction", packet.runId, packet.iteration, "diagnostics"]),
+      label: "Diagnostics снижают надёжность текущей картины.",
+      severity: "medium",
+      reason: "Indexer/graph diagnostics могут искажать полноту структурного покрытия.",
+    });
+  }
+
+  return contradictions;
+}
+
+function buildValidationGaps(
+  packet: ValidationPacket,
+  contradictionLevel: ValidationResult["contradictionLevel"],
+): ValidationResult["gaps"] {
+  const gaps: ValidationResult["gaps"] = [];
+  const normalizedTask = packet.task.toLowerCase();
+
+  if (packet.evidenceHighlights.length < 2) {
+    gaps.push({
+      id: stableId(["validation-gap", packet.runId, packet.iteration, "evidence-count"]),
+      label: "Недостаточно сильных evidence anchors.",
+      severity: "high",
+      reason: "Для уверенного direct answer найдено слишком мало подтверждений.",
+    });
+  }
+
+  if (packet.questionType === "configuration" && !packet.structuralAnchors.some((anchor) => anchor.toLowerCase().includes("config") || anchor.toLowerCase().includes("middleware"))) {
+    gaps.push({
+      id: stableId(["validation-gap", packet.runId, packet.iteration, "config-anchor"]),
+      label: "Нет прямого config/middleware подтверждения.",
+      severity: "high",
+      reason: "Для configuration-вопроса не хватает config/runtime anchor нужного типа.",
+    });
+  }
+
+  if (packet.questionType === "existence" && packet.evidenceHighlights.length === 0) {
+    gaps.push({
+      id: stableId(["validation-gap", packet.runId, packet.iteration, "existence-direct"]),
+      label: "Нет ни одного прямого подтверждения existence-вопроса.",
+      severity: "high",
+      reason: "Для yes/no вопроса нужен хотя бы один прямой code anchor.",
+    });
+  }
+
+  if (packet.questionType === "flow" && packet.graphCoverage.entryPointCount === 0) {
+    gaps.push({
+      id: stableId(["validation-gap", packet.runId, packet.iteration, "entrypoint"]),
+      label: "Не найдены явные entry points для flow-вопроса.",
+      severity: "medium",
+      reason: "Без entry point цепочка поведения остаётся частично восстановленной.",
+    });
+  }
+
+  if (normalizedTask.includes("oauth") && !packet.structuralAnchors.some((anchor) => anchor.toLowerCase().includes("oauth") || anchor.toLowerCase().includes("google"))) {
+    gaps.push({
+      id: stableId(["validation-gap", packet.runId, packet.iteration, "oauth-anchor"]),
+      label: "Нет явного OAuth/Google anchor.",
+      severity: "medium",
+      reason: "Для вопроса о Google OAuth стоит проверить provider/controller binding.",
+    });
+  }
+
+  if (contradictionLevel === "major") {
+    gaps.push({
+      id: stableId(["validation-gap", packet.runId, packet.iteration, "contradiction-major"]),
+      label: "Есть серьёзные противоречия в текущих материалах.",
+      severity: "high",
+      reason: "Нельзя переходить к уверенному ответу без локального уточнения картины.",
+    });
+  }
+
+  return gaps;
+}
+
+function buildMissingConfirmations(packet: ValidationPacket): string[] {
+  const confirmations: string[] = [];
+  const normalizedTask = packet.task.toLowerCase();
+
+  if (packet.questionType === "configuration" && normalizedTask.includes("locale")) {
+    confirmations.push("Не хватает явного подтверждения runtime locale chain через middleware/config.");
+  }
+
+  if (packet.questionType === "existence" && normalizedTask.includes("oauth")) {
+    confirmations.push("Не хватает прямого подтверждения route/controller/provider chain для OAuth.");
+  }
+
+  if (packet.questionType === "flow" && packet.graphCoverage.entryPointCount === 0) {
+    confirmations.push("Не хватает подтверждённого entry point для начала flow.");
+  }
+
+  if (packet.diagnostics.length > 0) {
+    confirmations.push("Нужно учитывать diagnostics indexer/graph перед окончательным выводом.");
+  }
+
+  return confirmations;
+}
+
+function buildRecommendedActions(
+  packet: ValidationPacket,
+  gaps: ValidationResult["gaps"],
+  contradictionLevel: ValidationResult["contradictionLevel"],
+): ValidationRecommendedAction[] {
+  const actions: ValidationRecommendedAction[] = [];
+  const normalizedTask = packet.task.toLowerCase();
+
+  if (packet.backgroundState?.freshness === "missing" || packet.backgroundState?.freshness === "stale") {
+    actions.push("request-background-refresh");
+  }
+
+  if (gaps.some((gap) => gap.label.includes("entry points")) || (packet.questionType === "flow" && packet.graphCoverage.entryPointCount === 0)) {
+    actions.push("run-entrypoint-traversal");
+  }
+
+  if (packet.questionType === "configuration" && normalizedTask.includes("locale")) {
+    actions.push("check-middleware-chain", "check-config-file");
+  }
+
+  if (packet.questionType === "existence" && normalizedTask.includes("oauth")) {
+    actions.push("check-oauth-provider-binding", "check-route-controller-binding");
+  }
+
+  if (normalizedTask.includes("rollback") || normalizedTask.includes("ролбек")) {
+    actions.push("check-history-guard-flow");
+  }
+
+  if (contradictionLevel !== "none") {
+    actions.push("narrow-to-entrypoint");
+  }
+
+  if (gaps.length === 0 && packet.remainingIterationBudget <= 0) {
+    actions.push("allow-partial-answer");
+  }
+
+  return Array.from(new Set(actions));
+}
+
+function resolveRecommendedResearchProfile(
+  packet: ValidationPacket,
+  actions: ValidationRecommendedAction[],
+): ValidationRecommendedResearchProfile | undefined {
+  if (actions.includes("check-config-file") || actions.includes("check-env-fallback")) {
+    return "focused-config-check";
+  }
+
+  if (
+    actions.includes("check-middleware-chain")
+    || actions.includes("check-oauth-provider-binding")
+    || actions.includes("check-history-guard-flow")
+  ) {
+    return "focused-runtime-check";
+  }
+
+  if (
+    actions.includes("run-call-chain-expansion")
+    || actions.includes("run-reverse-dependency-check")
+    || actions.includes("run-inheritance-expansion")
+    || actions.includes("run-interface-implementation-check")
+  ) {
+    return "focused-dependency-check";
+  }
+
+  if (actions.includes("run-entrypoint-traversal") || actions.includes("narrow-to-entrypoint")) {
+    return "focused-entrypoint-traversal";
+  }
+
+  if (packet.questionType === "configuration") {
+    return "focused-config-check";
+  }
+
+  return undefined;
+}
+
+function resolveValidationStatus(input: {
+  packet: ValidationPacket;
+  readinessScore: number;
+  contradictionLevel: ValidationResult["contradictionLevel"];
+  evidenceSufficiency: ValidationResult["evidenceSufficiency"];
+  directAnswerFeasibility: ValidationResult["directAnswerFeasibility"];
+  recommendedActions: ValidationRecommendedAction[];
+}): ValidationResult["status"] {
+  if (input.contradictionLevel === "major") {
+    return input.packet.remainingIterationBudget > 0 ? "needs-focused-research" : "contradictory-evidence";
+  }
+
+  if (input.readinessScore >= VALIDATOR_HIGH_READINESS && input.directAnswerFeasibility === "strong") {
+    return "ready-for-answer";
+  }
+
+  if (input.readinessScore >= VALIDATOR_PARTIAL_READINESS && input.directAnswerFeasibility !== "blocked") {
+    return input.packet.remainingIterationBudget > 0 && input.recommendedActions.length > 0
+      ? "needs-focused-research"
+      : "partial-answer-allowed";
+  }
+
+  if (input.packet.remainingIterationBudget > 0 && input.recommendedActions.length > 0) {
+    return "needs-focused-research";
+  }
+
+  return input.evidenceSufficiency === "partial"
+    ? "partial-answer-allowed"
+    : "insufficient-evidence";
+}
+
+function buildValidationRationale(
+  packet: ValidationPacket,
+  readinessScore: number,
+  contradictionLevel: ValidationResult["contradictionLevel"],
+  gaps: ValidationResult["gaps"],
+  missingConfirmations: string[],
+  status: ValidationResult["status"],
+): string {
+  const parts: string[] = [];
+
+  parts.push(`Validator оценивает readiness независимо от upstream confidence; текущий readiness score ${readinessScore}.`);
+
+  if (packet.researchConfidence >= 80 && readinessScore < VALIDATOR_PARTIAL_READINESS) {
+    parts.push("Высокий Research confidence не принят как достаточное основание, потому что current evidence не закрывает ключевые подтверждения для этого типа вопроса.");
+  }
+
+  if (packet.researchConfidence < 60 && readinessScore >= VALIDATOR_HIGH_READINESS) {
+    parts.push("Несмотря на сравнительно низкий Research confidence, для текущего вопроса найдено уже достаточно прямых anchors и quality evidence.");
+  }
+
+  if (contradictionLevel !== "none") {
+    parts.push(`Обнаружен уровень противоречий: ${contradictionLevel}.`);
+  }
+
+  if (gaps.length > 0) {
+    parts.push(`Ключевые gaps: ${gaps.slice(0, 2).map((gap) => gap.label).join(" | ")}.`);
+  }
+
+  if (missingConfirmations.length > 0) {
+    parts.push(`Не хватает подтверждений: ${missingConfirmations.slice(0, 2).join(" | ")}.`);
+  }
+
+  if (status === "ready-for-answer") {
+    parts.push("Текущий набор материалов достаточен для answer preparation.");
+  } else if (status === "needs-focused-research") {
+    parts.push("Есть локализуемый следующий refinement step, поэтому answer лучше отложить до focused research.");
+  } else if (status === "partial-answer-allowed") {
+    parts.push("Можно дать ограниченный ответ с caveats, но не стоит делать сильный final claim.");
+  } else {
+    parts.push("Надёжного основания для сильного ответа пока недостаточно.");
+  }
+
+  return parts.join(" ");
+}
+
+function buildValidationPrompt(packet: ValidationPacket): string {
+  return [
+    `Question: ${packet.task}`,
+    `Question type: ${packet.questionType}`,
+    `Research summary: ${packet.researchSummary}`,
+    `Functional summary: ${packet.functionalSummary}`,
+    `Research confidence signal: ${packet.researchConfidence}`,
+    `Impact summary: ${packet.impactSummary}`,
+    `Impact confidence signal: ${packet.impactConfidence}`,
+    `Context summary: ${packet.contextSummary}`,
+    `Context confidence signal: ${packet.contextConfidence}`,
+    `Structural anchors: ${packet.structuralAnchors.join(" | ") || "(none)"}`,
+    `Evidence: ${packet.evidenceHighlights.map((item) => `${item.label} :: ${item.reason} :: ${item.filePath ?? "?"} :: ${item.origin}`).join(" | ") || "(none)"}`,
+    `Graph coverage: nodes=${packet.graphCoverage.nodeCount}, edges=${packet.graphCoverage.edgeCount}, anchors=${packet.graphCoverage.relevantAnchorCount}, entryPoints=${packet.graphCoverage.entryPointCount}`,
+    `Diagnostics: ${packet.diagnostics.join(" | ") || "(none)"}`,
+    packet.backgroundState
+      ? `Background: freshness=${packet.backgroundState.freshness}, baselineSource=${packet.backgroundState.baselineSource}, localChanges=${packet.backgroundState.hasLocalChanges}, changedFiles=${packet.backgroundState.changedFileCount}`
+      : "Background: (none)",
+    `Prior actions: ${packet.priorActions.join(" | ") || "(none)"}`,
+    `Remaining iteration budget: ${packet.remainingIterationBudget}`,
+    "Evaluate whether current evidence is sufficient to answer the user. Do not inherit Research confidence automatically. Choose only allowed actions.",
+  ].join("\n");
+}
+
+function isValidationStatus(value: unknown): value is ValidationResult["status"] {
+  return [
+    "ready-for-answer",
+    "partial-answer-allowed",
+    "needs-focused-research",
+    "contradictory-evidence",
+    "insufficient-evidence",
+    "validator-unavailable",
+  ].includes(String(value));
+}
+
+function isDirectAnswerFeasibility(value: unknown): value is ValidationResult["directAnswerFeasibility"] {
+  return ["strong", "partial", "blocked"].includes(String(value));
+}
+
+function isEvidenceSufficiency(value: unknown): value is ValidationResult["evidenceSufficiency"] {
+  return ["sufficient", "partial", "insufficient"].includes(String(value));
+}
+
+function isContradictionLevel(value: unknown): value is ValidationResult["contradictionLevel"] {
+  return ["none", "minor", "major"].includes(String(value));
 }
 
 function determineRuntimeStatus(
@@ -256,6 +1068,7 @@ function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
     answerId: stableId(["answer", input.runId]),
     runId: input.runId,
     answerMode,
+    ...(input.validatedAnswerPacket?.questionType ? { questionType: input.validatedAnswerPacket.questionType } : {}),
     summary: buildDeterministicSummary(input, answerMode),
     explanation,
     evidenceHighlights,
@@ -272,6 +1085,8 @@ function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
       "Открыть Plan, если нужен безопасный план изменений.",
     ],
     generatedAt: new Date().toISOString(),
+    ...(input.validation ? { validation: input.validation } : {}),
+    ...(input.validatedAnswerPacket ? { validatedAnswerPacket: input.validatedAnswerPacket } : {}),
     providerUsed: {
       baseUrl: input.providerBaseUrl,
       model: input.providerModel,
@@ -297,8 +1112,40 @@ async function synthesizeAnswerWithProvider(
     messages: [
       {
         role: "system",
-        content:
-          "Ты инженерный AI-ассистент. Отвечай только на основе переданных артефактов. Не выдумывай факты. Пиши по-русски. Сначала дай краткий ответ по сути, потом короткое объяснение, потом 1-3 следующих шага, если они нужны.",
+        content: [
+          "Ты senior software engineer, который разбирается в кодовой базе проекта и помогает коллегам.",
+          "",
+          "Твоя задача — дать чёткий, структурированный ответ на вопрос пользователя, опираясь исключительно на переданные тебе артефакты анализа (Research, Impact, Context, Plan).",
+          "",
+          "Правила:",
+          "- Не выдумывай факты, которых нет в артефактах.",
+          "- Если данных недостаточно — честно скажи об этом, не придумывай.",
+          "- Не упоминай внутренние названия артефактов (Research, Impact, Context, Plan) в ответе.",
+          "- Не пересказывай артефакты дословно — синтезируй ответ.",
+          "- Пиши по-русски, в стиле опытного инженера.",
+          "",
+          "Структура ответа (соблюдай строго):",
+          "",
+          "## Краткий ответ",
+          "1-2 предложения по сути вопроса.",
+          "",
+          "## Как это работает",
+          "Объясни механизм человеческим языком, опираясь на functional summary и findings из Research.",
+          "",
+          "## Где искать код",
+          "Конкретные файлы, классы, методы из evidence. Перечисли в формате bullet-списка.",
+          "",
+          "## Что изменится при модификации",
+          "Опиши impact: какие файлы/модули будут затронуты, какие побочные эффекты возможны.",
+          "",
+          "## Возможные риски",
+          "Перечисли риски из impact-анализа и unknowns из research. Если рисков нет — так и напиши.",
+          "",
+          "## Рекомендуемый план действий",
+          "Конкретные шаги в порядке выполнения. Если есть готовый execution plan — используй его.",
+          "",
+          "Если по какому-то разделу недостаточно данных, напиши: «Недостаточно данных для уверенного вывода по этому разделу.»",
+        ].join("\n"),
       },
       {
         role: "user",
@@ -349,12 +1196,9 @@ function parseProviderAnswer(
   nextActions: string[];
   warnings: string[];
 } {
-  const lines = content
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+  const sections = parseMarkdownSections(content);
 
-  if (lines.length === 0) {
+  if (sections.size === 0) {
     return {
       summary: fallback.summary,
       explanation: fallback.explanation,
@@ -363,20 +1207,79 @@ function parseProviderAnswer(
     };
   }
 
-  const summary = lines[0] ?? fallback.summary;
-  const remaining = lines.slice(1);
-  const bulletLines = remaining.filter((line) => /^[-*•]/.test(line));
-  const nonBullet = remaining.filter((line) => !/^[-*•]/.test(line));
+  const shortAnswer = extractSectionText(sections, "Краткий ответ");
+  const planSteps = extractSectionBullets(sections, "Рекомендуемый план действий");
 
   return {
-    summary,
-    explanation: nonBullet.join(" ") || fallback.explanation,
-    nextActions: bulletLines
-      .map((line) => line.replace(/^[-*•]\s*/, "").trim())
-      .filter(Boolean)
-      .slice(0, 3),
+    summary: shortAnswer || fallback.summary,
+    explanation: content.trim() || fallback.explanation,
+    nextActions: planSteps.length > 0 ? planSteps : fallback.nextActions,
     warnings: fallback.warnings,
   };
+}
+
+function parseMarkdownSections(content: string): Map<string, string> {
+  const result = new Map<string, string>();
+  const lines = content.split("\n");
+
+  let currentSection = "";
+  let currentLines: string[] = [];
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    const headingMatch = /^##\s+(.+)/.exec(line);
+
+    if (headingMatch && headingMatch[1] !== undefined) {
+      if (currentSection && currentLines.length > 0) {
+        result.set(currentSection, currentLines.join("\n").trim());
+      }
+
+      currentSection = headingMatch[1].trim();
+      currentLines = [];
+      continue;
+    }
+
+    if (currentSection) {
+      currentLines.push(raw);
+    }
+  }
+
+  if (currentSection && currentLines.length > 0) {
+    result.set(currentSection, currentLines.join("\n").trim());
+  }
+
+  return result;
+}
+
+function extractSectionText(sections: Map<string, string>, sectionName: string): string {
+  const raw = sections.get(sectionName);
+
+  if (!raw) {
+    return "";
+  }
+
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !/^[-*•]/.test(line))
+    .join(" ")
+    .trim();
+}
+
+function extractSectionBullets(sections: Map<string, string>, sectionName: string): string[] {
+  const raw = sections.get(sectionName);
+
+  if (!raw) {
+    return [];
+  }
+
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^[-*•]/.test(line))
+    .map((line) => line.replace(/^[-*•]\s*/, "").trim())
+    .filter(Boolean)
+    .slice(0, 4);
 }
 
 function resolveAnswerMode(input: BuildAnswerInput): AnswerMode {
@@ -407,6 +1310,7 @@ function shouldForceEvidenceLockedMode(input: BuildAnswerInput): boolean {
 }
 
 function computeAnswerConfidence(input: BuildAnswerInput): number {
+  const validationCap = input.validatedAnswerPacket?.confidenceCeiling ?? 95;
   const freshnessPenalty =
     input.backgroundState?.freshness === "stale"
       ? 8
@@ -417,7 +1321,7 @@ function computeAnswerConfidence(input: BuildAnswerInput): number {
   return Math.max(
     15,
     Math.min(
-      95,
+      validationCap,
       Math.round(
         (
           input.research.confidence
@@ -516,6 +1420,10 @@ function getBillingEvidenceWeight(item: ResearchReport["evidence"][number]): num
 function buildWarnings(input: BuildAnswerInput): string[] {
   const warnings: string[] = [];
 
+  if (input.validation && input.validation.status !== "ready-for-answer") {
+    warnings.push("Перед финальным ответом сработал validation layer: часть выводов ограничена качеством текущего evidence.");
+  }
+
   if (input.backgroundState?.freshness === "stale") {
     warnings.push("Ответ построен поверх не полностью свежего baseline и текущего branch/worktree overlay. Для максимальной точности желательно обновить фон.");
   }
@@ -546,6 +1454,10 @@ function buildWarnings(input: BuildAnswerInput): string[] {
 function buildNextActions(input: BuildAnswerInput, mode: AnswerMode): string[] {
   const actions: string[] = [];
 
+  if (input.validation?.status === "partial-answer-allowed") {
+    actions.push("Если нужен более сильный ответ, стоит усилить targeted research по рекомендациям validation layer.");
+  }
+
   if (input.backgroundState?.freshness === "stale" || input.backgroundState?.freshness === "missing") {
     actions.push("Если вопрос критичен по точности, сначала запусти принудительный пересбор branch-aware фона.");
   }
@@ -570,6 +1482,10 @@ function buildNextActions(input: BuildAnswerInput, mode: AnswerMode): string[] {
 }
 
 function buildDeterministicSummary(input: BuildAnswerInput, mode: AnswerMode): string {
+  if (input.validatedAnswerPacket?.directAnswerAllowed === false) {
+    return "Текущих подтверждений недостаточно для сильного прямого ответа, поэтому система ограничивает вывод только тем, что реально доказано.";
+  }
+
   if (mode === "insufficient-data-answer") {
     return "Сейчас недостаточно данных для полностью уверенного вывода, но система уже сузила вероятную зону причины.";
   }
@@ -596,49 +1512,211 @@ function buildDeterministicExplanation(
   unknowns: string[],
 ): string {
   if (shouldForceEvidenceLockedMode(input)) {
-    return buildEvidenceLockedExplanation(input, evidenceHighlights, unknowns);
+    return buildStructuredFallbackExplanation(input, mode, evidenceHighlights, unknowns, true);
   }
 
+  return buildStructuredFallbackExplanation(input, mode, evidenceHighlights, unknowns, false);
+}
+
+function buildStructuredFallbackExplanation(
+  input: BuildAnswerInput,
+  mode: AnswerMode,
+  evidenceHighlights: AnswerEvidenceHighlight[],
+  unknowns: string[],
+  evidenceLocked: boolean,
+): string {
+  const sections: string[] = [];
+  const freshnessNote = buildFreshnessExplanation(input);
+  const provenanceNote = buildEvidenceProvenanceExplanation(input.research);
+
+  // Section: Как это работает
+  const howItWorks = buildHowItWorksSection(input, mode);
+  if (howItWorks) {
+    sections.push(howItWorks);
+  }
+
+  // Section: Где искать код
+  const whereToLook = buildWhereToLookSection(input, evidenceHighlights);
+  if (whereToLook) {
+    sections.push(whereToLook);
+  }
+
+  // Section: Что изменится при модификации
+  const impactSection = buildImpactSection(input);
+  if (impactSection) {
+    sections.push(impactSection);
+  }
+
+  // Section: Возможные риски
+  const risksSection = buildRisksSection(input, unknowns);
+  if (risksSection) {
+    sections.push(risksSection);
+  }
+
+  // Section: Рекомендуемый план действий
+  const planSection = buildPlanSection(input);
+  if (planSection) {
+    sections.push(planSection);
+  }
+
+  // Provenance note
+  if (provenanceNote) {
+    sections.push(`*${provenanceNote}*`);
+  }
+
+  if (freshnessNote) {
+    sections.push(`*${freshnessNote}*`);
+  }
+
+  if (evidenceLocked) {
+    sections.push("*Ответ зафиксирован в evidence-locked режиме: недоказанные гипотезы намеренно не включены.*");
+  }
+
+  if (sections.length === 0) {
+    return input.research.summary;
+  }
+
+  return sections.join("\n\n");
+}
+
+function buildHowItWorksSection(input: BuildAnswerInput, mode: AnswerMode): string {
   const parts: string[] = [];
 
-  if (mode === "plan-summary-answer") {
-    parts.push(input.plan.summary);
-    parts.push(`План затрагивает ${input.plan.targetFiles.length} файлов и ${input.plan.targetModules.length} модулей.`);
+  parts.push("## Как это работает");
+
+  if (input.research.functionalSummary.trim().length > 0) {
+    parts.push(input.research.functionalSummary);
   } else {
     parts.push(input.research.summary);
-    const freshnessExplanation = buildFreshnessExplanation(input);
-    const provenanceExplanation = buildEvidenceProvenanceExplanation(input.research);
+  }
 
-    if (freshnessExplanation) {
-      parts.push(freshnessExplanation);
-    }
-
-    if (provenanceExplanation) {
-      parts.push(provenanceExplanation);
-    }
-
-    if (input.research.functionalSummary.trim().length > 0) {
-      parts.push(input.research.functionalSummary);
-    }
-
-    if (input.research.entryPoints.length > 0) {
-      parts.push(`Ключевые точки входа: ${input.research.entryPoints.slice(0, 4).join(", ")}.`);
-    }
-
-    if (input.research.dataSources.length > 0) {
-      parts.push(`Основные источники данных: ${input.research.dataSources.slice(0, 4).join(", ")}.`);
+  if (input.research.entryPoints.length > 0) {
+    parts.push(`\nКлючевые точки входа:`);
+    for (const ep of input.research.entryPoints.slice(0, 5)) {
+      parts.push(`- ${ep}`);
     }
   }
 
-  if (evidenceHighlights.length > 0) {
-    parts.push(`Подтверждения: ${evidenceHighlights.map((item) => `${item.label} — ${item.detail}`).join(" | ")}.`);
+  if (input.research.dataSources.length > 0) {
+    parts.push(`\nИсточники данных:`);
+    for (const ds of input.research.dataSources.slice(0, 4)) {
+      parts.push(`- ${ds}`);
+    }
+  }
+
+  if (input.research.findings.length > 0) {
+    parts.push(`\nДетали:`);
+    for (const finding of input.research.findings.slice(0, 5)) {
+      parts.push(`- ${finding}`);
+    }
+  }
+
+  if (mode === "plan-summary-answer") {
+    parts.push(`\n${input.plan.summary}`);
+  }
+
+  return parts.join("\n");
+}
+
+function buildWhereToLookSection(
+  input: BuildAnswerInput,
+  evidenceHighlights: AnswerEvidenceHighlight[],
+): string {
+  const evidence = input.research.evidence.filter((item) => item.filePath).slice(0, 6);
+
+  if (evidence.length === 0) {
+    return "";
+  }
+
+  const parts: string[] = ["## Где искать код"];
+
+  for (const item of evidence) {
+    const filePath = item.filePath ?? "";
+    parts.push(`- \`${filePath}\` — ${item.label}`);
+    if (item.reason) {
+      parts.push(`  ${item.reason}`);
+    }
+  }
+
+  if (input.plan.targetFiles.length > 0) {
+    parts.push(`\nЦелевые файлы плана (первые 5 из ${input.plan.targetFiles.length}):`);
+    for (const tf of input.plan.targetFiles.slice(0, 5)) {
+      parts.push(`- \`${tf}\``);
+    }
+  }
+
+  return parts.join("\n");
+}
+
+function buildImpactSection(input: BuildAnswerInput): string {
+  const parts: string[] = ["## Что изменится при модификации"];
+
+  parts.push(input.impact.summary);
+
+  if (input.impact.affectedFiles.length > 0) {
+    parts.push(`\nЗатронутые файлы (${input.impact.affectedFiles.length}):`);
+    for (const f of input.impact.affectedFiles.slice(0, 8)) {
+      const path = typeof f === "string" ? f : (f as { filePath?: string }).filePath ?? "?";
+      parts.push(`- \`${path}\``);
+    }
+
+    if (input.impact.affectedFiles.length > 8) {
+      parts.push(`- ...и ещё ${input.impact.affectedFiles.length - 8} файлов`);
+    }
+  }
+
+  if (input.impact.affectedSymbols.length > 0) {
+    parts.push(`\nЗатронутые символы (${input.impact.affectedSymbols.length}): ${input.impact.affectedSymbols.slice(0, 6).join(", ")}`);
+  }
+
+  return parts.join("\n");
+}
+
+function buildRisksSection(input: BuildAnswerInput, unknowns: string[]): string {
+  const riskItems: string[] = [];
+
+  if (input.impact.risks.length > 0) {
+    riskItems.push(...input.impact.risks);
   }
 
   if (unknowns.length > 0) {
-    parts.push(`Открытые вопросы: ${unknowns.slice(0, 2).join(" | ")}.`);
+    riskItems.push(...unknowns.map((u) => `⚠️ Не подтверждено: ${u}`));
   }
 
-  return parts.join(" ");
+  if (riskItems.length === 0) {
+    return "## Возможные риски\n\nЯвных рисков не выявлено на основе текущих данных.";
+  }
+
+  const parts: string[] = ["## Возможные риски"];
+
+  for (const risk of riskItems.slice(0, 6)) {
+    parts.push(`- ${risk}`);
+  }
+
+  return parts.join("\n");
+}
+
+function buildPlanSection(input: BuildAnswerInput): string {
+  const parts: string[] = ["## Рекомендуемый план действий"];
+
+  if (input.plan.steps.length > 0) {
+    for (let i = 0; i < Math.min(input.plan.steps.length, 6); i++) {
+      const step = input.plan.steps[i];
+      if (step === undefined) {
+        continue;
+      }
+      const label = step.title ?? step.description ?? `Шаг ${i + 1}`;
+      parts.push(`${i + 1}. ${label}`);
+    }
+  } else {
+    parts.push("Недостаточно данных для построения конкретного плана.");
+  }
+
+  if (input.plan.planningNotes) {
+    parts.push(`\n*${input.plan.planningNotes}*`);
+  }
+
+  return parts.join("\n");
 }
 
 function buildConfirmedFacts(
@@ -839,31 +1917,136 @@ function collectRuntimeFacts(input: BuildAnswerInput): string[] {
 }
 
 function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage): string {
+  const evidenceList = input.research.evidence.length > 0
+    ? input.research.evidence.slice(0, 8).map((item) =>
+        `- \`${item.filePath ?? "?"}\`: ${item.label} — ${item.reason}`,
+      ).join("\n")
+    : "(нет evidence)";
+
+  const provenanceLine = [
+    `baseline-фактов: ${input.research.evidenceSummary.baselineCount}`,
+    `overlay-фактов: ${input.research.evidenceSummary.overlayCount}`,
+    `structural-опор: ${input.research.evidenceSummary.structuralCount}`,
+    input.research.evidenceSummary.overlayInfluenced
+      ? "Локальные незакоммиченные изменения materially влияют на вывод."
+      : "Вывод опирается прежде всего на committed baseline.",
+  ].join(" | ");
+
+  const freshnessLine = input.backgroundState
+    ? [
+        `freshness: ${input.backgroundState.freshness}`,
+        `baselineSource: ${input.backgroundState.baselineSource}`,
+        input.backgroundState.hasLocalChanges
+          ? `Есть ${input.backgroundState.changedFileCount} незакоммиченных изменений в worktree — это overlay, а не baseline.`
+          : "Worktree чист, все факты из committed baseline.",
+      ].join(" | ")
+    : "backgroundState отсутствует";
+
+  const unknownsLine = input.research.unknowns.length > 0
+    ? input.research.unknowns.slice(0, 4).map((u) => `- ${u}`).join("\n")
+    : "(нет unknowns)";
+
+  const risksLine = input.impact.risks.length > 0
+    ? input.impact.risks.slice(0, 5).map((r) => `- ${r}`).join("\n")
+    : "(риски не выявлены)";
+
+  const planStepsLine = input.plan.steps.length > 0
+    ? input.plan.steps.slice(0, 6).map((s, i) => `- Шаг ${i + 1}: ${s.title ?? s.description ?? ""}`).join("\n")
+    : "(плана нет)";
+
   return [
-    `Запрос пользователя: ${input.task}`,
-    `Режим ответа: ${fallback.answerMode}`,
-    `Research summary: ${input.research.summary}`,
-    `Functional summary: ${input.research.functionalSummary}`,
-    `Entry points: ${input.research.entryPoints.slice(0, 6).join(", ") || "нет данных"}`,
-    `Data sources: ${input.research.dataSources.slice(0, 6).join(", ") || "нет данных"}`,
-    `Findings: ${input.research.findings.slice(0, 8).join(" | ") || "нет данных"}`,
-    `Baseline findings: ${input.research.baselineFindings.slice(0, 6).join(" | ") || "нет данных"}`,
-    `Overlay findings: ${input.research.overlayFindings.slice(0, 4).join(" | ") || "нет данных"}`,
-    `Evidence provenance: baseline=${input.research.evidenceSummary.baselineCount}, overlay=${input.research.evidenceSummary.overlayCount}, structural=${input.research.evidenceSummary.structuralCount}`,
-    `Unknowns: ${input.research.unknowns.slice(0, 4).join(" | ") || "нет данных"}`,
+    "=== ЗАПРОС ПОЛЬЗОВАТЕЛЯ ===",
+    input.task,
+    "",
+    "=== 1. RESEARCH (что система знает о коде) ===",
+    `Functional summary: ${input.research.functionalSummary || "(нет)"}`,
+    `Суммарный вывод: ${input.research.summary}`,
+    `Confidence: ${input.research.confidence}%`,
+    "",
+    "Entry points:",
+    input.research.entryPoints.length > 0
+      ? input.research.entryPoints.slice(0, 6).map((ep) => `- ${ep}`).join("\n")
+      : "(нет)",
+    "",
+    "Data sources:",
+    input.research.dataSources.length > 0
+      ? input.research.dataSources.slice(0, 6).map((ds) => `- ${ds}`).join("\n")
+      : "(нет)",
+    "",
+    "Key findings:",
+    input.research.findings.length > 0
+      ? input.research.findings.slice(0, 8).map((f) => `- ${f}`).join("\n")
+      : "(нет)",
+    "",
+    "Evidence (файлы и факты):",
+    evidenceList,
+    "",
+    "Baseline findings (committed map):",
+    input.research.baselineFindings.length > 0
+      ? input.research.baselineFindings.slice(0, 6).map((bf) => `- ${bf}`).join("\n")
+      : "(нет отдельных baseline-фактов)",
+    "",
+    "Overlay findings (локальные незакоммиченные изменения):",
+    input.research.overlayFindings.length > 0
+      ? input.research.overlayFindings.slice(0, 4).map((of) => `- ${of}`).join("\n")
+      : "(нет локальных изменений, влияющих на вывод)",
+    "",
+    `Provenance: ${provenanceLine}`,
+    "",
+    `Freshness: ${freshnessLine}`,
+    "",
+    "=== 2. IMPACT (что будет затронуто при изменениях) ===",
     `Impact summary: ${input.impact.summary}`,
-    `Impact risks: ${input.impact.risks.slice(0, 5).join(" | ") || "нет данных"}`,
-    `Context highlights: ${input.context.functionalHighlights.slice(0, 5).join(" | ") || "нет данных"}`,
+    `Affected files: ${input.impact.affectedFiles.length}`,
+    input.impact.affectedFiles.length > 0
+      ? input.impact.affectedFiles.slice(0, 8).map((f) => `- ${typeof f === "string" ? f : (f as { filePath?: string }).filePath ?? "?"}`).join("\n")
+      : "(нет)",
+    "",
+    "Риски:",
+    risksLine,
+    "",
+    "=== 3. CONTEXT (релевантные фрагменты кода) ===",
+    `Context confidence: ${input.context.confidence}%`,
+    `Token budget: ${input.context.tokenBudget}`,
+    `Selected chunks: ${input.context.selectedChunks.length}`,
+    input.context.functionalHighlights.length > 0
+      ? `Highlights: ${input.context.functionalHighlights.slice(0, 5).join(" | ")}`
+      : "(нет highlights)",
+    input.context.rankingSummary
+      ? `Ranking: ${input.context.rankingSummary}`
+      : "",
+    "",
+    "=== 4. PLAN (план действий) ===",
     `Plan summary: ${input.plan.summary}`,
-    `Execution preview: ${input.preview.summary}`,
-    `Fallback summary: ${fallback.summary}`,
-    "Сформируй короткий пользовательский ответ по-русски.",
-    "Разрешено использовать только факты, которые прямо подтверждены переданными evidence, findings, data sources и entry points.",
-    "Если факт опирается только на локальный незакоммиченный overlay, это нужно явно обозначить и не выдавать как committed baseline проекта.",
-    "Запрещено добавлять типичные догадки про Laravel, middleware order, session, cookie, query params, kernel registration или другие детали, если они не подтверждены во входных данных.",
-    "Если чего-то не хватает для уверенного вывода, прямо скажи, что это не подтверждено текущими данными.",
-    "Не упоминай названия внутренних артефактов как основной результат. Не выдумывай то, чего нет в данных.",
-  ].join("\n");
+    `Target modules: ${input.plan.targetModules.join(", ") || "(нет)"}`,
+    `Target files: ${input.plan.targetFiles.length}`,
+    `Approval required: ${input.plan.approvalRequired ? "да" : "нет"}`,
+    input.plan.planningNotes
+      ? `Planning notes: ${input.plan.planningNotes}`
+      : "",
+    "",
+    "Steps:",
+    planStepsLine,
+    "",
+    "=== 5. EXECUTION PREVIEW ===",
+    `Preview summary: ${input.preview.summary}`,
+    `Allowed actions: ${input.preview.allowedActions.length}`,
+    "",
+    "=== UNKNOWNS (чего система НЕ знает) ===",
+    unknownsLine,
+    "",
+    "=== ИНСТРУКЦИЯ ===",
+    `Режим ответа: ${fallback.answerMode}`,
+    "Сформируй ответ по-русски строго по структуре из system prompt.",
+    "Используй только факты, прямо подтверждённые в секциях выше.",
+    "Если факт только из overlay findings — явно обозначь: «это обнаружено в незакоммиченных изменениях».",
+    "Не добавляй типичные догадки про Laravel, middleware order, session, cookie, query params, kernel registration — если они не подтверждены выше.",
+    "Если по разделу данных недостаточно — честно напиши об этом.",
+    "Не упоминай слова Research, Impact, Context, Plan в ответе.",
+    "Пиши как senior-разработчик, который объясняет коллеге.",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
 }
 
 function validateProviderAnswer(

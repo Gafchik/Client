@@ -1532,6 +1532,8 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeInspectorTab, setActiveInspectorTab] = useState<InspectorTab>("overview");
   const activeRunIdRef = useRef<string | null>(null);
+  const selectedProjectIdRef = useRef<string>("");
+  const projectPathRef = useRef<string>("");
   const readiness = projectReadinessState(project);
   const backgroundSyncStatus = backgroundSyncState(project);
 
@@ -1576,6 +1578,14 @@ export function App() {
   }, [activeRunId]);
 
   useEffect(() => {
+    selectedProjectIdRef.current = selectedProjectId;
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    projectPathRef.current = projectPath;
+  }, [projectPath]);
+
+  useEffect(() => {
     if (!project?.backgroundState || !selectedProjectId || running) {
       return;
     }
@@ -1617,8 +1627,12 @@ export function App() {
     try {
       const loadedProjects = await loadProjects();
       await loadProviders();
-      const initialProjectId = loadedProjects[0]?.id ?? "";
-      await loadProject(initialProjectId ? undefined : projectPath, initialProjectId || undefined);
+      const preferredProjectId =
+        selectedProjectIdRef.current && loadedProjects.some((projectItem) => projectItem.id === selectedProjectIdRef.current)
+          ? selectedProjectIdRef.current
+          : loadedProjects[0]?.id ?? "";
+      const preferredProject = loadedProjects.find((projectItem) => projectItem.id === preferredProjectId) ?? null;
+      await loadProject(preferredProject?.paths[0]?.rootPath, preferredProjectId || undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось инициализировать приложение.");
       setLoading(false);
@@ -1631,11 +1645,13 @@ export function App() {
     startTransition(() => {
       setProjects(projectCatalog.projects);
       setSelectedProjectId((current) => {
-        if (current && projectCatalog.projects.some((projectItem) => projectItem.id === current)) {
-          return current;
-        }
+        const nextProjectId =
+          current && projectCatalog.projects.some((projectItem) => projectItem.id === current)
+            ? current
+            : projectCatalog.projects[0]?.id ?? "";
 
-        return projectCatalog.projects[0]?.id ?? "";
+        selectedProjectIdRef.current = nextProjectId;
+        return nextProjectId;
       });
     });
 
@@ -1715,12 +1731,21 @@ export function App() {
 
       const projectResponse = await fetchJsonWithTimeout<ProjectInfo>(`${API_BASE_URL}/api/project${params.size ? `?${params.toString()}` : ""}`);
       const data = normalizeProjectInfo(projectResponse);
+      const matchingProject =
+        data.projectRecord
+        ?? projects.find((projectItem) =>
+          safeList(projectItem.paths).some((pathItem) => pathItem.rootPath === data.rootPath),
+        )
+        ?? null;
       const latestEntry = data.latestRun ? safeList(data.recentRuns).find((entry) => entry.runId === data.latestRun?.runId) ?? null : null;
 
       startTransition(() => {
         setProject(data);
-        setSelectedProjectId(data.projectRecord?.id ?? requestedProjectId);
+        const resolvedProjectId = matchingProject?.id ?? requestedProjectId;
+        setSelectedProjectId(resolvedProjectId);
+        selectedProjectIdRef.current = resolvedProjectId;
         setProjectPath(data.rootPath);
+        projectPathRef.current = data.rootPath;
         const activePath = resolveSelectedProjectPath(data.projectRecord, data.rootPath);
         setSelectedProjectPathId(activePath?.id ?? "");
         setResult((current) => {
@@ -1865,6 +1890,17 @@ export function App() {
       });
 
       if (status.status === "completed" && status.result) {
+        const resolvedProjectId =
+          selectedProjectIdRef.current
+          || project?.projectRecord?.id
+          || selectedProjectId
+          || undefined;
+        const resolvedProjectPath =
+          status.result.project.rootPath
+          || projectPathRef.current
+          || project?.rootPath
+          || projectPath;
+
         startTransition(() => {
           setResult(status.result ?? null);
           setActiveRunId(null);
@@ -1894,7 +1930,7 @@ export function App() {
               : current,
           );
         });
-        await loadProject(status.result.project.rootPath, selectedProjectId || undefined);
+        await loadProject(resolvedProjectPath, resolvedProjectId);
         return;
       }
 
