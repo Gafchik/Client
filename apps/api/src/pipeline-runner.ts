@@ -44,6 +44,12 @@ const runStore = new Map<string, PipelineRunStatus>();
 const runAppRootStore = new Map<string, string>();
 const PIPELINE_STATUS_RETENTION_MS = 1000 * 60 * 60 * 24 * 3;
 
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineRunStatus {
   const createdAt = new Date().toISOString();
   const initialStatus: PipelineRunStatus = {
@@ -67,7 +73,9 @@ export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineR
   runStore.set(request.runId, initialStatus);
   runAppRootStore.set(request.runId, request.appRootPath);
   void persistRunStatus(request.appRootPath, initialStatus);
-  void executePipelineRun(request);
+  setTimeout(() => {
+    void executePipelineRun(request);
+  }, 0);
 
   return initialStatus;
 }
@@ -199,6 +207,7 @@ export async function bootstrapPipelineRunStatuses(appRootPath: string): Promise
 
 async function executePipelineRun(request: PipelineExecutionRequest): Promise<void> {
   markRunRunning(request.runId);
+  await yieldToEventLoop();
 
   try {
     const result = await buildPipelineRunResult(request);
@@ -265,6 +274,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       ? `Собран repository snapshot: ветка ${repository.branch || "unknown"}, изменений ${repository.summary.changedFileCount}.`
       : "Git-репозиторий не обнаружен, historical repository intelligence недоступен.",
   );
+  await yieldToEventLoop();
 
   const projectRootPath = overview.rootPath;
   const projectId = overview.projectId;
@@ -279,6 +289,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     baselineRun: previousRun,
     baselineSource: baselineSelection.source,
   });
+  await yieldToEventLoop();
 
   const baselineWorkspace = previousRun ? await openWorkspaceSelective(projectPath, {
     includePaths: [],
@@ -326,12 +337,14 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     repository,
     backgroundState,
   });
+  await yieldToEventLoop();
   const incrementalIndex = buildIncrementalIndexPlan(previousRun, repository, selectiveCandidatePaths, shouldUseSelectiveWorkspace);
   const graphInvalidation = buildGraphInvalidationPlan(previousRun, repository, workspace.rootPath);
   updatePartialArtifacts(runId, {
     incrementalIndex,
     graphInvalidation,
   });
+  await yieldToEventLoop();
 
   const canUseLightweightQuestionFlow =
     isQuestionRun
@@ -369,6 +382,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       diagnostics: index.diagnostics,
     },
   });
+  await yieldToEventLoop();
 
   const graphStartedAt = startStage(runId, "graph");
   const graph = buildGraph(workspace, index, {
@@ -381,6 +395,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       summary: graph.summary,
     },
   });
+  await yieldToEventLoop();
 
   const researchStartedAt = startStage(runId, "research");
   const research = runResearch({
@@ -401,6 +416,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   updatePartialArtifacts(runId, {
     research,
   });
+  await yieldToEventLoop();
 
   const impactStartedAt = startStage(runId, "impact");
   const impact = analyzeImpact({
@@ -412,6 +428,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   updatePartialArtifacts(runId, {
     impact,
   });
+  await yieldToEventLoop();
 
   const contextStartedAt = startStage(runId, "context");
   const context = buildContextPackage({
@@ -427,6 +444,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   updatePartialArtifacts(runId, {
     context,
   });
+  await yieldToEventLoop();
 
   const planStartedAt = startStage(runId, "plan");
   const plan = buildExecutionPlan({
@@ -441,6 +459,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   updatePartialArtifacts(runId, {
     plan,
   });
+  await yieldToEventLoop();
 
   const previewStartedAt = startStage(runId, "preview");
   const executionPreview = buildExecutionPreview(runId, plan);
@@ -448,6 +467,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   updatePartialArtifacts(runId, {
     executionPreview,
   });
+  await yieldToEventLoop();
 
   const runtimeStartedAt = startStage(runId, "runtime");
   const executionRuntime = buildControlledExecutionRuntime({
@@ -460,6 +480,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   updatePartialArtifacts(runId, {
     executionRuntime,
   });
+  await yieldToEventLoop();
 
   const answerStartedAt = startStage(runId, "answer");
   const answer = await buildAnswerPackage({
@@ -480,6 +501,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   updatePartialArtifacts(runId, {
     answer,
   });
+  await yieldToEventLoop();
 
   const knowledgeStartedAt = startStage(runId, "knowledge");
   const knowledge = await saveKnowledgeArtifacts({

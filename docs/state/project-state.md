@@ -1,6 +1,6 @@
 # Project State
 
-**Дата обновления:** 2026-07-09  
+**Дата обновления:** 2026-07-10  
 **Текущий этап:** MVP / Slice 1
 
 ## Что уже реализовано
@@ -21,6 +21,12 @@
   - каждый пользовательский запрос автоматически создаёт внутренний `Run`;
   - прогресс pipeline показывается inline внутри AI-сообщения;
   - детальные инженерные артефакты вынесены в правый `Inspector`.
+- Chat-first UI product pass первого уровня завершён:
+  - добавлена отдельная продуктовая спецификация `docs/modules/chat-ui.md`;
+  - главный экран перестроен вокруг спокойного ежедневного сценария `выбрал проект -> задал вопрос -> прочитал ответ`;
+  - верхняя панель упрощена, слева оставлена история диалога, справа `Inspector` открывается только по требованию;
+  - на главной поверхности оставлены только `Project`, `Path`, `Provider`, `Model`, статус проекта, чат и composer;
+  - шумные технические панели убраны из primary UX и переведены во вторичный слой.
 - Центральное хранение артефактов внутри проекта `client`, а не внутри внешних тестируемых репозиториев.
 - Сохранение истории запусков по каждому анализируемому проекту.
 - Просмотр сохранённых запусков в UI.
@@ -175,6 +181,15 @@
   - добавлены retry/backoff для transient ошибок и `429/5xx`;
   - учитывается `Retry-After`, если провайдер его возвращает;
   - при ошибке провайдера система обязана отдавать deterministic fallback answer вместо падения run.
+- Главный chat-ответ упрощён до LLM-подобного UX:
+  - в основном bubble теперь доминирует нормальный человеко-читаемый ответ, а не report dump;
+  - на главной поверхности сохранены только компактные блоки `Ответ`, `Impact`, `Context`, `Plan`;
+  - сохранены `Ограничения`, `План реализации` и действия `Почему я так ответил`, `Открыть исследование`, `Посмотреть план`, `Execution preview`;
+  - из основного ответа убраны raw evidence lists, provenance dump и избыточные технические сводки.
+- Frontend chat runtime согласован с новым UX:
+  - исправлен класс ошибок, при котором результат предыдущего run мог визуально попасть в новое сообщение;
+  - теперь UI показывает ответ только если `result.runId` совпадает с активным `runStatus.runId`;
+  - это уменьшает риск ложного ответа при быстрых последовательных вопросах.
 - Главный пользовательский UX упрощён до минимального chat-first сценария:
   - на основном экране оставлены только выбор проекта, выбор провайдера, выбор модели и чат;
   - operator-facing сводки, подсказки и вторичные панели убраны с главной поверхности;
@@ -357,6 +372,8 @@
 25. управлять проектами и провайдерами через отдельные страницы GUI, а не через перегруженный основной экран чата.
 26. различать `background-sync` и `question-run` как отдельные runtime-режимы в API, knowledge artifacts и UI.
 27. автоматически поднимать фоновую пересборку project intelligence при устаревшем или отсутствующем baseline.
+28. отвечать через подключённый live LLM runtime поверх `Research -> Impact -> Context -> Plan`, а при ошибке провайдера честно откатываться к deterministic fallback answer.
+29. использовать новый спокойный chat shell как основную пользовательскую поверхность вместо старого перегруженного operator-facing экрана.
 
 ## Что пока ограничено
 
@@ -380,7 +397,10 @@
 - Planner теперь строит richer graph-backed deterministic plan, но всё ещё без полноценного execution runtime, rollback orchestration и live replanning.
 - Planner уже чувствителен к типу исследовательского профиля, но ещё не использует формальный rollback-plan и pre-execution blocking rules по confidence/unknowns.
 - Execution layer теперь имеет safe preview и controlled runtime contract, но всё ещё без фактической мутации файлов.
-- Provider runtime config уже собирается и сохраняется вместе с запуском, но фактический live-вызов модели ещё не подключён.
+- Provider/runtime контур уже выполняет реальные live-вызовы модели, но пока ещё ограничен по observability и runtime-governance:
+  - нет полноценного cost dashboard;
+  - нет rich rate-limit analytics по провайдерам и моделям;
+  - нет отдельного provider health/history слоя уровня production runtime platform.
 - Chat-first UX уже показывает branch-aware readiness проекта, но сами question-time исследования всё ещё запускают полный pipeline run; следующий шаг — отделить background refresh от лёгкого question answering поверх готового state.
 - Проект пока использует первый путь сохранённого `Project` как активный runtime-root для чата; полноценная multi-path orchestration внутри одного общего branch-aware run ещё не реализована.
 - `question-run` уже отделён от `background-sync` по runtime-контракту, но semantic lightweight path пока остаётся MVP-уровня: он всё ещё использует тот же базовый pipeline и пока не заменён полноценным overlay-native research engine.
@@ -426,12 +446,15 @@
   - нет различения между кратковременной сетевой ошибкой и реальной смертью backend;
   - сброс зависшего запуска пока ручной, а не policy-driven.
 - Live LLM runtime пока отсутствует:
-  - полноценный mutation/runtime loop всё ещё не подключён;
-  - live model orchestration только начинается с answer synthesis слоя;
-  - token accounting, cost accounting и richer provider observability ещё не доведены до отдельного subsystem уровня.
-- Answer-first response layer пока описан архитектурно, но ещё не реализован в runtime:
-  - follow-up continuity и conversational answer reuse ещё не materialized;
-  - Inspector всё ещё остаётся довольно техническим и требует дальнейшего product pass.
+- Mutation/runtime loop по-прежнему отсутствует:
+  - MVP пока сознательно не пишет код и не вносит изменения в проект;
+  - `Execution Preview` остаётся превью-поверхностью, а не реальным executor-слоем;
+  - post-change orchestration остаётся следующей фазой, а не частью текущего MVP.
+- Live answer runtime уже работает, но сам answer-слой ещё требует усиления:
+  - follow-up continuity между сообщениями остаётся слабой;
+  - формулировки ответа ещё не всегда достаточно “человеческие” на больших и шумных репозиториях;
+  - `Inspector` всё ещё остаётся техническим и требует дальнейшего product pass;
+  - нужны дополнительные quality passes для реальных кейсов на больших PHP-репозиториях.
 
 ## Где хранятся артефакты
 
@@ -461,28 +484,18 @@
 
 Следующий этап после текущего MVP expansion pass:
 
-- подключить первый реальный live LLM runtime поверх уже готового provider/model слоя;
-- реализовать `Answer Engine` как user-facing answer synthesis layer поверх внутреннего pipeline;
-- передавать во внешний inference runtime `Research + Impact + Context + Plan` вместо чисто локального preview-контура;
-- начать controlled execution runtime вместо одного preview-слоя;
-- добавить фактический mutation executor поверх уже готовых scope guard и write boundary;
-- подготовить post-change reindex, graph refresh и knowledge refresh orchestration как исполняемый runtime flow;
-- продолжить staged pipeline для больших репозиториев: cheap-first workspace/index path, потом selective deep analysis;
-- углубить functional research, чтобы feature-level understanding было точнее и менее эвристическим;
-- добавить model-aware token budgeting и semantic reranking в Context Builder;
-- углубить Context Builder до graph-backed dependency expansion внутри query profile, а не только path/rule-based ranking;
-- продолжить graph-core evolution до richer relation semantics, snapshot/version layer и query surface, пригодных для будущего DB-backed graph storage;
-- продолжить перенос Research с file/content heuristics на более явный graph-first traversal и query-profile-specific expansion;
-- развить `Repository Git Intelligence` от MVP к operational/historical subsystem:
-  - связать Git change scope с planner safety rules;
-  - добавить historical signals для research и impact;
-  - добавить rollback anchors и run-scoped mutation ownership;
-  - начать co-change и hotspot анализ.
-- следующий инфраструктурный шаг для runtime:
-  - вынести тяжёлые стадии из одного процесса при необходимости;
-  - углубить `resume` от restart-from-start до stage-aware continuation;
-  - вынести retention и cleanup policy в конфигурационный слой;
+- стабилизировать `question-run` на больших репозиториях, чтобы вопрос действительно работал поверх готового baseline + overlay, а не ощущался как скрытый full research;
+- дожать качество `Research` на реальных рабочих кейсах, особенно для behavioral/runtime вопросов и нестандартных enterprise-архитектур;
+- почистить `Impact`, чтобы он не раздувал answer scope нерелевантными файлами и соседними доменами;
+- усилить `Context Builder`, чтобы в `Context Package` попадал только действительно полезный материал под текущий вопрос и token budget;
+- сделать `Planner` практически полезным как инженерный план реализации, а не просто как формально корректную структуру;
+- отполировать финальный `Answer`, чтобы он читался как сильный ответ AI-помощника, а не как технический отчёт;
+- продолжить branch-aware background intelligence:
+  - углубить baseline reuse;
+  - усилить lightweight overlay для локальных незакоммиченных изменений;
+  - довести hard resync / background sync / question-run до полностью понятной и устойчивой модели;
+- продолжить staged runtime для больших репозиториев:
   - углубить `incremental index plan` до symbol-aware incremental index и AST reuse;
   - углубить `graph invalidation plan` до partial graph refresh поверх предыдущего graph state;
-  - разнести partial artifacts в отдельные stage-scoped persisted artifacts;
+  - вынести retention/cleanup policy в конфигурационный слой;
   - усилить data-shape validation между API, сохранёнными артефактами и UI.

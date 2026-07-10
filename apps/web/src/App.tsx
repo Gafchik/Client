@@ -345,32 +345,148 @@ function PanelFallback({ title, message }: { title: string; message: string }) {
   );
 }
 
-function NavigationTabs({
-  activeView,
-  onChange,
-}: {
-  activeView: AppView;
-  onChange: (view: AppView) => void;
-}) {
-  const tabs: Array<{ id: AppView; label: string }> = [
-    { id: "chat", label: "Чат" },
-    { id: "projects", label: "Проекты" },
-    { id: "providers", label: "Провайдеры" },
-  ];
+function formatHistoryTime(value: string | undefined): string {
+  if (!value) {
+    return "Недавно";
+  }
 
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Недавно";
+  }
+
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function buildHistoryTitle(task: string | undefined): string {
+  const normalized = safeText(task, "Новый вопрос");
+  return normalized.length > 72 ? `${normalized.slice(0, 69)}...` : normalized;
+}
+
+function RunHistorySidebar({
+  recentRuns,
+  activeRunId,
+  onSelectRun,
+  projectName,
+}: {
+  recentRuns: KnowledgeCatalogEntry[];
+  activeRunId: string | null;
+  onSelectRun: (runId: string) => void;
+  projectName: string;
+}) {
   return (
-    <nav className="top-nav">
-      {tabs.map((tab) => (
-        <button
-          key={tab.id}
-          type="button"
-          className={`top-nav-button ${activeView === tab.id ? "top-nav-button-active" : ""}`}
-          onClick={() => onChange(tab.id)}
-        >
-          {tab.label}
+    <aside className="chat-history">
+      <div className="chat-history-head">
+        <button type="button" className="primary-button history-new-button">
+          Новый чат
         </button>
-      ))}
-    </nav>
+      </div>
+
+      <div className="chat-history-group">
+        <p className="section-kicker">Недавние вопросы</p>
+        <div className="chat-history-list">
+          {safeList(recentRuns).length ? (
+            safeList(recentRuns).slice(0, 10).map((entry) => (
+              <button
+                key={entry.runId}
+                type="button"
+                className={`history-item ${activeRunId === entry.runId ? "history-item-active" : ""}`}
+                onClick={() => onSelectRun(entry.runId)}
+              >
+                <strong>{buildHistoryTitle(entry.task)}</strong>
+                <span>{projectName} · {formatHistoryTime(entry.savedAt)}</span>
+              </button>
+            ))
+          ) : (
+            <div className="empty-card">
+              <strong>История появится после первого вопроса</strong>
+              <span>Сейчас здесь будут сохраняться последние запуски.</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="chat-history-foot">
+        <span>{projectName}</span>
+      </div>
+    </aside>
+  );
+}
+
+function EnvironmentStrip({
+  projects,
+  selectedProjectId,
+  selectedProjectPathId,
+  selectedProviderId,
+  providerModelDraft,
+  providers,
+  providerModels,
+  project,
+  onProjectChange,
+  onProjectPathChange,
+  onProviderChange,
+  onModelChange,
+}: {
+  projects: ProjectRecord[];
+  selectedProjectId: string;
+  selectedProjectPathId: string;
+  selectedProviderId: string;
+  providerModelDraft: string;
+  providers: ProviderRecord[];
+  providerModels: ProviderModelRecord[];
+  project: ProjectInfo | null;
+  onProjectChange: (projectId: string) => void;
+  onProjectPathChange: (pathId: string) => void;
+  onProviderChange: (providerId: string) => void;
+  onModelChange: (modelId: string) => void;
+}) {
+  return (
+    <section className="environment-strip">
+      <select className="environment-pill" value={selectedProjectId} onChange={(event) => onProjectChange(event.target.value)}>
+        <option value="">Проект</option>
+        {safeList(projects).map((projectItem) => (
+          <option key={projectItem.id} value={projectItem.id}>
+            {projectItem.name}
+          </option>
+        ))}
+      </select>
+
+      <select className="environment-pill" value={selectedProjectPathId} onChange={(event) => onProjectPathChange(event.target.value)}>
+        <option value="">Путь</option>
+        {safeList(projects.find((item) => item.id === selectedProjectId)?.paths).map((pathItem) => (
+          <option key={pathItem.id} value={pathItem.id}>
+            {pathItem.name}
+          </option>
+        ))}
+      </select>
+
+      <select className="environment-pill" value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)}>
+        <option value="">Провайдер</option>
+        {safeList(providers).map((provider) => (
+          <option key={provider.id} value={provider.id}>
+            {provider.name}
+          </option>
+        ))}
+      </select>
+
+      <select className="environment-pill" value={providerModelDraft} onChange={(event) => onModelChange(event.target.value)}>
+        {safeList(providerModels).map((model) => (
+          <option key={model.id} value={model.id}>
+            {model.label}
+          </option>
+        ))}
+        {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
+      </select>
+
+      <div className="environment-status-pill">
+        <strong>{backgroundSyncState(project).title}</strong>
+        <span>{projectReadinessState(project).title}</span>
+      </div>
+    </section>
   );
 }
 
@@ -509,7 +625,7 @@ function AssistantRunMessage({
   onOpenInspector: (tab?: InspectorTab) => void;
 }) {
   const running = runStatus && (runStatus.status === "queued" || runStatus.status === "running");
-  const completed = hasRunArtifacts(result);
+  const completed = hasRunArtifacts(result) && (!runStatus || runStatus.runId === result.runId);
   const failed = runStatus?.status === "failed";
 
   if (!running && !completed && !failed) {
@@ -517,8 +633,8 @@ function AssistantRunMessage({
       <div className="message assistant-message">
         <div className="message-badge">Client</div>
         <div className="message-card">
-          <h3>Run ещё не запущен</h3>
-          <p>Сформулируй вопрос или инженерную задачу, а дальше система сама построит pipeline и покажет артефакты.</p>
+          <h3>Готов ответить по проекту</h3>
+          <p>Выбери проект, провайдера и модель, затем задай инженерный вопрос. Client возьмёт уже собранную карту проекта, добавит твой вопрос в контекст и вернёт прикладной ответ.</p>
         </div>
       </div>
     );
@@ -531,10 +647,9 @@ function AssistantRunMessage({
         {running ? (
           <>
             <p className="message-label">Сейчас система думает</p>
-            <h3>{runModeLabel(runStatus?.mode)} · {safeText(runStatus?.currentStageLabel, "Готовлю исследование проекта")}</h3>
+            <h3>Изучаю актуальное состояние проекта и готовлю ответ</h3>
             <p>
-              Run уже создан и выполняется во внутреннем pipeline. Ты видишь наружу только безопасный прогресс, а все
-              детальные артефакты можно открыть через Inspector.
+              Вопрос уже запущен поверх project baseline. Ниже виден только полезный прогресс, а детальные инженерные артефакты можно открыть через Inspector.
             </p>
             <InlinePipeline
               stages={safeList(runStatus?.stages)}
@@ -562,77 +677,6 @@ function AssistantRunMessage({
             <p className="message-label">Ответ подготовлен</p>
             <h3>{safeText(result.answer?.summary, result.research.summary)}</h3>
             <p>{safeText(result.answer?.explanation, result.research.functionalSummary || "Функциональная картина пока не сформирована.")}</p>
-
-            <div className="provenance-card">
-              <div className="provenance-head">
-                <strong>{buildAnswerProvenanceLabel(result)}</strong>
-                <span>{safeText(result.backgroundState?.worktreeStatus === "overlay" ? "Есть локальные изменения" : "Локальный overlay не влияет")}</span>
-              </div>
-              <p>{buildAnswerProvenanceSummary(result)}</p>
-              <div className="provenance-chips">
-                <span className="provenance-chip">
-                  baseline {safeCount(result.research?.evidenceSummary?.baselineCount)}
-                </span>
-                <span className="provenance-chip">
-                  overlay {safeCount(result.research?.evidenceSummary?.overlayCount)}
-                </span>
-                <span className="provenance-chip">
-                  structural {safeCount(result.research?.evidenceSummary?.structuralCount)}
-                </span>
-              </div>
-            </div>
-
-            <div className="list">
-              {safeList(result.answer?.evidenceHighlights).length ? (
-                safeList(result.answer?.evidenceHighlights).map((item) => (
-                  <div key={`${item.label}:${item.detail}`} className="list-item">
-                    <strong>{item.label}</strong>
-                    <span>{item.detail}</span>
-                  </div>
-                ))
-              ) : null}
-            </div>
-
-            <div className="answer-sections">
-              {safeList(result.answer?.confirmedFacts).length ? (
-                <div className="answer-section-card">
-                  <p className="message-label">Подтверждено</p>
-                  <div className="list">
-                    {safeList(result.answer?.confirmedFacts).map((item) => (
-                      <div key={item} className="list-item compact">
-                        <span>{item}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-
-              {safeList(result.answer?.unconfirmedFacts).length ? (
-                <div className="answer-section-card">
-                  <p className="message-label">Не подтверждено</p>
-                  <div className="list">
-                    {safeList(result.answer?.unconfirmedFacts).map((item) => (
-                      <div key={item} className="list-item compact">
-                        <span>{item}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-
-              {safeList(result.answer?.manualChecks).length ? (
-                <div className="answer-section-card">
-                  <p className="message-label">Проверить вручную</p>
-                  <div className="list">
-                    {safeList(result.answer?.manualChecks).map((item) => (
-                      <div key={item} className="list-item compact">
-                        <span>{item}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-            </div>
 
             <div className="result-quick-grid">
               <div className="result-card">
@@ -664,13 +708,13 @@ function AssistantRunMessage({
 
             <div className="execution-preview-card">
               <div>
-                <p className="message-label">Execution Preview</p>
+                <p className="message-label">План реализации</p>
                 <strong>{safeText(result.executionPreview.summary)}</strong>
               </div>
               <div className="execution-preview-metrics">
                 <span>Файлы: {safeList(result.plan.targetFiles).length || safeList(result.impact.affectedFiles).length}</span>
                 <span>Модули: {safeList(result.plan.targetModules).length || safeList(result.research.affectedModules).length}</span>
-                <span>Approval: требуется</span>
+                <span>Шагов: {safeList(result.plan.steps).length}</span>
               </div>
             </div>
 
@@ -1679,8 +1723,20 @@ export function App() {
         setProjectPath(data.rootPath);
         const activePath = resolveSelectedProjectPath(data.projectRecord, data.rootPath);
         setSelectedProjectPathId(activePath?.id ?? "");
-        setResult((current) => current ?? data.latestRun ?? null);
-        setSelectedTask((current) => current || latestEntry?.task || "");
+        setResult((current) => {
+          if (activeRunIdRef.current) {
+            return current;
+          }
+
+          return data.latestRun ?? null;
+        });
+        setSelectedTask((current) => {
+          if (activeRunIdRef.current) {
+            return current;
+          }
+
+          return current || latestEntry?.task || "";
+        });
       });
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сводку по проекту.");
@@ -1723,6 +1779,7 @@ export function App() {
         setRunStatus(accepted);
         setSelectedTask(task);
         setActiveRunId(accepted.runId);
+        setResult(null);
         setInspectorOpen(false);
       });
 
@@ -1772,6 +1829,7 @@ export function App() {
         startTransition(() => {
           setRunStatus(accepted);
           setActiveRunId(accepted.runId);
+          setResult(null);
         });
         await pollPipelineStatus(accepted.runId);
       }
@@ -2086,13 +2144,71 @@ export function App() {
     }
   }
 
+  async function openRunFromHistory(runId: string) {
+    if (!projectPath) {
+      return;
+    }
+
+    setError(null);
+
+    try {
+      const params = new URLSearchParams({
+        projectPath,
+        runId,
+      });
+      const artifact = await fetchJsonWithTimeout<PipelineRunResult>(`${API_BASE_URL}/api/runs/selected?${params.toString()}`);
+
+      startTransition(() => {
+        setResult(artifact);
+        setRunStatus(null);
+        setActiveRunId(null);
+        setSelectedTask(artifact.knowledge?.runId ? safeText(artifact.research?.summary, selectedTask) : selectedTask);
+      });
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Не удалось открыть запуск из истории.");
+    }
+  }
+
   return (
-    <main className="app-shell">
-      <section className="chat-shell chat-shell-full">
-        <header className="chat-header">
+    <main className="app-shell app-shell-product">
+      <header className="app-topbar">
+        <div className="app-topbar-brand">
+          <strong>Client</strong>
+        </div>
+        <div className="app-topbar-actions">
+          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={() => setActiveView("chat")}>
+            Чат
+          </button>
+          <button type="button" className={`top-nav-button ${activeView === "projects" ? "top-nav-button-active" : ""}`} onClick={() => setActiveView("projects")}>
+            Проекты
+          </button>
+          <button type="button" className={`top-nav-button ${activeView === "providers" ? "top-nav-button-active" : ""}`} onClick={() => setActiveView("providers")}>
+            Провайдеры
+          </button>
+        </div>
+      </header>
+
+      <section className="app-workspace">
+        {activeView === "chat" ? (
+          <RunHistorySidebar
+            recentRuns={safeList(project?.recentRuns)}
+            activeRunId={activeRunId ?? result?.runId ?? null}
+            onSelectRun={(runId) => void openRunFromHistory(runId)}
+            projectName={safeText(project?.name, "Проект")}
+          />
+        ) : null}
+
+        <section className="chat-shell chat-shell-full">
+          <header className="chat-header">
           <div>
-            <h1>Client</h1>
-            <p className="chat-subtitle">Простой интерфейс сверху, сложная инженерная система внутри.</p>
+            <h1>{activeView === "chat" ? "Чат по проекту" : activeView === "projects" ? "Проекты" : "Провайдеры"}</h1>
+            <p className="chat-subtitle">
+              {activeView === "chat"
+                ? "Задай вопрос и получи инженерный ответ поверх уже собранной карты проекта."
+                : activeView === "projects"
+                  ? "Редко используемый экран настройки проектов и их путей."
+                  : "Редко используемый экран настройки AI-провайдеров."}
+            </p>
           </div>
 
           <div className="header-actions">
@@ -2104,186 +2220,55 @@ export function App() {
           </div>
         </header>
 
-        <NavigationTabs activeView={activeView} onChange={setActiveView} />
-
         {activeView === "chat" ? (
           <>
-            <section className="runtime-bar">
-              <label className="field">
-                <span>Проект</span>
-                <select
-                  value={selectedProjectId}
-                  onChange={(event) => {
-                    const nextProjectId = event.target.value;
-                    setSelectedProjectId(nextProjectId);
-                    const selectedProject = projects.find((item) => item.id === nextProjectId);
-                    const activePath = selectedProject?.paths[0] ?? null;
-                    setSelectedProjectPathId(activePath?.id ?? "");
-                    setProjectPath(activePath?.rootPath ?? "");
-                    void loadProject(activePath?.rootPath, nextProjectId);
-                  }}
-                >
-                  <option value="">Не выбран</option>
-                  {safeList(projects).map((projectItem) => (
-                    <option key={projectItem.id} value={projectItem.id}>
-                      {projectItem.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="field">
-                <span>Путь</span>
-                <select
-                  value={selectedProjectPathId}
-                  onChange={(event) => {
-                    const nextPathId = event.target.value;
-                    setSelectedProjectPathId(nextPathId);
-                    const selectedProject = projects.find((item) => item.id === selectedProjectId) ?? null;
-                    const selectedPath = selectedProject?.paths.find((pathItem) => pathItem.id === nextPathId) ?? null;
-                    setProjectPath(selectedPath?.rootPath ?? "");
-                    void loadProject(selectedPath?.rootPath, selectedProjectId || undefined);
-                  }}
-                >
-                  <option value="">Не выбран</option>
-                  {safeList(projects.find((item) => item.id === selectedProjectId)?.paths).map((pathItem) => (
-                    <option key={pathItem.id} value={pathItem.id}>
-                      {pathItem.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="field">
-                <span>Провайдер</span>
-                <select value={selectedProviderId} onChange={(event) => void selectProvider(event.target.value)}>
-                  <option value="">Не выбран</option>
-                  {safeList(providers).map((provider) => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="field">
-                <span>Модель</span>
-                <select value={providerModelDraft} onChange={(event) => setProviderModelDraft(event.target.value)}>
-                  {safeList(providerModels).map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.label}
-                    </option>
-                  ))}
-                  {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
-                </select>
-              </label>
-
-              <button type="button" className="ghost-button runtime-refresh" onClick={() => void loadProject(projectPath, selectedProjectId || undefined)}>
-                Обновить
-              </button>
-              <button
-                type="button"
-                className="ghost-button"
-                onClick={() => void triggerHardResync()}
-                disabled={running || loading}
-              >
-                Хард ресинк
-              </button>
-            </section>
-
-            <section className="runtime-bar runtime-bar-secondary">
-              <div className={`runtime-pill runtime-pill-status runtime-pill-status-${readiness.tone}`}>
-                <strong>{readiness.title}</strong>
-                <span>{readiness.description}</span>
-              </div>
-              <div className="runtime-pill">
-                <strong>Ветка</strong>
-                <span>{safeText(project?.repository?.branch, "не определена")}</span>
-              </div>
-              <div className="runtime-pill">
-                <strong>HEAD</strong>
-                <span>{shortCommit(project?.repository?.headCommit)}</span>
-              </div>
-              <div className="runtime-pill">
-                <strong>Состояние проекта</strong>
-                <span>{backgroundSyncLabel(project?.backgroundState?.syncStatus)}</span>
-              </div>
-              <div className="runtime-pill">
-                <strong>Worktree</strong>
-                <span>{worktreeStatusLabel(project?.backgroundState?.worktreeStatus)}</span>
-              </div>
-              <div className="runtime-pill">
-                <strong>Актуальность</strong>
-                <span>{backgroundFreshnessLabel(project?.backgroundState?.freshness)}</span>
-              </div>
-              <div className="runtime-pill">
-                <strong>Изменений</strong>
-                <span>{safeCount(project?.backgroundState?.changedFileCount)}</span>
-              </div>
-              <div className="runtime-pill">
-                <strong>Baseline</strong>
-                <span>{baselineSourceLabel(project?.backgroundState?.baselineSource)}</span>
-              </div>
-            </section>
+            <EnvironmentStrip
+              projects={projects}
+              selectedProjectId={selectedProjectId}
+              selectedProjectPathId={selectedProjectPathId}
+              selectedProviderId={selectedProviderId}
+              providerModelDraft={providerModelDraft}
+              providers={providers}
+              providerModels={providerModels}
+              project={project}
+              onProjectChange={(nextProjectId) => {
+                setSelectedProjectId(nextProjectId);
+                const selectedProject = projects.find((item) => item.id === nextProjectId);
+                const activePath = selectedProject?.paths[0] ?? null;
+                setSelectedProjectPathId(activePath?.id ?? "");
+                setProjectPath(activePath?.rootPath ?? "");
+                void loadProject(activePath?.rootPath, nextProjectId);
+              }}
+              onProjectPathChange={(nextPathId) => {
+                setSelectedProjectPathId(nextPathId);
+                const selectedProject = projects.find((item) => item.id === selectedProjectId) ?? null;
+                const selectedPath = selectedProject?.paths.find((pathItem) => pathItem.id === nextPathId) ?? null;
+                setProjectPath(selectedPath?.rootPath ?? "");
+                void loadProject(selectedPath?.rootPath, selectedProjectId || undefined);
+              }}
+              onProviderChange={(providerId) => void selectProvider(providerId)}
+              onModelChange={setProviderModelDraft}
+            />
 
             <div className="chat-body">
-              {project?.projectRecord?.paths?.length ? (
-                <div className="system-note">
-                  <strong>Контуры проекта:</strong>{" "}
-                  {project.projectRecord.paths.map((pathItem) => `${pathItem.name}: ${pathItem.rootPath}`).join(" · ")}
-                </div>
-              ) : null}
-
-              {project?.backgroundState ? (
-                <div className="system-note">
-                  <strong>Фоновое понимание проекта:</strong>{" "}
-                  {backgroundSyncLabel(project.backgroundState.syncStatus)}. Ветка{" "}
-                  <strong>{safeText(project.backgroundState.branch, "неизвестно")}</strong>, актуальность{" "}
-                  <strong>{backgroundFreshnessLabel(project.backgroundState.freshness)}</strong>, переиспользуемых файлов{" "}
-                  <strong>{safeCount(project.backgroundState.reusableFileCount)}</strong>, worktree{" "}
-                  <strong>{worktreeStatusLabel(project.backgroundState.worktreeStatus)}</strong>.
-                </div>
-              ) : null}
-
-              <div className={`system-note system-note-${readiness.tone}`}>
-                <strong>{readiness.title}:</strong> {readiness.description}
-              </div>
-
-              <div className={`system-note system-note-sync-${backgroundSyncStatus.tone}`}>
-                <strong>{backgroundSyncStatus.title}:</strong> {backgroundSyncStatus.description}
-              </div>
-
-              {project?.baselineInfo ? (
-                <div className="system-note">
-                  <strong>Готовность baseline:</strong>{" "}
-                  {project.baselineInfo.baselineExactForHead ? "для текущего branch/head уже есть committed baseline" : "для текущего branch/head нужен committed background sync"}
-                  {project.baselineInfo.hasLocalOverlay ? (
-                    <>
-                      {" "}· локальный overlay <strong>{project.baselineInfo.localOverlayChangeCount}</strong> файлов
-                    </>
-                  ) : null}
-                  {project.baselineInfo.sameHeadRunStatus ? (
-                    <>
-                      {" "}· background run <strong>{project.baselineInfo.sameHeadRunStatus}</strong>
-                    </>
-                  ) : null}
-                  {project.baselineInfo.baselineRunId ? (
-                    <>
-                      {" "}· baseline run <strong>{shortCommit(project.baselineInfo.baselineRunId)}</strong>
-                    </>
-                  ) : null}
-                </div>
-              ) : null}
-
-              {project?.baselineInfo?.backgroundSyncRecommended ? (
-                <div className="system-note">
-                  <strong>Нужно обновить фон:</strong> для текущего branch/head ещё нет актуального committed baseline. Вопрос всё ещё можно задать, но для лучшего качества стоит дождаться фоновой пересборки.
-                </div>
-              ) : null}
-
-              {project?.baselineInfo?.hasLocalOverlay ? (
-                <div className="system-note">
-                  <strong>Локальная разработка учтена отдельно:</strong> незакоммиченные изменения не попадают в committed baseline и будут использованы как worktree overlay для ответа на вопрос.
+              {!selectedTask && !running && !result ? (
+                <div className="chat-hero">
+                  <p className="section-kicker">Chat</p>
+                  <h2>Понимание проекта за минуты, а не за часы</h2>
+                  <p>
+                    Выбери проект, задай вопрос и получи инженерный ответ поверх уже собранной карты проекта.
+                  </p>
+                  <div className="chat-suggestions">
+                    <button type="button" className="ghost-button" onClick={() => setTask("Где начинается авторизация в проекте?")}>
+                      Где начинается авторизация?
+                    </button>
+                    <button type="button" className="ghost-button" onClick={() => setTask("Что затронет изменение billing flow?")}>
+                      Что затронет изменение billing?
+                    </button>
+                    <button type="button" className="ghost-button" onClick={() => setTask("Можно ли авторизоваться через Google?")}>
+                      Можно ли войти через Google?
+                    </button>
+                  </div>
                 </div>
               ) : null}
 
@@ -2302,23 +2287,17 @@ export function App() {
                 />
 
                 <div className="composer-actions">
-              <div className="composer-meta">
-                <span>Вопрос идёт поверх уже собранного понимания проекта; полный фон пересобирается отдельно</span>
-                {runStatus ? <span>Текущий этап: {safeText(runStatus.currentStageLabel, "Ожидание")}</span> : null}
-              </div>
+                  <div className="composer-meta">
+                    <span>
+                      {backgroundSyncStatus.title}. {project?.backgroundState?.worktreeStatus === "overlay" ? "Есть локальные изменения." : "Локальных изменений нет."}
+                    </span>
+                    {runStatus ? <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span> : null}
+                  </div>
                   <button type="submit" className="primary-button" disabled={running || loading}>
-                    {running ? "Система исследует проект..." : "Запустить исследование"}
+                    {running ? "Собираю ответ..." : "Получить ответ по проекту"}
                   </button>
                 </div>
               </div>
-
-              {runStatus ? (
-                <div className="composer-status">
-                  <span>Режим: {runModeLabel(runStatus.mode)}</span>
-                  <span>Статус: {runStatus.status}</span>
-                  <span>Resume: {runStatus.resumeContext?.canResumeFromStart ? "restart-from-start доступен" : "не требуется"}</span>
-                </div>
-              ) : null}
             </form>
           </>
         ) : null}
@@ -2497,6 +2476,7 @@ export function App() {
         ) : null}
 
         {error ? <p className="error">{error}</p> : null}
+        </section>
       </section>
 
       <InspectorDrawer

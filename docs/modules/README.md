@@ -14,3 +14,4 @@
 - [Knowledge](/Users/evgenii/Desktop/client/docs/modules/knowledge.md)
 - [Provider System](/Users/evgenii/Desktop/client/docs/modules/provider-system.md)
 - [Answer Engine](/Users/evgenii/Desktop/client/docs/modules/answer-engine.md)
+- [Chat UI](/Users/evgenii/Desktop/client/docs/modules/chat-ui.md)
