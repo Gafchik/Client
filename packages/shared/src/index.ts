@@ -320,8 +320,11 @@ export interface ScoredReference {
   score: number;
   reason: string;
   filePath?: string;
-  origin: "baseline" | "overlay" | "structural";
+  // "recalled" — переиспользовано из Fact Store (см. ProjectFact): подтверждено
+  // не текущим git-состоянием, а накопленным ранее знанием о проекте.
+  origin: "baseline" | "overlay" | "structural" | "recalled";
   originDetails?: string;
+  reinforcedByFactIds?: string[];
 }
 
 export interface ModuleIntentMatch {
@@ -378,12 +381,41 @@ export interface ResearchReport {
     baselineCount: number;
     overlayCount: number;
     structuralCount: number;
+    recalledCount: number;
     overlayInfluenced: boolean;
   };
   affectedModules: string[];
   unknowns: string[];
   confidence: number;
   references: string[];
+}
+
+/**
+ * Fact Store — durable память проекта между research-запросами (см.
+ * docs/architecture/010-senior-developer-capability-roadmap.md, пункт 1).
+ * В отличие от Knowledge (архив run-артефактов целиком), ProjectFact —
+ * атомарный, переиспользуемый вывод, привязанный к конкретным файлам через
+ * их content hash на момент подтверждения.
+ */
+export type FactStatus = "fresh" | "potentially_stale" | "deprecated";
+export type FactSource = "research" | "user-confirmed" | "execution";
+
+export interface ProjectFact {
+  id: string;
+  projectRootPath: string;
+  /** Совпадает с ResearchReport.dominantModule на момент создания факта. */
+  category: string;
+  statement: string;
+  filePaths: string[];
+  confidence: number;
+  status: FactStatus;
+  source: FactSource;
+  /** filePath -> IndexedFile.contentHash на момент последнего подтверждения. */
+  contentHashes: Record<string, string>;
+  createdAt: string;
+  lastConfirmedAt: string;
+  lastConfirmedHeadCommit?: string;
+  supersededByFactId?: string;
 }
 
 export interface ImpactReport {

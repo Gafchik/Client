@@ -15,6 +15,14 @@ export function getPostgresPool(): Pool {
           password: process.env.POSTGRES_PASSWORD?.trim() || "clientmeta",
           database: process.env.POSTGRES_DB?.trim() || "client",
         });
+
+    // node-postgres требует обработчик 'error' на самом Pool: без него
+    // разрыв соединения на IDLE-клиенте (например Postgres перезапустился
+    // или контейнер остановлен) становится unhandled 'error' event и роняет
+    // весь процесс — проверено живьём (docker stop postgres убил API).
+    pool.on("error", (error) => {
+      console.warn("[postgres] idle client error (соединение разорвано, пул восстановится сам):", error);
+    });
   }
 
   return pool;
@@ -85,6 +93,27 @@ export async function initializePostgresSchema(): Promise<void> {
   `);
   await runSql(
     `create index if not exists idx_knowledge_catalog_project on knowledge_catalog(project_root_path, saved_at desc)`,
+  );
+
+  await runSql(`
+    create table if not exists project_facts (
+      id text primary key,
+      project_root_path text not null,
+      category text not null,
+      statement text not null,
+      file_paths text[] not null default '{}',
+      confidence integer not null default 50,
+      status text not null default 'fresh',
+      source text not null default 'research',
+      content_hashes jsonb not null default '{}',
+      created_at timestamptz not null,
+      last_confirmed_at timestamptz not null,
+      last_confirmed_head_commit text,
+      superseded_by_fact_id text references project_facts(id)
+    )
+  `);
+  await runSql(
+    `create index if not exists idx_project_facts_lookup on project_facts(project_root_path, status, category)`,
   );
 }
 

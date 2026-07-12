@@ -1,6 +1,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runSql } from "./postgres-client.js";
+
+export { promoteFactsFromResearch, queryRelevantFacts } from "./facts.js";
 import type { PipelineRunMode } from "@client/shared";
 import {
   type AnswerPackage,

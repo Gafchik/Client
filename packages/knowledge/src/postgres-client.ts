@@ -15,6 +15,13 @@ function getPool(): Pool {
           password: process.env.POSTGRES_PASSWORD?.trim() || "clientmeta",
           database: process.env.POSTGRES_DB?.trim() || "client",
         });
+
+    // node-postgres требует обработчик 'error' на самом Pool: без него
+    // разрыв соединения на IDLE-клиенте становится unhandled 'error' event
+    // и роняет весь процесс — проверено живьём (docker stop postgres убил API).
+    pool.on("error", (error) => {
+      console.warn("[knowledge/postgres] idle client error (соединение разорвано, пул восстановится сам):", error);
+    });
   }
 
   return pool;

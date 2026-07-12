@@ -73,6 +73,12 @@ async function pollProjectStates(config: ProjectStateMonitorConfig): Promise<voi
         await observeProjectPath(config, project.id, projectPath.id, projectPath.rootPath);
       }
     }
+  } catch (error) {
+    // Этот тик вызывается из setInterval через `void pollProjectStates(...)` —
+    // необработанное исключение здесь становится unhandled promise rejection
+    // и роняет весь процесс (проверено живьём: временная недоступность
+    // Postgres убивала API в течение 15 секунд без возможности восстановления).
+    console.warn("[project-state-monitor] poll tick failed, will retry next interval:", error);
   } finally {
     monitorRunning = false;
   }

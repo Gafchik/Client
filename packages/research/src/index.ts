@@ -26,6 +26,7 @@ import {
   type IndexSymbol,
   type IndexResult,
   type ModuleIntentMatch,
+  type ProjectFact,
   type ResearchIntentClass,
   type ResearchQueryProfileKey,
   type ResearchReport,
@@ -42,6 +43,8 @@ interface ResearchInput {
   graph: GraphState;
   repository?: RepositorySnapshot;
   backgroundState?: BackgroundProjectState;
+  /** Факты, накопленные Fact Store для этого проекта (см. packages/knowledge/src/facts.ts). */
+  knownFacts?: ProjectFact[];
 }
 
 interface IntentProfile {
@@ -554,10 +557,18 @@ export function runResearch(input: ResearchInput): ResearchReport {
     });
   }
 
-  const evidence = [...fileEvidence, ...symbolEvidence]
+  let evidence = [...fileEvidence, ...symbolEvidence]
     .sort((left, right) => right.score - left.score)
     .slice(0, 12)
     .map((item) => classifyReferenceOrigin(item, input));
+
+  // Bolt-on Fact Store стадия — строго после classifyReferenceOrigin (иначе
+  // backfill-элементы получили бы origin "baseline" вместо "recalled") и до
+  // любых нижестоящих вычислений (findings/confidence/evidenceSummary их
+  // автоматически подхватывают, т.к. читают `evidence` дальше по функции).
+  const factApplication = applyKnownFacts(evidence, input.knownFacts, dominantModule);
+  evidence = factApplication.evidence;
+
   const topFiles = evidence.filter((item) => item.filePath).map((item) => item.filePath as string);
   const moduleRelations = dominantModule !== "не определён" ? getModuleRelations(input.graph, dominantModule) : [];
   const dominantModuleNodeId = findModuleNodeId(input.graph, dominantModule);
@@ -579,7 +590,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
   const baselineFindings = buildBaselineFindings(input, evidence, strongGraphSeed);
   const overlayFindings = buildOverlayFindings(input, evidence);
   const unknowns = buildUnknowns(input, evidence, moduleIntents, entryPoints, sideEffects, dataSources, strongGraphSeed);
-  const confidence = computeConfidence(input, evidence, unknowns, ctx);
+  const confidence = computeConfidence(input, evidence, unknowns, ctx, factApplication.reinforcedCount);
   const evidenceSummary = buildEvidenceSummary(evidence);
 
   return {
@@ -608,6 +619,97 @@ export function runResearch(input: ResearchInput): ResearchReport {
     unknowns,
     confidence,
     references: evidence.map((item) => item.filePath ?? item.label),
+  };
+}
+
+/**
+ * Bolt-on интеграция Fact Store в уже собранный evidence-список (после
+ * classifyReferenceOrigin). Две независимые операции:
+ *  - reinforcement: если уже найденный evidence-элемент подтверждён известным
+ *    фактом (совпадение по filePath) — небольшой score-бонус + пометка.
+ *  - backfill: если сканирование этого прохода дало мало evidence (< 4) и
+ *    есть релевантные (той же категории, ещё валидные) факты — добавить их
+ *    как evidence с origin "recalled", т.е. явно "не подтверждено текущим
+ *    git-состоянием, а вспомнено из предыдущего исследования".
+ * Объединённый список пересортирован по score — downstream-срезы (top-8/6 в
+ * packages/ai) читают его дальше без знания об источнике элементов.
+ */
+function applyKnownFacts(
+  evidence: ScoredReference[],
+  knownFacts: ProjectFact[] | undefined,
+  dominantModule: string,
+): { evidence: ScoredReference[]; reinforcedCount: number } {
+  if (!knownFacts || knownFacts.length === 0) {
+    return { evidence, reinforcedCount: 0 };
+  }
+
+  const factsByFilePath = new Map<string, ProjectFact[]>();
+
+  for (const fact of knownFacts) {
+    for (const filePath of fact.filePaths) {
+      const bucket = factsByFilePath.get(filePath) ?? [];
+      bucket.push(fact);
+      factsByFilePath.set(filePath, bucket);
+    }
+  }
+
+  let reinforcedCount = 0;
+  const reinforced = evidence.map((item) => {
+    const matchingFacts = item.filePath ? factsByFilePath.get(item.filePath) : undefined;
+
+    if (!matchingFacts || matchingFacts.length === 0) {
+      return item;
+    }
+
+    reinforcedCount += 1;
+
+    return {
+      ...item,
+      score: item.score + 6,
+      reinforcedByFactIds: matchingFacts.map((fact) => fact.id),
+    };
+  });
+
+  const matchedFilePaths = new Set(
+    reinforced.filter((item) => item.filePath).map((item) => item.filePath as string),
+  );
+  const backfill: ScoredReference[] = [];
+
+  if (reinforced.length < 4) {
+    const relevantFacts = knownFacts.filter(
+      (fact) =>
+        fact.category === dominantModule
+        && fact.status !== "deprecated"
+        && fact.filePaths.some((filePath) => !matchedFilePaths.has(filePath)),
+    );
+
+    for (const fact of relevantFacts) {
+      if (backfill.length >= 3) {
+        break;
+      }
+
+      const filePath = fact.filePaths.find((path) => !matchedFilePaths.has(path));
+
+      if (!filePath) {
+        continue;
+      }
+
+      matchedFilePaths.add(filePath);
+      backfill.push({
+        id: fact.id,
+        label: fact.category,
+        score: Math.max(20, Math.min(fact.confidence, 60)),
+        reason: `Известно из предыдущего исследования: ${fact.statement}`,
+        filePath,
+        origin: "recalled",
+        reinforcedByFactIds: [fact.id],
+      });
+    }
+  }
+
+  return {
+    evidence: [...reinforced, ...backfill].sort((left, right) => right.score - left.score),
+    reinforcedCount,
   };
 }
 
@@ -647,11 +749,13 @@ function buildEvidenceSummary(evidence: ScoredReference[]): ResearchReport["evid
   const baselineCount = evidence.filter((item) => item.origin === "baseline").length;
   const overlayCount = evidence.filter((item) => item.origin === "overlay").length;
   const structuralCount = evidence.filter((item) => item.origin === "structural").length;
+  const recalledCount = evidence.filter((item) => item.origin === "recalled").length;
 
   return {
     baselineCount,
     overlayCount,
     structuralCount,
+    recalledCount,
     overlayInfluenced: overlayCount > 0,
   };
 }
@@ -3646,11 +3750,18 @@ function findModuleNodeId(graph: GraphState, moduleLabel: string): string | null
   return graph.nodes.find((node) => node.kind === "module" && node.label === moduleLabel)?.id ?? null;
 }
 
-function computeConfidence(input: ResearchInput, evidence: ScoredReference[], unknowns: string[], ctx: ResearchContext): number {
+function computeConfidence(
+  input: ResearchInput,
+  evidence: ScoredReference[],
+  unknowns: string[],
+  ctx: ResearchContext,
+  reinforcedCount = 0,
+): number {
   let confidence = 45;
   confidence += Math.min(evidence.length * 4, 30);
   confidence += Math.min(input.graph.summary.symbolCount / 10, 15);
   confidence -= unknowns.length * 8;
+  confidence += Math.min(reinforcedCount * 3, 10);
 
   if (ctx.routing.intentClass === "broad-unknown") {
     confidence -= 28;

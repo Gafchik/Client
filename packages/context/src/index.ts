@@ -74,7 +74,9 @@ export function buildContextPackage(input: BuildContextInput): ContextPackage {
         ? `${evidence.reason} Источник: локальный worktree overlay.`
         : evidence.origin === "baseline"
           ? `${evidence.reason} Источник: committed baseline.`
-          : `${evidence.reason} Источник: structural graph/symbol layer.`,
+          : evidence.origin === "recalled"
+            ? `${evidence.reason} Источник: переиспользовано из предыдущего исследования (не подтверждено текущим git-состоянием).`
+            : `${evidence.reason} Источник: structural graph/symbol layer.`,
     };
 
     if (evidence.filePath) {

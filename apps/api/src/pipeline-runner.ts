@@ -11,7 +11,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunCatalogEntry, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -414,6 +414,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   await yieldToEventLoop();
 
   const researchStartedAt = startStage(runId, "research");
+  const knownFacts = await queryRelevantFacts(projectRootPath, index, repository);
   const initialResearch = runResearch({
     runId,
     task,
@@ -422,16 +423,20 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     graph,
     repository,
     backgroundState,
+    knownFacts,
   });
   completeStage(
     runId,
     "research",
     researchStartedAt,
-    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}.`,
+    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}, recalled ${initialResearch.evidenceSummary.recalledCount}.`,
   );
   updatePartialArtifacts(runId, {
     research: initialResearch,
   });
+  // fire-and-forget: Fact Store — вспомогательная память, не должна ни
+  // блокировать ответ пользователю, ни ронять run при сбое Postgres.
+  void promoteFactsFromResearch(projectRootPath, initialResearch, repository, index);
   await yieldToEventLoop();
 
   const impactStartedAt = startStage(runId, "impact");
@@ -1165,6 +1170,7 @@ async function runFocusedResearch(input: {
   });
   const focusedGraph = buildGraph(focusedWorkspace, focusedIndex);
   const focusedTask = buildFocusedResearchTask(input.task, input.request);
+  const focusedKnownFacts = await queryRelevantFacts(input.workspace.rootPath, focusedIndex, input.repository);
   const focusedResearch = runResearch({
     runId: `${input.runId}-focused-${input.request.iteration}`,
     task: focusedTask,
@@ -1173,6 +1179,7 @@ async function runFocusedResearch(input: {
     graph: focusedGraph,
     repository: input.repository,
     backgroundState: input.backgroundState,
+    knownFacts: focusedKnownFacts,
   });
 
   const previousEvidenceIds = new Set(input.currentResearch.evidence.map((item) => `${item.label}::${item.filePath ?? ""}`));
