@@ -1,5 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { runSql } from "./postgres-client.js";
+import type { PipelineRunMode } from "@client/shared";
 import {
   type AnswerPackage,
   type BackgroundProjectState,
@@ -25,32 +27,6 @@ import {
   type ValidationResult,
   type WorkspaceSnapshot,
 } from "@client/shared";
-
-/**
- * `catalog.json` живёт по одному файлу на проект и обновляется через
- * read-modify-write (прочитать массив, пересобрать, записать целиком).
- * Без сериализации два параллельных run'а (например question-run и
- * автоматический background-sync), завершившиеся почти одновременно, могут
- * прочитать один и тот же исходный каталог и затем один из write'ов
- * полностью затирает запись другого — реально наблюдалось: вопрос
- * пользователя пропадал из истории чата после фонового ресинка.
- * Все read-modify-write секции над catalog.json одного проекта должны идти
- * через `runExclusive` с ключом = путь к catalog.json.
- */
-const catalogWriteQueues = new Map<string, Promise<unknown>>();
-
-function runExclusive<T>(key: string, task: () => Promise<T>): Promise<T> {
-  const previous = catalogWriteQueues.get(key) ?? Promise.resolve();
-  const result = previous.then(task, task);
-  catalogWriteQueues.set(
-    key,
-    result.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  return result;
-}
 
 interface SaveKnowledgeInput {
   runId: string;
@@ -121,7 +97,6 @@ interface PersistedPipelineRunArtifact {
 export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise<KnowledgeSaveResult> {
   const stateDirectory = getKnowledgeProjectDirectory(input.appRootPath, input.workspace.rootPath);
   const runsDirectory = path.join(stateDirectory, "runs");
-  const catalogPath = path.join(stateDirectory, "catalog.json");
   const storagePath = path.join(runsDirectory, `${input.runId}.json`);
   const savedAt = new Date().toISOString();
 
@@ -131,7 +106,7 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
     runId: input.runId,
     savedAt,
     storagePath,
-    catalogPath,
+    catalogPath: "postgres:knowledge_catalog",
     artifactCount: 5,
   };
 
@@ -213,41 +188,87 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
   };
 
   await fs.writeFile(storagePath, JSON.stringify(artifact, null, 2));
-  await runExclusive(catalogPath, async () => {
-    const catalog = await loadKnowledgeCatalog(input.appRootPath, input.workspace.rootPath);
-    const nextEntry: KnowledgeCatalogEntry = {
-      runId: input.runId,
-      task: input.task,
+
+  // upsert по run_id — атомарный, никакого read-modify-write и гонок между
+  // параллельными run'ами (см. историю в git blame: раньше catalog.json
+  // обновлялся через read-modify-write целого файла, и параллельный
+  // background-sync мог затереть свежесохранённый вопрос пользователя).
+  await runSql(
+    `
+      insert into knowledge_catalog
+        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      on conflict (run_id) do update set
+        project_root_path = $2,
+        task = $3,
+        saved_at = $4,
+        storage_path = $5,
+        summary = $6,
+        mode = $7,
+        repository_id = $8,
+        branch = $9,
+        head_commit = $10,
+        head_fingerprint = $11
+    `,
+    [
+      input.runId,
+      input.workspace.rootPath,
+      input.task,
       savedAt,
       storagePath,
-      summary: input.research.summary,
-      mode: input.mode,
-      repositoryId: input.repository.repositoryId,
-      branch: input.repository.branch,
-      headCommit: input.repository.headCommit,
-      headFingerprint: input.repository.headFingerprint,
-    };
-    const nextCatalog = [nextEntry, ...catalog.filter((entry) => entry.runId !== input.runId)].slice(0, 20);
-    await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
-  });
+      input.research.summary,
+      input.mode,
+      input.repository.repositoryId ?? null,
+      input.repository.branch ?? null,
+      input.repository.headCommit ?? null,
+      input.repository.headFingerprint ?? null,
+    ],
+  );
 
   return knowledge;
 }
 
-export async function loadKnowledgeCatalog(appRootPath: string, projectRootPath: string): Promise<KnowledgeCatalogEntry[]> {
-  const catalogPath = path.join(getKnowledgeProjectDirectory(appRootPath, projectRootPath), "catalog.json");
+interface KnowledgeCatalogRow {
+  run_id: string;
+  task: string;
+  saved_at: Date;
+  storage_path: string;
+  summary: string;
+  mode: string;
+  repository_id: string | null;
+  branch: string | null;
+  head_commit: string | null;
+  head_fingerprint: string | null;
+}
 
-  try {
-    const content = await fs.readFile(catalogPath, "utf8");
-    return JSON.parse(content) as KnowledgeCatalogEntry[];
-  } catch {
-    return [];
-  }
+export async function loadKnowledgeCatalog(_appRootPath: string, projectRootPath: string): Promise<KnowledgeCatalogEntry[]> {
+  const rows = await runSql<KnowledgeCatalogRow>(
+    `
+      select * from knowledge_catalog
+      where project_root_path = $1
+      order by saved_at desc
+      limit 20
+    `,
+    [projectRootPath],
+  );
+
+  return rows.map((row) => ({
+    runId: row.run_id,
+    task: row.task,
+    savedAt: new Date(row.saved_at).toISOString(),
+    storagePath: row.storage_path,
+    summary: row.summary,
+    mode: row.mode as PipelineRunMode,
+    ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
+    ...(row.branch ? { branch: row.branch } : {}),
+    ...(row.head_commit ? { headCommit: row.head_commit } : {}),
+    ...(row.head_fingerprint ? { headFingerprint: row.head_fingerprint } : {}),
+  }));
 }
 
 /**
  * Удаляет один или несколько run/чатов проекта: файл артефакта `runs/<runId>.json`
- * и запись из `catalog.json` (источник списка чатов в сайдбаре фронта).
+ * и запись в knowledge_catalog (источник списка чатов в сайдбаре фронта).
  * Отсутствующий файл артефакта не считается ошибкой — каталог всё равно
  * очищается от "битой" ссылки.
  */
@@ -259,7 +280,6 @@ export async function deleteKnowledgeRuns(
   const idsToDelete = new Set(runIds);
   const projectDirectory = getKnowledgeProjectDirectory(appRootPath, projectRootPath);
   const runsDirectory = path.join(projectDirectory, "runs");
-  const catalogPath = path.join(projectDirectory, "catalog.json");
 
   const deleted: string[] = [];
   const notFound: string[] = [];
@@ -275,14 +295,10 @@ export async function deleteKnowledgeRuns(
     }
   }
 
-  await runExclusive(catalogPath, async () => {
-    const catalog = await loadKnowledgeCatalog(appRootPath, projectRootPath);
-    const nextCatalog = catalog.filter((entry) => !idsToDelete.has(entry.runId));
-
-    if (nextCatalog.length !== catalog.length) {
-      await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
-    }
-  });
+  await runSql(
+    `delete from knowledge_catalog where project_root_path = $1 and run_id = any($2::text[])`,
+    [projectRootPath, [...idsToDelete]],
+  );
 
   return { deleted, notFound };
 }

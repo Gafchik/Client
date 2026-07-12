@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ProjectPathRecord, ProjectRecord } from "@client/shared";
-import { runQuery } from "./neo4j-client.js";
+import { runSql, withTransaction } from "./postgres-client.js";
 
 export interface SaveProjectPathInput {
   id?: string;
@@ -15,51 +15,48 @@ export interface SaveProjectInput {
   paths: SaveProjectPathInput[];
 }
 
+interface ProjectRow {
+  id: string;
+  name: string;
+  description: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+interface ProjectPathRow {
+  id: string;
+  project_id: string;
+  name: string;
+  root_path: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export async function initializeProjectStore(): Promise<void> {
-  await runQuery(`create constraint project_id_unique if not exists for (p:Project) require p.id is unique`);
-  await runQuery(`create constraint project_path_id_unique if not exists for (pp:ProjectPath) require pp.id is unique`);
+  // Таблицы создаются централизованно в initializePostgresSchema() (postgres-client.ts).
 }
 
 export async function listProjects(): Promise<ProjectRecord[]> {
-  const rows = await runQuery<{
-    project: Record<string, unknown>;
-    paths: Array<Record<string, unknown>>;
-  }>(`
-    match (p:Project)
-    optional match (p)-[:HAS_PATH]->(pp:ProjectPath)
-    with p, pp
-    order by pp.createdAt asc
-    with p, collect(pp { .* }) as paths
-    return p { .* } as project, paths
-    order by p.updatedAt desc
-  `);
+  const projects = await runSql<ProjectRow>(`select * from projects order by updated_at desc`);
+  const paths = await runSql<ProjectPathRow>(`select * from project_paths order by created_at asc`);
 
-  return rows.map((row) => mapProjectRow(row.project, row.paths));
+  return projects.map((project) => mapProjectRow(project, paths.filter((path) => path.project_id === project.id)));
 }
 
 export async function getProjectById(id: string): Promise<ProjectRecord | null> {
-  const rows = await runQuery<{
-    project: Record<string, unknown>;
-    paths: Array<Record<string, unknown>>;
-  }>(
-    `
-      match (p:Project { id: $id })
-      optional match (p)-[:HAS_PATH]->(pp:ProjectPath)
-      with p, pp
-      order by pp.createdAt asc
-      with p, collect(pp { .* }) as paths
-      return p { .* } as project, paths
-    `,
-    { id },
-  );
+  const projects = await runSql<ProjectRow>(`select * from projects where id = $1`, [id]);
+  const project = projects[0];
 
-  const row = rows[0];
-
-  if (!row) {
+  if (!project) {
     return null;
   }
 
-  return mapProjectRow(row.project, row.paths);
+  const paths = await runSql<ProjectPathRow>(
+    `select * from project_paths where project_id = $1 order by created_at asc`,
+    [id],
+  );
+
+  return mapProjectRow(project, paths);
 }
 
 export async function saveProject(input: SaveProjectInput): Promise<ProjectRecord> {
@@ -81,41 +78,31 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
   }
 
   const now = new Date().toISOString();
+  const name = input.name.trim();
+  const description = input.description?.trim() || "";
 
-  await runQuery(
-    `
-      merge (p:Project { id: $id })
-      on create set p.createdAt = $now
-      set p.name = $name, p.description = $description, p.updatedAt = $now
-      with p
-      optional match (p)-[r:HAS_PATH]->(old:ProjectPath)
-      delete r, old
-    `,
-    {
-      id: nextId,
-      name: input.name.trim(),
-      description: input.description?.trim() || "",
-      now,
-    },
-  );
-
-  for (const pathItem of normalizedPaths) {
-    await runQuery(
+  await withTransaction(async (client) => {
+    await client.query(
       `
-        match (p:Project { id: $projectId })
-        merge (pp:ProjectPath { id: $pathId })
-        set pp.name = $name, pp.rootPath = $rootPath, pp.createdAt = $now, pp.updatedAt = $now
-        merge (p)-[:HAS_PATH]->(pp)
+        insert into projects (id, name, description, created_at, updated_at)
+        values ($1, $2, $3, $4, $4)
+        on conflict (id) do update set name = $2, description = $3, updated_at = $4
       `,
-      {
-        projectId: nextId,
-        pathId: pathItem.id,
-        name: pathItem.name,
-        rootPath: pathItem.rootPath,
-        now,
-      },
+      [nextId, name, description, now],
     );
-  }
+
+    await client.query(`delete from project_paths where project_id = $1`, [nextId]);
+
+    for (const pathItem of normalizedPaths) {
+      await client.query(
+        `
+          insert into project_paths (id, project_id, name, root_path, created_at, updated_at)
+          values ($1, $2, $3, $4, $5, $5)
+        `,
+        [pathItem.id, nextId, pathItem.name, pathItem.rootPath, now],
+      );
+    }
+  });
 
   const saved = await getProjectById(nextId);
 
@@ -127,43 +114,28 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
 }
 
 export async function deleteProject(id: string): Promise<boolean> {
-  const rows = await runQuery<{ deletedCount: number }>(
-    `
-      match (p:Project { id: $id })
-      optional match (p)-[:HAS_PATH]->(pp:ProjectPath)
-      with p, collect(pp) as paths
-      foreach (item in paths | detach delete item)
-      with p
-      with p, 1 as deletedCount
-      detach delete p
-      return deletedCount
-    `,
-    { id },
-  );
-
-  return rows.length > 0;
+  const result = await runSql<{ id: string }>(`delete from projects where id = $1 returning id`, [id]);
+  return result.length > 0;
 }
 
-function mapProjectRow(project: Record<string, unknown>, paths: Array<Record<string, unknown>>): ProjectRecord {
+function mapProjectRow(project: ProjectRow, paths: ProjectPathRow[]): ProjectRecord {
   return {
-    id: String(project.id),
-    name: String(project.name),
-    description: String(project.description ?? ""),
-    createdAt: String(project.createdAt),
-    updatedAt: String(project.updatedAt),
-    paths: paths
-      .filter((path) => path && path.id)
-      .map((path) => mapProjectPathRow(path, String(project.id))),
+    id: project.id,
+    name: project.name,
+    description: project.description ?? "",
+    createdAt: new Date(project.created_at).toISOString(),
+    updatedAt: new Date(project.updated_at).toISOString(),
+    paths: paths.map((path) => mapProjectPathRow(path)),
   };
 }
 
-function mapProjectPathRow(path: Record<string, unknown>, projectId: string): ProjectPathRecord {
+function mapProjectPathRow(path: ProjectPathRow): ProjectPathRecord {
   return {
-    id: String(path.id),
-    projectId,
-    name: String(path.name),
-    rootPath: String(path.rootPath),
-    createdAt: String(path.createdAt),
-    updatedAt: String(path.updatedAt),
+    id: path.id,
+    projectId: path.project_id,
+    name: path.name,
+    rootPath: path.root_path,
+    createdAt: new Date(path.created_at).toISOString(),
+    updatedAt: new Date(path.updated_at).toISOString(),
   };
 }

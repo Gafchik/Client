@@ -7,6 +7,7 @@ import { normalizePath, stableId, type PipelineRunMode, type PipelineRunStatus, 
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
+import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
 import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus } from "./pipeline-runner.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
@@ -93,6 +94,7 @@ export function createApp() {
   void bootstrapPipelineRunStatuses(appRootPath);
 
   app.addHook("onReady", async () => {
+    await initializePostgresSchema();
     await initializeSecretCrypto(appRootPath);
     await initializeProviderStore();
     await initializeProjectStore();
@@ -108,11 +110,15 @@ export function createApp() {
   app.addHook("onClose", async () => {
     stopProjectStateMonitor();
     await closeNeo4jDriver();
+    await closePostgresPool();
   });
 
   app.get("/api/health", async () => {
-    const neo4jConnected = await verifyNeo4jConnectivity();
-    return { status: "ok", now: new Date().toISOString(), neo4jConnected };
+    const [neo4jConnected, postgresConnected] = await Promise.all([
+      verifyNeo4jConnectivity(),
+      verifyPostgresConnectivity(),
+    ]);
+    return { status: "ok", now: new Date().toISOString(), neo4jConnected, postgresConnected };
   });
 
   app.get("/api/providers", async () => {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderModelRecord, ProviderRecord } from "@client/shared";
-import { runQuery } from "./neo4j-client.js";
+import { runSql, withTransaction } from "./postgres-client.js";
 import { decryptSecret, encryptSecret } from "./secret-crypto.js";
 
 export interface ProviderSecretRecord extends ProviderRecord {
@@ -25,45 +25,43 @@ export interface ProviderCatalog {
 // price band Micro 0.0x) — разумный дефолт для тестов, не требует платного провайдера "из коробки".
 const DEFAULT_RECOMMENDED_MODEL_ID = "nvidia/nemotron-3-ultra";
 
+interface ProviderRow {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  is_active: boolean;
+  is_current: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export async function initializeProviderStore(): Promise<void> {
-  await runQuery(`create constraint provider_id_unique if not exists for (p:Provider) require p.id is unique`);
+  // Таблица создаётся централизованно в initializePostgresSchema() (postgres-client.ts).
   await ensureDefaultProvider();
 }
 
 export async function listProviders(): Promise<ProviderRecord[]> {
-  const rows = await runQuery<{ provider: Record<string, unknown> }>(`
-    match (p:Provider)
-    return p { .* } as provider
-    order by p.isCurrent desc, p.updatedAt desc
-  `);
+  const rows = await runSql<ProviderRow>(
+    `select * from providers order by is_current desc, updated_at desc`,
+  );
 
-  return rows.map((row) => mapProviderRow(row.provider));
+  return rows.map((row) => mapProviderRow(row));
 }
 
 export async function getCurrentProvider(): Promise<ProviderSecretRecord | null> {
-  const rows = await runQuery<{ provider: Record<string, unknown> }>(`
-    match (p:Provider { isCurrent: true, isActive: true })
-    return p { .* } as provider
-    order by p.updatedAt desc
-    limit 1
-  `);
-
-  const row = rows[0];
-  return row ? mapProviderSecretRow(row.provider) : null;
-}
-
-export async function getProviderById(id: string): Promise<ProviderSecretRecord | null> {
-  const rows = await runQuery<{ provider: Record<string, unknown> }>(
-    `
-      match (p:Provider { id: $id })
-      return p { .* } as provider
-      limit 1
-    `,
-    { id },
+  const rows = await runSql<ProviderRow>(
+    `select * from providers where is_current = true and is_active = true order by updated_at desc limit 1`,
   );
 
   const row = rows[0];
-  return row ? mapProviderSecretRow(row.provider) : null;
+  return row ? mapProviderSecretRow(row) : null;
+}
+
+export async function getProviderById(id: string): Promise<ProviderSecretRecord | null> {
+  const rows = await runSql<ProviderRow>(`select * from providers where id = $1 limit 1`, [id]);
+  const row = rows[0];
+  return row ? mapProviderSecretRow(row) : null;
 }
 
 export async function saveProvider(input: SaveProviderInput): Promise<ProviderRecord> {
@@ -71,37 +69,31 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderRe
   const shouldBeCurrent = input.isCurrent ?? false;
   const now = new Date().toISOString();
 
-  if (shouldBeCurrent) {
-    await runQuery(`match (p:Provider { isCurrent: true }) set p.isCurrent = false, p.updatedAt = $now`, { now });
-  }
-
   // getProviderById уже отдаёт расшифрованный apiKey (см. mapProviderSecretRow),
   // поэтому nextApiKey здесь всегда plaintext — шифруем непосредственно перед записью.
   const existing = await getProviderById(nextId);
   const nextApiKey = input.apiKey.trim() || existing?.apiKey || "";
 
-  await runQuery(
-    `
-      merge (p:Provider { id: $id })
-      on create set p.createdAt = $now
-      set
-        p.name = $name,
-        p.baseUrl = $baseUrl,
-        p.apiKey = $apiKey,
-        p.isActive = $isActive,
-        p.isCurrent = $isCurrent,
-        p.updatedAt = $now
-    `,
-    {
-      id: nextId,
-      name: input.name.trim(),
-      baseUrl: input.baseUrl.trim(),
-      apiKey: encryptSecret(nextApiKey),
-      isActive: input.isActive ?? true,
-      isCurrent: shouldBeCurrent,
-      now,
-    },
-  );
+  await withTransaction(async (client) => {
+    if (shouldBeCurrent) {
+      await client.query(`update providers set is_current = false, updated_at = $1 where is_current = true`, [now]);
+    }
+
+    await client.query(
+      `
+        insert into providers (id, name, base_url, api_key, is_active, is_current, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $7)
+        on conflict (id) do update set
+          name = $2,
+          base_url = $3,
+          api_key = $4,
+          is_active = $5,
+          is_current = $6,
+          updated_at = $7
+      `,
+      [nextId, input.name.trim(), input.baseUrl.trim(), encryptSecret(nextApiKey), input.isActive ?? true, shouldBeCurrent, now],
+    );
+  });
 
   const saved = await getProviderById(nextId);
 
@@ -120,14 +112,14 @@ export async function setCurrentProvider(id: string): Promise<ProviderRecord | n
   }
 
   const now = new Date().toISOString();
-  await runQuery(`match (p:Provider { isCurrent: true }) set p.isCurrent = false, p.updatedAt = $now`, { now });
-  await runQuery(
-    `
-      match (p:Provider { id: $id })
-      set p.isCurrent = true, p.isActive = true, p.updatedAt = $now
-    `,
-    { id, now },
-  );
+
+  await withTransaction(async (client) => {
+    await client.query(`update providers set is_current = false, updated_at = $1 where is_current = true`, [now]);
+    await client.query(`update providers set is_current = true, is_active = true, updated_at = $1 where id = $2`, [
+      now,
+      id,
+    ]);
+  });
 
   const saved = await getProviderById(id);
   return saved ? stripApiKey(saved) : null;
@@ -140,25 +132,17 @@ export async function deleteProvider(id: string): Promise<boolean> {
     return false;
   }
 
-  await runQuery(`match (p:Provider { id: $id }) detach delete p`, { id });
+  await runSql(`delete from providers where id = $1`, [id]);
 
   if (existing.isCurrent) {
     const now = new Date().toISOString();
-    const fallbackRows = await runQuery<{ id: string }>(
-      `
-        match (p:Provider { isActive: true })
-        return p.id as id
-        order by p.updatedAt desc
-        limit 1
-      `,
+    const fallbackRows = await runSql<{ id: string }>(
+      `select id from providers where is_active = true order by updated_at desc limit 1`,
     );
     const fallbackId = fallbackRows[0]?.id;
 
     if (fallbackId) {
-      await runQuery(`match (p:Provider { id: $id }) set p.isCurrent = true, p.updatedAt = $now`, {
-        id: fallbackId,
-        now,
-      });
+      await runSql(`update providers set is_current = true, updated_at = $1 where id = $2`, [now, fallbackId]);
     } else {
       await ensureDefaultProvider();
     }
@@ -237,7 +221,7 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
 }
 
 async function ensureDefaultProvider(): Promise<void> {
-  const countRows = await runQuery<{ count: number }>(`match (p:Provider) return count(p) as count`);
+  const countRows = await runSql<{ count: string }>(`select count(*)::text as count from providers`);
   const count = Number(countRows[0]?.count ?? 0);
 
   if (count > 0) {
@@ -254,19 +238,19 @@ async function ensureDefaultProvider(): Promise<void> {
   });
 }
 
-function mapProviderRow(row: Record<string, unknown>): ProviderRecord {
-  const apiKey = decryptSecret(String(row.apiKey ?? ""));
+function mapProviderRow(row: ProviderRow): ProviderRecord {
+  const apiKey = decryptSecret(row.api_key ?? "");
 
   return {
-    id: String(row.id),
-    name: String(row.name),
-    baseUrl: String(row.baseUrl),
+    id: row.id,
+    name: row.name,
+    baseUrl: row.base_url,
     apiKeyMasked: maskApiKey(apiKey),
     hasApiKey: apiKey.length > 0,
-    isActive: Boolean(row.isActive),
-    isCurrent: Boolean(row.isCurrent),
-    createdAt: String(row.createdAt),
-    updatedAt: String(row.updatedAt),
+    isActive: Boolean(row.is_active),
+    isCurrent: Boolean(row.is_current),
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
   };
 }
 
@@ -276,12 +260,12 @@ function stripApiKey(record: ProviderSecretRecord): ProviderRecord {
   return publicRecord;
 }
 
-function mapProviderSecretRow(row: Record<string, unknown>): ProviderSecretRecord {
+function mapProviderSecretRow(row: ProviderRow): ProviderSecretRecord {
   const publicRecord = mapProviderRow(row);
 
   return {
     ...publicRecord,
-    apiKey: decryptSecret(String(row.apiKey ?? "")),
+    apiKey: decryptSecret(row.api_key ?? ""),
   };
 }
 

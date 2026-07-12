@@ -7,6 +7,10 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@client/shared": "0.1.0"
+    "@client/shared": "0.1.0",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.0"
   }
 }

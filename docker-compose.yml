@@ -1,4 +1,5 @@
-# В Docker поднимается только Neo4j (persistent knowledge graph storage).
+# В Docker поднимаются Neo4j (persistent knowledge graph storage) и Postgres
+# (метаданные: Project/Provider/история чатов — см. docs/architecture/002-storage.md).
 # Backend (apps/api) и frontend (apps/web) запускаются локально без Docker.
 services:
   neo4j:
@@ -22,6 +23,24 @@ services:
       timeout: 5s
       retries: 30
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-client}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clientmeta}
+      POSTGRES_DB: ${POSTGRES_DB:-client}
+      TZ: ${TZ:-Europe/Kiev}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-client} -d ${POSTGRES_DB:-client}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
 volumes:
   neo4j_data:
   neo4j_logs:
+  postgres_data:
