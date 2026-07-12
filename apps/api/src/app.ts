@@ -362,6 +362,12 @@ export function createApp() {
     const explicitProviderModel = request.body.providerModel?.trim() || "";
     const explicitProviderApiKey = request.body.providerApiKey?.trim() || "";
 
+    if (!request.body.projectId?.trim() && !explicitProjectPath) {
+      return reply.code(400).send({
+        message: "Нужно выбрать проект перед отправкой вопроса. Ни projectId, ни projectPath не переданы.",
+      });
+    }
+
     let projectRecord = null;
 
     if (request.body.projectId?.trim()) {
@@ -377,6 +383,12 @@ export function createApp() {
             message: "Не удалось загрузить проект из хранилища.",
           });
         }
+      }
+
+      if (!projectRecord && !explicitProjectPath) {
+        return reply.code(404).send({
+          message: "Проект с указанным projectId не найден и projectPath не передан. Вопрос не выполнен, чтобы не отвечать по неверному проекту.",
+        });
       }
     }
 

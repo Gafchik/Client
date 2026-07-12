@@ -53,6 +53,7 @@ export interface QuestionTypeConfig {
 class QuestionTypeRegistry {
   private types = new Map<QuestionType, QuestionTypeConfig>();
   private fallbackType: QuestionType = "unknown";
+  private unicodeSafeRegexCache = new Map<RegExp, RegExp>();
 
   /** Регистрация нового типа вопроса */
   register(config: QuestionTypeConfig): void {
@@ -69,6 +70,29 @@ class QuestionTypeRegistry {
     return [...this.types.values()];
   }
 
+  /**
+   * JavaScript-регексы считают `\w`/`\b` только для латиницы, цифр и `_` —
+   * кириллица в `\w` не входит, поэтому `\b` никогда не срабатывает вокруг
+   * русских слов ("где", "почему", "есть ли" и т.д. никогда не матчились).
+   * Это транслирует `\b` в explicit unicode-aware lookaround-границу, работающую
+   * одинаково для латиницы и кириллицы, без переписывания самих паттернов.
+   */
+  private toUnicodeSafeRegex(pattern: RegExp): RegExp {
+    const cached = this.unicodeSafeRegexCache.get(pattern);
+
+    if (cached) {
+      return cached;
+    }
+
+    const wordBoundary = "(?:(?<=[\\p{L}\\p{N}_])(?![\\p{L}\\p{N}_])|(?<![\\p{L}\\p{N}_])(?=[\\p{L}\\p{N}_]))";
+    const transformedSource = pattern.source.split("\\b").join(wordBoundary);
+    const flags = pattern.flags.includes("u") ? pattern.flags : `${pattern.flags}u`;
+    const safeRegex = new RegExp(transformedSource, flags);
+
+    this.unicodeSafeRegexCache.set(pattern, safeRegex);
+    return safeRegex;
+  }
+
   /** Классификация вопроса */
   classify(question: string): { type: QuestionType; confidence: number; matchedPattern?: QuestionTypePattern } {
     const lower = question.toLowerCase();
@@ -76,7 +100,7 @@ class QuestionTypeRegistry {
 
     for (const config of this.types.values()) {
       for (const pattern of config.patterns) {
-        const regexMatch = pattern.regex.test(lower);
+        const regexMatch = this.toUnicodeSafeRegex(pattern.regex).test(lower);
         if (!regexMatch) continue;
 
         // Проверка required keywords
@@ -183,6 +207,8 @@ export function registerBuiltinQuestionTypes(): void {
     patterns: [
       { regex: /\b(как работает|как происходит|что происходит|process|flow|logic|works)\b/i, weight: 90 },
       { regex: /\b(алгоритм|algorithm|последовательность|sequence|шаги|steps)\b/i, weight: 80 },
+      { regex: /\b(в каком случае|в каких случаях|при каких условиях|при каком условии|когда именно|in which case|in what case|under what conditions|when exactly)\b/i, weight: 90 },
+      { regex: /\b(нужно|надо|необходимо|должен|должна|должны|required|must|needs? to)\b.*\b(подтвердить|подтверждение|верифицировать|верификация|confirm|verify|validate)\b/i, weight: 85 },
     ],
     defaultSearchProfiles: ["entrypoint-traversal", "broad-scan"],
     contextualProfiles: {},
@@ -194,7 +220,7 @@ export function registerBuiltinQuestionTypes(): void {
     label: "Configuration Inspection",
     description: "Вопросы о конфигурации, настройках, env",
     patterns: [
-      { regex: /\b(как настроен|настройки|конфиг|config|settings|configuration|env|environment)\b/i, weight: 90 },
+      { regex: /\b(как настроен[а-яё]*|настройки|конфиг[а-яё]*|config|settings|configuration|env|environment)\b/i, weight: 90 },
       { regex: /\b(параметр|parameter|option|опция)\b/i, weight: 70 },
     ],
     defaultSearchProfiles: ["config-inventory"],

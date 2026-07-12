@@ -452,14 +452,14 @@ async function fetchJsonWithTimeout<T>(input: string, init?: RequestInit, timeou
   }
 }
 
-function UserTaskMessage({ task, projectPath }: { task: string; projectPath: string }) {
+function UserTaskMessage({ task, projectName, projectPath }: { task: string; projectName: string; projectPath: string }) {
   return (
     <div className="message user-message">
       <div className="message-badge">Ты</div>
       <div className="message-card">
-        <p className="message-label">Задача</p>
+        <p className="message-label">Задача · {safeText(projectName, "Проект не выбран")}</p>
         <p>{safeText(task)}</p>
-        <p className="message-footnote">Проект: {safeText(projectPath)}</p>
+        <p className="message-footnote">Путь: {safeText(projectPath)}</p>
       </div>
     </div>
   );
@@ -601,7 +601,7 @@ function AssistantRunMessage({
 
         {completed ? (
           <>
-            <p className="message-label">Ответ подготовлен</p>
+            <p className="message-label">Ответ подготовлен · {safeText(result.project.name, "Проект неизвестен")}</p>
             <h3>{safeText(result.answer?.summary, result.research.summary)}</h3>
             <p>{safeText(result.answer?.explanation, result.research.functionalSummary || "Функциональная картина пока не сформирована.")}</p>
 
@@ -1732,6 +1732,11 @@ export function App() {
   }
 
   async function submitPipelineRun(forceRefresh: boolean, hardResync = false) {
+    if (!selectedProjectId && !projectPath.trim()) {
+      setError("Нужно выбрать проект перед отправкой вопроса.");
+      return;
+    }
+
     setRunning(true);
     setError(null);
 
@@ -1774,6 +1779,10 @@ export function App() {
   }
 
   async function triggerBackgroundSync(silent: boolean) {
+    if (!selectedProjectId && !projectPath.trim()) {
+      return;
+    }
+
     if (!silent) {
       setRunning(true);
     }
@@ -2300,7 +2309,7 @@ export function App() {
                 </div>
               ) : null}
 
-              {selectedTask ? <UserTaskMessage task={selectedTask} projectPath={projectPath} /> : null}
+              {selectedTask ? <UserTaskMessage task={selectedTask} projectName={safeText(project?.name, "")} projectPath={projectPath} /> : null}
 
               <AssistantRunMessage runStatus={runStatus} result={result} onOpenInspector={openInspector} />
             </div>
