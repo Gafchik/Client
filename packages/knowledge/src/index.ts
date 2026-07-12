@@ -26,6 +26,32 @@ import {
   type WorkspaceSnapshot,
 } from "@client/shared";
 
+/**
+ * `catalog.json` живёт по одному файлу на проект и обновляется через
+ * read-modify-write (прочитать массив, пересобрать, записать целиком).
+ * Без сериализации два параллельных run'а (например question-run и
+ * автоматический background-sync), завершившиеся почти одновременно, могут
+ * прочитать один и тот же исходный каталог и затем один из write'ов
+ * полностью затирает запись другого — реально наблюдалось: вопрос
+ * пользователя пропадал из истории чата после фонового ресинка.
+ * Все read-modify-write секции над catalog.json одного проекта должны идти
+ * через `runExclusive` с ключом = путь к catalog.json.
+ */
+const catalogWriteQueues = new Map<string, Promise<unknown>>();
+
+function runExclusive<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = catalogWriteQueues.get(key) ?? Promise.resolve();
+  const result = previous.then(task, task);
+  catalogWriteQueues.set(
+    key,
+    result.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return result;
+}
+
 interface SaveKnowledgeInput {
   runId: string;
   mode: PipelineRunResult["mode"];
@@ -187,21 +213,23 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
   };
 
   await fs.writeFile(storagePath, JSON.stringify(artifact, null, 2));
-  const catalog = await loadKnowledgeCatalog(input.appRootPath, input.workspace.rootPath);
-  const nextEntry: KnowledgeCatalogEntry = {
-    runId: input.runId,
-    task: input.task,
-    savedAt,
-    storagePath,
-    summary: input.research.summary,
-    mode: input.mode,
-    repositoryId: input.repository.repositoryId,
-    branch: input.repository.branch,
-    headCommit: input.repository.headCommit,
-    headFingerprint: input.repository.headFingerprint,
-  };
-  const nextCatalog = [nextEntry, ...catalog.filter((entry) => entry.runId !== input.runId)].slice(0, 20);
-  await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
+  await runExclusive(catalogPath, async () => {
+    const catalog = await loadKnowledgeCatalog(input.appRootPath, input.workspace.rootPath);
+    const nextEntry: KnowledgeCatalogEntry = {
+      runId: input.runId,
+      task: input.task,
+      savedAt,
+      storagePath,
+      summary: input.research.summary,
+      mode: input.mode,
+      repositoryId: input.repository.repositoryId,
+      branch: input.repository.branch,
+      headCommit: input.repository.headCommit,
+      headFingerprint: input.repository.headFingerprint,
+    };
+    const nextCatalog = [nextEntry, ...catalog.filter((entry) => entry.runId !== input.runId)].slice(0, 20);
+    await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
+  });
 
   return knowledge;
 }
@@ -247,12 +275,14 @@ export async function deleteKnowledgeRuns(
     }
   }
 
-  const catalog = await loadKnowledgeCatalog(appRootPath, projectRootPath);
-  const nextCatalog = catalog.filter((entry) => !idsToDelete.has(entry.runId));
+  await runExclusive(catalogPath, async () => {
+    const catalog = await loadKnowledgeCatalog(appRootPath, projectRootPath);
+    const nextCatalog = catalog.filter((entry) => !idsToDelete.has(entry.runId));
 
-  if (nextCatalog.length !== catalog.length) {
-    await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
-  }
+    if (nextCatalog.length !== catalog.length) {
+      await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
+    }
+  });
 
   return { deleted, notFound };
 }
@@ -273,12 +303,20 @@ export async function loadPipelineRunArtifact(
   }
 }
 
+/**
+ * "Последний run" в смысле чата — это последний реальный вопрос пользователя,
+ * а не последняя запись каталога вообще. background-sync — служебная фоновая
+ * пересборка project intelligence, у неё своя семантика (см.
+ * `loadLatestBackgroundRunCatalogEntry`) и она не должна попадать сюда: иначе
+ * задача/ответ на экране чата могут относиться к двум разным run'ам, если
+ * background-sync завершился позже, чем реальный вопрос пользователя.
+ */
 export async function loadLatestPipelineRunArtifact(
   appRootPath: string,
   projectRootPath: string,
 ): Promise<PipelineRunResult | null> {
   const catalog = await loadKnowledgeCatalog(appRootPath, projectRootPath);
-  const latestRun = catalog[0];
+  const latestRun = catalog.find((entry) => entry.mode !== "background-sync");
 
   if (!latestRun) {
     return null;

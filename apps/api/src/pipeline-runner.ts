@@ -787,14 +787,6 @@ function buildQuestionWorkspacePlan(
     ]),
   );
   const gitScopedPaths = deriveRepositoryScopedPaths(repository, workspace);
-  const normalizedTask = task.toLowerCase();
-  const billingRollbackFocus =
-    normalizedTask.includes("rollback")
-    || normalizedTask.includes("ролбек")
-    || normalizedTask.includes("generated")
-    || normalizedTask.includes("дженер")
-    || normalizedTask.includes("billhistory")
-    || normalizedTask.includes("истори");
   const taskTokens = Array.from(
     new Set([
       ...tokenize(task),
@@ -896,50 +888,8 @@ function buildQuestionWorkspacePlan(
         })
         .slice(0, 120)
     : [];
-  const billingRollbackPaths = billingRollbackFocus
-    ? availableRelativePaths
-        .filter((relativePath) => {
-          const lowerPath = relativePath.toLowerCase();
-          return (
-            lowerPath.includes("/containers/billing/bill/ui/api/routes/routeprovider.php")
-            || lowerPath.includes("/containers/billing/bill/ui/api/controllers/billcontroller.php")
-            || lowerPath.includes("/containers/billing/bill/actions/togeneratedbillaction.php")
-            || lowerPath.includes("/containers/billing/bill/actions/todraftbillaction.php")
-            || lowerPath.includes("/containers/billing/bill/models/bill.php")
-            || lowerPath.includes("/ship/parents/models/billmodel.php")
-            || lowerPath.includes("/containers/billing/billhistory/")
-            || lowerPath.includes("/containers/billing/bill/support/billhistorydocumentsyncresolver.php")
-            || lowerPath.includes("/containers/billing/billhistory/actions/createbillhistoryaction.php")
-          );
-        })
-        .slice(0, 40)
-    : [];
-  const localizationRuntimeFocus =
-    normalizedTask.includes("locale")
-    || normalizedTask.includes("localization")
-    || normalizedTask.includes("локал")
-    || normalizedTask.includes("язык")
-    || normalizedTask.includes("header")
-    || normalizedTask.includes("заголов")
-    || normalizedTask.includes("middleware");
-  const localizationRuntimePaths = localizationRuntimeFocus
-    ? availableRelativePaths
-        .filter((relativePath) => {
-          const lowerPath = relativePath.toLowerCase();
-          return (
-            lowerPath.includes("/middleware/localemiddleware.php")
-            || lowerPath.endsWith("/bootstrap/app.php")
-            || lowerPath.includes("/enums/localeenum.php")
-            || lowerPath.endsWith("/config/app.php")
-          );
-        })
-        .slice(0, 20)
-    : [];
-
   const primaryPaths = Array.from(
     new Set([
-      ...localizationRuntimePaths,
-      ...billingRollbackPaths,
       ...gitScopedPaths,
       ...previousSymbolMatchedPaths,
       ...graphMatchedPaths,

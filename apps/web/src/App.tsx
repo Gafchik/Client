@@ -1494,6 +1494,14 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeInspectorTab, setActiveInspectorTab] = useState<InspectorTab>("overview");
   const activeRunIdRef = useRef<string | null>(null);
+  // `activeRunIdRef` обновляется синхронно вместе с state (а не через отдельный
+  // useEffect с лагом в один рендер), чтобы `pollPipelineStatus` могла надёжно
+  // определить, что запущенный ею run уже брошен (например, пользователь нажал
+  // "Новый чат"), и не перезаписать ответ нового чата результатом старого run'а.
+  function updateActiveRunId(nextRunId: string | null) {
+    activeRunIdRef.current = nextRunId;
+    setActiveRunId(nextRunId);
+  }
   const selectedProjectIdRef = useRef<string>("");
   const projectPathRef = useRef<string>("");
   const readiness = projectReadinessState(project);
@@ -1534,10 +1542,6 @@ export function App() {
       }),
     );
   }, [providerDraft, providerModelDraft]);
-
-  useEffect(() => {
-    activeRunIdRef.current = activeRunId;
-  }, [activeRunId]);
 
   useEffect(() => {
     selectedProjectIdRef.current = selectedProjectId;
@@ -1613,7 +1617,7 @@ export function App() {
 
     setResult(null);
     setRunStatus(null);
-    setActiveRunId(null);
+    updateActiveRunId(null);
     setSelectedTask("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, routeRunId]);
@@ -1806,7 +1810,7 @@ export function App() {
       startTransition(() => {
         setRunStatus(accepted);
         setSelectedTask(task);
-        setActiveRunId(accepted.runId);
+        updateActiveRunId(accepted.runId);
         setResult(null);
         setInspectorOpen(false);
       });
@@ -1861,7 +1865,7 @@ export function App() {
       if (!silent) {
         startTransition(() => {
           setRunStatus(accepted);
-          setActiveRunId(accepted.runId);
+          updateActiveRunId(accepted.runId);
           setResult(null);
         });
         await pollPipelineStatus(accepted.runId);
@@ -1883,7 +1887,13 @@ export function App() {
 
   async function pollPipelineStatus(runId: string) {
     for (;;) {
-      if (activeRunIdRef.current && activeRunIdRef.current !== runId) {
+      // Раньше здесь стояла проверка `activeRunIdRef.current && ...`, которая
+      // не останавливала поллинг, если run был брошен через "Новый чат"
+      // (activeRunId сбрасывается в null, а не в id другого run'а). Из-за этого
+      // уже отменённый run мог дозавершиться и подменить собой ответ в новом,
+      // пустом чате — задача показывалась от старого run'а, а ответ от него же,
+      // но пользователь уже успел открыть другой чат/задать другой вопрос.
+      if (activeRunIdRef.current !== runId) {
         return;
       }
 
@@ -1911,7 +1921,7 @@ export function App() {
 
         startTransition(() => {
           setResult(status.result ?? null);
-          setActiveRunId(null);
+          updateActiveRunId(null);
           setProject((current) =>
             current
               ? {
@@ -1944,7 +1954,7 @@ export function App() {
 
       if (status.status === "failed") {
         startTransition(() => {
-          setActiveRunId(null);
+          updateActiveRunId(null);
         });
         throw new Error(status.errorMessage || "Pipeline завершился ошибкой.");
       }
@@ -1956,7 +1966,7 @@ export function App() {
   function resetStuckRun() {
     startTransition(() => {
       setRunning(false);
-      setActiveRunId(null);
+      updateActiveRunId(null);
       setRunStatus(null);
     });
   }
@@ -2135,7 +2145,12 @@ export function App() {
     setError(null);
 
     try {
-      await fetchJsonWithTimeout<ProjectRecord>(`${API_BASE_URL}/api/projects`, {
+      // Сервер возвращает полную сохранённую запись с её настоящим id — используем
+      // именно его, а не гадаем по имени в заново загруженном списке проектов.
+      // Раньше при отсутствии точного совпадения по имени (например из-за
+      // рассинхрона пробелов/регистра) код тихо откатывался на loadedProjects[0],
+      // что могло активировать совершенно другой проект — источник cross-project leak.
+      const savedProject = await fetchJsonWithTimeout<ProjectRecord>(`${API_BASE_URL}/api/projects`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -2148,8 +2163,8 @@ export function App() {
         }),
       });
 
-      const loadedProjects = await loadProjects();
-      const activeProjectId = projectDraft.id || loadedProjects.find((item) => item.name === projectDraft.name)?.id || loadedProjects[0]?.id || "";
+      await loadProjects();
+      const activeProjectId = savedProject.id;
       resetProjectDraft();
 
       if (activeProjectId) {
@@ -2205,7 +2220,7 @@ export function App() {
       startTransition(() => {
         setResult(artifact);
         setRunStatus(null);
-        setActiveRunId(null);
+        updateActiveRunId(null);
         setSelectedTask(artifact.knowledge?.runId ? safeText(artifact.research?.summary, selectedTask) : selectedTask);
       });
     } catch (loadError) {
@@ -2226,7 +2241,7 @@ export function App() {
     startTransition(() => {
       setResult(null);
       setRunStatus(null);
-      setActiveRunId(null);
+      updateActiveRunId(null);
       setSelectedTask("");
       setTask("");
       setError(null);

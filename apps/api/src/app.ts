@@ -11,6 +11,7 @@ import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider } from "./provider-store.js";
+import { initializeSecretCrypto } from "./secret-crypto.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -92,6 +93,7 @@ export function createApp() {
   void bootstrapPipelineRunStatuses(appRootPath);
 
   app.addHook("onReady", async () => {
+    await initializeSecretCrypto(appRootPath);
     await initializeProviderStore();
     await initializeProjectStore();
     await initializeGraphStore();
@@ -247,7 +249,13 @@ export function createApp() {
     }
 
     const overview = await scanWorkspaceOverview(projectPath);
-    const recentRuns = await loadKnowledgeCatalog(appRootPath, overview.rootPath);
+    // background-sync — это фоновая пересборка project intelligence, инициированная
+    // системой, а не пользователем. Она гоняет служебную фразу через тот же pipeline
+    // ради обновления графа/знаний, но не должна маскироваться под реальный чат:
+    // у неё уже есть отдельный канал уведомления через backgroundState/пилюлю статуса.
+    const recentRuns = (await loadKnowledgeCatalog(appRootPath, overview.rootPath)).filter(
+      (entry) => entry.mode !== "background-sync",
+    );
     const latestRun = await loadLatestPipelineRunArtifact(appRootPath, overview.rootPath);
     const latestBackgroundRun = await loadLatestBackgroundRunCatalogEntry(appRootPath, overview.rootPath);
     const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
@@ -303,15 +311,25 @@ export function createApp() {
       runId?: string;
     };
   }>("/api/runs/selected", async (request, reply) => {
-    const projectPath = request.query.projectPath?.trim() || appRootPath;
+    const projectPath = request.query.projectPath?.trim() || "";
     const runId = request.query.runId?.trim();
-    const normalizedProjectPath = normalizePath(path.resolve(projectPath));
 
     if (!runId) {
       return reply.code(400).send({
         message: "Нужно указать runId.",
       });
     }
+
+    // Без явного projectPath запрос ранее тихо уходил в appRootPath и мог
+    // вернуть run из совершенно другого проекта (тот самый cross-project leak) —
+    // лучше явная ошибка, чем ответ не по адресу.
+    if (!projectPath) {
+      return reply.code(400).send({
+        message: "Нужно явно передать projectPath.",
+      });
+    }
+
+    const normalizedProjectPath = normalizePath(path.resolve(projectPath));
 
     const artifact = await loadPipelineRunArtifact(appRootPath, normalizedProjectPath, runId);
 

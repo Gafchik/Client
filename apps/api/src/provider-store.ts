@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderModelRecord, ProviderRecord } from "@client/shared";
 import { runQuery } from "./neo4j-client.js";
+import { decryptSecret, encryptSecret } from "./secret-crypto.js";
 
 export interface ProviderSecretRecord extends ProviderRecord {
   apiKey: string;
@@ -72,6 +73,8 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderRe
     await runQuery(`match (p:Provider { isCurrent: true }) set p.isCurrent = false, p.updatedAt = $now`, { now });
   }
 
+  // getProviderById уже отдаёт расшифрованный apiKey (см. mapProviderSecretRow),
+  // поэтому nextApiKey здесь всегда plaintext — шифруем непосредственно перед записью.
   const existing = await getProviderById(nextId);
   const nextApiKey = input.apiKey.trim() || existing?.apiKey || "";
 
@@ -91,7 +94,7 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderRe
       id: nextId,
       name: input.name.trim(),
       baseUrl: input.baseUrl.trim(),
-      apiKey: nextApiKey,
+      apiKey: encryptSecret(nextApiKey),
       isActive: input.isActive ?? true,
       isCurrent: shouldBeCurrent,
       now,
@@ -250,7 +253,7 @@ async function ensureDefaultProvider(): Promise<void> {
 }
 
 function mapProviderRow(row: Record<string, unknown>): ProviderRecord {
-  const apiKey = String(row.apiKey ?? "");
+  const apiKey = decryptSecret(String(row.apiKey ?? ""));
 
   return {
     id: String(row.id),
@@ -276,7 +279,7 @@ function mapProviderSecretRow(row: Record<string, unknown>): ProviderSecretRecor
 
   return {
     ...publicRecord,
-    apiKey: String(row.apiKey ?? ""),
+    apiKey: decryptSecret(String(row.apiKey ?? "")),
   };
 }
 
