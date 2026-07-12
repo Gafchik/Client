@@ -217,6 +217,46 @@ export async function loadKnowledgeCatalog(appRootPath: string, projectRootPath:
   }
 }
 
+/**
+ * Удаляет один или несколько run/чатов проекта: файл артефакта `runs/<runId>.json`
+ * и запись из `catalog.json` (источник списка чатов в сайдбаре фронта).
+ * Отсутствующий файл артефакта не считается ошибкой — каталог всё равно
+ * очищается от "битой" ссылки.
+ */
+export async function deleteKnowledgeRuns(
+  appRootPath: string,
+  projectRootPath: string,
+  runIds: string[],
+): Promise<{ deleted: string[]; notFound: string[] }> {
+  const idsToDelete = new Set(runIds);
+  const projectDirectory = getKnowledgeProjectDirectory(appRootPath, projectRootPath);
+  const runsDirectory = path.join(projectDirectory, "runs");
+  const catalogPath = path.join(projectDirectory, "catalog.json");
+
+  const deleted: string[] = [];
+  const notFound: string[] = [];
+
+  for (const runId of idsToDelete) {
+    const storagePath = path.join(runsDirectory, `${runId}.json`);
+
+    try {
+      await fs.unlink(storagePath);
+      deleted.push(runId);
+    } catch {
+      notFound.push(runId);
+    }
+  }
+
+  const catalog = await loadKnowledgeCatalog(appRootPath, projectRootPath);
+  const nextCatalog = catalog.filter((entry) => !idsToDelete.has(entry.runId));
+
+  if (nextCatalog.length !== catalog.length) {
+    await fs.writeFile(catalogPath, JSON.stringify(nextCatalog, null, 2));
+  }
+
+  return { deleted, notFound };
+}
+
 export async function loadPipelineRunArtifact(
   appRootPath: string,
   projectRootPath: string,

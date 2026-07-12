@@ -1127,7 +1127,7 @@ function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): Module
   }
 
   return INTENT_PROFILES.map((profile) => {
-    const taskMentionsDomain = profile.aliases.some((alias) => tokens.some((token) => token.includes(alias) || alias.includes(token)));
+    const taskMentionsDomain = profile.aliases.some((alias) => tokens.some((token) => isMeaningfulAliasMatch(token, alias)));
     const matchedFiles: Array<{ filePath: string; score: number; reasons: string[] }> = [];
     let totalScore = 0;
 
@@ -1791,6 +1791,46 @@ function detectDataSources(input: ResearchInput, ctx: ResearchContext): string[]
   return [...sources].slice(0, 6);
 }
 
+/**
+ * Короткие служебные слова (предлоги, союзы, местоимения), которые ни при
+ * каких обстоятельствах не должны сами по себе матчиться как alias профиля.
+ * Без этого фильтра, например, "при" (как в "При каких условиях...")
+ * является substring'ом алиаса "приватный" (servers/vault профиль) и ложно
+ * триггерит весь инфраструктурный профиль на вопросах, вообще не про
+ * серверы/vault.
+ */
+const TOKEN_MATCH_STOPWORDS = new Set([
+  "при", "из-за", "из", "за", "для", "под", "над", "про", "на", "по",
+  "как", "что", "это", "эта", "эти", "этот", "эту", "если", "или", "либо",
+  "так", "уже", "все", "всех", "всей", "всем", "всей", "куда", "когда",
+  "чем", "чему", "чтобы", "то", "тот", "которая", "который", "которые",
+  "the", "and", "for", "are", "but", "not", "you", "all", "can", "her",
+  "was", "one", "our", "out", "his", "has", "had",
+]);
+
+/** Минимальная длина токена/alias'а для substring-матчинга (защита от false positive на коротких словах). */
+const TOKEN_MATCH_MIN_SUBSTRING_LENGTH = 4;
+
+function isMeaningfulAliasMatch(token: string, alias: string): boolean {
+  if (TOKEN_MATCH_STOPWORDS.has(token) || TOKEN_MATCH_STOPWORDS.has(alias)) {
+    return false;
+  }
+
+  if (token === alias) {
+    return true;
+  }
+
+  if (token.length >= TOKEN_MATCH_MIN_SUBSTRING_LENGTH && alias.includes(token)) {
+    return true;
+  }
+
+  if (alias.length >= TOKEN_MATCH_MIN_SUBSTRING_LENGTH && token.includes(alias)) {
+    return true;
+  }
+
+  return false;
+}
+
 function expandTaskTokens(task: string): string[] {
   const baseTokens = tokenize(task);
   const expanded = new Set(baseTokens);
@@ -1810,7 +1850,7 @@ function expandTaskTokens(task: string): string[] {
 
   for (const token of baseTokens) {
     for (const profile of INTENT_PROFILES) {
-      if (profile.aliases.some((alias) => token.includes(alias) || alias.includes(token))) {
+      if (profile.aliases.some((alias) => isMeaningfulAliasMatch(token, alias))) {
         expanded.add(profile.key);
 
         for (const alias of profile.aliases) {

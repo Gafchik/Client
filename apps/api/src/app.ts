@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { buildBackgroundProjectState, deleteKnowledgeRuns, loadBestBaselineRunArtifact, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
@@ -322,6 +322,42 @@ export function createApp() {
     }
 
     return artifact;
+  });
+
+  /**
+   * Удаление чатов (run/history entries) — одного или пачкой.
+   * projectPath передаётся явно и обязательно: удаление деструктивно,
+   * поэтому здесь намеренно нет fallback на appRootPath — лучше явная
+   * ошибка 400, чем риск удалить чаты не того проекта.
+   */
+  app.post<{
+    Body: {
+      projectPath?: string;
+      runIds?: string[];
+    };
+  }>("/api/runs/delete", async (request, reply) => {
+    const runIds = Array.isArray(request.body.runIds)
+      ? request.body.runIds.map((id) => id.trim()).filter(Boolean)
+      : [];
+
+    if (!runIds.length) {
+      return reply.code(400).send({
+        message: "Нужно указать хотя бы один runId для удаления.",
+      });
+    }
+
+    const explicitProjectPath = request.body.projectPath?.trim() || "";
+
+    if (!explicitProjectPath) {
+      return reply.code(400).send({
+        message: "Нужно явно передать projectPath, чтобы не удалить чаты не того проекта.",
+      });
+    }
+
+    const normalizedProjectPath = normalizePath(path.resolve(explicitProjectPath));
+    const result = await deleteKnowledgeRuns(appRootPath, normalizedProjectPath, runIds);
+
+    return { ok: true, ...result };
   });
 
   app.get<{

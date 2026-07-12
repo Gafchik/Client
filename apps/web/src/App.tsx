@@ -10,7 +10,6 @@ import type {
   ProjectRecord,
   PipelineRunResult,
   PipelineRunStatus,
-  PipelineStage,
   ProviderCatalogResponse,
   ProviderModelRecord,
   ProviderRecord,
@@ -87,6 +86,73 @@ function safeText(value: string | undefined | null, fallback = "Недоступ
 
 function safeCount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Лёгкий markdown-рендерер под формат ответа Answer Engine: `## Заголовок`,
+ * абзацы и списки `- пункт`. Без внешней зависимости — формат ответа
+ * ограничен и полноценный markdown-парсер не нужен.
+ */
+function AnswerMarkdown({ text }: { text: string }) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+
+  if (!trimmed) {
+    return null;
+  }
+
+  const blocks: Array<{ type: "heading"; text: string } | { type: "list"; items: string[] } | { type: "paragraph"; text: string }> = [];
+  let currentList: string[] | null = null;
+
+  for (const rawLine of trimmed.split("\n")) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      currentList = null;
+      continue;
+    }
+
+    const headingMatch = /^#{1,6}\s+(.+)/.exec(line);
+    if (headingMatch && headingMatch[1]) {
+      currentList = null;
+      blocks.push({ type: "heading", text: headingMatch[1].trim() });
+      continue;
+    }
+
+    const bulletMatch = /^[-*•]\s+(.+)/.exec(line);
+    if (bulletMatch && bulletMatch[1]) {
+      if (!currentList) {
+        currentList = [];
+        blocks.push({ type: "list", items: currentList });
+      }
+      currentList.push(bulletMatch[1].trim());
+      continue;
+    }
+
+    currentList = null;
+    blocks.push({ type: "paragraph", text: line });
+  }
+
+  return (
+    <div className="answer-markdown">
+      {blocks.map((block, index) => {
+        if (block.type === "heading") {
+          return <h4 key={index}>{block.text}</h4>;
+        }
+
+        if (block.type === "list") {
+          return (
+            <ul key={index}>
+              {block.items.map((item, itemIndex) => (
+                <li key={itemIndex}>{item}</li>
+              ))}
+            </ul>
+          );
+        }
+
+        return <p key={index}>{block.text}</p>;
+      })}
+    </div>
+  );
 }
 
 function normalizeProjectInfo(data: ProjectInfo): ProjectInfo {
@@ -220,19 +286,6 @@ function formatDateTime(value: string | undefined | null): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
-function stageStatusLabel(status: PipelineStage["status"]): string {
-  switch (status) {
-    case "completed":
-      return "Готово";
-    case "running":
-      return "В работе";
-    case "failed":
-      return "Ошибка";
-    default:
-      return "Ожидание";
-  }
-}
-
 function runModeLabel(mode: PipelineRunStatus["mode"] | PipelineRunResult["mode"] | undefined): string {
   switch (mode) {
     case "background-sync":
@@ -243,19 +296,6 @@ function runModeLabel(mode: PipelineRunStatus["mode"] | PipelineRunResult["mode"
       return "Ответ по проекту";
     default:
       return "Run";
-  }
-}
-
-function stageTone(status: PipelineStage["status"]): string {
-  switch (status) {
-    case "completed":
-      return "done";
-    case "running":
-      return "running";
-    case "failed":
-      return "failed";
-    default:
-      return "pending";
   }
 }
 
@@ -298,35 +338,82 @@ function RunHistorySidebar({
   onSelectRun,
   onStartNewChat,
   projectName,
+  selectedIds,
+  onToggleSelect,
+  onToggleSelectAll,
+  onDeleteSelected,
+  onDeleteOne,
+  deleting,
 }: {
   recentRuns: KnowledgeCatalogEntry[];
   activeRunId: string | null;
   onSelectRun: (runId: string) => void;
   onStartNewChat: () => void;
   projectName: string;
+  selectedIds: Set<string>;
+  onToggleSelect: (runId: string) => void;
+  onToggleSelectAll: (allIds: string[]) => void;
+  onDeleteSelected: () => void;
+  onDeleteOne: (runId: string) => void;
+  deleting: boolean;
 }) {
+  const items = safeList(recentRuns).slice(0, 10);
+  const allIds = items.map((entry) => entry.runId);
+  const allSelected = items.length > 0 && selectedIds.size === items.length;
+
   return (
     <aside className="chat-history">
       <div className="chat-history-head">
         <button type="button" className="primary-button history-new-button" onClick={onStartNewChat}>
-          Новый чат
+          + Новый чат
         </button>
       </div>
 
       <div className="chat-history-group">
-        <p className="section-kicker">Недавние вопросы</p>
+        <div className="chat-history-toolbar">
+          <p className="section-kicker">Чаты</p>
+          {items.length ? (
+            <label className="history-select-all">
+              <input type="checkbox" checked={allSelected} onChange={() => onToggleSelectAll(allIds)} />
+              Все
+            </label>
+          ) : null}
+        </div>
+
+        {selectedIds.size > 0 ? (
+          <button type="button" className="history-delete-selected" onClick={onDeleteSelected} disabled={deleting}>
+            {deleting ? "Удаляю..." : `Удалить (${selectedIds.size})`}
+          </button>
+        ) : null}
+
         <div className="chat-history-list">
-          {safeList(recentRuns).length ? (
-            safeList(recentRuns).slice(0, 10).map((entry) => (
-              <button
-                key={entry.runId}
-                type="button"
-                className={`history-item ${activeRunId === entry.runId ? "history-item-active" : ""}`}
-                onClick={() => onSelectRun(entry.runId)}
-              >
-                <strong>{buildHistoryTitle(entry.task)}</strong>
-                <span>{projectName} · {formatHistoryTime(entry.savedAt)}</span>
-              </button>
+          {items.length ? (
+            items.map((entry) => (
+              <div key={entry.runId} className={`history-item-row ${activeRunId === entry.runId ? "history-item-row-active" : ""}`}>
+                <input
+                  type="checkbox"
+                  className="history-item-checkbox"
+                  checked={selectedIds.has(entry.runId)}
+                  onChange={() => onToggleSelect(entry.runId)}
+                  onClick={(event) => event.stopPropagation()}
+                />
+                <button type="button" className="history-item" onClick={() => onSelectRun(entry.runId)}>
+                  <strong>{buildHistoryTitle(entry.task)}</strong>
+                  <span>{formatHistoryTime(entry.savedAt)}</span>
+                </button>
+                <button
+                  type="button"
+                  className="history-item-delete"
+                  title="Удалить чат"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onDeleteOne(entry.runId);
+                  }}
+                  disabled={deleting}
+                >
+                  ×
+                </button>
+              </div>
             ))
           ) : (
             <div className="empty-card">
@@ -465,79 +552,21 @@ function UserTaskMessage({ task, projectName, projectPath }: { task: string; pro
   );
 }
 
-function InlinePipeline({ stages, currentStageLabel }: { stages: PipelineStage[]; currentStageLabel?: string }) {
+/**
+ * Компактный индикатор "система думает" вместо развёрнутого списка стадий
+ * pipeline и шести карточек partial-артефактов — тот же смысл, но в формате
+ * обычного AI-чата. Детальный прогресс по стадиям остаётся доступен через
+ * Inspector ("Подробнее"), здесь только текущий шаг.
+ */
+function ThinkingIndicator({ currentStageLabel }: { currentStageLabel?: string }) {
   return (
-    <div className="inline-pipeline">
-      <div className="inline-pipeline-head">
-        <strong>Pipeline</strong>
-        <span>{safeText(currentStageLabel, "Подготовка run")}</span>
-      </div>
-      <div className="pipeline-list">
-        {stages.map((stage) => (
-          <div key={stage.key} className={`pipeline-item pipeline-item-${stageTone(stage.status)}`}>
-            <div className="pipeline-marker" />
-            <div className="pipeline-copy">
-              <strong>
-                {stage.label} · {stageStatusLabel(stage.status)}
-              </strong>
-              <span>{safeText(stage.details, "Без дополнительных деталей")}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function PartialArtifactHighlights({ runStatus }: { runStatus: PipelineRunStatus | null }) {
-  const partial = runStatus?.partialArtifacts;
-
-  if (!runStatus || !partial) {
-    return null;
-  }
-
-  return (
-    <div className="inline-highlights">
-      <div className="highlight-card">
-        <strong>Workspace</strong>
-        <span>
-          {partial.workspace
-            ? `ignored paths: ${safeList(partial.workspace.ignoredPaths).length}`
-            : "ещё не собран"}
-        </span>
-      </div>
-      <div className="highlight-card">
-        <strong>Repository</strong>
-        <span>
-          {partial.repository
-            ? `${safeText(partial.repository.branch, "HEAD")} · изменений ${safeCount(partial.repository.summary?.changedFileCount)}`
-            : "ещё не собран"}
-        </span>
-      </div>
-      <div className="highlight-card">
-        <strong>Index</strong>
-        <span>
-          {partial.index
-            ? `${safeText(partial.index.manifest?.mode, "full")} · ${safeCount(partial.index.manifest?.symbolCount)} символов`
-            : "ещё не готов"}
-        </span>
-      </div>
-      <div className="highlight-card">
-        <strong>Graph</strong>
-        <span>
-          {partial.graph
-            ? `${safeCount(partial.graph.summary?.nodeCount)} узлов · ${safeCount(partial.graph.summary?.edgeCount)} рёбер`
-            : "ещё не готов"}
-        </span>
-      </div>
-      <div className="highlight-card">
-        <strong>Research</strong>
-        <span>{partial.research ? safeText(partial.research.summary) : "ожидает очереди"}</span>
-      </div>
-      <div className="highlight-card">
-        <strong>Plan</strong>
-        <span>{partial.plan ? safeText(partial.plan.summary) : "ещё не построен"}</span>
-      </div>
+    <div className="thinking-indicator">
+      <span className="thinking-dots">
+        <span />
+        <span />
+        <span />
+      </span>
+      <span className="thinking-label">{safeText(currentStageLabel, "Изучаю проект")}</span>
     </div>
   );
 }
@@ -573,16 +602,7 @@ function AssistantRunMessage({
       <div className="message-card">
         {running ? (
           <>
-            <p className="message-label">Сейчас система думает</p>
-            <h3>Изучаю актуальное состояние проекта и готовлю ответ</h3>
-            <p>
-              Вопрос уже запущен поверх project baseline. Ниже виден только полезный прогресс, а детальные инженерные артефакты можно открыть через Inspector.
-            </p>
-            <InlinePipeline
-              stages={safeList(runStatus?.stages)}
-              {...(runStatus?.currentStageLabel ? { currentStageLabel: runStatus.currentStageLabel } : {})}
-            />
-            <PartialArtifactHighlights runStatus={runStatus} />
+            <ThinkingIndicator {...(runStatus?.currentStageLabel ? { currentStageLabel: runStatus.currentStageLabel } : {})} />
             <div className="action-row">
               <button type="button" className="ghost-button" onClick={() => onOpenInspector("overview")}>
                 Подробнее
@@ -603,7 +623,12 @@ function AssistantRunMessage({
           <>
             <p className="message-label">Ответ подготовлен · {safeText(result.project.name, "Проект неизвестен")}</p>
             <h3>{safeText(result.answer?.summary, result.research.summary)}</h3>
-            <p>{safeText(result.answer?.explanation, result.research.functionalSummary || "Функциональная картина пока не сформирована.")}</p>
+            <AnswerMarkdown
+              text={safeText(
+                result.answer?.explanation,
+                result.research.functionalSummary || "Функциональная картина пока не сформирована.",
+              )}
+            />
 
             <div className="result-quick-grid">
               <div className="result-card">
@@ -1431,7 +1456,7 @@ export function App() {
   const routeRunId = routeParams.runId ?? null;
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
-  const [task, setTask] = useState("Построй структурный отчёт по текущему проекту и покажи ключевые зависимости.");
+  const [task, setTask] = useState("");
   const [projectPath, setProjectPath] = useState("");
   const [selectedProjectId, setSelectedProjectId] = useState<string>("");
   const [selectedProjectPathId, setSelectedProjectPathId] = useState<string>("");
@@ -1464,6 +1489,8 @@ export function App() {
   const [result, setResult] = useState<PipelineRunResult | null>(null);
   const [selectedTask, setSelectedTask] = useState<string>("");
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set());
+  const [deletingHistory, setDeletingHistory] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [activeInspectorTab, setActiveInspectorTab] = useState<InspectorTab>("overview");
   const activeRunIdRef = useRef<string | null>(null);
@@ -1575,6 +1602,21 @@ export function App() {
     void openRunFromUrl(routeRunId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, routeRunId, projectPath]);
+
+  // Переход на голый "/chat" (клик по табу, back/forward браузера) должен
+  // всегда открывать чистый экран нового чата, а не оставлять содержимое
+  // предыдущего run — раньше сброс происходил только через кнопку "Новый чат".
+  useEffect(() => {
+    if (activeView !== "chat" || routeRunId) {
+      return;
+    }
+
+    setResult(null);
+    setRunStatus(null);
+    setActiveRunId(null);
+    setSelectedTask("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, routeRunId]);
 
   async function initializeApp() {
     setLoading(true);
@@ -2186,10 +2228,62 @@ export function App() {
       setRunStatus(null);
       setActiveRunId(null);
       setSelectedTask("");
-      setTask("Построй структурный отчёт по текущему проекту и покажи ключевые зависимости.");
+      setTask("");
       setError(null);
+      setSelectedHistoryIds(new Set());
     });
     navigate("/chat");
+  }
+
+  function toggleHistorySelection(runId: string) {
+    setSelectedHistoryIds((previous) => {
+      const next = new Set(previous);
+
+      if (next.has(runId)) {
+        next.delete(runId);
+      } else {
+        next.add(runId);
+      }
+
+      return next;
+    });
+  }
+
+  function toggleSelectAllHistory(allRunIds: string[]) {
+    setSelectedHistoryIds((previous) => (previous.size === allRunIds.length ? new Set() : new Set(allRunIds)));
+  }
+
+  async function deleteHistoryEntries(runIds: string[]) {
+    if (!runIds.length || !projectPath) {
+      return;
+    }
+
+    setDeletingHistory(true);
+
+    try {
+      await fetchJsonWithTimeout<{ ok: boolean }>(`${API_BASE_URL}/api/runs/delete`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ projectPath, runIds }),
+      });
+
+      setProject((previous) =>
+        previous
+          ? { ...previous, recentRuns: previous.recentRuns.filter((entry) => !runIds.includes(entry.runId)) }
+          : previous,
+      );
+      setSelectedHistoryIds(new Set());
+
+      if (activeRunId && runIds.includes(activeRunId)) {
+        startNewChat();
+      }
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Не удалось удалить чат.");
+    } finally {
+      setDeletingHistory(false);
+    }
   }
 
   return (
@@ -2199,7 +2293,7 @@ export function App() {
           <strong>Client</strong>
         </div>
         <div className="app-topbar-actions">
-          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/chat")}>
+          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={startNewChat}>
             Чат
           </button>
           <button type="button" className={`top-nav-button ${activeView === "projects" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/projects")}>
@@ -2219,6 +2313,12 @@ export function App() {
             onSelectRun={(runId) => void openRunFromHistory(runId)}
             onStartNewChat={startNewChat}
             projectName={safeText(project?.name, "Проект")}
+            selectedIds={selectedHistoryIds}
+            onToggleSelect={toggleHistorySelection}
+            onToggleSelectAll={toggleSelectAllHistory}
+            onDeleteSelected={() => void deleteHistoryEntries([...selectedHistoryIds])}
+            onDeleteOne={(runId) => void deleteHistoryEntries([runId])}
+            deleting={deletingHistory}
           />
         ) : null}
 
