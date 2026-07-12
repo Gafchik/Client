@@ -1,5 +1,6 @@
 import { startTransition, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import type {
   BackgroundProjectState,
   ContextCandidate,
@@ -88,33 +89,6 @@ function safeCount(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function buildAnswerProvenanceSummary(result: PipelineRunResult | null): string {
-  if (!hasRunArtifacts(result)) {
-    return "Источник фактов будет показан после завершения run.";
-  }
-
-  const summary = result.research?.evidenceSummary;
-  const baselineCount = safeCount(summary?.baselineCount);
-  const overlayCount = safeCount(summary?.overlayCount);
-  const structuralCount = safeCount(summary?.structuralCount);
-
-  if (overlayCount > 0) {
-    return `Ответ опирается на committed baseline проекта и локальный overlay: baseline ${baselineCount}, overlay ${overlayCount}, structural ${structuralCount}.`;
-  }
-
-  return `Ответ опирается в основном на committed baseline проекта: baseline ${baselineCount}, overlay ${overlayCount}, structural ${structuralCount}.`;
-}
-
-function buildAnswerProvenanceLabel(result: PipelineRunResult | null): string {
-  if (!hasRunArtifacts(result)) {
-    return "Источник фактов недоступен";
-  }
-
-  return safeCount(result.research?.evidenceSummary?.overlayCount) > 0
-    ? "Baseline + Overlay"
-    : "Baseline First";
-}
-
 function normalizeProjectInfo(data: ProjectInfo): ProjectInfo {
   return {
     ...data,
@@ -148,40 +122,6 @@ function normalizeProjectCatalog(data: ProjectCatalogResponse): ProjectCatalogRe
   };
 }
 
-function shortCommit(value: string | undefined | null): string {
-  if (!value) {
-    return "нет";
-  }
-
-  return value.slice(0, 8);
-}
-
-function backgroundFreshnessLabel(value: BackgroundProjectState["freshness"] | undefined): string {
-  switch (value) {
-    case "fresh":
-      return "актуально";
-    case "stale":
-      return "устарело";
-    case "missing":
-      return "не собрано";
-    default:
-      return "неизвестно";
-  }
-}
-
-function backgroundSyncLabel(value: BackgroundProjectState["syncStatus"] | undefined): string {
-  switch (value) {
-    case "ready":
-      return "готово";
-    case "syncing":
-      return "требует обновления";
-    case "degraded":
-      return "ограничено";
-    default:
-      return "неизвестно";
-  }
-}
-
 function worktreeStatusLabel(value: BackgroundProjectState["worktreeStatus"] | undefined): string {
   switch (value) {
     case "clean":
@@ -190,21 +130,6 @@ function worktreeStatusLabel(value: BackgroundProjectState["worktreeStatus"] | u
       return "локальный overlay";
     case "conflict":
       return "конфликт";
-    default:
-      return "неизвестно";
-  }
-}
-
-function baselineSourceLabel(value: BackgroundProjectState["baselineSource"] | undefined): string {
-  switch (value) {
-    case "exact-head":
-      return "точный HEAD";
-    case "merge-base":
-      return "merge-base";
-    case "recent-branch":
-      return "последний run ветки";
-    case "none":
-      return "без baseline";
     default:
       return "неизвестно";
   }
@@ -371,17 +296,19 @@ function RunHistorySidebar({
   recentRuns,
   activeRunId,
   onSelectRun,
+  onStartNewChat,
   projectName,
 }: {
   recentRuns: KnowledgeCatalogEntry[];
   activeRunId: string | null;
   onSelectRun: (runId: string) => void;
+  onStartNewChat: () => void;
   projectName: string;
 }) {
   return (
     <aside className="chat-history">
       <div className="chat-history-head">
-        <button type="button" className="primary-button history-new-button">
+        <button type="button" className="primary-button history-new-button" onClick={onStartNewChat}>
           Новый чат
         </button>
       </div>
@@ -1493,7 +1420,15 @@ function InspectorDrawer({
 }
 
 export function App() {
-  const [activeView, setActiveView] = useState<AppView>("chat");
+  const navigate = useNavigate();
+  const location = useLocation();
+  const routeParams = useParams<{ runId?: string }>();
+  const activeView: AppView = location.pathname.startsWith("/projects")
+    ? "projects"
+    : location.pathname.startsWith("/providers")
+      ? "providers"
+      : "chat";
+  const routeRunId = routeParams.runId ?? null;
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [task, setTask] = useState("Построй структурный отчёт по текущему проекту и покажи ключевые зависимости.");
@@ -1619,6 +1554,27 @@ export function App() {
       window.clearInterval(interval);
     };
   }, [activeView, projectPath, selectedProjectId]);
+
+  useEffect(() => {
+    if (activeView !== "chat") {
+      return;
+    }
+
+    if (!routeRunId) {
+      return;
+    }
+
+    if (routeRunId === activeRunIdRef.current || routeRunId === result?.runId) {
+      return;
+    }
+
+    if (!projectPath) {
+      return;
+    }
+
+    void openRunFromUrl(routeRunId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, routeRunId, projectPath]);
 
   async function initializeApp() {
     setLoading(true);
@@ -1807,6 +1763,7 @@ export function App() {
         setResult(null);
         setInspectorOpen(false);
       });
+      navigate(`/chat/${encodeURIComponent(accepted.runId)}`);
 
       await pollPipelineStatus(accepted.runId);
     } catch (runError) {
@@ -2085,7 +2042,7 @@ export function App() {
             },
           ],
     });
-    setActiveView("projects");
+    navigate("/projects");
   }
 
   function updateProjectDraftPath(index: number, patch: Partial<ProjectDraftPath>) {
@@ -2180,7 +2137,7 @@ export function App() {
     }
   }
 
-  async function openRunFromHistory(runId: string) {
+  async function fetchRunArtifact(runId: string): Promise<void> {
     if (!projectPath) {
       return;
     }
@@ -2205,6 +2162,27 @@ export function App() {
     }
   }
 
+  async function openRunFromHistory(runId: string) {
+    navigate(`/chat/${encodeURIComponent(runId)}`);
+    await fetchRunArtifact(runId);
+  }
+
+  async function openRunFromUrl(runId: string) {
+    await fetchRunArtifact(runId);
+  }
+
+  function startNewChat() {
+    startTransition(() => {
+      setResult(null);
+      setRunStatus(null);
+      setActiveRunId(null);
+      setSelectedTask("");
+      setTask("Построй структурный отчёт по текущему проекту и покажи ключевые зависимости.");
+      setError(null);
+    });
+    navigate("/chat");
+  }
+
   return (
     <main className="app-shell app-shell-product">
       <header className="app-topbar">
@@ -2212,24 +2190,25 @@ export function App() {
           <strong>Client</strong>
         </div>
         <div className="app-topbar-actions">
-          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={() => setActiveView("chat")}>
+          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/chat")}>
             Чат
           </button>
-          <button type="button" className={`top-nav-button ${activeView === "projects" ? "top-nav-button-active" : ""}`} onClick={() => setActiveView("projects")}>
+          <button type="button" className={`top-nav-button ${activeView === "projects" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/projects")}>
             Проекты
           </button>
-          <button type="button" className={`top-nav-button ${activeView === "providers" ? "top-nav-button-active" : ""}`} onClick={() => setActiveView("providers")}>
+          <button type="button" className={`top-nav-button ${activeView === "providers" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/providers")}>
             Провайдеры
           </button>
         </div>
       </header>
 
-      <section className="app-workspace">
+      <section className={`app-workspace ${activeView === "chat" ? "app-workspace-with-history" : "app-workspace-single"}`}>
         {activeView === "chat" ? (
           <RunHistorySidebar
             recentRuns={safeList(project?.recentRuns)}
-            activeRunId={activeRunId ?? result?.runId ?? null}
+            activeRunId={routeRunId ?? activeRunId ?? result?.runId ?? null}
             onSelectRun={(runId) => void openRunFromHistory(runId)}
+            onStartNewChat={startNewChat}
             projectName={safeText(project?.name, "Проект")}
           />
         ) : null}
@@ -2287,7 +2266,20 @@ export function App() {
             />
 
             <div className="chat-body">
-              {!selectedTask && !running && !result ? (
+              {!safeList(projects).length && !loading ? (
+                <div className="chat-hero chat-hero-empty">
+                  <p className="section-kicker">Начало работы</p>
+                  <h2>Сначала добавь проект</h2>
+                  <p>
+                    Client отвечает на вопросы по уже собранной карте проекта. Чтобы начать, добавь путь к своему проекту на странице «Проекты».
+                  </p>
+                  <div className="chat-suggestions">
+                    <button type="button" className="primary-button" onClick={() => navigate("/projects")}>
+                      Добавить проект
+                    </button>
+                  </div>
+                </div>
+              ) : !selectedTask && !running && !result ? (
                 <div className="chat-hero">
                   <p className="section-kicker">Chat</p>
                   <h2>Понимание проекта за минуты, а не за часы</h2>
@@ -2325,12 +2317,12 @@ export function App() {
                 <div className="composer-actions">
                   <div className="composer-meta">
                     <span>
-                      {backgroundSyncStatus.title}. {project?.backgroundState?.worktreeStatus === "overlay" ? "Есть локальные изменения." : "Локальных изменений нет."}
+                      {backgroundSyncStatus.title}. Рабочее дерево: {worktreeStatusLabel(project?.backgroundState?.worktreeStatus)}.
                     </span>
                     {runStatus ? <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span> : null}
                   </div>
-                  <button type="submit" className="primary-button" disabled={running || loading}>
-                    {running ? "Собираю ответ..." : "Получить ответ по проекту"}
+                  <button type="submit" className="primary-button" disabled={running || loading || !selectedProjectId}>
+                    {running ? "Собираю ответ..." : !selectedProjectId ? "Сначала выбери проект" : "Получить ответ по проекту"}
                   </button>
                 </div>
               </div>
@@ -2491,7 +2483,7 @@ export function App() {
                         type="button"
                         className="ghost-button"
                         onClick={() => {
-                          setActiveView("chat");
+                          navigate("/chat");
                           setSelectedProjectId(projectItem.id);
                           setSelectedProjectPathId(projectItem.paths[0]?.id ?? "");
                           setProjectPath(projectItem.paths[0]?.rootPath ?? "");

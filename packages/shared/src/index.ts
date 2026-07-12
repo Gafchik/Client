@@ -336,6 +336,10 @@ export type ResearchIntentClass =
   | "infrastructure-storage"
   | "inventory-localization"
   | "inventory-config"
+  | "model-schema"
+  | "auth-inventory"
+  | "websocket-inventory"
+  | "redis-inventory"
   | "broad-unknown";
 
 export type ResearchStrategyKey =

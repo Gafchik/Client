@@ -35,6 +35,7 @@ import {
   type ValidationResult,
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
+import { saveGraphSnapshot } from "./graph-store.js";
 
 export interface PipelineExecutionRequest {
   runId: string;
@@ -409,6 +410,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       summary: graph.summary,
     },
   });
+  void persistGraphSnapshotSafely(graph);
   await yieldToEventLoop();
 
   const researchStartedAt = startStage(runId, "research");
@@ -1359,6 +1361,20 @@ function buildFocusedResearchTask(task: string, request: FocusedResearchRequest)
       return `${task}. Фокус проверки: entry points и их ближайшая функциональная цепочка. Действия: ${actionHints}.`;
     default:
       return `${task}. Focused refinement. Действия: ${actionHints}.`;
+  }
+}
+
+/**
+ * Персистентность графа (Slice 4, docs/architecture/008-next-generation-architecture.md, раздел 6).
+ * Сохранение в Neo4j не должно блокировать или ломать pipeline run, если graph store временно
+ * недоступен — это вспомогательная инвестиция в переиспользуемость, а не критический путь ответа.
+ */
+async function persistGraphSnapshotSafely(graph: GraphState): Promise<void> {
+  try {
+    await saveGraphSnapshot(graph);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn("Не удалось сохранить graph snapshot в Neo4j:", error instanceof Error ? error.message : error);
   }
 }
 

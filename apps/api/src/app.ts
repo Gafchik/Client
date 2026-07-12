@@ -5,6 +5,8 @@ import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadKnowledge
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
+import { initializeGraphStore } from "./graph-store.js";
+import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
 import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus } from "./pipeline-runner.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
@@ -92,6 +94,7 @@ export function createApp() {
   app.addHook("onReady", async () => {
     await initializeProviderStore();
     await initializeProjectStore();
+    await initializeGraphStore();
     startProjectStateMonitor({
       appRootPath,
       providerBaseUrl: defaultProviderBaseUrl,
@@ -102,10 +105,12 @@ export function createApp() {
 
   app.addHook("onClose", async () => {
     stopProjectStateMonitor();
+    await closeNeo4jDriver();
   });
 
   app.get("/api/health", async () => {
-    return { status: "ok", now: new Date().toISOString() };
+    const neo4jConnected = await verifyNeo4jConnectivity();
+    return { status: "ok", now: new Date().toISOString(), neo4jConnected };
   });
 
   app.get("/api/providers", async () => {

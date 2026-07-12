@@ -340,6 +340,22 @@
   - structural fallback-paths теперь подключаются только если graph seed и repository-scoped seed оказались слишком слабыми;
   - при плотном graph seed question runtime должен открывать именно graph-relevant overlay, а не широкий набор типовых директорий;
   - research report теперь явно сообщает, работал ли вопрос в `graph-first` режиме или был вынужден частично добирать candidate set через fallback.
+- Сделан первый шаг целевой архитектуры `008-next-generation-architecture.md` (Slice 4 — Persistent Structural Foundation):
+  - PostgreSQL полностью выведен из проекта; единственная база данных теперь — Neo4j (`docker-compose.yml` поднимает только Neo4j, backend и frontend работают локально без Docker);
+  - `Project` и `Provider` перенесены с PostgreSQL CRUD на Neo4j (`apps/api/src/project-store.ts`, `apps/api/src/provider-store.ts`) с сохранением прежнего API-контракта — изменений во внешнем поведении `/api/projects` и `/api/providers` нет;
+  - добавлен `apps/api/src/graph-store.ts` — первый персистентный слой для `GraphState`: после стадии `graph` в pipeline снапшот узлов и рёбер сохраняется в Neo4j (`GraphNode`/`RELATES`) и переживает перезапуск API-процесса;
+  - это устраняет главный зафиксированный архитектурный разрыв MVP — Graph был in-memory и не персистентным (см. `002-storage.md` и предыдущую версию раздела "Что пока ограничено");
+  - важное уточнение: это ещё не полная snapshot+overlay модель по коммитам из `008`, раздел 6.2 — сейчас Neo4j хранит один актуальный срез на проект, который полностью перезаписывается на каждый успешный run; runtime graph queries (`packages/graph`) по-прежнему выполняются над in-memory структурой текущего run, а не читают напрямую из Neo4j;
+  - persistence в Neo4j намеренно неблокирующая: сбой записи графа не должен прерывать pipeline run (см. `persistGraphSnapshotSafely` в `apps/api/src/pipeline-runner.ts`);
+  - `/api/health` теперь возвращает `neo4jConnected` для быстрой диагностики связи с графовым хранилищем.
+- Frontend получил проходной ремонт навигации и визуальной согласованности после регрессии, замеченной при ручном тестировании:
+  - добавлен настоящий client-side роутинг (`react-router-dom`): `/chat`, `/chat/:runId`, `/projects`, `/providers` — URL теперь всегда отражает текущий экран и конкретный открытый run, включая поддержку прямых ссылок (deep link) и навигации назад/вперёд браузера;
+  - кнопка `Новый чат` в истории раньше не имела обработчика и не делала ничего — теперь она сбрасывает текущий диалог и переводит на `/chat`;
+  - добавлено явное пустое состояние `Сначала добавь проект` на главном экране чата, если у пользователя ещё нет ни одного сохранённого проекта, с прямым CTA `Добавить проект`, ведущим на `/projects` — раньше при отсутствии проектов пользователь видел пустые выпадающие списки без объяснения, что делать;
+  - кнопка отправки вопроса теперь дизейблится и явно поясняет `Сначала выбери проект`, если проект не выбран, вместо разрешения отправить вопрос в пустоту;
+  - исправлены отсутствующие CSS-классы, из-за которых часть интерфейса рендерилась без стилей: `.chat-suggestions` (подсказки вопросов в пустом состоянии чата) и восстановлены рабочие классы `ErrorBoundary` (использовал `.shell/.panel/.panel-form/.actions`, которых не существовало в `styles.css` — теперь использует реальные классы `app-shell/settings-card/action-row`);
+  - удалён неиспользуемый (осиротевший от предыдущего рефакторинга) код: JS-функции `buildAnswerProvenanceSummary`, `buildAnswerProvenanceLabel`, `shortCommit`, `backgroundFreshnessLabel`, `backgroundSyncLabel`, `baselineSourceLabel` и CSS-классы `.runtime-pill`, `.system-note`, `.provenance-card`, `.provenance-chip`, `.answer-sections`, `.answer-section-card`, `.empty-grid`, `.empty-state`, `.compact-stack`, `.composer-status`, `.runtime-meta`, `.runtime-inline-button`, `.app-sidebar`, `.sidebar-card`, `.provider-card` — определялись, но нигде не рендерились/не применялись, создавая ложное ощущение недостроенного интерфейса при чтении кода;
+  - подпись состояния рабочего дерева в composer переведена на человекочитаемый лейбл (`worktreeStatusLabel`) вместо сравнения технического enum-значения напрямую в JSX.
 
 ## Текущее состояние MVP Slice 1
 
@@ -383,8 +399,7 @@
   - JSON
   - Markdown
 - Остальные языки архитектурно предусмотрены, но ещё не реализованы полноценно.
-- Graph пока реализован как in-memory canonical structure MVP-уровня, без отдельного постоянного graph storage.
-- Graph уже ближе к канонической модели из доки, но persistent storage, snapshot/version layer и полноценный query engine ещё не реализованы.
+- Graph теперь персистентен между перезапусками процесса (Neo4j, см. раздел "Что уже реализовано"), но это пока единый актуальный срез на проект (полная перезапись при каждом run), а не snapshot+overlay модель по коммитам из `008-next-generation-architecture.md`. Version layer и полноценный Cypher-driven query engine поверх Neo4j ещё не реализованы — runtime-запросы графа (`packages/graph`) по-прежнему работают над in-memory структурой текущего run.
 - Research и Impact пока rule-based и deterministic; functional understanding уже начато эвристиками, но ещё не опирается на полноценную semantic model.
 - Research уже начал использовать graph-derived entry points и module relation summaries, но всё ещё остаётся эвристическим и требует дальнейшего углубления semantic layer.
 - Research теперь частично graph-profile-driven на уровне seed selection, но всё ещё нуждается в более глубоком semantic traversal и снижении шума внутри близких доменов.
@@ -455,6 +470,51 @@
   - формулировки ответа ещё не всегда достаточно “человеческие” на больших и шумных репозиториях;
   - `Inspector` всё ещё остаётся техническим и требует дальнейшего product pass;
   - нужны дополнительные quality passes для реальных кейсов на больших PHP-репозиториях.
+- Навигация получила настоящий client-side роутинг (`/chat`, `/chat/:runId`, `/projects`, `/providers`), но остаётся минимальной:
+  - нет отдельных URL для конкретного `projectId`/`providerId` (переключение проекта/провайдера не отражается в адресной строке);
+  - `Новый чат` не создаёт отдельную сущность диалога — это просто сброс текущего локального состояния UI, полноценной модели "нескольких параллельных чатов" не существует;
+  - страницы `/projects` и `/providers` остаются формами CRUD без собственной вложенной маршрутизации (например, отдельного URL на редактирование конкретного проекта).
+
+## Новая декларативная система классификации вопросов (2026-07-10)
+
+Добавлена полностью новая архитектура классификации вопросов в пакет `packages/research`:
+
+### QuestionTypeRegistry (`question-types.ts`)
+- **12 типов вопросов**: `existence`, `schema`, `location`, `flow`, `configuration`, `inventory`, `impact`, `why`, `comparison`, `fix`, `history`, `unknown`
+- Декларативная регистрация через `registerQuestionType()` — новые типы добавляются без изменения кода
+- Паттерны матчинга с весами, required/exclude keywords
+- Каждый тип имеет дефолтные search profiles и contextual profiles для уточнения
+
+### SearchProfileRegistry (`search-profiles.ts`)
+- **5 профилей поиска**: `storage-topology`, `config-inventory`, `entrypoint-traversal`, `localization-inventory`, `broad-scan`
+- Цели поиска (`SearchGoal`) с приоритетами, паттернами, путями, ограничениями и контекстуальными ключами
+- Декларативная регистрация через `registerSearchProfile()`
+- Фильтрация целей по контексту вопроса
+
+### QuestionClassifier (`question-classifier.ts`)
+- Единая точка входа: `classify(question, input?) → ClassificationResult`
+- Объединяет QuestionTypeRegistry + SearchProfileRegistry
+- Возвращает: questionType, confidence, searchProfiles[], searchGoals[], reasoning, contextKeys[]
+- Специфичные правила для известных комбинаций (Google OAuth, Redis, WebSocket, Model schema, Auth existence)
+
+### Новые Intent Profiles в Research (`index.ts`)
+Добавлены 4 новых профиля намерений:
+- **model-schema** — модели, схемы, сущности, поля, отношения (belongsTo, hasMany, morphMany и т.д.)
+- **auth-inventory** — Google OAuth, Socialite, провайдеры авторизации
+- **websocket-inventory** — WebSocket, Pusher, Laravel Echo, broadcast, channels, realtime
+- **redis-inventory** — Redis, cache, session, queue, jobs, workers
+
+### Новые функции классификации и бустинга
+- `isModelSchemaQuestion()`, `isAuthInventoryQuestion()`, `isWebsocketInventoryQuestion()`, `isRedisInventoryQuestion()`
+- File/symbol/route boost/penalty функции для каждого нового профиля
+- Интеграция в `runResearch()` scoring loops
+
+### Преимущества новой архитектуры
+1. **Расширяемость** — новые типы вопросов и профили поиска добавляются декларативно
+2. **Чёткое разделение** — Question Type (семантика) → Search Profiles (стратегия) → Search Goals (конкретные цели)
+3. **Контекстуальность** — профили адаптируются под доменные ключи в вопросе
+4. **Наблюдаемость** — `reasoning` в ClassificationResult показывает полную цепочку принятия решения
+5. **Замена старой системы** — заменяет `classifyIntent()` + `buildInitialSearchPlan()` на единый типизированный pipeline
 
 ## Где хранятся артефакты
 

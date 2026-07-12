@@ -32,8 +32,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   public render(): ReactNode {
     if (this.state.hasError) {
       return (
-        <main className="shell">
-          <section className="panel panel-form error-shell">
+        <main className="app-shell">
+          <section className="settings-card error-shell">
             <div className="panel-header">
               <h2>Интерфейс Временно Недоступен</h2>
               <span>Recovery Mode</span>
@@ -48,8 +48,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
                   <span>{this.state.message || "Неизвестная ошибка интерфейса."}</span>
                 </div>
               </div>
-              <div className="actions">
-                <button type="button" onClick={() => window.location.reload()}>
+              <div className="action-row">
+                <button type="button" className="primary-button" onClick={() => window.location.reload()}>
                   Перезагрузить интерфейс
                 </button>
               </div>

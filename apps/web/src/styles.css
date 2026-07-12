@@ -72,18 +72,18 @@ button {
   margin: 0 auto;
   width: 100%;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr);
   gap: 20px;
   align-items: start;
 }
 
-.app-sidebar {
-  display: grid;
-  gap: 18px;
-  align-content: start;
+.app-workspace-with-history {
+  grid-template-columns: 248px minmax(0, 1fr);
 }
 
-.sidebar-card,
+.app-workspace-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .message-card,
 .composer,
 .inspector-panel,
@@ -94,15 +94,10 @@ button {
   box-shadow: 0 18px 50px rgba(47, 56, 77, 0.08);
 }
 
-.sidebar-card,
 .message-card,
 .composer,
 .inspector-panel {
   border-radius: 24px;
-}
-
-.sidebar-card {
-  padding: 18px;
 }
 
 .section-head,
@@ -128,21 +123,16 @@ button {
 .panel-header h2,
 .chat-header h1,
 .inspector-head h2,
-.message-card h3,
-.empty-state h3 {
+.message-card h3 {
   margin: 0;
 }
 
-.section-caption,
 .panel-header span,
 .subtle,
 .muted,
-.history-meta,
 .message-footnote,
 .chat-subtitle,
 .composer-meta span,
-.composer-status span,
-.sidebar-copy,
 .field span,
 .list-item span {
   color: #5b667f;
@@ -359,76 +349,15 @@ button {
   letter-spacing: -0.05em;
 }
 
-.runtime-pill,
-.system-note {
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(29, 36, 51, 0.05);
+.chat-hero-empty {
+  border-color: rgba(202, 107, 0, 0.28);
+  background: rgba(255, 250, 240, 0.94);
 }
 
-.runtime-pill {
-  display: grid;
-  gap: 6px;
-}
-
-.runtime-pill strong,
-.system-note strong {
-  color: #24324d;
-}
-
-.runtime-pill span {
-  color: #5b667f;
-}
-
-.system-note {
-  line-height: 1.6;
-}
-
-.runtime-pill-status-ready,
-.system-note-ready {
-  background: rgba(31, 143, 87, 0.11);
-}
-
-.runtime-pill-status-warning,
-.system-note-warning {
-  background: rgba(202, 107, 0, 0.12);
-}
-
-.runtime-pill-status-overlay,
-.system-note-overlay {
-  background: rgba(25, 87, 178, 0.1);
-}
-
-.system-note-sync-running {
-  background: rgba(25, 87, 178, 0.12);
-}
-
-.system-note-sync-scheduled {
-  background: rgba(202, 107, 0, 0.1);
-}
-
-.system-note-sync-idle {
-  background: rgba(31, 143, 87, 0.09);
-}
-
-.runtime-meta {
+.chat-suggestions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  align-items: center;
-  color: #5b667f;
-  font-size: 0.94rem;
-  padding: 0 4px;
-}
-
-.runtime-meta span {
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: rgba(29, 36, 51, 0.05);
-}
-
-.runtime-inline-button {
-  padding: 8px 12px;
 }
 
 .message {
@@ -492,9 +421,7 @@ button {
 
 .inline-pipeline,
 .inline-highlights,
-.execution-preview-card,
-.provenance-card,
-.empty-state {
+.execution-preview-card {
   margin-top: 16px;
 }
 
@@ -551,8 +478,7 @@ button {
 }
 
 .inline-highlights,
-.result-quick-grid,
-.empty-grid {
+.result-quick-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
@@ -562,7 +488,6 @@ button {
 .result-card,
 .empty-card,
 .mini-stat,
-.provider-card,
 .history-item,
 .list-item {
   display: grid;
@@ -580,62 +505,11 @@ button {
   background: linear-gradient(135deg, rgba(247, 162, 70, 0.12), rgba(25, 87, 178, 0.08));
 }
 
-.answer-sections {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 16px;
-}
-
-.answer-section-card {
-  display: grid;
-  gap: 10px;
-  padding: 16px 18px;
-  border-radius: 20px;
-  background: rgba(29, 36, 51, 0.045);
-}
-
-.provenance-card {
-  display: grid;
-  gap: 12px;
-  padding: 16px 18px;
-  border-radius: 20px;
-  background: linear-gradient(135deg, rgba(25, 87, 178, 0.08), rgba(29, 36, 51, 0.04));
-}
-
-.provenance-head,
-.provenance-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.provenance-card p {
-  margin: 0;
-}
-
-.provenance-chip {
-  padding: 8px 12px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.7);
-  color: #244166;
-  font-size: 0.86rem;
-}
-
 .execution-preview-metrics span {
   padding: 8px 12px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.72);
   color: #31415e;
-}
-
-.empty-state {
-  padding: 22px;
-  border-radius: 24px;
-  border: 1px dashed rgba(29, 36, 51, 0.14);
-  background: rgba(255, 252, 247, 0.46);
 }
 
 .composer {
@@ -684,20 +558,9 @@ button {
   gap: 4px;
 }
 
-.composer-status {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  font-size: 0.94rem;
-}
-
 .stack {
   display: grid;
   gap: 14px;
-}
-
-.compact-stack {
-  gap: 10px;
 }
 
 .history-item {
@@ -712,7 +575,6 @@ button {
   background: rgba(25, 87, 178, 0.1);
 }
 
-.provider-card strong,
 .history-item strong,
 .list-item strong,
 .mini-stat strong,
@@ -835,7 +697,7 @@ button {
 }
 
 @media (max-width: 1280px) {
-  .app-workspace {
+  .app-workspace-with-history {
     grid-template-columns: 220px minmax(0, 1fr);
   }
 }
@@ -845,7 +707,7 @@ button {
     padding: 18px;
   }
 
-  .app-workspace {
+  .app-workspace-with-history {
     grid-template-columns: 1fr;
   }
 
@@ -869,9 +731,7 @@ button {
 @media (max-width: 880px) {
   .settings-layout,
   .inline-highlights,
-  .result-quick-grid,
-  .answer-sections,
-  .empty-grid {
+  .result-quick-grid {
     grid-template-columns: 1fr;
   }
 
@@ -898,7 +758,6 @@ button {
 
   .message-card,
   .composer,
-  .sidebar-card,
   .inspector-panel,
   .inspector-drawer {
     border-radius: 20px;

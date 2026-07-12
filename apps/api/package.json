@@ -22,8 +22,7 @@
     "@client/shared": "0.1.0",
     "@client/workspace": "0.1.0",
     "@fastify/cors": "^11.1.0",
-    "@types/pg": "^8.20.0",
     "fastify": "^5.4.0",
-    "pg": "^8.22.0"
+    "neo4j-driver": "^5.28.3"
   }
 }

@@ -11,6 +11,7 @@ import {
   getRoutesForModule,
   getRuntimeSemanticEdges,
 } from "@client/graph";
+import { questionClassifier, ClassificationResult } from "./question-classifier.js";
 import {
   type BackgroundProjectState,
   clamp,
@@ -225,28 +226,189 @@ const INTENT_PROFILES: IntentProfile[] = [
     key: "notification",
     aliases: ["notification", "notifications", "email", "mail", "sms", "уведомление", "уведомления", "письмо"],
   },
+  {
+    key: "model-schema",
+    aliases: [
+      "model",
+      "models",
+      "schema",
+      "schemas",
+      "entity",
+      "entities",
+      "field",
+      "fields",
+      "column",
+      "columns",
+      "attribute",
+      "attributes",
+      "property",
+      "properties",
+      "relation",
+      "relations",
+      "relationship",
+      "relationships",
+      "belongsTo",
+      "hasMany",
+      "hasOne",
+      "morphMany",
+      "morphOne",
+      "модель",
+      "модели",
+      "схема",
+      "схемы",
+      "сущность",
+      "сущности",
+      "поле",
+      "поля",
+      "колонка",
+      "колонки",
+      "атрибут",
+      "атрибуты",
+      "свойство",
+      "свойства",
+      "отношение",
+      "отношения",
+    ],
+  },
+  {
+    key: "auth-inventory",
+    aliases: [
+      "google",
+      "oauth",
+      "socialite",
+      "provider",
+      "providers",
+      "google-auth",
+      "googleauth",
+      "google-authentication",
+      "google-авторизация",
+      "google-аутентификация",
+      "гугл",
+      "гугл-авторизация",
+      "гугл-аутентификация",
+      "google-логин",
+      "google-вход",
+    ],
+  },
+  {
+    key: "websocket-inventory",
+    aliases: [
+      "websocket",
+      "websockets",
+      "ws",
+      "socket",
+      "sockets",
+      "realtime",
+      "real-time",
+      "pusher",
+      "laravel-echo",
+      "echo",
+      "broadcast",
+      "broadcasting",
+      "channel",
+      "channels",
+      "вебсокет",
+      "вебсокеты",
+      "сокет",
+      "сокеты",
+      "реалтайм",
+      "реал-тайм",
+      "пушер",
+      "эхо",
+      " бродкаст",
+      " бродкастинг",
+      "канал",
+      "каналы",
+    ],
+  },
+  {
+    key: "redis-inventory",
+    aliases: [
+      "redis",
+      "cache",
+      "caching",
+      "session",
+      "sessions",
+      "queue",
+      "queues",
+      "job",
+      "jobs",
+      "worker",
+      "workers",
+      "редис",
+      "кэш",
+      "кэширование",
+      "сессия",
+      "сессии",
+      "очередь",
+      "очереди",
+      "джоб",
+      "джобы",
+      "воркер",
+      "воркеры",
+    ],
+  },
 ];
+
+interface ResearchContext {
+  tokens: string[];
+  classification: ClassificationResult;
+  routing: ResearchRoutingDecision;
+  broadFocus: boolean;
+  infrastructureFocus: boolean;
+  localizationInventoryFocus: boolean;
+  localizationBehaviorFocus: boolean;
+  billingRollbackFocus: boolean;
+  configFocus: boolean;
+  modelSchemaFocus: boolean;
+  authInventoryFocus: boolean;
+  websocketInventoryFocus: boolean;
+  redisInventoryFocus: boolean;
+}
 
 export function runResearch(input: ResearchInput): ResearchReport {
   const tokens = expandTaskTokens(input.task);
-  const routing = routeResearch(tokens);
+  const task = tokens.join(" ");
+  const classification = questionClassifier.classify(task);
+  const routing = mapClassificationToRouting(classification);
   const broadFocus = routing.intentClass === "broad-unknown";
   const infrastructureFocus = isInfrastructureQuestion(tokens);
   const localizationInventoryFocus = isLocalizationInventoryQuestion(tokens);
   const localizationBehaviorFocus = isLocalizationBehaviorQuestion(tokens);
   const billingRollbackFocus = isBillingRollbackQuestion(tokens);
   const configFocus = isConfigQuestion(tokens);
+  const modelSchemaFocus = isModelSchemaQuestion(tokens);
+  const authInventoryFocus = isAuthInventoryQuestion(tokens);
+  const websocketInventoryFocus = isWebsocketInventoryQuestion(tokens);
+  const redisInventoryFocus = isRedisInventoryQuestion(tokens);
+
+  const ctx: ResearchContext = {
+    tokens,
+    classification,
+    routing,
+    broadFocus,
+    infrastructureFocus,
+    localizationInventoryFocus,
+    localizationBehaviorFocus,
+    billingRollbackFocus,
+    configFocus,
+    modelSchemaFocus,
+    authInventoryFocus,
+    websocketInventoryFocus,
+    redisInventoryFocus,
+  };
+
   const fileEvidence: ScoredReference[] = [];
   const symbolEvidence: ScoredReference[] = [];
-  const moduleIntents = detectModuleIntents(input, tokens);
-  const dominantModule = broadFocus ? "не определён" : moduleIntents[0]?.module ?? "не определён";
-  const functionalFocus = isFunctionalQuestion(tokens);
+  const moduleIntents = detectModuleIntents(input, ctx);
+  const dominantModule = ctx.broadFocus ? "не определён" : moduleIntents[0]?.module ?? "не определён";
+  const functionalFocus = isFunctionalQuestion(ctx.tokens);
   const routeNodes = getRouteNodes(input.graph);
   const codeNodes = getCodeNodes(input.graph);
   const graphModules = getNodesByKind(input.graph, "module");
   const graphSeedNodes = getNodesForQueryProfile(
     input.graph,
-    routing.queryProfileKey,
+    ctx.routing.queryProfileKey,
     dominantModule !== "не определён" ? { moduleLabel: dominantModule } : undefined,
   );
   const runtimeLocaleNodes = localizationBehaviorFocus ? getLocalizationRuntimeNodes(input.graph) : [];
@@ -286,7 +448,11 @@ export function runResearch(input: ResearchInput): ResearchReport {
       getLocalizationFileBoost(file, localizationInventoryFocus, tokens) +
       getLocaleRuntimeFileBoost(file, localizationBehaviorFocus, tokens) +
       getBillingRollbackFileBoost(file, billingRollbackFocus, tokens) +
-      getConfigFileBoost(file, configFocus, tokens);
+      getConfigFileBoost(file, configFocus, tokens) +
+      getModelSchemaFileBoost(file, modelSchemaFocus, tokens) +
+      getAuthInventoryFileBoost(file, authInventoryFocus, tokens) +
+      getWebsocketInventoryFileBoost(file, websocketInventoryFocus, tokens) +
+      getRedisInventoryFileBoost(file, redisInventoryFocus, tokens);
 
     if (score <= 0) {
       continue;
@@ -316,7 +482,11 @@ export function runResearch(input: ResearchInput): ResearchReport {
       getLocalizationSymbolBoost(symbol, localizationInventoryFocus, tokens) +
       getLocaleRuntimeSymbolBoost(symbol, localizationBehaviorFocus, tokens) +
       getBillingRollbackSymbolBoost(symbol, billingRollbackFocus, tokens) +
-      getConfigSymbolBoost(symbol, configFocus, tokens);
+      getConfigSymbolBoost(symbol, configFocus, tokens) +
+      getModelSchemaSymbolBoost(symbol, modelSchemaFocus, tokens) +
+      getAuthInventorySymbolBoost(symbol, authInventoryFocus, tokens) +
+      getWebsocketInventorySymbolBoost(symbol, websocketInventoryFocus, tokens) +
+      getRedisInventorySymbolBoost(symbol, redisInventoryFocus, tokens);
 
     if (score <= 0) {
       continue;
@@ -343,7 +513,11 @@ export function runResearch(input: ResearchInput): ResearchReport {
       getLocalizationRoutePenalty(routeNode.filePath ?? "", localizationInventoryFocus) +
       getLocaleRuntimeRouteBoost(routeNode.filePath ?? "", localizationBehaviorFocus) +
       getBillingRollbackRouteBoost(routeNode.filePath ?? "", billingRollbackFocus) +
-      getConfigRoutePenalty(routeNode.filePath ?? "", configFocus);
+      getConfigRoutePenalty(routeNode.filePath ?? "", configFocus) +
+      getModelSchemaRoutePenalty(routeNode.filePath ?? "", modelSchemaFocus) +
+      getAuthInventoryRoutePenalty(routeNode.filePath ?? "", authInventoryFocus) +
+      getWebsocketInventoryRoutePenalty(routeNode.filePath ?? "", websocketInventoryFocus) +
+      getRedisInventoryRoutePenalty(routeNode.filePath ?? "", redisInventoryFocus);
 
     if (score <= 0) {
       continue;
@@ -395,17 +569,17 @@ export function runResearch(input: ResearchInput): ResearchReport {
     )
     .filter((node): node is GraphState["nodes"][number] => Boolean(node && node.kind === "module"))
     .map((node) => node.label);
-  const entryPoints = detectEntryPoints(input, topFiles, routeNodes, dominantModule);
-  const primaryEntities = detectPrimaryEntities(input, topFiles, codeNodes);
-  const sideEffects = detectSideEffects(input);
-  const dataSources = detectDataSources(input);
+  const entryPoints = detectEntryPoints(input, topFiles, routeNodes, dominantModule, ctx);
+  const primaryEntities = detectPrimaryEntities(input, topFiles, codeNodes, ctx);
+  const sideEffects = detectSideEffects(input, ctx);
+  const dataSources = detectDataSources(input, ctx);
   const affectedModules = deriveAffectedModules(moduleIntents, dominantModule, graphRelatedModules, topFiles, entryPoints);
-  const functionalSummary = buildFunctionalSummary(input, affectedModules, dominantModule, moduleIntents, entryPoints, primaryEntities, sideEffects, dataSources);
-  const findings = buildFindings(input, evidence, moduleIntents, dominantModule, strongGraphSeed);
+  const functionalSummary = buildFunctionalSummary(input, affectedModules, dominantModule, moduleIntents, entryPoints, primaryEntities, sideEffects, dataSources, ctx);
+  const findings = buildFindings(input, evidence, moduleIntents, dominantModule, strongGraphSeed, ctx);
   const baselineFindings = buildBaselineFindings(input, evidence, strongGraphSeed);
   const overlayFindings = buildOverlayFindings(input, evidence);
   const unknowns = buildUnknowns(input, evidence, moduleIntents, entryPoints, sideEffects, dataSources, strongGraphSeed);
-  const confidence = computeConfidence(input, evidence, unknowns);
+  const confidence = computeConfidence(input, evidence, unknowns, ctx);
   const evidenceSummary = buildEvidenceSummary(evidence);
 
   return {
@@ -527,67 +701,169 @@ function buildOverlayFindings(input: ResearchInput, evidence: ScoredReference[])
   ];
 }
 
-function routeResearch(tokens: string[]): ResearchRoutingDecision {
-  if (isLocalizationBehaviorQuestion(tokens)) {
-    return {
-      intentClass: "functional-flow",
-      strategyKey: "graph-functional-entrypoints",
-      queryProfileKey: "entrypoint-traversal",
-    };
+function mapClassificationToRouting(classification: ClassificationResult): ResearchRoutingDecision {
+  const { questionType, searchProfiles, contextKeys } = classification;
+  
+  // Primary profile is the first one
+  const primaryProfile = searchProfiles[0] ?? "broad-scan";
+  
+  // Map question type to intentClass
+  const intentClassMap: Record<string, ResearchIntentClass> = {
+    "existence": "inventory-config",
+    "schema": "model-schema",
+    "location": "broad-unknown",
+    "flow": "functional-flow",
+    "configuration": "inventory-config",
+    "inventory": "inventory-config",
+    "impact": "functional-flow",
+    "why": "broad-unknown",
+    "comparison": "broad-unknown",
+    "fix": "functional-flow",
+    "history": "broad-unknown",
+    "unknown": "broad-unknown",
+  };
+  
+  // Map question type to strategyKey
+  const strategyKeyMap: Record<string, ResearchStrategyKey> = {
+    "existence": "graph-config-inventory",
+    "schema": "graph-storage-structure",
+    "location": "broad-repository-scan",
+    "flow": "graph-functional-entrypoints",
+    "configuration": "graph-config-inventory",
+    "inventory": "graph-config-inventory",
+    "impact": "graph-functional-entrypoints",
+    "why": "broad-repository-scan",
+    "comparison": "broad-repository-scan",
+    "fix": "graph-functional-entrypoints",
+    "history": "broad-repository-scan",
+    "unknown": "broad-repository-scan",
+  };
+  
+  // Special handling for specific context keys - SPECIFIC intents first (priority order)
+  
+  // model-schema: check for model/schema/entity context keys
+  if (contextKeys.includes("model") || contextKeys.includes("schema") || contextKeys.includes("entity") || contextKeys.includes("field") || contextKeys.includes("column") || contextKeys.includes("attribute") || contextKeys.includes("property") || contextKeys.includes("relation")) {
+    if (questionType === "schema" || questionType === "existence" || questionType === "inventory") {
+      return {
+        intentClass: "model-schema",
+        strategyKey: "graph-storage-structure",
+        queryProfileKey: "storage-topology",
+      };
+    }
   }
-
-  if (isBillingRollbackQuestion(tokens)) {
-    return {
-      intentClass: "functional-flow",
-      strategyKey: "graph-functional-entrypoints",
-      queryProfileKey: "entrypoint-traversal",
-    };
+  
+  // auth-inventory: check for google/oauth/socialite/provider context keys
+  if (contextKeys.includes("google") || contextKeys.includes("oauth") || contextKeys.includes("socialite") || contextKeys.includes("provider")) {
+    if (questionType === "inventory" || questionType === "existence" || questionType === "configuration") {
+      return {
+        intentClass: "auth-inventory",
+        strategyKey: "graph-config-inventory",
+        queryProfileKey: "config-inventory",
+      };
+    }
   }
-
-  if (isLocalizationInventoryQuestion(tokens)) {
-    return {
-      intentClass: "inventory-localization",
-      strategyKey: "graph-localization-inventory",
-      queryProfileKey: "localization-inventory",
-    };
+  
+  // websocket-inventory: check for websocket/realtime/broadcast context keys
+  if (contextKeys.includes("websocket") || contextKeys.includes("realtime") || contextKeys.includes("broadcast") || contextKeys.includes("pusher") || contextKeys.includes("echo") || contextKeys.includes("channel")) {
+    if (questionType === "inventory" || questionType === "existence" || questionType === "configuration") {
+      return {
+        intentClass: "websocket-inventory",
+        strategyKey: "graph-config-inventory",
+        queryProfileKey: "config-inventory",
+      };
+    }
+    if (questionType === "flow" || questionType === "why") {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
   }
-
-  if (isConfigQuestion(tokens)) {
-    return {
-      intentClass: "inventory-config",
-      strategyKey: "graph-config-inventory",
-      queryProfileKey: "config-inventory",
-    };
+  
+  // redis-inventory: check for redis/cache/queue/session context keys
+  if (contextKeys.includes("redis") || contextKeys.includes("cache") || contextKeys.includes("queue") || contextKeys.includes("session") || contextKeys.includes("job") || contextKeys.includes("worker")) {
+    if (questionType === "inventory" || questionType === "existence" || questionType === "configuration") {
+      return {
+        intentClass: "redis-inventory",
+        strategyKey: "graph-storage-structure",
+        queryProfileKey: "storage-topology",
+      };
+    }
+    if (questionType === "flow" || questionType === "why") {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
   }
-
-  if (isInfrastructureQuestion(tokens)) {
-    return {
-      intentClass: "infrastructure-storage",
-      strategyKey: "graph-storage-structure",
-      queryProfileKey: "storage-topology",
-    };
+  
+  // localization: existing logic
+  if (contextKeys.includes("localization") || contextKeys.includes("locale") || contextKeys.includes("translation") || contextKeys.includes("i18n")) {
+    if (questionType === "inventory") {
+      return {
+        intentClass: "inventory-localization",
+        strategyKey: "graph-localization-inventory",
+        queryProfileKey: "localization-inventory",
+      };
+    }
+    if (questionType === "flow" || questionType === "why") {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
   }
-
-  if (!hasSpecificIntentSignal(tokens)) {
-    return {
-      intentClass: "broad-unknown",
-      strategyKey: "broad-repository-scan",
-      queryProfileKey: "broad-scan",
-    };
+  
+  // billing: existing logic
+  if (contextKeys.includes("billing") || contextKeys.includes("bill") || contextKeys.includes("payment")) {
+    if (questionType === "flow" || questionType === "fix") {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
   }
-
-  if (isFunctionalQuestion(tokens)) {
-    return {
-      intentClass: "functional-flow",
-      strategyKey: "graph-functional-entrypoints",
-      queryProfileKey: "entrypoint-traversal",
-    };
+  
+  // why + domain context → functional-flow
+  if (questionType === "why") {
+    if (contextKeys.includes("auth") || contextKeys.includes("oauth") || contextKeys.includes("login") || contextKeys.includes("provider") || contextKeys.includes("socialite")) {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
+    if (contextKeys.includes("redis") || contextKeys.includes("cache") || contextKeys.includes("queue") || contextKeys.includes("session")) {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
+    if (contextKeys.includes("websocket") || contextKeys.includes("broadcast") || contextKeys.includes("realtime")) {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
+    if (contextKeys.includes("database") || contextKeys.includes("model") || contextKeys.includes("storage") || contextKeys.includes("db")) {
+      return {
+        intentClass: "functional-flow",
+        strategyKey: "graph-functional-entrypoints",
+        queryProfileKey: "entrypoint-traversal",
+      };
+    }
   }
-
+  
   return {
-    intentClass: "broad-unknown",
-    strategyKey: "broad-repository-scan",
-    queryProfileKey: "broad-scan",
+    intentClass: intentClassMap[questionType] ?? "broad-unknown",
+    strategyKey: strategyKeyMap[questionType] ?? "broad-repository-scan",
+    queryProfileKey: primaryProfile,
   };
 }
 
@@ -600,13 +876,10 @@ function buildFunctionalSummary(
   primaryEntities: string[],
   sideEffects: string[],
   dataSources: string[],
+  ctx: ResearchContext,
 ): string {
-  const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
-  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
-  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
-  const configFocus = isConfigQuestion(expandTaskTokens(input.task));
-  const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
+  const broadFocus = ctx.routing.intentClass === "broad-unknown";
+  const isWhyQuestion = ctx.classification.questionType === "why";
   const moduleText = affectedModules.length ? affectedModules.join(", ") : "неопределённых зонах";
   const intentText = moduleIntents.length
     ? `Наиболее вероятный функциональный модуль: ${dominantModule}.`
@@ -620,27 +893,37 @@ function buildFunctionalSummary(
     return `По текущему исследованию задача "${input.task}" сформулирована слишком широко, поэтому система перешла в broad repository scan вместо узкого доменного обхода. Обнаружены наиболее заметные зоны проекта: ${moduleText}. Стартовые structural anchors: ${entryPointText}. Первичные сущности верхнего уровня: ${entityText}. Подтверждённый общий signal: ${sideEffectText}. Основной источник сведений: ${dataSourceText}. Для точного ответа желательно сузить вопрос до конкретного модуля, потока или подсистемы.`;
   }
 
-  if (localizationBehaviorFocus) {
+  if (ctx.localizationBehaviorFocus) {
     return `По текущему исследованию задача "${input.task}" относится к runtime-поведению локализации, а не к inventory переводов. Основные точки входа: ${entryPointText}. Вероятные сущности, влияющие на выбор локали: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных для выбора локали: ${dataSourceText}. Система должна проверять middleware, request headers, config fallback и места, где locale устанавливается в жизненном цикле запроса.`;
   }
 
-  if (billingRollbackFocus) {
+  if (ctx.billingRollbackFocus) {
     return `По текущему исследованию задача "${input.task}" относится к runtime-поведению rollback bill и проверкам истории статусов. Основные точки входа: ${entryPointText}. Ключевые сущности перехода: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных для решения о rollback: ${dataSourceText}. Система должна проверять controller/action flow, bill history relations, вычисляемые rollback guards и создание новых BillHistory при смене статуса.`;
   }
 
-  if (localizationInventoryFocus) {
+  if (ctx.localizationInventoryFocus) {
     const localeCodes = detectLocalizationCodes(input);
     return `По текущему исследованию задача "${input.task}" больше всего связана с ${moduleText}. В проекте обнаружено ${localeCodes.length} языков локализации: ${localeCodes.join(", ") || "не удалось определить"}. Основные точки хранения: ${entryPointText}. Ключевые сущности локализации: ${entityText}. Главный подтверждённый i18n signal: ${sideEffectText}. Основной источник локализационных данных: ${dataSourceText}.`;
   }
 
-  if (configFocus) {
+  if (ctx.configFocus) {
     const configFiles = detectConfigFiles(input);
     const envKeys = detectEnvKeys(input);
+    if (isWhyQuestion) {
+      return `По текущему исследованию вопрос "${input.task}" требует объяснения причин конфигурации. Обнаружены ${configFiles.length} конфигурационных файлов и ${envKeys.length} env-сигналов в зоне ${moduleText}. Ключевые конфигурационные сущности: ${entityText}. Найденные настройки: ${configFiles.slice(0, 3).join(", ")}. Основной источник конфигурационных данных: ${dataSourceText}. Анализ показывает выбранные параметры и их значения в конфигурации.`;
+    }
     return `По текущему исследованию задача "${input.task}" больше всего связана с ${moduleText}. Основные точки хранения конфигурации: ${entryPointText}. Найдено ${configFiles.length} ключевых config-файлов и ${envKeys.length} env-сигналов. Ключевые конфигурационные сущности: ${entityText}. Главный подтверждённый config signal: ${sideEffectText}. Основной источник конфигурационных данных: ${dataSourceText}.`;
   }
 
-  if (infrastructureFocus) {
+  if (ctx.infrastructureFocus) {
+    if (isWhyQuestion) {
+      return `По текущему исследованию вопрос "${input.task}" требует объяснения причин выбора инфраструктуры. Обнаружена зона ${moduleText} (${dominantModule}). Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Найденные инфраструктурные решения: ${sideEffectText}. Основной источник данных: ${dataSourceText}. Анализ показывает выбранные технологии и их конфигурацию.`;
+    }
     return `По текущему исследованию задача "${input.task}" больше всего связана с ${moduleText}. Наиболее вероятная зона хранения: ${dominantModule}. Основные точки входа и операции: ${entryPointText}. Ключевые сущности хранения: ${entityText}. Главный подтверждённый infrastructure signal: ${sideEffectText}. Основной источник данных и секретов: ${dataSourceText}.`;
+  }
+
+  if (isWhyQuestion) {
+    return `По текущему исследованию вопрос "${input.task}" требует объяснения причин архитектурного выбора. Задача связана с ${moduleText}. ${intentText} Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Найденные архитектурные решения: ${sideEffectText}. Основной источник данных: ${dataSourceText}. Анализ показывает зависимости, ограничения и выбранные паттерны в коде.`;
   }
 
   return `По текущему исследованию задача "${input.task}" больше всего связана с ${moduleText}. ${intentText} Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных: ${dataSourceText}.`;
@@ -652,6 +935,7 @@ function buildFindings(
   moduleIntents: ModuleIntentMatch[],
   dominantModule: string,
   strongGraphSeed: boolean,
+  ctx: ResearchContext,
 ): string[] {
   if (evidence.length === 0) {
     return [
@@ -660,15 +944,11 @@ function buildFindings(
     ];
   }
 
+  const isWhyQuestion = ctx.classification.questionType === "why";
   const topLabels = evidence.slice(0, 3).map((item) => item.label);
   const moduleRelationSummary =
     dominantModule !== "не определён" ? getModuleRelationSummary(input.graph, dominantModule).slice(0, 3) : [];
-  const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
-  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
-  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
-  const configFocus = isConfigQuestion(expandTaskTokens(input.task));
-  const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
+  const broadFocus = ctx.routing.intentClass === "broad-unknown";
 
   if (broadFocus) {
     return [
@@ -681,7 +961,7 @@ function buildFindings(
     ];
   }
 
-  if (localizationBehaviorFocus) {
+  if (ctx.localizationBehaviorFocus) {
     return [
       `Самые сильные structural anchors для runtime-вопроса о локали: ${topLabels.join(", ")}.`,
       "Вопрос распознан как поведение запроса, поэтому research ищет не только translation-файлы, а middleware, request lifecycle, headers и config fallback.",
@@ -696,7 +976,7 @@ function buildFindings(
     ];
   }
 
-  if (billingRollbackFocus) {
+  if (ctx.billingRollbackFocus) {
     return [
       `Самые сильные structural anchors для rollback/history вопроса: ${topLabels.join(", ")}.`,
       "Вопрос распознан как runtime-поведение billing rollback, поэтому research ищет не только status enum, но и controller endpoints, rollback actions, bill history relations и guards по истории.",
@@ -711,7 +991,7 @@ function buildFindings(
     ];
   }
 
-  if (localizationInventoryFocus) {
+  if (ctx.localizationInventoryFocus) {
     const localeCodes = detectLocalizationCodes(input);
     return [
       `Самые сильные структурные опоры для локализационного вопроса: ${topLabels.join(", ")}.`,
@@ -726,10 +1006,10 @@ function buildFindings(
     ];
   }
 
-  if (configFocus) {
+  if (ctx.configFocus) {
     const configFiles = detectConfigFiles(input);
     const envKeys = detectEnvKeys(input);
-    return [
+    const findings = [
       `Самые сильные структурные опоры для config/env вопроса: ${topLabels.join(", ")}.`,
       configFiles.length > 0
         ? `По структуре проекта обнаружены ключевые config-файлы: ${configFiles.slice(0, 6).join(", ")}.`
@@ -741,10 +1021,14 @@ function buildFindings(
         ? `Inventory/config эвристики отдали приоритет модулю "${moduleIntents[0].module}" на основе config/env/settings сигналов.`
         : "Inventory/config эвристики не смогли уверенно выделить конфигурационную зону.",
     ];
+    if (isWhyQuestion) {
+      findings.push("Для why-вопроса приоритет отдан конфигурационным значениям, провайдерам и документации, объясняющим выбор параметров.");
+    }
+    return findings;
   }
 
-  if (infrastructureFocus) {
-    return [
+  if (ctx.infrastructureFocus) {
+    const findings = [
       `Самые сильные структурные опоры для инфраструктурного вопроса: ${topLabels.join(", ")}.`,
       moduleIntents[0]
         ? `Инфраструктурные эвристики отдали приоритет модулю "${moduleIntents[0].module}" на основе host/port/credential/server/vault сигналов.`
@@ -757,7 +1041,12 @@ function buildFindings(
       `Сейчас проект даёт для анализа ${input.index.manifest.fileCount} индексированных файлов и ${input.index.manifest.symbolCount} извлечённых символов.`,
       "Отчёт исследования строится из Graph и прямых данных файлов, поэтому остаётся детерминированным и воспроизводимым для одного и того же состояния репозитория.",
     ];
+    if (isWhyQuestion) {
+      findings.push("Для why-вопроса приоритет отдан сервис-провайдерам, архитектурным границам и зависимостям, объясняющим выбор технологии.");
+    }
+    return findings;
   }
+
 
   return [
     `Самые сильные структурные опоры для задачи: ${topLabels.join(", ")}.`,
@@ -823,11 +1112,12 @@ function buildUnknowns(
   return unknowns;
 }
 
-function detectModuleIntents(input: ResearchInput, tokens: string[]): ModuleIntentMatch[] {
-  const infrastructureFocus = isInfrastructureQuestion(tokens);
-  const localizationInventoryFocus = isLocalizationInventoryQuestion(tokens);
-  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(tokens);
-  const configFocus = isConfigQuestion(tokens);
+function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): ModuleIntentMatch[] {
+  const tokens = ctx.tokens;
+  const infrastructureFocus = ctx.infrastructureFocus;
+  const localizationInventoryFocus = ctx.localizationInventoryFocus;
+  const localizationBehaviorFocus = ctx.localizationBehaviorFocus;
+  const configFocus = ctx.configFocus;
   const symbolHaystacks = new Map<string, string>();
 
   for (const symbol of input.index.symbols) {
@@ -968,24 +1258,27 @@ function detectEntryPoints(
   topFiles: string[],
   routeNodes: GraphState["nodes"],
   dominantModule: string,
+  ctx: ResearchContext,
 ): string[] {
-  if (isLocalizationBehaviorQuestion(expandTaskTokens(input.task))) {
+  const isWhyQuestion = ctx.classification.questionType === "why";
+
+  if (ctx.localizationBehaviorFocus) {
     return detectLocalizationRuntimeEntryPoints(input).slice(0, 6);
   }
 
-  if (isBillingRollbackQuestion(expandTaskTokens(input.task))) {
+  if (ctx.billingRollbackFocus) {
     return detectBillingEntryPoints(input).slice(0, 6);
   }
 
-  if (routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown") {
+  if (ctx.routing.intentClass === "broad-unknown") {
     return deriveBroadEntryPoints(input, topFiles).slice(0, 6);
   }
 
-  if (isLocalizationInventoryQuestion(expandTaskTokens(input.task))) {
+  if (ctx.localizationInventoryFocus) {
     return detectLocalizationEntryPoints(input).slice(0, 6);
   }
 
-  if (isConfigQuestion(expandTaskTokens(input.task))) {
+  if (ctx.configFocus) {
     return detectConfigEntryPoints(input).slice(0, 6);
   }
 
@@ -1007,12 +1300,31 @@ function detectEntryPoints(
       score += 2;
     }
 
-    if (isInfrastructureQuestion(expandTaskTokens(input.task)) && normalized.includes("/servers/")) {
+    if (ctx.infrastructureFocus && normalized.includes("/servers/")) {
       score += 6;
     }
 
-    if (isInfrastructureQuestion(expandTaskTokens(input.task)) && normalized.includes("/vault/")) {
+    if (ctx.infrastructureFocus && normalized.includes("/vault/")) {
       score += 4;
+    }
+
+    // Why-question: boost providers, services, config, events
+    if (isWhyQuestion) {
+      if (normalized.includes("/providers/") || normalized.includes("provider")) {
+        score += 8;
+      }
+      if (normalized.includes("/services/") || normalized.includes("/service")) {
+        score += 8;
+      }
+      if (normalized.includes("/config/") || normalized.includes("config")) {
+        score += 6;
+      }
+      if (normalized.includes("/events/") || normalized.includes("/listeners/") || normalized.includes("event")) {
+        score += 6;
+      }
+      if (normalized.includes("/bootstrap/") || normalized.includes("bootstrap")) {
+        score += 5;
+      }
     }
 
     if (topFiles.includes(file.relativePath)) {
@@ -1040,16 +1352,23 @@ function detectEntryPoints(
     }
 
     if (
-      isInfrastructureQuestion(expandTaskTokens(input.task))
+      ctx.infrastructureFocus
       && ["store", "update", "delete", "createserver", "updateserver"].includes(name)
       && symbol.filePath.toLowerCase().includes("server")
     ) {
       ranked.set(`${symbol.filePath}#${symbol.name}`, (ranked.get(`${symbol.filePath}#${symbol.name}`) ?? 0) + 8);
     }
+
+    // Why-question: boost providers, services, config, events symbols
+    if (isWhyQuestion) {
+      if (name.includes("provider") || name.includes("service") || name.includes("config") || name.includes("event") || name.includes("listener")) {
+        ranked.set(`${symbol.filePath}#${symbol.name}`, (ranked.get(`${symbol.filePath}#${symbol.name}`) ?? 0) + 5);
+      }
+    }
   }
 
   for (const routeNode of combinedRoutes) {
-    const routeScore = scoreText(routeNode.label, expandTaskTokens(input.task)) * 6 + 4;
+    const routeScore = scoreText(routeNode.label, ctx.tokens) * 6 + 4;
 
     if (routeScore > 0) {
       const routeTargets = getEntryPointNeighbors(input.graph, routeNode.id)
@@ -1066,13 +1385,13 @@ function detectEntryPoints(
     .map(([label]) => label);
 }
 
-function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNodes: GraphState["nodes"]): string[] {
-  const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
-  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
-  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
-  const configFocus = isConfigQuestion(expandTaskTokens(input.task));
-  const broadFocus = routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown";
+function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNodes: GraphState["nodes"], ctx: ResearchContext): string[] {
+  const broadFocus = ctx.routing.intentClass === "broad-unknown";
+  const localizationInventoryFocus = ctx.localizationInventoryFocus;
+  const localizationBehaviorFocus = ctx.localizationBehaviorFocus;
+  const billingRollbackFocus = ctx.billingRollbackFocus;
+  const configFocus = ctx.configFocus;
+  const infrastructureFocus = ctx.infrastructureFocus;
 
   if (localizationInventoryFocus) {
     const localeCodes = detectLocalizationCodes(input);
@@ -1212,17 +1531,17 @@ function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNod
         return true;
       }
 
-      if (infrastructureFocus && isInfrastructureEntity(node)) {
+      if (ctx.infrastructureFocus && isInfrastructureEntity(node)) {
         return true;
       }
 
       return isPrimaryEntityKind(node.kind);
     })
     .sort((left, right) => {
-      const leftRouteWeight = infrastructureFocus
+      const leftRouteWeight = ctx.infrastructureFocus
         ? getInfrastructureEntityWeight(left)
         : left.kind === "route" ? 2 : left.kind === "method" ? 1 : 0;
-      const rightRouteWeight = infrastructureFocus
+      const rightRouteWeight = ctx.infrastructureFocus
         ? getInfrastructureEntityWeight(right)
         : right.kind === "route" ? 2 : right.kind === "method" ? 1 : 0;
       const leftWeight = topFiles.includes(left.filePath ?? "") ? 1 : 0;
@@ -1234,13 +1553,13 @@ function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNod
     .slice(0, 8);
 }
 
-function detectSideEffects(input: ResearchInput): string[] {
+function detectSideEffects(input: ResearchInput, ctx: ResearchContext): string[] {
   const effects = new Set<string>();
-  const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
-  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
-  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
-  const configFocus = isConfigQuestion(expandTaskTokens(input.task));
+  const infrastructureFocus = ctx.infrastructureFocus;
+  const localizationInventoryFocus = ctx.localizationInventoryFocus;
+  const localizationBehaviorFocus = ctx.localizationBehaviorFocus;
+  const billingRollbackFocus = ctx.billingRollbackFocus;
+  const configFocus = ctx.configFocus;
 
   for (const file of input.workspace.files) {
     const content = file.content.toLowerCase();
@@ -1353,13 +1672,13 @@ function detectSideEffects(input: ResearchInput): string[] {
   return [...effects].slice(0, 6);
 }
 
-function detectDataSources(input: ResearchInput): string[] {
+function detectDataSources(input: ResearchInput, ctx: ResearchContext): string[] {
   const sources = new Set<string>();
-  const infrastructureFocus = isInfrastructureQuestion(expandTaskTokens(input.task));
-  const localizationInventoryFocus = isLocalizationInventoryQuestion(expandTaskTokens(input.task));
-  const localizationBehaviorFocus = isLocalizationBehaviorQuestion(expandTaskTokens(input.task));
-  const billingRollbackFocus = isBillingRollbackQuestion(expandTaskTokens(input.task));
-  const configFocus = isConfigQuestion(expandTaskTokens(input.task));
+  const infrastructureFocus = ctx.infrastructureFocus;
+  const localizationInventoryFocus = ctx.localizationInventoryFocus;
+  const localizationBehaviorFocus = ctx.localizationBehaviorFocus;
+  const billingRollbackFocus = ctx.billingRollbackFocus;
+  const configFocus = ctx.configFocus;
 
   for (const file of input.workspace.files) {
     const content = file.content.toLowerCase();
@@ -1679,6 +1998,136 @@ function isConfigQuestion(tokens: string[]): boolean {
       "переменные",
       "окружение",
       "env-переменные",
+    ].includes(token),
+  );
+}
+
+function isModelSchemaQuestion(tokens: string[]): boolean {
+  return tokens.some((token) =>
+    [
+      "model",
+      "models",
+      "schema",
+      "schemas",
+      "entity",
+      "entities",
+      "field",
+      "fields",
+      "column",
+      "columns",
+      "attribute",
+      "attributes",
+      "property",
+      "properties",
+      "relation",
+      "relations",
+      "relationship",
+      "relationships",
+      "belongsTo",
+      "hasMany",
+      "hasOne",
+      "morphMany",
+      "morphOne",
+      "модель",
+      "модели",
+      "схема",
+      "схемы",
+      "сущность",
+      "сущности",
+      "поле",
+      "поля",
+      "колонка",
+      "колонки",
+      "атрибут",
+      "атрибуты",
+      "свойство",
+      "свойства",
+      "отношение",
+      "отношения",
+    ].includes(token),
+  );
+}
+
+function isAuthInventoryQuestion(tokens: string[]): boolean {
+  return tokens.some((token) =>
+    [
+      "google",
+      "oauth",
+      "socialite",
+      "provider",
+      "providers",
+      "google-auth",
+      "googleauth",
+      "google-authentication",
+      "google-авторизация",
+      "google-аутентификация",
+      "гугл",
+      "гугл-авторизация",
+      "гугл-аутентификация",
+      "google-логин",
+      "google-вход",
+    ].includes(token),
+  );
+}
+
+function isWebsocketInventoryQuestion(tokens: string[]): boolean {
+  return tokens.some((token) =>
+    [
+      "websocket",
+      "websockets",
+      "ws",
+      "socket",
+      "sockets",
+      "realtime",
+      "real-time",
+      "pusher",
+      "laravel-echo",
+      "echo",
+      "broadcast",
+      "broadcasting",
+      "channel",
+      "channels",
+      "вебсокет",
+      "вебсокеты",
+      "сокет",
+      "сокеты",
+      "реалтайм",
+      "реал-тайм",
+      "пушер",
+      "эхо",
+      " бродкаст",
+      " бродкастинг",
+      "канал",
+      "каналы",
+    ].includes(token),
+  );
+}
+
+function isRedisInventoryQuestion(tokens: string[]): boolean {
+  return tokens.some((token) =>
+    [
+      "redis",
+      "cache",
+      "caching",
+      "session",
+      "sessions",
+      "queue",
+      "queues",
+      "job",
+      "jobs",
+      "worker",
+      "workers",
+      "редис",
+      "кэш",
+      "кэширование",
+      "сессия",
+      "сессии",
+      "очередь",
+      "очереди",
+      "джоб",
+      "джобы",
+      "воркер",
+      "воркеры",
     ].includes(token),
   );
 }
@@ -2699,6 +3148,358 @@ function getConfigRoutePenalty(filePath: string, configFocus: boolean): number {
   return isConfigPath(filePath.toLowerCase()) ? 8 : -42;
 }
 
+function getModelSchemaFileBoost(
+  file: WorkspaceSnapshot["files"][number],
+  modelSchemaFocus: boolean,
+  tokens: string[],
+): number {
+  if (!modelSchemaFocus) {
+    return 0;
+  }
+
+  const pathText = file.relativePath.toLowerCase();
+  const contentText = file.content.slice(0, 4000).toLowerCase();
+  let score = 0;
+
+  if (pathText.includes("/models/") || pathText.includes("/entities/") || pathText.includes("/schemas/")) {
+    score += 50;
+  }
+
+  if (contentText.includes("belongsTo") || contentText.includes("hasMany") || contentText.includes("hasOne") || contentText.includes("morphMany") || contentText.includes("morphOne")) {
+    score += 30;
+  }
+
+  if (contentText.includes("protected $fillable") || contentText.includes("protected $casts") || contentText.includes("protected $dates")) {
+    score += 20;
+  }
+
+  if (pathText.includes("/migrations/")) {
+    score -= 20;
+  }
+
+  if (tokens.some((token) => pathText.includes(token) || contentText.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getModelSchemaSymbolBoost(
+  symbol: IndexSymbol,
+  modelSchemaFocus: boolean,
+  tokens: string[],
+): number {
+  if (!modelSchemaFocus) {
+    return 0;
+  }
+
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  const filePath = symbol.filePath.toLowerCase();
+  let score = 0;
+
+  if (filePath.includes("/models/") || filePath.includes("/entities/") || filePath.includes("/schemas/")) {
+    score += 25;
+  }
+
+  if (label.includes("model") || label.includes("entity") || label.includes("schema") || label.includes("field") || label.includes("column") || label.includes("attribute") || label.includes("property") || label.includes("relation")) {
+    score += 15;
+  }
+
+  if (label.includes("belongsto") || label.includes("hasmany") || label.includes("hasone") || label.includes("morphmany") || label.includes("morphone")) {
+    score += 20;
+  }
+
+  if (symbol.kind === "class" || symbol.kind === "interface") {
+    score += 10;
+  }
+
+  if (symbol.kind === "route" || symbol.kind === "method") {
+    score -= 15;
+  }
+
+  if (tokens.some((token) => label.includes(token))) {
+    score += 4;
+  }
+
+  return score;
+}
+
+function getModelSchemaRoutePenalty(filePath: string, modelSchemaFocus: boolean): number {
+  if (!modelSchemaFocus) {
+    return 0;
+  }
+
+  const normalized = filePath.toLowerCase();
+
+  if (normalized.includes("/models/") || normalized.includes("/entities/") || normalized.includes("/schemas/")) {
+    return 10;
+  }
+
+  if (normalized.includes("/routes/") || normalized.includes("/controllers/") || normalized.includes("/auth/")) {
+    return -30;
+  }
+
+  return -5;
+}
+
+function getAuthInventoryFileBoost(
+  file: WorkspaceSnapshot["files"][number],
+  authInventoryFocus: boolean,
+  tokens: string[],
+): number {
+  if (!authInventoryFocus) {
+    return 0;
+  }
+
+  const pathText = file.relativePath.toLowerCase();
+  const contentText = file.content.slice(0, 4000).toLowerCase();
+  let score = 0;
+
+  if (pathText.includes("/auth/") || pathText.includes("socialite") || pathText.includes("google")) {
+    score += 50;
+  }
+
+  if (contentText.includes("socialite") || contentText.includes("google") || contentText.includes("oauth")) {
+    score += 30;
+  }
+
+  if (contentText.includes("provider") || contentText.includes("providers")) {
+    score += 20;
+  }
+
+  if (pathText.includes("/routes/") || pathText.includes("/controllers/")) {
+    score -= 10;
+  }
+
+  if (tokens.some((token) => pathText.includes(token) || contentText.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getAuthInventorySymbolBoost(
+  symbol: IndexSymbol,
+  authInventoryFocus: boolean,
+  tokens: string[],
+): number {
+  if (!authInventoryFocus) {
+    return 0;
+  }
+
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  const filePath = symbol.filePath.toLowerCase();
+  let score = 0;
+
+  if (filePath.includes("/auth/") || filePath.includes("socialite") || filePath.includes("google")) {
+    score += 25;
+  }
+
+  if (label.includes("google") || label.includes("oauth") || label.includes("socialite") || label.includes("provider")) {
+    score += 20;
+  }
+
+  if (symbol.kind === "route" || symbol.kind === "method") {
+    score -= 10;
+  }
+
+  if (tokens.some((token) => label.includes(token))) {
+    score += 4;
+  }
+
+  return score;
+}
+
+function getAuthInventoryRoutePenalty(filePath: string, authInventoryFocus: boolean): number {
+  if (!authInventoryFocus) {
+    return 0;
+  }
+
+  const normalized = filePath.toLowerCase();
+
+  if (normalized.includes("/auth/") || normalized.includes("socialite") || normalized.includes("google")) {
+    return 15;
+  }
+
+  if (normalized.includes("/billing/") || normalized.includes("/servers/") || normalized.includes("/vault/")) {
+    return -20;
+  }
+
+  return -5;
+}
+
+function getWebsocketInventoryFileBoost(
+  file: WorkspaceSnapshot["files"][number],
+  websocketInventoryFocus: boolean,
+  tokens: string[],
+): number {
+  if (!websocketInventoryFocus) {
+    return 0;
+  }
+
+  const pathText = file.relativePath.toLowerCase();
+  const contentText = file.content.slice(0, 4000).toLowerCase();
+  let score = 0;
+
+  if (pathText.includes("/websocket/") || pathText.includes("/websockets/") || pathText.includes("/broadcast/") || pathText.includes("/channels/") || pathText.includes("/echo/")) {
+    score += 50;
+  }
+
+  if (contentText.includes("pusher") || contentText.includes("laravel-echo") || contentText.includes("broadcast") || contentText.includes("channel")) {
+    score += 30;
+  }
+
+  if (contentText.includes("realtime") || contentText.includes("real-time") || contentText.includes("websocket")) {
+    score += 20;
+  }
+
+  if (pathText.includes("/routes/") || pathText.includes("/controllers/")) {
+    score -= 10;
+  }
+
+  if (tokens.some((token) => pathText.includes(token) || contentText.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getWebsocketInventorySymbolBoost(
+  symbol: IndexSymbol,
+  websocketInventoryFocus: boolean,
+  tokens: string[],
+): number {
+  if (!websocketInventoryFocus) {
+    return 0;
+  }
+
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  const filePath = symbol.filePath.toLowerCase();
+  let score = 0;
+
+  if (filePath.includes("/websocket/") || filePath.includes("/websockets/") || filePath.includes("/broadcast/") || filePath.includes("/channels/") || filePath.includes("/echo/")) {
+    score += 25;
+  }
+
+  if (label.includes("websocket") || label.includes("socket") || label.includes("pusher") || label.includes("echo") || label.includes("broadcast") || label.includes("channel")) {
+    score += 20;
+  }
+
+  if (symbol.kind === "route" || symbol.kind === "method") {
+    score -= 10;
+  }
+
+  if (tokens.some((token) => label.includes(token))) {
+    score += 4;
+  }
+
+  return score;
+}
+
+function getWebsocketInventoryRoutePenalty(filePath: string, websocketInventoryFocus: boolean): number {
+  if (!websocketInventoryFocus) {
+    return 0;
+  }
+
+  const normalized = filePath.toLowerCase();
+
+  if (normalized.includes("/websocket/") || normalized.includes("/websockets/") || normalized.includes("/broadcast/") || normalized.includes("/channels/") || normalized.includes("/echo/")) {
+    return 15;
+  }
+
+  if (normalized.includes("/billing/") || normalized.includes("/servers/") || normalized.includes("/vault/")) {
+    return -20;
+  }
+
+  return -5;
+}
+
+function getRedisInventoryFileBoost(
+  file: WorkspaceSnapshot["files"][number],
+  redisInventoryFocus: boolean,
+  tokens: string[],
+): number {
+  if (!redisInventoryFocus) {
+    return 0;
+  }
+
+  const pathText = file.relativePath.toLowerCase();
+  const contentText = file.content.slice(0, 4000).toLowerCase();
+  let score = 0;
+
+  if (pathText.includes("/redis/") || pathText.includes("/cache/") || pathText.includes("/queue/") || pathText.includes("/jobs/") || pathText.includes("/workers/")) {
+    score += 50;
+  }
+
+  if (contentText.includes("redis") || contentText.includes("cache") || contentText.includes("queue") || contentText.includes("job") || contentText.includes("worker")) {
+    score += 30;
+  }
+
+  if (contentText.includes("session") || contentText.includes("sessions")) {
+    score += 20;
+  }
+
+  if (pathText.includes("/routes/") || pathText.includes("/controllers/")) {
+    score -= 10;
+  }
+
+  if (tokens.some((token) => pathText.includes(token) || contentText.includes(token))) {
+    score += 6;
+  }
+
+  return score;
+}
+
+function getRedisInventorySymbolBoost(
+  symbol: IndexSymbol,
+  redisInventoryFocus: boolean,
+  tokens: string[],
+): number {
+  if (!redisInventoryFocus) {
+    return 0;
+  }
+
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+  const filePath = symbol.filePath.toLowerCase();
+  let score = 0;
+
+  if (filePath.includes("/redis/") || filePath.includes("/cache/") || filePath.includes("/queue/") || filePath.includes("/jobs/") || filePath.includes("/workers/")) {
+    score += 25;
+  }
+
+  if (label.includes("redis") || label.includes("cache") || label.includes("queue") || label.includes("job") || label.includes("worker") || label.includes("session")) {
+    score += 20;
+  }
+
+  if (symbol.kind === "route" || symbol.kind === "method") {
+    score -= 10;
+  }
+
+  if (tokens.some((token) => label.includes(token))) {
+    score += 4;
+  }
+
+  return score;
+}
+
+function getRedisInventoryRoutePenalty(filePath: string, redisInventoryFocus: boolean): number {
+  if (!redisInventoryFocus) {
+    return 0;
+  }
+
+  const normalized = filePath.toLowerCase();
+
+  if (normalized.includes("/redis/") || normalized.includes("/cache/") || normalized.includes("/queue/") || normalized.includes("/jobs/") || normalized.includes("/workers/")) {
+    return 15;
+  }
+
+  if (normalized.includes("/billing/") || normalized.includes("/servers/") || normalized.includes("/vault/")) {
+    return -20;
+  }
+
+  return -5;
+}
+
 function prioritizeInfrastructureEffects(effects: string[]): string[] {
   const preferred = [
     "есть работа с чувствительными credential-ссылками, приватными ключами или passphrase для серверных подключений",
@@ -2805,13 +3606,13 @@ function findModuleNodeId(graph: GraphState, moduleLabel: string): string | null
   return graph.nodes.find((node) => node.kind === "module" && node.label === moduleLabel)?.id ?? null;
 }
 
-function computeConfidence(input: ResearchInput, evidence: ScoredReference[], unknowns: string[]): number {
+function computeConfidence(input: ResearchInput, evidence: ScoredReference[], unknowns: string[], ctx: ResearchContext): number {
   let confidence = 45;
   confidence += Math.min(evidence.length * 4, 30);
   confidence += Math.min(input.graph.summary.symbolCount / 10, 15);
   confidence -= unknowns.length * 8;
 
-  if (routeResearch(expandTaskTokens(input.task)).intentClass === "broad-unknown") {
+  if (ctx.routing.intentClass === "broad-unknown") {
     confidence -= 28;
   }
 
@@ -3198,3 +3999,4 @@ function deriveBroadEntryPoints(input: ResearchInput, topFiles: string[]): strin
 
   return candidates.filter((value, index, list) => list.indexOf(value) === index).slice(0, 8);
 }
+

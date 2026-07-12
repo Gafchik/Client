@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
 import type { ProjectPathRecord, ProjectRecord } from "@client/shared";
+import { runQuery } from "./neo4j-client.js";
 
 export interface SaveProjectPathInput {
   id?: string;
@@ -15,91 +15,51 @@ export interface SaveProjectInput {
   paths: SaveProjectPathInput[];
 }
 
-let pool: Pool | null = null;
-let initialized = false;
-
 export async function initializeProjectStore(): Promise<void> {
-  const databasePool = getPool();
-
-  if (!initialized) {
-    await databasePool.query(`
-      create table if not exists projects (
-        id text primary key,
-        name text not null,
-        description text not null default '',
-        created_at timestamptz not null default now(),
-        updated_at timestamptz not null default now()
-      )
-    `);
-    await databasePool.query(`
-      create table if not exists project_paths (
-        id text primary key,
-        project_id text not null references projects(id) on delete cascade,
-        name text not null,
-        root_path text not null,
-        created_at timestamptz not null default now(),
-        updated_at timestamptz not null default now()
-      )
-    `);
-    initialized = true;
-  }
+  await runQuery(`create constraint project_id_unique if not exists for (p:Project) require p.id is unique`);
+  await runQuery(`create constraint project_path_id_unique if not exists for (pp:ProjectPath) require pp.id is unique`);
 }
 
 export async function listProjects(): Promise<ProjectRecord[]> {
-  const result = await getPool().query(
-    `
-      select
-        p.id as project_id,
-        p.name as project_name,
-        p.description as project_description,
-        p.created_at as project_created_at,
-        p.updated_at as project_updated_at,
-        pp.id as path_id,
-        pp.name as path_name,
-        pp.root_path as path_root_path,
-        pp.created_at as path_created_at,
-        pp.updated_at as path_updated_at
-      from projects p
-      left join project_paths pp on pp.project_id = p.id
-      order by p.updated_at desc, pp.created_at asc
-    `,
-  );
+  const rows = await runQuery<{
+    project: Record<string, unknown>;
+    paths: Array<Record<string, unknown>>;
+  }>(`
+    match (p:Project)
+    optional match (p)-[:HAS_PATH]->(pp:ProjectPath)
+    with p, pp
+    order by pp.createdAt asc
+    with p, collect(pp { .* }) as paths
+    return p { .* } as project, paths
+    order by p.updatedAt desc
+  `);
 
-  const projectMap = new Map<string, ProjectRecord>();
-
-  for (const row of result.rows) {
-    const projectId = String(row.project_id);
-    const existing = projectMap.get(projectId);
-
-    if (!existing) {
-      projectMap.set(projectId, {
-        id: projectId,
-        name: String(row.project_name),
-        description: String(row.project_description ?? ""),
-        createdAt: new Date(String(row.project_created_at)).toISOString(),
-        updatedAt: new Date(String(row.project_updated_at)).toISOString(),
-        paths: [],
-      });
-    }
-
-    if (row.path_id) {
-      projectMap.get(projectId)?.paths.push({
-        id: String(row.path_id),
-        projectId,
-        name: String(row.path_name),
-        rootPath: String(row.path_root_path),
-        createdAt: new Date(String(row.path_created_at)).toISOString(),
-        updatedAt: new Date(String(row.path_updated_at)).toISOString(),
-      });
-    }
-  }
-
-  return Array.from(projectMap.values());
+  return rows.map((row) => mapProjectRow(row.project, row.paths));
 }
 
 export async function getProjectById(id: string): Promise<ProjectRecord | null> {
-  const projects = await listProjects();
-  return projects.find((project) => project.id === id) ?? null;
+  const rows = await runQuery<{
+    project: Record<string, unknown>;
+    paths: Array<Record<string, unknown>>;
+  }>(
+    `
+      match (p:Project { id: $id })
+      optional match (p)-[:HAS_PATH]->(pp:ProjectPath)
+      with p, pp
+      order by pp.createdAt asc
+      with p, collect(pp { .* }) as paths
+      return p { .* } as project, paths
+    `,
+    { id },
+  );
+
+  const row = rows[0];
+
+  if (!row) {
+    return null;
+  }
+
+  return mapProjectRow(row.project, row.paths);
 }
 
 export async function saveProject(input: SaveProjectInput): Promise<ProjectRecord> {
@@ -120,41 +80,41 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
     throw new Error("Нужно добавить хотя бы один путь проекта.");
   }
 
-  const client = await getPool().connect();
+  const now = new Date().toISOString();
 
-  try {
-    await client.query("begin");
-    await client.query(
+  await runQuery(
+    `
+      merge (p:Project { id: $id })
+      on create set p.createdAt = $now
+      set p.name = $name, p.description = $description, p.updatedAt = $now
+      with p
+      optional match (p)-[r:HAS_PATH]->(old:ProjectPath)
+      delete r, old
+    `,
+    {
+      id: nextId,
+      name: input.name.trim(),
+      description: input.description?.trim() || "",
+      now,
+    },
+  );
+
+  for (const pathItem of normalizedPaths) {
+    await runQuery(
       `
-        insert into projects (id, name, description)
-        values ($1, $2, $3)
-        on conflict (id)
-        do update set
-          name = excluded.name,
-          description = excluded.description,
-          updated_at = now()
+        match (p:Project { id: $projectId })
+        merge (pp:ProjectPath { id: $pathId })
+        set pp.name = $name, pp.rootPath = $rootPath, pp.createdAt = $now, pp.updatedAt = $now
+        merge (p)-[:HAS_PATH]->(pp)
       `,
-      [nextId, input.name.trim(), input.description?.trim() || ""],
+      {
+        projectId: nextId,
+        pathId: pathItem.id,
+        name: pathItem.name,
+        rootPath: pathItem.rootPath,
+        now,
+      },
     );
-
-    await client.query(`delete from project_paths where project_id = $1`, [nextId]);
-
-    for (const pathItem of normalizedPaths) {
-      await client.query(
-        `
-          insert into project_paths (id, project_id, name, root_path)
-          values ($1, $2, $3, $4)
-        `,
-        [pathItem.id, nextId, pathItem.name, pathItem.rootPath],
-      );
-    }
-
-    await client.query("commit");
-  } catch (error) {
-    await client.query("rollback");
-    throw error;
-  } finally {
-    client.release();
   }
 
   const saved = await getProjectById(nextId);
@@ -167,21 +127,43 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
 }
 
 export async function deleteProject(id: string): Promise<boolean> {
-  const result = await getPool().query(`delete from projects where id = $1`, [id]);
-  return Number(result.rowCount ?? 0) > 0;
+  const rows = await runQuery<{ deletedCount: number }>(
+    `
+      match (p:Project { id: $id })
+      optional match (p)-[:HAS_PATH]->(pp:ProjectPath)
+      with p, collect(pp) as paths
+      foreach (item in paths | detach delete item)
+      with p
+      with p, 1 as deletedCount
+      detach delete p
+      return deletedCount
+    `,
+    { id },
+  );
+
+  return rows.length > 0;
 }
 
-function getPool(): Pool {
-  if (!pool) {
-    pool = new Pool({
-      host: process.env.DATABASE_HOST ?? "127.0.0.1",
-      port: Number(process.env.DATABASE_PORT ?? 35433),
-      database: process.env.DATABASE_NAME ?? process.env.POSTGRES_DB ?? "client",
-      user: process.env.DATABASE_USER ?? process.env.POSTGRES_USER ?? "postgres",
-      password: process.env.DATABASE_PASSWORD ?? process.env.POSTGRES_PASSWORD ?? "postgres",
-      max: 10,
-    });
-  }
+function mapProjectRow(project: Record<string, unknown>, paths: Array<Record<string, unknown>>): ProjectRecord {
+  return {
+    id: String(project.id),
+    name: String(project.name),
+    description: String(project.description ?? ""),
+    createdAt: String(project.createdAt),
+    updatedAt: String(project.updatedAt),
+    paths: paths
+      .filter((path) => path && path.id)
+      .map((path) => mapProjectPathRow(path, String(project.id))),
+  };
+}
 
-  return pool;
+function mapProjectPathRow(path: Record<string, unknown>, projectId: string): ProjectPathRecord {
+  return {
+    id: String(path.id),
+    projectId,
+    name: String(path.name),
+    rootPath: String(path.rootPath),
+    createdAt: String(path.createdAt),
+    updatedAt: String(path.updatedAt),
+  };
 }

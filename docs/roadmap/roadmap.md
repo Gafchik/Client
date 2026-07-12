@@ -33,6 +33,7 @@
 - Functional Research MVP поверх structural pipeline
 - Context Builder Evolution pass с explainable ranking
 - Graph core evolution toward persistent canonical model
+- Persistent graph storage в Neo4j (первый шаг Slice 4 из `008-next-generation-architecture.md`); PostgreSQL выведен из проекта, Project/Provider перенесены на Neo4j
 
 ### Сейчас в фокусе
 
@@ -41,6 +42,7 @@
 - Углубление Planner
 - Подготовка controlled execution runtime
 - Усиление контрактов данных между API, артефактами и UI
+- Продолжение Slice 4 (`008-next-generation-architecture.md`): переход от единого перезаписываемого graph snapshot к snapshot+overlay модели по коммитам; content-addressing индексатора по git blob hash
 
 ## Следующие этапы
 
