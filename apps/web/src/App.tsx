@@ -71,6 +71,10 @@ const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
 const PROVIDER_STORAGE_KEY = "client.provider-config";
 const REQUEST_TIMEOUT_MS = 15000;
 const DEFAULT_MODEL_ID = "nvidia/nemotron-3-ultra";
+// Circuit breaker для цепочки уточняющих вопросов — после этого числа
+// подряд идущих раундов clarification-needed фронт перестаёт показывать
+// chips повторно, чтобы не зациклить пользователя.
+const MAX_CLARIFICATION_ROUNDS = 2;
 
 function hasRunArtifacts(result: PipelineRunResult | null): result is PipelineRunResult {
   return Boolean(result?.runId && result?.project && result?.research && result?.impact);
@@ -131,6 +135,29 @@ function groupModelsByVendor(models: ProviderModelRecord[]): Array<{ vendor: str
   return Array.from(groups.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([vendor, vendorModels]) => ({ vendor, models: vendorModels }));
+}
+
+// Человекочитаемые лейблы для сырых module key из INTENT_PROFILES
+// (packages/research/src/index.ts) — общий, не привязанный к проекту
+// словарь. Value, которое реально уходит в task при уточнении — сырой key,
+// не label (лучше матчится алиасами профиля при повторной токенизации).
+const MODULE_LABELS: Record<string, string> = {
+  auth: "Авторизация",
+  billing: "Биллинг",
+  user: "Пользователи",
+  localization: "Локализация",
+  config: "Конфигурация",
+  servers: "Серверы",
+  vault: "Хранилище секретов",
+  notification: "Уведомления",
+  "model-schema": "Схема данных",
+  "auth-inventory": "Инвентаризация авторизации",
+  "websocket-inventory": "WebSocket",
+  "redis-inventory": "Redis",
+};
+
+function getModuleLabel(key: string): string {
+  return MODULE_LABELS[key] ?? key;
 }
 
 function safeText(value: string | undefined | null, fallback = "Недоступно"): string {
@@ -632,14 +659,23 @@ function AssistantRunMessage({
   runStatus,
   result,
   onOpenInspector,
+  clarificationRound,
+  onSelectClarification,
 }: {
   runStatus: PipelineRunStatus | null;
   result: PipelineRunResult | null;
   onOpenInspector: (tab?: InspectorTab) => void;
+  clarificationRound: number;
+  onSelectClarification: (moduleKey: string) => void;
 }) {
   const running = runStatus && (runStatus.status === "queued" || runStatus.status === "running");
   const completed = hasRunArtifacts(result) && (!runStatus || runStatus.runId === result.runId);
   const failed = runStatus?.status === "failed";
+  // Circuit breaker: после MAX_CLARIFICATION_ROUNDS не показываем chips
+  // повторно, даже если бэкенд снова вернул clarification-needed — иначе
+  // риск бесконечного цикла уточнений. Рендерим как обычный ответ.
+  const needsClarification =
+    completed && result?.answer?.answerMode === "clarification-needed" && clarificationRound < MAX_CLARIFICATION_ROUNDS;
 
   if (!running && !completed && !failed) {
     return (
@@ -676,7 +712,24 @@ function AssistantRunMessage({
           </>
         ) : null}
 
-        {completed ? (
+        {completed && needsClarification ? (
+          <>
+            {/* Суженная ветка: quick-grid/план намеренно не показываем — иначе
+                рядом с "уточните вопрос" будет показан уверенный конкретный
+                план для одной из отброшенных интерпретаций. */}
+            <p className="message-label">Нужно уточнение · {safeText(result.project.name, "Проект неизвестен")}</p>
+            <h3>{safeText(result?.answer?.summary, "Уточните вопрос")}</h3>
+            <div className="chat-suggestions">
+              {safeList(result?.answer?.clarificationOptions).map((moduleKey) => (
+                <button key={moduleKey} type="button" className="ghost-button" onClick={() => onSelectClarification(moduleKey)}>
+                  {getModuleLabel(moduleKey)}
+                </button>
+              ))}
+            </div>
+          </>
+        ) : null}
+
+        {completed && !needsClarification ? (
           <>
             <p className="message-label">Ответ подготовлен · {safeText(result.project.name, "Проект неизвестен")}</p>
             <h3>{safeText(result.answer?.summary, result.research.summary)}</h3>
@@ -1545,6 +1598,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PipelineRunResult | null>(null);
   const [selectedTask, setSelectedTask] = useState<string>("");
+  const [clarificationRound, setClarificationRound] = useState(0);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set());
   const [deletingHistory, setDeletingHistory] = useState(false);
@@ -1676,6 +1730,7 @@ export function App() {
     setRunStatus(null);
     updateActiveRunId(null);
     setSelectedTask("");
+    setClarificationRound(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, routeRunId]);
 
@@ -1843,6 +1898,18 @@ export function App() {
     setRunning(true);
     setError(null);
 
+    // Нет backend-модели "продолжения диалога" — уточнение реализовано как
+    // склейка строки на клиенте перед независимым pipeline run. Не
+    // применяется к hardResync/background-sync (это системные операции, не
+    // продолжение вопроса пользователя).
+    const isFollowUpClarification =
+      !hardResync
+      && result?.answer?.answerMode === "clarification-needed"
+      && clarificationRound < MAX_CLARIFICATION_ROUNDS;
+    const composedTask = isFollowUpClarification
+      ? `${selectedTask}\n\nУточнение пользователя: ${task.trim()}`
+      : task.trim();
+
     try {
       const accepted = await fetchJsonWithTimeout<PipelineRunStatus>(`${API_BASE_URL}/api/pipeline/run`, {
         method: "POST",
@@ -1850,7 +1917,7 @@ export function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          task: task.trim() || (hardResync
+          task: composedTask || (hardResync
             ? "Выполни полный ручной хард ресинк project intelligence."
             : "Обнови фоновое понимание проекта и подготовь структурный отчёт."),
           projectPath,
@@ -1866,7 +1933,8 @@ export function App() {
 
       startTransition(() => {
         setRunStatus(accepted);
-        setSelectedTask(task);
+        setSelectedTask(composedTask);
+        setClarificationRound((round) => (isFollowUpClarification ? round + 1 : 0));
         updateActiveRunId(accepted.runId);
         setResult(null);
         setInspectorOpen(false);
@@ -2303,6 +2371,7 @@ export function App() {
       setTask("");
       setError(null);
       setSelectedHistoryIds(new Set());
+      setClarificationRound(0);
     });
     navigate("/chat");
   }
@@ -2483,7 +2552,13 @@ export function App() {
 
               {selectedTask ? <UserTaskMessage task={selectedTask} projectName={safeText(project?.name, "")} projectPath={projectPath} /> : null}
 
-              <AssistantRunMessage runStatus={runStatus} result={result} onOpenInspector={openInspector} />
+              <AssistantRunMessage
+                runStatus={runStatus}
+                result={result}
+                onOpenInspector={openInspector}
+                clarificationRound={clarificationRound}
+                onSelectClarification={(moduleKey) => setTask(moduleKey)}
+              />
             </div>
 
             <form className="composer" onSubmit={runPipeline}>

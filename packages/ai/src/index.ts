@@ -1,6 +1,7 @@
 import {
   type BackgroundProjectState,
   clamp,
+  detectResearchAmbiguity,
   stableId,
   type AnswerEvidenceHighlight,
   type AnswerMode,
@@ -473,6 +474,29 @@ function normalizeProviderValidationResult(
 export async function buildAnswerPackage(input: BuildAnswerInput): Promise<AnswerPackage> {
   const fallback = buildDeterministicAnswer(input);
   const evidenceLocked = shouldForceEvidenceLockedMode(input);
+
+  // Diagnostic/баг-репорт вопросы законно задевают несколько модулей
+  // одновременно (сам факт нескольких затронутых зон — улика, а не
+  // неоднозначность) — поэтому evidence-locked проверяется первым и
+  // побеждает: уточняющий вопрос имеет смысл только для "открытых"
+  // вопросов без явного одного намерения, не для диагностики.
+  if (!evidenceLocked) {
+    const ambiguity = detectResearchAmbiguity(input.research);
+
+    if (ambiguity.ambiguous) {
+      const clarificationQuestion = buildClarificationQuestion(ambiguity.competingModules);
+
+      return {
+        ...fallback,
+        answerMode: "clarification-needed",
+        summary: clarificationQuestion,
+        explanation: `## Уточните вопрос\n${clarificationQuestion}`,
+        clarificationOptions: ambiguity.competingModules,
+        synthesis: "deterministic-fallback",
+      };
+    }
+  }
+
   const canUseProvider =
     !evidenceLocked
     && input.providerBaseUrl.trim().length > 0
@@ -517,6 +541,14 @@ export async function buildAnswerPackage(input: BuildAnswerInput): Promise<Answe
       ].slice(0, 4),
     };
   }
+}
+
+/**
+ * Полностью generic шаблон — без хардкода под конкретный проект: modules
+ * приходят из общего, не привязанного к проекту словаря INTENT_PROFILES.
+ */
+function buildClarificationQuestion(modules: string[]): string {
+  return `Вопрос затрагивает сразу несколько зон проекта: ${modules.join(", ")}. Уточните, какая именно вас интересует, или переформулируйте вопрос конкретнее.`;
 }
 
 function resolveQuestionType(task: string, research: ResearchReport): string {

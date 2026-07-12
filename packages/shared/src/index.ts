@@ -391,6 +391,51 @@ export interface ResearchReport {
 }
 
 /**
+ * Сигнал "вопрос реально бьёт в несколько равносильных доменных зон", а не
+ * просто "мало данных" (intentClass === "broad-unknown" — другой случай,
+ * туда не лезем) и не "что попутно будет затронуто" (affectedModules в
+ * deriveAffectedModules — тот сигнал подмешивает graph-related модули через
+ * соседей по графу, это другая семантика: "что заденет", а не "что вы
+ * имели в виду"). Двойной порог: лидер должен быть реально сильным сигналом
+ * (ABSOLUTE_MIN_LEADER_SCORE), иначе на слабых/расплывчатых вопросах
+ * (low top.score) почти любой второй модуль ложно считался бы "конкурентом".
+ * Пороги — эвристика, не откалиброванная на реальных данных (тестов/логов
+ * в проекте нет) — тюнить по мере накопления опыта использования.
+ */
+export interface ResearchAmbiguity {
+  ambiguous: boolean;
+  competingModules: string[];
+}
+
+export function detectResearchAmbiguity(research: ResearchReport): ResearchAmbiguity {
+  if (research.intentClass === "broad-unknown") {
+    return { ambiguous: false, competingModules: [] };
+  }
+
+  const ABSOLUTE_MIN_LEADER_SCORE = 500;
+  const RELATIVE_THRESHOLD_RATIO = 0.65;
+  const MAX_COMPETING_MODULES = 4;
+
+  const sorted = [...research.moduleIntents].sort((left, right) => right.score - left.score);
+  const top = sorted[0];
+
+  if (!top || top.score < ABSOLUTE_MIN_LEADER_SCORE) {
+    return { ambiguous: false, competingModules: [] };
+  }
+
+  const threshold = top.score * RELATIVE_THRESHOLD_RATIO;
+  const competing = sorted
+    .filter((item) => item.score >= threshold)
+    .map((item) => item.module)
+    .slice(0, MAX_COMPETING_MODULES + 1);
+
+  return {
+    ambiguous: competing.length >= 2 && competing.length <= MAX_COMPETING_MODULES,
+    competingModules: competing.slice(0, MAX_COMPETING_MODULES),
+  };
+}
+
+/**
  * Fact Store — durable память проекта между research-запросами (см.
  * docs/architecture/010-senior-developer-capability-roadmap.md, пункт 1).
  * В отличие от Knowledge (архив run-артефактов целиком), ProjectFact —
@@ -701,7 +746,8 @@ export type AnswerMode =
   | "diagnostic-answer"
   | "plan-summary-answer"
   | "insufficient-data-answer"
-  | "fallback-answer";
+  | "fallback-answer"
+  | "clarification-needed";
 
 export interface AnswerEvidenceHighlight {
   label: string;
@@ -732,6 +778,8 @@ export interface AnswerPackage {
   synthesis: "llm" | "deterministic-fallback";
   validation?: ValidationResult;
   validatedAnswerPacket?: ValidatedAnswerPacket;
+  /** Заполнено только при answerMode === "clarification-needed" — см. detectResearchAmbiguity. */
+  clarificationOptions?: string[];
 }
 
 export interface KnowledgeCatalogEntry {
