@@ -1,6 +1,6 @@
 # Project State
 
-**Дата обновления:** 2026-07-10  
+**Дата обновления:** 2026-07-13  
 **Текущий этап:** MVP / Slice 1
 
 ## Что уже реализовано
@@ -253,23 +253,7 @@
   - введена post-validation проверка LLM-ответа против evidence corpus;
   - при выходе модели за рамки доказанных данных система откатывается к deterministic fallback answer;
   - пользовательский ответ теперь честно фиксирует только подтверждённые runtime-факты и явно помечает, что недоказанные гипотезы исключены.
-- Semantic coverage расширен на Magenda billing rollback/history сценарии:
-  - indexer теперь извлекает PHP runtime-сигналы для `BillHistory` чтения, `CreateBillHistoryAction` записи и `was_been_rollback_to_generated` / rollback guards;
-  - graph получил billing runtime node discovery поверх semantic edges `bill-history-read`, `bill-history-write`, `bill-rollback-guard`;
-  - research начал отдельно усиливать billing rollback questions, поднимая `BillController`, `ToGeneratedBillAction`, `ToDraftBillAction`, `BillModel` и `Bill` как evidence-first anchors;
-  - billing rollback extraction стал строже против шумных соседних файлов:
-    - `entryPoints` и `primaryEntities` теперь сильнее приоритизируют `rollbackGenerated`, `BillController`, `ToGeneratedBillAction`, `BillHistory`, history relations и rollback guards;
-    - `biller/export/analytics/collection` зоны дополнительно штрафуются, если они не подтверждают rollback/history flow напрямую;
-    - runtime summary теперь должен оставаться на controller/action/history цепочке вместо broad generated-scan.
-  - answer synthesis теперь умеет выдавать deterministic evidence-locked ответ по rollback/generated/history вопросам без доменных догадок.
-- Billing rollback ranking усилен против Magenda-specific шума:
-  - research и context теперь сильнее поднимают `v1/billing/bill/{bill}/rollback/generated`, `BillController@rollbackGenerated`, `ToGeneratedBillAction`, `BillHistory`, `latestBillHistory`, `billSpecificHistories`, `CreateBillHistoryAction`;
-  - для rollback/history вопросов добавлены явные штрафы к `Biller*`, export, analytics и collection-зонам, если они не подтверждают сам rollback flow;
-  - цель этого шага: answer-first UX должен начинаться с реальной controller/action/history цепочки rollback bill, а не с соседних billing admin/export сущностей.
-- Lightweight question overlay усилен для billing rollback сценариев:
-  - `question-run` теперь принудительно добавляет в selective candidate set ключевые billing rollback файлы:
-    `Bill RouteProvider`, `BillController`, `ToGeneratedBillAction`, `ToDraftBillAction`, `Bill`, `BillModel`, `BillHistory`;
-  - это нужно, чтобы overlay не сужался только до `generated`-совпадений в action/CLI файлах и не терял реальный HTTP entrypoint `v1/billing/bill/{bill}/rollback/generated`.
+- ~~Semantic coverage расширен на Magenda billing rollback/history сценарии~~ / ~~Billing rollback ranking усилен против Magenda-specific шума~~ / ~~Lightweight question overlay усилен для billing rollback сценариев~~ — **полностью удалено 2026-07-13**, см. раздел "Устранение project-specific оверфита" ниже. Эти три пункта на протяжении нескольких сессий описывали хардкод одного реального бэкенда (`magendamd_backend`) прямо в shared-пакетах (`indexer`, `graph`, `research`, `context`, `ai`) — literal PHP-имена (`BillController`, `ToGeneratedBillAction`, `BillHistory`, `was_been_rollback_to_generated`), literal пути (`/containers/billing/bill/`, `v1/billing/bill/{bill}/rollback/generated`). Это прямо нарушало продуктовый принцип "приложение полезно для любого проекта, а не только для того, на котором тестировали" — оставлено в истории лога намеренно вычеркнутым, а не удалено, чтобы не потерять след регрессии.
 - Зафиксирован следующий архитектурный шаг для масштабирования продукта:
   - добавлена cross-cutting спецификация `docs/modules/branch-aware-intelligence.md`;
   - в ней формализована модель `baseline snapshot + branch overlay + worktree overlay`;
@@ -478,6 +462,9 @@
   - `/api/pipeline/run` теперь явно отвечает `400`/`404`, если проект не резолвится, вместо молчаливого fallback;
   - фронтенд (`submitPipelineRun`, `triggerBackgroundSync`) больше не отправляет запрос без валидного `selectedProjectId`/`projectPath`;
   - имя проекта теперь явно показывается и в сообщении пользователя, и в ответе ассистента в чате (`UserTaskMessage`, `AssistantRunMessage`) — чтобы рассинхронизация состояния была видна сразу, а не только через Inspector.
+- Устранение project-specific оверфита (2026-07-13): обнаружена и полностью удалена ветка `billingRollbackFocus` — параллельный, захардкоженный под один реальный бэкенд (`magendamd_backend`) путь анализа, накопившийся за несколько предыдущих сессий и пронизывавший 5 пакетов (`indexer`, `graph`, `research`, `context`, `ai`, суммарно ~800 строк). Найдено при разборе жалобы пользователя на формулировку одного конкретного ответа. Удалено целиком; domain-detection для billing-вопросов остался только через уже существующий generic-механизм `INTENT_PROFILES`. Живой прогон на magendamd_backend после удаления подтвердил, что качество результата не пострадало (нужный код по-прежнему находится первым по релевантности). Подробности и разбор по пакетам — `docs/architecture/010-senior-developer-capability-roadmap.md`, раздел 7.
+- Тон ответа дочищен (2026-07-13): из `packages/research` убраны оставшиеся "отчёт-генераторские" формулировки в findings/summary (внутренний жаргон вида "эвристики отдали приоритет модулю", бессмысленная для пользователя мета-информация про детерминированность/воспроизводимость research-отчёта) — заменены на разговорные формулировки того же уровня детализации.
+- Найден и исправлен баг избыточного срабатывания evidence-locked режима (2026-07-13): `buildUnknowns` (`packages/research`) считал два чисто служебных сигнала о ходе research ("Selective workspace limit достигнут" от indexer'а, "graph seed недостаточно плотный") эпистемической неуверенностью в ответе, из-за чего `shouldForceEvidenceLockedMode` почти всегда принудительно отключал LLM-синтез в пользу deterministic fallback — независимо от реального объёма evidence. Подтверждено вживую: вопрос с 12 evidence-элементами уходил в deterministic fallback только из-за одной служебной заметки о графе. Исправлено — оба сигнала убраны из `unknowns`, там остались только признаки реальной неуверенности (нет evidence, нет модуля, реальные сбои индексации и т.п.).
 
 ## Новая декларативная система классификации вопросов (2026-07-10)
 

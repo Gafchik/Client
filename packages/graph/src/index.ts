@@ -669,61 +669,6 @@ export function getLocalizationRuntimeNodes(graph: GraphState): GraphNode[] {
   return graph.nodes.filter((node) => nodeIds.has(node.id));
 }
 
-export function getBillingRuntimeNodes(graph: GraphState): GraphNode[] {
-  const nodeIds = new Set<string>();
-
-  for (const node of graph.nodes) {
-    const label = node.label.toLowerCase();
-    const filePath = node.filePath?.toLowerCase() ?? "";
-
-    if (
-      label.includes("bill")
-      || label.includes("rollback")
-      || label.includes("history")
-      || label.includes("generated")
-      || filePath.includes("/billing/")
-      || filePath.includes("billhistory")
-      || filePath.includes("togeneratedbillaction")
-      || filePath.includes("todraftbillaction")
-    ) {
-      nodeIds.add(node.id);
-    }
-  }
-
-  for (const edge of graph.edges) {
-    const semantic = String(edge.metadata?.semantic ?? "").toLowerCase();
-    const relation = String(edge.metadata?.relation ?? "").toLowerCase();
-    const guard = String(edge.metadata?.guard ?? "").toLowerCase();
-    const operation = String(edge.metadata?.operation ?? "").toLowerCase();
-
-    if (
-      semantic === "bill-history-read"
-      || semantic === "bill-history-write"
-      || semantic === "bill-rollback-guard"
-      || relation.includes("history")
-      || guard.includes("rollback")
-      || guard.includes("generated")
-      || operation.includes("history")
-    ) {
-      nodeIds.add(edge.sourceId);
-      nodeIds.add(edge.targetId);
-    }
-  }
-
-  for (const nodeId of [...nodeIds]) {
-    for (const neighbor of getStructuralNeighbors(
-      graph,
-      nodeId,
-      ["BELONGS_TO", "CONTAINS", "USES", "REFERENCES", "READS", "WRITES", "CALLS", "CREATES"],
-      "both",
-    )) {
-      nodeIds.add(neighbor.id);
-    }
-  }
-
-  return graph.nodes.filter((node) => nodeIds.has(node.id));
-}
-
 export function getRuntimeSemanticEdges(graph: GraphState, semantic: string): GraphEdge[] {
   const normalized = semantic.toLowerCase();
   return graph.edges.filter((edge) => String(edge.metadata?.semantic ?? "").toLowerCase() === normalized);

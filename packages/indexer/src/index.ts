@@ -1257,25 +1257,6 @@ function extractPhpRuntimeSignals(
   ];
   const configPattern = /\b(?:config|env)\(\s*['"]([^'"]+)['"]/g;
   const localeSetPattern = /\b(?:app\(\)->setLocale|App::setLocale)\(\s*\$?([A-Za-z_][A-Za-z0-9_]*)?/g;
-  const billHistoryRelationPatterns = [
-    /\$[A-Za-z_][A-Za-z0-9_]*->billSpecificHistories\s*\(/g,
-    /\$[A-Za-z_][A-Za-z0-9_]*->latestBillHistory\s*\(/g,
-    /\$[A-Za-z_][A-Za-z0-9_]*->latestBillSpecificHistory\s*\(/g,
-    /\$[A-Za-z_][A-Za-z0-9_]*->latestChronologicalBillStatusHistory\s*\(/g,
-    /\$[A-Za-z_][A-Za-z0-9_]*->latestEffectiveBillStatusHistory\s*\(/g,
-  ];
-  const rollbackGuardPatterns = [
-    /was_been_rollback_to_generated/g,
-    /rollbackGenerated/g,
-    /rollbackDraft/g,
-    /ToGeneratedBillAction/g,
-    /ToDraftBillAction/g,
-  ];
-  const billHistoryWritePatterns = [
-    /createBillHistoryAction->run\s*\(/g,
-    /BillHistoryCreated::dispatch\s*\(/g,
-    /billHistories\(\)->create\s*\(/g,
-  ];
 
   for (const pattern of headerPatterns) {
     for (const match of content.matchAll(pattern)) {
@@ -1344,73 +1325,6 @@ function extractPhpRuntimeSignals(
     });
   }
 
-  for (const pattern of billHistoryRelationPatterns) {
-    for (const match of content.matchAll(pattern)) {
-      const sourceScope = findPhpMethodScopeAtOffset(methodScopes, match.index ?? 0);
-      const sourceId = sourceScope?.symbolId ?? file.id;
-      const relationLabel = extractPhpRuntimeSignalLabel(match[0], "bill-history");
-
-      relations.push({
-        id: stableId(["reads", sourceId, file.id, "bill-history", relationLabel, match.index ?? 0]),
-        type: "READS",
-        sourceId,
-        targetId: file.id,
-        metadata: {
-          semantic: "bill-history-read",
-          relation: relationLabel,
-          targetLabel: relationLabel,
-          sourceFilePath: file.relativePath,
-        },
-      });
-    }
-  }
-
-  for (const pattern of rollbackGuardPatterns) {
-    for (const match of content.matchAll(pattern)) {
-      const sourceScope = findPhpMethodScopeAtOffset(methodScopes, match.index ?? 0);
-      const sourceId = sourceScope?.symbolId ?? file.id;
-      const guardLabel = extractPhpRuntimeSignalLabel(match[0], "rollback-guard");
-
-      relations.push({
-        id: stableId(["uses", sourceId, file.id, "rollback-guard", guardLabel, match.index ?? 0]),
-        type: "USES",
-        sourceId,
-        targetId: file.id,
-        metadata: {
-          semantic: "bill-rollback-guard",
-          guard: guardLabel,
-          targetLabel: guardLabel,
-          sourceFilePath: file.relativePath,
-        },
-      });
-    }
-  }
-
-  for (const pattern of billHistoryWritePatterns) {
-    for (const match of content.matchAll(pattern)) {
-      const sourceScope = findPhpMethodScopeAtOffset(methodScopes, match.index ?? 0);
-      const sourceId = sourceScope?.symbolId ?? file.id;
-      const writeLabel = extractPhpRuntimeSignalLabel(match[0], "bill-history-write");
-
-      relations.push({
-        id: stableId(["creates", sourceId, file.id, "bill-history-write", writeLabel, match.index ?? 0]),
-        type: "CREATES",
-        sourceId,
-        targetId: file.id,
-        metadata: {
-          semantic: "bill-history-write",
-          operation: writeLabel,
-          targetLabel: writeLabel,
-          sourceFilePath: file.relativePath,
-        },
-      });
-    }
-  }
-}
-
-function extractPhpRuntimeSignalLabel(value: string, fallback: string): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length > 0 ? normalized.slice(0, 120) : fallback;
 }
 
 function resolvePhpSymbolOrDependencyId(

@@ -544,11 +544,16 @@ export async function buildAnswerPackage(input: BuildAnswerInput): Promise<Answe
 }
 
 /**
- * Полностью generic шаблон — без хардкода под конкретный проект: modules
- * приходят из общего, не привязанного к проекту словаря INTENT_PROFILES.
+ * Полностью generic шаблон — без хардкода под конкретный проект. Сырые
+ * module key (auth, billing и т.п.) сюда намеренно не подставляются —
+ * человекочитаемые варианты уже показаны отдельными chip-кнопками на
+ * фронте (getModuleLabel), незачем дублировать их английскими ключами
+ * прямо в русской фразе.
  */
 function buildClarificationQuestion(modules: string[]): string {
-  return `Вопрос затрагивает сразу несколько зон проекта: ${modules.join(", ")}. Уточните, какая именно вас интересует, или переформулируйте вопрос конкретнее.`;
+  return modules.length > 2
+    ? "Вопрос сразу про несколько разных частей проекта — не уверен, какая именно тебя интересует. Уточни, о чём речь, или выбери вариант ниже."
+    : "Тут не одна зона, а сразу пара — не уверен, какую ты имеешь в виду. Уточни, о какой именно речь, или выбери вариант ниже.";
 }
 
 function resolveQuestionType(task: string, research: ResearchReport): string {
@@ -708,15 +713,9 @@ function buildQuestionContract(input: BuildAnswerInput): QuestionContract {
 
 function getPrioritizedEvidence(input: BuildAnswerInput): ResearchReport["evidence"] {
   const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
-  const billingRollback = input.research.functionalSummary.toLowerCase().includes("rollback bill")
-    || input.research.functionalSummary.toLowerCase().includes("истории статусов");
 
   if (localeBehavior) {
     return [...input.research.evidence].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left));
-  }
-
-  if (billingRollback) {
-    return [...input.research.evidence].sort((left, right) => getBillingEvidenceWeight(right) - getBillingEvidenceWeight(left));
   }
 
   return input.research.evidence;
@@ -732,7 +731,7 @@ function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): Val
       ? {
           id: stableId(["claim", input.runId, "direct-blocked"]),
           type: "direct-answer",
-          statement: "Текущих подтверждений недостаточно для сильного прямого ответа.",
+          statement: "Пока не хватает уверенных доказательств для прямого ответа.",
           evidence: caveats,
           filePaths: [],
           supportLevel: "weak",
@@ -883,7 +882,7 @@ function buildAnswerBrief(input: BuildAnswerInput, answerMode: AnswerMode): Answ
   return {
     questionContract,
     claimSet,
-    directAnswer: claimSet.directClaim?.statement ?? "Текущих подтверждений недостаточно для сильного прямого ответа.",
+    directAnswer: claimSet.directClaim?.statement ?? "Пока не хватает уверенных доказательств для прямого ответа.",
     explanationLead: claimSet.supportingClaims[0]?.statement ?? (input.research.functionalSummary || input.research.summary),
     whereToLook: claimSet.locationClaims.flatMap((claim) => claim.filePaths).slice(0, 6),
     impactLines: claimSet.impactClaims.map((claim) => claim.statement).slice(0, 3),
@@ -1481,6 +1480,8 @@ function buildAnswerSystemPrompt(contract: QuestionContract): string {
     "- Не упоминай внутренние названия артефактов (Research, Impact, Context, Plan) в ответе.",
     "- Не пересказывай артефакты дословно — синтезируй ответ своими словами.",
     "- Пиши по-русски, в стиле опытного инженера, который отвечает коллеге в чате, а не пишет отчёт.",
+    "- Никогда не начинай ответ и не строй его вокруг служебных фраз про происхождение данных ('ответ опирается на committed baseline', 'по происхождению фактов', 'baseline source exact-head', 'evidence-locked режим' и подобных) — это внутренняя механика системы, а не то, что интересует человека. Если нужно упомянуть неуверенность — скажи это одной обычной фразой ('не до конца уверен, но похоже, что...'), а не терминами системы.",
+    "- Пиши как человек, а не как система, описывающая саму себя: не 'система ограничивает вывод', а прямо по делу.",
     "",
     "Правила по объёму и форме (это критично, ответы регулярно получаются слишком длинными и неструктурированными):",
     `- Пиши ТОЛЬКО перечисленные ниже разделы: ${sectionNames}. Больше никаких разделов не создавай, даже если кажется, что "для полноты" стоит что-то добавить.`,
@@ -1671,12 +1672,10 @@ function resolveAnswerMode(input: BuildAnswerInput): AnswerMode {
 function shouldForceEvidenceLockedMode(input: BuildAnswerInput): boolean {
   const diagnosticMode = looksLikeDiagnosticTask(input.task);
   const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
-  const billingRollback = input.research.functionalSummary.toLowerCase().includes("rollback bill")
-    || input.research.functionalSummary.toLowerCase().includes("истории статусов");
   const hasUnknowns = input.research.unknowns.length > 0;
   const lowStructuralCoverage = input.research.evidence.length < 3;
 
-  return diagnosticMode || localeBehavior || billingRollback || hasUnknowns || lowStructuralCoverage;
+  return diagnosticMode || localeBehavior || hasUnknowns || lowStructuralCoverage;
 }
 
 function computeAnswerConfidence(input: BuildAnswerInput): number {
@@ -1748,38 +1747,6 @@ function getLocaleEvidenceWeight(item: ResearchReport["evidence"][number]): numb
   return score;
 }
 
-function getBillingEvidenceWeight(item: ResearchReport["evidence"][number]): number {
-  const label = item.label.toLowerCase();
-  const filePath = (item.filePath ?? "").toLowerCase();
-  let score = item.score;
-
-  if (label.includes("rollbackgenerated") || label.includes("rollbackdraft")) {
-    score += 100;
-  }
-
-  if (filePath.includes("billcontroller.php")) {
-    score += 80;
-  }
-
-  if (filePath.includes("togeneratedbillaction") || filePath.includes("todraftbillaction")) {
-    score += 90;
-  }
-
-  if (filePath.includes("billmodel.php") || filePath.endsWith("/bill.php")) {
-    score += 60;
-  }
-
-  if (label.includes("billhistory") || filePath.includes("billhistory")) {
-    score += 70;
-  }
-
-  if (label.includes("was_been_rollback_to_generated")) {
-    score += 110;
-  }
-
-  return score;
-}
-
 function buildWarnings(input: BuildAnswerInput): string[] {
   const warnings: string[] = [];
 
@@ -1808,7 +1775,7 @@ function buildWarnings(input: BuildAnswerInput): string[] {
   }
 
   if (shouldForceEvidenceLockedMode(input)) {
-    warnings.push("Ответ зафиксирован в evidence-locked режиме: недоказанные гипотезы намеренно не выдаются как факты.");
+    warnings.push("Держусь только доказанного — недоказанные гипотезы сюда намеренно не попали.");
   }
 
   return warnings.slice(0, 3);
@@ -1846,11 +1813,11 @@ function buildNextActions(input: BuildAnswerInput, mode: AnswerMode): string[] {
 
 function buildDeterministicSummary(input: BuildAnswerInput, brief: AnswerBrief, mode: AnswerMode): string {
   if (input.validatedAnswerPacket?.directAnswerAllowed === false) {
-    return "Текущих подтверждений недостаточно для сильного прямого ответа, поэтому система ограничивает вывод только тем, что реально доказано.";
+    return "Не готов дать уверенный прямой ответ — держусь только того, что реально подтверждено.";
   }
 
   if (mode === "insufficient-data-answer") {
-    return "Сейчас недостаточно данных для полностью уверенного вывода, но система уже сузила вероятную зону причины.";
+    return "Пока не хватает данных для уверенного вывода, но зону уже удалось сузить.";
   }
 
   if (mode === "plan-summary-answer") {
@@ -1934,7 +1901,7 @@ function buildStructuredFallbackExplanation(
   }
 
   if (evidenceLocked) {
-    sections.push("*Ответ зафиксирован в evidence-locked режиме: недоказанные гипотезы намеренно не включены.*");
+    sections.push("*Держусь только доказанного — недоказанные гипотезы сюда намеренно не включил.*");
   }
 
   if (sections.length === 0) {
@@ -1958,7 +1925,7 @@ function buildHowItWorksSection(input: BuildAnswerInput, brief: AnswerBrief, mod
   }
 
   if (brief.claimSet.directClaim && brief.claimSet.directClaim.caveats.length > 0) {
-    parts.push(`\nОграничения direct claim:`);
+    parts.push(`\nСтоит иметь в виду:`);
     for (const caveat of brief.claimSet.directClaim.caveats.slice(0, 2)) {
       parts.push(`- ${caveat}`);
     }
@@ -2059,7 +2026,7 @@ function buildRisksSection(input: BuildAnswerInput, unknowns: string[]): string 
   }
 
   if (riskItems.length === 0) {
-    return "## Возможные риски\n\nЯвных рисков не выявлено на основе текущих данных.";
+    return "## Возможные риски\n\nЯвных рисков не вижу.";
   }
 
   const parts: string[] = ["## Возможные риски"];
@@ -2096,7 +2063,7 @@ function buildPlanSection(input: BuildAnswerInput, brief: AnswerBrief): string {
       parts.push(`${i + 1}. ${label}`);
     }
   } else {
-    parts.push("Недостаточно данных для построения конкретного плана.");
+    parts.push("Пока маловато данных, чтобы собрать конкретный план.");
   }
 
   if (input.plan.planningNotes) {
@@ -2163,15 +2130,15 @@ function buildManualChecks(
 function buildEvidenceLockedSummary(input: BuildAnswerInput, brief: AnswerBrief): string {
   const topEvidence = getPrioritizedEvidence(input)[0];
 
-  if (brief.directAnswer.trim().length > 0 && !brief.directAnswer.startsWith("Текущих подтверждений недостаточно")) {
+  if (brief.directAnswer.trim().length > 0 && !brief.directAnswer.startsWith("Пока не хватает уверенных доказательств")) {
     return `${brief.directAnswer} ${buildFreshnessSuffix(input)}`.trim();
   }
 
   if (topEvidence?.filePath) {
-    return `Наиболее сильное подтверждение сейчас находится в ${topEvidence.filePath}. ${buildFreshnessSuffix(input)}`.trim();
+    return `Смотрю в первую очередь на \`${topEvidence.filePath}\` — там самое сильное подтверждение. ${buildFreshnessSuffix(input)}`.trim();
   }
 
-  return `Ответ ограничен только подтвержденными структурными и runtime-сигналами текущего запуска. ${buildFreshnessSuffix(input)}`.trim();
+  return `Держусь только того, что реально подтверждено кодом и рантаймом — без домыслов. ${buildFreshnessSuffix(input)}`.trim();
 }
 
 function buildEvidenceLockedExplanation(
@@ -2210,23 +2177,28 @@ function buildEvidenceLockedExplanation(
   return parts.join(" ");
 }
 
+/**
+ * "Всё свежо, локальных изменений нет" — это нормальное, ожидаемое
+ * состояние в большинстве запусков, поэтому в него не стоит вкладывать
+ * отдельную фразу в каждом ответе (человек не сообщает "кстати, у меня
+ * актуальные данные" на каждый вопрос — это молчаливая норма). Фраза
+ * появляется только там, где реально есть о чём предупредить.
+ */
 function buildFreshnessSuffix(input: BuildAnswerInput): string {
   if (!input.backgroundState) {
     return "";
   }
 
   if (input.backgroundState.freshness === "fresh") {
-    return input.backgroundState.hasLocalChanges
-      ? "Ответ опирается на актуальный committed baseline текущей ветки и локальный worktree overlay."
-      : "Ответ опирается на актуальный committed baseline текущей ветки.";
+    return input.backgroundState.hasLocalChanges ? "Учёл и твои локальные незакоммиченные правки." : "";
   }
 
   if (input.backgroundState.freshness === "stale") {
-    return "Ответ опирается на предыдущий committed baseline и текущий overlay изменений.";
+    return "Данные слегка устарели — что-то могло уже поменяться.";
   }
 
   if (input.backgroundState.freshness === "missing") {
-    return "Ответ собран без заранее подготовленного baseline для этого состояния ветки.";
+    return "Разбираю эту ветку впервые, так что мог что-то упустить.";
   }
 
   return "";
@@ -2239,32 +2211,33 @@ function buildFreshnessExplanation(input: BuildAnswerInput): string {
 
   if (input.backgroundState.freshness === "fresh") {
     return input.backgroundState.hasLocalChanges
-      ? `Состояние branch/head синхронизировано по committed baseline, а текущие незакоммиченные изменения учитываются через worktree overlay (${input.backgroundState.changedFileCount} файлов).`
-      : `Состояние branch/head синхронизировано: baseline source ${input.backgroundState.baselineSource}, локальный worktree чист.`;
+      ? `Учитываю и незакоммиченные изменения — их ${input.backgroundState.changedFileCount}.`
+      : "";
   }
 
   if (input.backgroundState.freshness === "stale") {
-    return `Состояние branch/head не полностью синхронизировано: используется baseline source ${input.backgroundState.baselineSource} и overlay для ${input.backgroundState.changedFileCount} изменённых файлов.`;
+    return `Актуальность не идеальная: с последнего полного разбора поменялось ${input.backgroundState.changedFileCount} файлов.`;
   }
 
   if (input.backgroundState.freshness === "missing") {
-    return `Для этого branch/head ещё нет подготовленного committed baseline, поэтому запуск работает как первый проход и одновременно формирует знания для следующих вопросов.`;
+    return "Разбираю эту ветку впервые — по мере новых вопросов пойму её лучше.";
   }
 
   return "";
 }
 
 function buildEvidenceProvenanceExplanation(research: ResearchReport): string {
-  const { baselineCount, overlayCount, structuralCount, overlayInfluenced } = research.evidenceSummary;
-  const parts = [`По происхождению фактов: baseline ${baselineCount}, overlay ${overlayCount}, structural ${structuralCount}.`];
+  const { overlayInfluenced } = research.evidenceSummary;
 
-  if (overlayInfluenced) {
-    parts.push("Локальные незакоммиченные изменения materially влияют на часть вывода и отделены от committed baseline.");
-  } else {
-    parts.push("Ключевой вывод опирается прежде всего на committed baseline и graph-first структурные связи.");
+  // Технические счётчики "baseline N, overlay N, structural N" — это
+  // внутренняя бухгалтерия research, не то, что интересует человека в
+  // чате. Стоит упоминать, только когда это реально меняет надёжность
+  // ответа (незакоммиченные правки повлияли на вывод).
+  if (!overlayInfluenced) {
+    return "";
   }
 
-  return parts.join(" ");
+  return "Часть вывода опирается на твои локальные незакоммиченные изменения, а не только на то, что уже в git.";
 }
 
 function collectRuntimeFacts(input: BuildAnswerInput): string[] {
@@ -2289,22 +2262,6 @@ function collectRuntimeFacts(input: BuildAnswerInput): string[] {
 
   if (evidenceText.includes("setlocale") || findingsText.includes("locale")) {
     facts.push("Есть подтверждение явной установки locale в runtime-потоке.");
-  }
-
-  if (evidenceText.includes("rollbackgenerated") || findingsText.includes("rollbackgenerated")) {
-    facts.push("Откат bill в generated подтвержден через отдельный controller/action flow `rollbackGenerated -> ToGeneratedBillAction`.");
-  }
-
-  if (evidenceText.includes("billspecifichistories") || evidenceText.includes("latestbillhistory") || dataSourcesText.includes("billhistory")) {
-    facts.push("Есть подтверждение, что проверки rollback и связанных ограничений опираются на BillHistory и relations модели bill.");
-  }
-
-  if (evidenceText.includes("was_been_rollback_to_generated") || findingsText.includes("историю статусов")) {
-    facts.push("Есть подтверждение вычисляемого guard-флага `was_been_rollback_to_generated`, который использует историю generated-статусов.");
-  }
-
-  if (evidenceText.includes("createbillhistoryaction") || evidenceText.includes("billhistorycreated::dispatch")) {
-    facts.push("Есть подтверждение, что смена статуса создает новую запись BillHistory через `CreateBillHistoryAction`.");
   }
 
   return facts.slice(0, 4);
