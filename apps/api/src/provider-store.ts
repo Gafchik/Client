@@ -21,7 +21,9 @@ export interface ProviderCatalog {
   recommendedModelId: string;
 }
 
-const DEFAULT_RECOMMENDED_MODEL_ID = "anthropic/claude-sonnet-5";
+// nvidia/nemotron-3-ultra бесплатна (см. docs/architecture/009-model-catalog-and-role-profiles.md,
+// price band Micro 0.0x) — разумный дефолт для тестов, не требует платного провайдера "из коробки".
+const DEFAULT_RECOMMENDED_MODEL_ID = "nvidia/nemotron-3-ultra";
 
 export async function initializeProviderStore(): Promise<void> {
   await runQuery(`create constraint provider_id_unique if not exists for (p:Provider) require p.id is unique`);

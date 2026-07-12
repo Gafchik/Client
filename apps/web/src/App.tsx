@@ -80,6 +80,59 @@ function safeList<T>(value: T[] | undefined | null): T[] {
   return Array.isArray(value) ? value : [];
 }
 
+// Известные слаги поставщиков моделей (см. docs/architecture/009-model-catalog-and-role-profiles.md)
+// для человекочитаемых заголовков групп в выпадающем списке. Для незнакомого
+// слага — заголовок строится автоматически (title case по дефисам), чтобы
+// новый поставщик в каталоге не ломал группировку.
+const MODEL_VENDOR_LABELS: Record<string, string> = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  google: "Google",
+  deepseek: "DeepSeek",
+  "x-ai": "xAI",
+  "z-ai": "Z-AI",
+  moonshotai: "Moonshot AI",
+  qwen: "Qwen",
+  minimax: "MiniMax",
+  meta: "Meta",
+  nvidia: "NVIDIA",
+  perplexity: "Perplexity",
+  sakana: "Sakana AI",
+  xiaomi: "Xiaomi",
+  baai: "BAAI",
+};
+
+function getModelVendorLabel(modelId: string): string {
+  const slug = modelId.includes("/") ? modelId.split("/")[0] ?? "" : "";
+
+  if (!slug) {
+    return "Другое";
+  }
+
+  return (
+    MODEL_VENDOR_LABELS[slug]
+    ?? slug
+      .split("-")
+      .map((part) => (part ? part[0]!.toUpperCase() + part.slice(1) : part))
+      .join(" ")
+  );
+}
+
+function groupModelsByVendor(models: ProviderModelRecord[]): Array<{ vendor: string; models: ProviderModelRecord[] }> {
+  const groups = new Map<string, ProviderModelRecord[]>();
+
+  for (const model of models) {
+    const vendor = getModelVendorLabel(model.id);
+    const bucket = groups.get(vendor) ?? [];
+    bucket.push(model);
+    groups.set(vendor, bucket);
+  }
+
+  return Array.from(groups.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([vendor, vendorModels]) => ({ vendor, models: vendorModels }));
+}
+
 function safeText(value: string | undefined | null, fallback = "Недоступно"): string {
   return typeof value === "string" && value.trim().length > 0 ? value : fallback;
 }
@@ -488,10 +541,14 @@ function EnvironmentStrip({
       </select>
 
       <select className="environment-pill" value={providerModelDraft} onChange={(event) => onModelChange(event.target.value)}>
-        {safeList(providerModels).map((model) => (
-          <option key={model.id} value={model.id}>
-            {model.label}
-          </option>
+        {groupModelsByVendor(safeList(providerModels)).map((group) => (
+          <optgroup key={group.vendor} label={group.vendor}>
+            {group.models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.label}
+              </option>
+            ))}
+          </optgroup>
         ))}
         {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
       </select>
