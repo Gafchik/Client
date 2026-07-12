@@ -792,39 +792,44 @@ function buildQuestionWorkspacePlan(
     ]),
   );
   const gitScopedPaths = deriveRepositoryScopedPaths(repository, workspace);
-  const taskTokens = Array.from(
-    new Set([
-      ...tokenize(task),
-      ...task
-        .split(/[^A-Za-z0-9_/-]+/)
-        .filter(Boolean)
-        .flatMap((token) =>
-          token
-            .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-            .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-            .split(/[^A-Za-z0-9а-яё]+/i)
-            .map((part) => part.trim().toLowerCase())
-            .filter((part) => part.length >= 2),
-        ),
-    ]),
-  ).filter((token) => token.length >= 3);
+  // Составные PascalCase-имена ("DataEntry") дают фрагменты ("data", "entry")
+  // при камелкейс-разбиении для ловли snake_case/kebab-case вариантов файлов.
+  // Но по одному короткому фрагменту нельзя матчить — "data" встречается в
+  // пути практически любого Laravel-контейнера (Containers/*/Data/...), и
+  // такой фрагмент топит реальное совпадение шумом из сотен чужих файлов.
+  // Поэтому фрагменты одного составного слова требуют совпадения ВСЕ сразу
+  // (as-typed токены вроде "dataentry" остаются одиночной группой и матчатся
+  // как раньше — по одному substring).
+  const standaloneTaskTokens = tokenize(task).filter((token) => token.length >= 3);
+  const compoundTaskTokenGroups = task
+    .split(/[^A-Za-z0-9_/-]+/)
+    .filter(Boolean)
+    .map((rawToken) =>
+      rawToken
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+        .split(/[^A-Za-z0-9а-яё]+/i)
+        .map((part) => part.trim().toLowerCase())
+        .filter((part) => part.length >= 2),
+    )
+    .filter((group) => group.length > 1);
+  const taskTokenGroups: string[][] = [
+    ...standaloneTaskTokens.map((token) => [token]),
+    ...compoundTaskTokenGroups,
+  ];
+  const matchesTaskTokens = (text: string): boolean =>
+    taskTokenGroups.some((group) => group.every((token) => text.includes(token)));
   const previousGraph = previousRun?.runtimeCache?.graph;
   const tokenMatchedPaths = availableRelativePaths
-    .filter((relativePath) => {
-      const lowerPath = relativePath.toLowerCase();
-      return taskTokens.some((token) => lowerPath.includes(token));
-    });
+    .filter((relativePath) => matchesTaskTokens(relativePath.toLowerCase()));
   const previousIndexPaths = previousIndex?.files
     .map((file) => normalizePath(file.filePath))
-    .filter((relativePath) => {
-      const lowerPath = relativePath.toLowerCase();
-      return taskTokens.some((token) => lowerPath.includes(token));
-    }) ?? [];
+    .filter((relativePath) => matchesTaskTokens(relativePath.toLowerCase())) ?? [];
   const previousSymbolMatchedPaths = previousIndex?.symbols
     .filter((symbol) => {
       const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
       const filePath = normalizePath(symbol.filePath).toLowerCase();
-      return taskTokens.some((token) => label.includes(token) || filePath.includes(token));
+      return matchesTaskTokens(label) || matchesTaskTokens(filePath);
     })
     .map((symbol) => normalizePath(symbol.filePath)) ?? [];
   const graphMatchedPaths = previousGraph?.nodes
@@ -834,7 +839,7 @@ function buildQuestionWorkspacePlan(
     }))
     .filter((item) =>
       item.filePath
-      && taskTokens.some((token) => item.filePath.includes(token) || item.label.includes(token)),
+      && (matchesTaskTokens(item.filePath) || matchesTaskTokens(item.label)),
     )
     .map((item) => item.filePath) ?? [];
   const graphNeighborPaths = previousGraph

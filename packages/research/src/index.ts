@@ -19,7 +19,7 @@ import {
   isConfigPath,
   isLocalizationPath,
   type RepositorySnapshot,
-  scoreText,
+  scoreTextGroups,
   tokenize,
   type GraphState,
   type IndexSymbol,
@@ -354,6 +354,7 @@ const INTENT_PROFILES: IntentProfile[] = [
 
 interface ResearchContext {
   tokens: string[];
+  tokenGroups: string[][];
   classification: ClassificationResult;
   routing: ResearchRoutingDecision;
   broadFocus: boolean;
@@ -369,6 +370,7 @@ interface ResearchContext {
 
 export function runResearch(input: ResearchInput): ResearchReport {
   const tokens = expandTaskTokens(input.task);
+  const tokenGroups = buildTokenGroups(input.task);
   const task = tokens.join(" ");
   const classification = questionClassifier.classify(task);
   const routing = mapClassificationToRouting(classification);
@@ -384,6 +386,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
 
   const ctx: ResearchContext = {
     tokens,
+    tokenGroups,
     classification,
     routing,
     broadFocus,
@@ -427,8 +430,8 @@ export function runResearch(input: ResearchInput): ResearchReport {
 
   for (const file of input.workspace.files) {
     const score =
-      scoreText(file.relativePath, tokens) * 6 +
-      scoreText(file.content.slice(0, 4000), tokens) +
+      scoreTextGroups(file.relativePath, tokenGroups) * 6 +
+      scoreTextGroups(file.content.slice(0, 4000), tokenGroups) +
       getModuleBoost(file.relativePath, moduleIntents) +
       getGraphProfileFileBoost(file.relativePath, graphSeedFilePaths, graphSeedLabels, routing.queryProfileKey) +
       getRuntimeLocaleGraphFileBoost(file.relativePath, runtimeLocaleFilePaths, runtimeLocaleEdges) +
@@ -458,8 +461,8 @@ export function runResearch(input: ResearchInput): ResearchReport {
   for (const symbol of input.index.symbols) {
     const label = symbol.containerName ? `${symbol.containerName}.${symbol.name}` : symbol.name;
     const score =
-      scoreText(label, tokens) * 8 +
-      scoreText(symbol.filePath, tokens) * 3 +
+      scoreTextGroups(label, tokenGroups) * 8 +
+      scoreTextGroups(symbol.filePath, tokenGroups) * 3 +
       getModuleBoost(symbol.filePath, moduleIntents) +
       getGraphProfileSymbolBoost(symbol, graphSeedFilePaths, graphSeedNodeIds, graphSeedLabels, routing.queryProfileKey) +
       getRuntimeLocaleGraphSymbolBoost(symbol, runtimeLocaleNodeIds, runtimeLocaleFilePaths, runtimeLocaleEdges) +
@@ -489,8 +492,8 @@ export function runResearch(input: ResearchInput): ResearchReport {
 
   for (const routeNode of routeNodes) {
     const score =
-      scoreText(routeNode.label, tokens) * 10 +
-      scoreText(routeNode.filePath ?? "", tokens) * 4 +
+      scoreTextGroups(routeNode.label, tokenGroups) * 10 +
+      scoreTextGroups(routeNode.filePath ?? "", tokenGroups) * 4 +
       getModuleBoost(routeNode.filePath ?? "", moduleIntents) +
       (graphSeedNodeIds.has(routeNode.id) ? 30 : 0) +
       (functionalFocus ? 36 : 12) +
@@ -523,7 +526,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
   }
 
   for (const moduleNode of graphModules) {
-    const score = scoreText(moduleNode.label, tokens) * 14 + (graphSeedNodeIds.has(moduleNode.id) ? 16 : 0);
+    const score = scoreTextGroups(moduleNode.label, tokenGroups) * 14 + (graphSeedNodeIds.has(moduleNode.id) ? 16 : 0);
 
     if (score <= 0) {
       continue;
@@ -1431,7 +1434,7 @@ function detectEntryPoints(
   }
 
   for (const routeNode of combinedRoutes) {
-    const routeScore = scoreText(routeNode.label, ctx.tokens) * 6 + 4;
+    const routeScore = scoreTextGroups(routeNode.label, ctx.tokenGroups) * 6 + 4;
 
     if (routeScore > 0) {
       const routeTargets = getEntryPointNeighbors(input.graph, routeNode.id)
@@ -1829,6 +1832,45 @@ function expandTaskTokens(task: string): string[] {
   }
 
   return [...expanded];
+}
+
+// Токены для scoreTextGroups: как expandTaskTokens, но фрагменты одного
+// составного PascalCase-слова ("ChiroNotes" -> ["chiro","notes"]) идут
+// отдельной AND-группой, а не независимыми токенами — см. комментарий у
+// scoreTextGroups (packages/shared). Одиночные слова и alias-расширения
+// доменных профилей остаются группами из одного элемента и ведут себя как
+// раньше.
+function buildTokenGroups(task: string): string[][] {
+  const baseTokens = tokenize(task);
+  const standaloneGroups = baseTokens.map((token) => [token]);
+
+  const compoundGroups = task
+    .split(/[^A-Za-z0-9_/-]+/)
+    .filter(Boolean)
+    .map((rawToken) =>
+      rawToken
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+        .split(/[^A-Za-z0-9а-яё]+/i)
+        .map((part) => part.trim().toLowerCase())
+        .filter((part) => part.length >= 2),
+    )
+    .filter((group) => group.length > 1);
+
+  const aliasGroups: string[][] = [];
+  for (const token of baseTokens) {
+    for (const profile of INTENT_PROFILES) {
+      if (profile.aliases.some((alias) => isMeaningfulAliasMatch(token, alias))) {
+        aliasGroups.push([profile.key]);
+
+        for (const alias of profile.aliases) {
+          aliasGroups.push([alias]);
+        }
+      }
+    }
+  }
+
+  return [...standaloneGroups, ...compoundGroups, ...aliasGroups];
 }
 
 function isInfrastructureQuestion(tokens: string[]): boolean {

@@ -997,6 +997,26 @@ export function scoreText(haystack: string, tokens: string[]): number {
   return score;
 }
 
+// Как scoreText, но токены сгруппированы: группа засчитывается только если
+// совпали ВСЕ её элементы. Нужно для составных PascalCase-имён вроде
+// "DataEntry" — если считать "data" и "entry" независимо, короткий общий
+// фрагмент ("data") совпадает почти с любым файлом в типовой Laravel-структуре
+// (Containers/*/Data/...) и топит реальное совпадение шумом. Группа "все
+// фрагменты сразу" восстанавливает исходную специфичность составного имени;
+// одиночные слова — это группа из одного элемента, ведут себя как раньше.
+export function scoreTextGroups(haystack: string, tokenGroups: string[][]): number {
+  const normalized = haystack.toLowerCase();
+  let score = 0;
+
+  for (const group of tokenGroups) {
+    if (group.length > 0 && group.every((token) => normalized.includes(token))) {
+      score += 1;
+    }
+  }
+
+  return score;
+}
+
 export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
