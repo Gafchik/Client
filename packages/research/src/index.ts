@@ -170,6 +170,13 @@ const INTENT_PROFILES: IntentProfile[] = [
   },
   {
     key: "servers",
+    // Намеренно нет "username": это substring слова "user" (>= порога
+    // isMeaningfulAliasMatch), а "user" — рутинный токен почти любого вопроса
+    // про пользователя/модель User. Из-за этого ЛЮБОЙ вопрос про User
+    // ошибочно тянул в expandTaskTokens весь alias-список servers/vault
+    // (server, ssh, credential...), включал infrastructureFocus и разгонял
+    // score файлов servers/vault до multi-thousand на пустом месте — живой
+    // баг, обнаруженный 2026-07-13 на вопросе "что хранит модель юзера".
     aliases: [
       "server",
       "servers",
@@ -179,7 +186,6 @@ const INTENT_PROFILES: IntentProfile[] = [
       "host",
       "hostname",
       "port",
-      "username",
       "private_key",
       "private-key",
       "passphrase",
@@ -2454,31 +2460,53 @@ function getExactEntitySymbolBoost(symbol: IndexSymbol, hints: ExactEntityHint[]
   const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`;
   const labelStrength = getExactEntityMatchStrength(label, hints);
   const pathStrength = getExactEntityMatchStrength(symbol.filePath, hints);
-  const strength = Math.max(labelStrength, pathStrength);
 
-  if (strength >= 3) {
+  // Путь файла — сигнал "символ живёт В файле сущности" (символ реально
+  // объявлен в User.php). Имя самого символа — гораздо более слабый сигнал:
+  // relation-метод "user()" внутри Server.php упоминает User, но Server.php
+  // от этого не становится User. Раньше оба сигнала шли через Math.max с
+  // одинаковым весом, и чужой файл с relation-методом "user" перевешивал
+  // реальный User.php — отдельный content match не должен стоить как path match.
+  if (pathStrength >= 3) {
     return 56;
   }
 
-  if (strength === 2) {
+  if (pathStrength === 2) {
     return 28;
+  }
+
+  if (labelStrength >= 3) {
+    return 16;
+  }
+
+  if (labelStrength === 2) {
+    return 8;
   }
 
   return 0;
 }
 
 function getExactEntityRouteBoost(label: string, filePath: string, hints: ExactEntityHint[]): number {
-  const strength = Math.max(
-    getExactEntityMatchStrength(label, hints),
-    getExactEntityMatchStrength(filePath, hints),
-  );
+  const pathStrength = getExactEntityMatchStrength(filePath, hints);
+  const labelStrength = getExactEntityMatchStrength(label, hints);
 
-  if (strength >= 3) {
+  // Та же логика, что и в getExactEntitySymbolBoost: путь роут-файла — прямой
+  // сигнал, текст лейбла роута (может случайно упомянуть сущность мимоходом,
+  // например "POST /servers/{id}/assign-user") — сигнал слабее.
+  if (pathStrength >= 3) {
     return 26;
   }
 
-  if (strength === 2) {
+  if (pathStrength === 2) {
     return 12;
+  }
+
+  if (labelStrength >= 3) {
+    return 14;
+  }
+
+  if (labelStrength === 2) {
+    return 6;
   }
 
   return 0;
