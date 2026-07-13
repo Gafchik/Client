@@ -5,6 +5,7 @@ import {
   buildControlledExecutionRuntime,
   buildValidatedAnswerPacket,
   buildValidationPacket,
+  expandTaskSearchKeywords,
   validateEvidence,
 } from "@client/ai";
 import { buildContextPackage } from "@client/context";
@@ -457,7 +458,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
   const researchStartedAt = startStage(runId, "research");
   const knownFacts = await queryRelevantFacts(projectRootPath, index, repository);
-  const initialResearch = runResearch({
+  const researchInputForRun = {
     runId,
     task,
     workspace,
@@ -466,12 +467,24 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     repository,
     backgroundState,
     knownFacts,
+  };
+  const primaryResearch = runResearch(researchInputForRun);
+  const keywordExpansion = await maybeExpandResearchWithTranslatedKeywords(researchInputForRun, primaryResearch, {
+    isQuestionRun,
+    providerBaseUrl,
+    providerModel,
+    providerApiKey,
   });
+  const initialResearch = keywordExpansion.research;
   completeStage(
     runId,
     "research",
     researchStartedAt,
-    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}, recalled ${initialResearch.evidenceSummary.recalledCount}.`,
+    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}, recalled ${initialResearch.evidenceSummary.recalledCount}.${
+      keywordExpansion.keywords.length > 0
+        ? ` Дополнительно запрошены англоязычные ключевые слова через LLM: ${keywordExpansion.keywords.join(", ")}.`
+        : ""
+    }`,
   );
   updatePartialArtifacts(runId, {
     research: initialResearch,
@@ -858,6 +871,151 @@ function matchesCompoundTokenGroups(text: string, groups: string[][]): boolean {
   return groups.some((group) => group.every((token) => text.includes(token)));
 }
 
+function isStructuralHeuristicPath(relativePath: string): boolean {
+  const lowerPath = relativePath.toLowerCase();
+  return (
+    lowerPath.startsWith("routes/")
+    || lowerPath.startsWith("config/")
+    || lowerPath.startsWith("database/")
+    || lowerPath.includes("/controllers/")
+    || lowerPath.includes("/services/")
+    || lowerPath.includes("/repositories/")
+    || lowerPath.includes("/models/")
+    || lowerPath.includes("/middlewares/")
+    // Actions — общий DDD/Apiato-паттерн (не завязан на один проект): много
+    // бизнес-логики живёт именно тут, а не в controllers/services.
+    || lowerPath.includes("/actions/")
+  );
+}
+
+// Раньше это был обычный `.slice(0, N)` по списку путей — на маленьком
+// репозитории безобидно, но на большом (магенда: 144 контейнера) это значит
+// "взять первые N файлов в порядке индексации" — то есть только несколько
+// первых по алфавиту директорий, а все остальные ни разу не попадают в
+// scan. Живой баг: вопрос "что такое транспортировка пациента" получил
+// уверенный ответ "такой сущности нет", хотя Transportation.php реально
+// существует — просто его директория (132-я из 144 по алфавиту) была
+// далеко за пределами среза budget=90. Вместо среза с начала — берём
+// директории равномерно по всему диапазону (или round-robin вглубь, если
+// бюджета хватает на все директории), чтобы budget покрывал весь репозиторий,
+// а не только начало алфавита.
+function distributeAcrossDirectories(paths: string[], limit: number): string[] {
+  const byDirectory = new Map<string, string[]>();
+
+  for (const relativePath of paths) {
+    const directory = relativePath.split("/").slice(0, -1).join("/");
+    const bucket = byDirectory.get(directory);
+
+    if (bucket) {
+      bucket.push(relativePath);
+    } else {
+      byDirectory.set(directory, [relativePath]);
+    }
+  }
+
+  const groups = Array.from(byDirectory.values());
+
+  if (groups.length === 0) {
+    return [];
+  }
+
+  if (groups.length <= limit) {
+    const result: string[] = [];
+    let depth = 0;
+
+    while (result.length < limit) {
+      let addedAny = false;
+
+      for (const group of groups) {
+        if (depth < group.length && result.length < limit) {
+          result.push(group[depth] as string);
+          addedAny = true;
+        }
+      }
+
+      if (!addedAny) {
+        break;
+      }
+
+      depth += 1;
+    }
+
+    return result;
+  }
+
+  const step = groups.length / limit;
+  const result: string[] = [];
+
+  for (let i = 0; i < limit; i += 1) {
+    const group = groups[Math.floor(i * step)];
+
+    if (group && group.length > 0) {
+      result.push(group[0] as string);
+    }
+  }
+
+  return result;
+}
+
+// Fallback для "слепой зоны перевода": детерминированный поиск (packages/
+// research) — substring/prefix/suffix по токенам, плюс словарь фонетических
+// заимствований техжаргона (роут->route). Он не может связать обычное
+// русское слово с английским именем класса/директории в коде — живой баг:
+// "транспортировка пациента" не совпала ни с одним токеном, хотя
+// Transportation.php реально существует в проекте. Гоняется НЕ на каждый
+// вопрос — только когда первый детерминированный проход уже слабый
+// (broad-unknown/dominantModule не определён), чтобы не платить лишний
+// LLM-вызов на вопросах, которые и так работают. Если перезапуск с
+// добавленными LLM-словами не улучшил результат — тихо остаёмся на
+// исходном research, ничего не теряем.
+async function maybeExpandResearchWithTranslatedKeywords(
+  researchInput: Parameters<typeof runResearch>[0],
+  research: ReturnType<typeof runResearch>,
+  options: {
+    isQuestionRun: boolean;
+    providerBaseUrl: string;
+    providerModel: string;
+    providerApiKey: string;
+  },
+): Promise<{ research: ReturnType<typeof runResearch>; keywords: string[] }> {
+  const looksWeak = research.intentClass === "broad-unknown" || research.dominantModule === "не определён";
+  const hasCyrillic = /[а-яё]/i.test(researchInput.task);
+  const canUseProvider =
+    options.isQuestionRun
+    && options.providerBaseUrl.trim().length > 0
+    && options.providerModel.trim().length > 0
+    && options.providerApiKey.trim().length > 0;
+
+  if (!looksWeak || !hasCyrillic || !canUseProvider) {
+    return { research, keywords: [] };
+  }
+
+  const keywords = await expandTaskSearchKeywords({
+    task: researchInput.task,
+    providerBaseUrl: options.providerBaseUrl,
+    providerModel: options.providerModel,
+    providerApiKey: options.providerApiKey,
+  });
+
+  if (keywords.length === 0) {
+    return { research, keywords: [] };
+  }
+
+  // `evidence` всегда обрезается до `selectTopEvidence(..., limit = 12)` —
+  // на широком/структурном фолбэке кандидатов и так с избытком, поэтому
+  // "evidence.length увеличился" почти никогда не сработает как сигнал
+  // улучшения (оба прохода упираются в один и тот же потолок). Раз мы уже
+  // попали сюда только потому, что исходный research слабый (`looksWeak`),
+  // расширенный research — тот же вопрос плюс доп. слова — не может быть
+  // содержательно хуже, поэтому просто используем его.
+  const augmentedResearch = runResearch({
+    ...researchInput,
+    task: `${researchInput.task}\n\n(possible English keywords: ${keywords.join(", ")})`,
+  });
+
+  return { research: augmentedResearch, keywords };
+}
+
 function buildQuestionWorkspacePlan(
   task: string,
   repository: PipelineRunResult["repository"],
@@ -929,41 +1087,15 @@ function buildQuestionWorkspacePlan(
         ),
       )
     : [];
-  const baselineDiscoveryPaths = previousIndex?.files
-    .map((file) => normalizePath(file.filePath))
-    .filter((relativePath) => {
-      const lowerPath = relativePath.toLowerCase();
-      return (
-        lowerPath.startsWith("routes/")
-        || lowerPath.startsWith("config/")
-        || lowerPath.startsWith("database/")
-        || lowerPath.includes("/controllers/")
-        || lowerPath.includes("/services/")
-        || lowerPath.includes("/repositories/")
-        || lowerPath.includes("/models/")
-        || lowerPath.includes("/middlewares/")
-      );
-    })
-    .slice(0, 90) ?? [];
+  const baselineDiscoveryPaths = distributeAcrossDirectories(
+    previousIndex?.files.map((file) => normalizePath(file.filePath)).filter(isStructuralHeuristicPath) ?? [],
+    90,
+  );
   const hasStrongGraphSeed = graphMatchedPaths.length >= 3 || graphNeighborPaths.length >= 6;
   const hasRepositoryScopedSeed = gitScopedPaths.length >= 2;
   const shouldUseStructuralFallback = !hasStrongGraphSeed && !hasRepositoryScopedSeed;
   const fallbackStructuralPaths = shouldUseStructuralFallback
-    ? availableRelativePaths
-        .filter((relativePath) => {
-          const lowerPath = relativePath.toLowerCase();
-          return (
-            lowerPath.startsWith("routes/")
-            || lowerPath.startsWith("config/")
-            || lowerPath.startsWith("database/")
-            || lowerPath.includes("/controllers/")
-            || lowerPath.includes("/services/")
-            || lowerPath.includes("/repositories/")
-            || lowerPath.includes("/models/")
-            || lowerPath.includes("/middlewares/")
-          );
-        })
-        .slice(0, 120)
+    ? distributeAcrossDirectories(availableRelativePaths.filter(isStructuralHeuristicPath), 120)
     : [];
   const directMatchPathSet = new Set(directMatchPaths);
   const graphNeighborOnlyPaths = graphNeighborPaths.filter((relativePath) => !directMatchPathSet.has(relativePath));

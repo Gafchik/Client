@@ -228,6 +228,95 @@ export async function validateEvidence(input: ValidateEvidenceInput): Promise<Va
   }
 }
 
+export interface ExpandTaskSearchKeywordsInput {
+  task: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}
+
+// Детерминированный поиск (packages/research) — это substring/prefix/suffix
+// сравнение токенов, плюс словарь фонетических заимствований техжаргона
+// (роут->route, контроллер->controller). Он в принципе не может связать
+// обычное русское слово с английским именем класса/директории в коде —
+// "транспортировка" и "Transportation" не имеют ни одной общей буквенной
+// подстроки, хотя семантически это одно и то же. Живой баг: вопрос про
+// "транспортировку пациента" получил "такой сущности нет", хотя
+// Transportation.php реально существует — просто ни разу не совпал ни с
+// одним токеном вопроса. Это fallback ИМЕННО для слабого детерминированного
+// сигнала (см. вызов в apps/api/pipeline-runner.ts) — не гоняется на каждый
+// вопрос, только когда первый проход уже пришёл к broad-unknown/пустому
+// dominantModule, чтобы не платить лишний LLM-вызов на вопросах, которые и
+// так работают (auth/billing/locale — узкие, с сильным сигналом).
+export async function expandTaskSearchKeywords(input: ExpandTaskSearchKeywordsInput): Promise<string[]> {
+  const canUseProvider =
+    input.providerBaseUrl.trim().length > 0
+    && input.providerModel.trim().length > 0
+    && input.providerApiKey.trim().length > 0;
+
+  if (!canUseProvider) {
+    return [];
+  }
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    // Без `response_format: json_object` — часть моделей/роутеров (живой
+    // пример: nvidia/nemotron-3-ultra через rout.my) отвечают 400 Bad Request
+    // на строгий json-mode при коротком user-сообщении без видимой причины.
+    // Просим JSON текстом в промпте и парсим терпимее (вырезаем `{...}` из
+    // ответа на случай code-fence/лишнего текста вокруг).
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "Ты помогаешь построить поисковые термины для substring-поиска по исходному коду.",
+            "Пользователь задаёт инженерный вопрос о кодовой базе, обычно на русском.",
+            "Кодовая база обычно называет сущности английскими словами (классы, директории, поля, таблицы).",
+            "Придумай до 6 английских слов/коротких словосочетаний — переводов, синонимов и распространённых технических терминов, которыми в коде могла бы называться сущность или процесс из вопроса.",
+            "Не отвечай на сам вопрос. Не придумывай конкретные имена классов конкретного проекта — только обычные словарные английские слова по смыслу вопроса.",
+            "Ответь ТОЛЬКО одной строкой JSON без пояснений и без markdown-обрамления, ровно в таком виде: {\"keywords\": string[]}.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: input.task,
+        },
+      ],
+    });
+
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+
+    if (!content) {
+      return [];
+    }
+
+    const jsonMatch = /\{[\s\S]*\}/.exec(content);
+
+    if (!jsonMatch) {
+      return [];
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { keywords?: unknown };
+
+    if (!Array.isArray(parsed.keywords)) {
+      return [];
+    }
+
+    return [...new Set(
+      parsed.keywords
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter((item) => item.length >= 2 && item.length <= 40),
+    )].slice(0, 6);
+  } catch {
+    return [];
+  }
+}
+
 export function buildValidatedAnswerPacket(input: BuildValidatedAnswerPacketInput): ValidatedAnswerPacket {
   return {
     packetId: stableId(["validated-answer-packet", input.runId, input.validation.validationId]),
@@ -827,7 +916,6 @@ function getLocationEvidenceWeight(item: ResearchReport["evidence"][number]): nu
 
 function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): ValidatedClaimSet {
   const strongestEvidence = getPrioritizedEvidence(input)[0];
-  const runtimeFacts = collectRuntimeFacts(input);
   const caveats = input.validatedAnswerPacket?.mandatoryCaveats.slice(0, 2) ?? [];
   const directAnswerFromScenario = buildDirectAnswerFromScenario(input, contract, strongestEvidence);
 
@@ -845,18 +933,7 @@ function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): Val
         }
       : directAnswerFromScenario
         ? directAnswerFromScenario
-        : runtimeFacts[0]
-          ? {
-              id: stableId(["claim", input.runId, "direct-runtime"]),
-              type: "direct-answer",
-              statement: runtimeFacts[0],
-              evidence: runtimeFacts.slice(0, 2),
-              filePaths: strongestEvidence?.filePath ? [strongestEvidence.filePath] : [],
-              supportLevel: "strong",
-              status: "supported",
-              caveats,
-            }
-          : input.research.functionalSummary.trim().length > 0
+        : input.research.functionalSummary.trim().length > 0
             ? {
                 id: stableId(["claim", input.runId, "direct-functional"]),
                 type: "direct-answer",
@@ -870,16 +947,6 @@ function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): Val
             : undefined;
 
   const supportingClaims = [
-    ...runtimeFacts.slice(1, 3).map((fact, index) => ({
-      id: stableId(["claim", input.runId, "supporting-runtime", index]),
-      type: "supporting" as const,
-      statement: fact,
-      evidence: [fact],
-      filePaths: [],
-      supportLevel: "strong" as const,
-      status: "supported" as const,
-      caveats: [],
-    })),
     ...input.research.findings.slice(0, 2).map((finding, index) => ({
       id: stableId(["claim", input.runId, "supporting-finding", index]),
       type: "supporting" as const,
@@ -2269,7 +2336,6 @@ function buildConfirmedFacts(
   evidenceHighlights: AnswerEvidenceHighlight[],
 ): string[] {
   const facts = [
-    ...collectRuntimeFacts(input),
     brief.directAnswer,
     ...brief.claimSet.supportingClaims.map((claim) => claim.statement),
     ...evidenceHighlights.map((item) => `${item.label}: ${item.detail}`),
@@ -2337,14 +2403,7 @@ function buildEvidenceLockedExplanation(
   unknowns: string[],
 ): string {
   const parts: string[] = [];
-  const runtimeFacts = collectRuntimeFacts(input);
   const freshnessExplanation = buildFreshnessExplanation(input);
-
-  if (runtimeFacts.length > 0) {
-    parts.push(`Подтвержденные факты: ${runtimeFacts.join(" ")}`);
-  } else {
-    parts.push("Система не нашла достаточно прямых runtime-фактов, поэтому ответ ограничен структурными подтверждениями.");
-  }
 
   if (freshnessExplanation) {
     parts.push(freshnessExplanation);
@@ -2428,33 +2487,6 @@ function buildEvidenceProvenanceExplanation(research: ResearchReport): string {
   }
 
   return "Часть вывода опирается на твои локальные незакоммиченные изменения, а не только на то, что уже в git.";
-}
-
-function collectRuntimeFacts(input: BuildAnswerInput): string[] {
-  const facts: string[] = [];
-  const evidenceText = input.research.evidence
-    .map((item) => `${item.label} ${item.reason} ${item.filePath ?? ""}`.toLowerCase())
-    .join(" ");
-  const findingsText = input.research.findings.join(" ").toLowerCase();
-  const dataSourcesText = input.research.dataSources.join(" ").toLowerCase();
-
-  if (evidenceText.includes("localemiddleware") || findingsText.includes("localemiddleware")) {
-    facts.push("Выбор локали подтвержден через `LocaleMiddleware`.");
-  }
-
-  if (evidenceText.includes("x-locale") || dataSourcesText.includes("http-запроса")) {
-    facts.push("Есть подтверждение, что локаль зависит от входящего HTTP-запроса и его заголовков.");
-  }
-
-  if (dataSourcesText.includes("fallback locale") || evidenceText.includes("config/app.php")) {
-    facts.push("Есть подтверждение, что fallback локали читается из config/env-слоя.");
-  }
-
-  if (evidenceText.includes("setlocale") || findingsText.includes("locale")) {
-    facts.push("Есть подтверждение явной установки locale в runtime-потоке.");
-  }
-
-  return facts.slice(0, 4);
 }
 
 function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, brief: AnswerBrief): string {
@@ -2725,7 +2757,8 @@ async function performProviderRequest(endpoint: string, apiKey: string, body: Re
 
       if (!shouldRetryResponse(response.status) || attempt === PROVIDER_MAX_ATTEMPTS) {
         clearTimeout(timeoutId);
-        throw new Error(`Provider request failed with ${response.status}`);
+        const bodyText = await response.text().catch(() => "");
+        throw new Error(`Provider request failed with ${response.status}${bodyText ? `: ${bodyText.slice(0, 300)}` : ""}`);
       }
 
       const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
