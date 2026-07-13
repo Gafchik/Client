@@ -1,0 +1,167 @@
+import {
+  stableId,
+  type FactSource,
+  type FactStatus,
+  type IndexResult,
+  type ProjectFact,
+  type RepositorySnapshot,
+  type ResearchReport,
+} from "@client/shared";
+import { runSql } from "./postgres-client.js";
+
+interface ProjectFactRow {
+  id: string;
+  project_root_path: string;
+  category: string;
+  statement: string;
+  file_paths: string[];
+  confidence: number;
+  status: FactStatus;
+  source: FactSource;
+  content_hashes: Record<string, string>;
+  created_at: Date;
+  last_confirmed_at: Date;
+  last_confirmed_head_commit: string | null;
+  superseded_by_fact_id: string | null;
+}
+
+function mapFactRow(row: ProjectFactRow): ProjectFact {
+  return {
+    id: row.id,
+    projectRootPath: row.project_root_path,
+    category: row.category,
+    statement: row.statement,
+    filePaths: row.file_paths ?? [],
+    confidence: row.confidence,
+    status: row.status,
+    source: row.source,
+    contentHashes: row.content_hashes ?? {},
+    createdAt: new Date(row.created_at).toISOString(),
+    lastConfirmedAt: new Date(row.last_confirmed_at).toISOString(),
+    ...(row.last_confirmed_head_commit ? { lastConfirmedHeadCommit: row.last_confirmed_head_commit } : {}),
+    ...(row.superseded_by_fact_id ? { supersededByFactId: row.superseded_by_fact_id } : {}),
+  };
+}
+
+/**
+ * Читает накопленные факты проекта и пересчитывает staleness по content hash
+ * текущего индекса — без отдельного background job, пересчёт происходит на
+ * лету при каждом чтении. Переименованные файлы (git mv) мигрируются на новый
+ * путь по данным `repository.changedFiles`, а не считаются потерянными.
+ *
+ * Никогда не бросает исключение: при ошибке Postgres research должен
+ * деградировать до обычного broad-scan, а не падать целиком.
+ */
+export async function queryRelevantFacts(
+  projectRootPath: string,
+  currentIndex: IndexResult,
+  repository?: RepositorySnapshot,
+): Promise<ProjectFact[]> {
+  try {
+    const rows = await runSql<ProjectFactRow>(
+      `select * from project_facts where project_root_path = $1 and status != 'deprecated' order by last_confirmed_at desc limit 100`,
+      [projectRootPath],
+    );
+
+    const currentHashByPath = new Map(currentIndex.files.map((file) => [file.filePath, file.contentHash]));
+    const renameTargetByOldPath = new Map(
+      (repository?.changedFiles ?? [])
+        .filter((entry) => entry.changeType === "renamed" && entry.previousPath)
+        .map((entry) => [entry.previousPath as string, entry.path]),
+    );
+
+    return rows.map((row) => {
+      const fact = mapFactRow(row);
+      const migratedFilePaths = fact.filePaths.map((filePath) => renameTargetByOldPath.get(filePath) ?? filePath);
+      const stillValid = migratedFilePaths.some(
+        (filePath) => currentHashByPath.get(filePath) === fact.contentHashes[filePath],
+      );
+
+      return {
+        ...fact,
+        filePaths: migratedFilePaths,
+        status: stillValid ? fact.status : ("potentially_stale" as FactStatus),
+      };
+    });
+  } catch (error) {
+    console.warn("[facts] queryRelevantFacts failed, degrading to no facts:", error);
+    return [];
+  }
+}
+
+/**
+ * Промоутит top-evidence текущего research'а (только origin === "baseline" —
+ * грязный worktree не должен становиться durable фактом) в Fact Store.
+ * Дедуп — по содержанию (projectRootPath+category+statement), не по составу
+ * файлов: повторное обнаружение того же вывода обновляет существующую
+ * запись (union filePaths/contentHashes), а не плодит дубликаты.
+ *
+ * Намеренно НЕ пытается детектировать семантическое противоречие между
+ * разными фактами на одном файле — ранняя версия помечала любые два факта
+ * с пересекающимися filePaths как superseded, что на практике убивало
+ * совместимые, взаимно дополняющие факты об одном файле (см. живой тест:
+ * два разных, оба верных вывода про AuthController.php гасили друг друга).
+ * Временной дрейф ("этот факт больше не верен") обрабатывается content-hash
+ * staleness-проверкой в queryRelevantFacts, а не supersede-эвристикой здесь.
+ * `supersededByFactId` в схеме зарезервировано под будущий явный путь
+ * (например user-confirmed коррекция), но promotion его не заполняет.
+ *
+ * Вызывается fire-and-forget из pipeline-runner — никогда не бросает
+ * исключение и не должен блокировать ответ пользователю.
+ */
+export async function promoteFactsFromResearch(
+  projectRootPath: string,
+  report: ResearchReport,
+  repository: RepositorySnapshot,
+  index: IndexResult,
+): Promise<void> {
+  try {
+    const currentHashByPath = new Map(index.files.map((file) => [file.filePath, file.contentHash]));
+    const category = report.dominantModule || "general";
+    const now = new Date().toISOString();
+
+    const candidates = report.evidence
+      .filter((item) => item.origin === "baseline" && item.filePath && currentHashByPath.has(item.filePath))
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 3);
+
+    for (const item of candidates) {
+      const filePath = item.filePath as string;
+      const contentHash = currentHashByPath.get(filePath) as string;
+      const statement = `${item.label}: ${item.reason}`;
+      const normalizedStatement = statement.trim().toLowerCase();
+      const id = stableId(["fact", projectRootPath, category, normalizedStatement]);
+      const contentHashesJson = JSON.stringify({ [filePath]: contentHash });
+
+      await runSql(
+        `
+          insert into project_facts
+            (id, project_root_path, category, statement, file_paths, confidence, status, source, content_hashes, created_at, last_confirmed_at, last_confirmed_head_commit)
+          values ($1, $2, $3, $4, array[$5]::text[], $6, 'fresh', 'research', $7::jsonb, $8, $8, $9)
+          on conflict (id) do update set
+            file_paths = array(select distinct unnest(project_facts.file_paths || excluded.file_paths)),
+            confidence = greatest(project_facts.confidence, excluded.confidence),
+            status = 'fresh',
+            content_hashes = project_facts.content_hashes || excluded.content_hashes,
+            last_confirmed_at = excluded.last_confirmed_at,
+            last_confirmed_head_commit = excluded.last_confirmed_head_commit
+        `,
+        [
+          id,
+          projectRootPath,
+          category,
+          statement,
+          filePath,
+          // item.score — сумма эвристических бонусов, не нормализована в [0,100] —
+          // клампим на всякий случай перед записью в integer-колонку.
+          Math.max(5, Math.min(100, Math.round(item.score))),
+          contentHashesJson,
+          now,
+          repository.headCommit,
+        ],
+      );
+    }
+  } catch (error) {
+    console.warn("[facts] promoteFactsFromResearch failed:", error);
+  }
+}

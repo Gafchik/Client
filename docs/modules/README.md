@@ -1,0 +1,17 @@
+# Modules
+
+- [Workspace](/Users/evgenii/Desktop/client/docs/modules/workspace.md)
+- [Indexer](/Users/evgenii/Desktop/client/docs/modules/indexer.md)
+- [Graph](/Users/evgenii/Desktop/client/docs/modules/graph.md)
+- [Repository Git Intelligence](/Users/evgenii/Desktop/client/docs/modules/repository-git.md)
+- [Branch-Aware Background Intelligence](/Users/evgenii/Desktop/client/docs/modules/branch-aware-intelligence.md)
+- [Project Intelligence Runtime](/Users/evgenii/Desktop/client/docs/modules/project-intelligence-runtime.md)
+- [Research Engine](/Users/evgenii/Desktop/client/docs/modules/research.md)
+- [Impact Analysis](/Users/evgenii/Desktop/client/docs/modules/impact-analysis.md)
+- [Context Builder](/Users/evgenii/Desktop/client/docs/modules/context-builder.md)
+- [Planner](/Users/evgenii/Desktop/client/docs/modules/planner.md)
+- [Execution Engine](/Users/evgenii/Desktop/client/docs/modules/execution-engine.md)
+- [Knowledge](/Users/evgenii/Desktop/client/docs/modules/knowledge.md)
+- [Provider System](/Users/evgenii/Desktop/client/docs/modules/provider-system.md)
+- [Answer Engine](/Users/evgenii/Desktop/client/docs/modules/answer-engine.md)
+- [Chat UI](/Users/evgenii/Desktop/client/docs/modules/chat-ui.md)

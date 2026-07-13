@@ -1,20 +1,20 @@
 {
-  "name": "@ai-agent-team/web",
+  "name": "@client/web",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0 --port 5173",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "vite",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "vite build"
   },
   "dependencies": {
-    "socket.io-client": "^4.8.3",
-    "vue": "^3.5.13",
-    "vue-router": "^4.5.1"
+    "@client/shared": "0.1.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.18.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.2.1",
-    "vite": "^6.0.5"
+    "@vitejs/plugin-react": "^5.0.0"
   }
 }

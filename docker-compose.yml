@@ -1,23 +1,46 @@
-# Только БД поднимается в Docker. API и фронт запускаются локально
-# (npm run start) — это даёт hot-reload и прямой доступ к локальному диску
-# для агентов, без пересборки образов и маппинга путей контейнера.
+# В Docker поднимаются Neo4j (persistent knowledge graph storage) и Postgres
+# (метаданные: Project/Provider/история чатов — см. docs/architecture/002-storage.md).
+# Backend (apps/api) и frontend (apps/web) запускаются локально без Docker.
 services:
-  db:
-    image: postgres:16-alpine
+  neo4j:
+    image: neo4j:5-community
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-ai_agent_team}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-clientgraph}
+      NEO4J_server_memory_pagecache_size: 512M
+      NEO4J_server_memory_heap_initial__size: 512M
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_PLUGINS: '["apoc"]'
       TZ: ${TZ:-Europe/Kiev}
     ports:
-      - "${POSTGRES_PORT:-35433}:5432"
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-client}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clientmeta}
+      POSTGRES_DB: ${POSTGRES_DB:-client}
+      TZ: ${TZ:-Europe/Kiev}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ai_agent_team}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-client} -d ${POSTGRES_DB:-client}"]
       interval: 5s
       timeout: 5s
-      retries: 20
+      retries: 30
 
 volumes:
+  neo4j_data:
+  neo4j_logs:
   postgres_data:

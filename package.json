@@ -1,34 +1,23 @@
 {
-  "name": "ai-agent-team",
-  "version": "0.1.0",
+  "name": "client",
   "private": true,
-  "description": "Docker-first monorepo with Vue 3 + Vite frontend, NestJS backend, Postgres, and an AI agent team orchestrator.",
+  "type": "module",
   "workspaces": [
-    "apps/api",
-    "apps/web"
+    "apps/*",
+    "packages/*"
   ],
   "scripts": {
-    "dev:api": "npm run start:dev -w apps/api",
-    "dev:web": "npm run dev -w apps/web",
-    "build": "npm run build -w apps/api && npm run build -w apps/web",
-    "db:up": "docker compose up -d db",
-    "db:down": "docker compose down",
-    "db:logs": "docker compose logs -f db",
-    "dev:kill": "sh scripts/kill-dev.sh",
-    "prestart": "npm run dev:kill && npm run db:up",
-    "start": "concurrently --handle-input -k --success first -n api,web -c blue,green \"npm:dev:api\" \"npm:dev:web\"",
-    "docker:up": "docker compose up --build",
-    "docker:rebuild": "docker compose up --build -d",
-    "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f",
-    "docker:ps": "docker compose ps"
-  },
-  "engines": {
-    "node": ">=24.0.0"
+    "dev:api": "npm run dev -w @client/api",
+    "dev:web": "npm run dev -w @client/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
   },
   "devDependencies": {
-    "concurrently": "^9.2.3",
-    "dotenv-cli": "^11.0.0",
-    "tsx": "^4.23.0"
+    "@types/node": "^24.0.10",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.2"
   }
 }
