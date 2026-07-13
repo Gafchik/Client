@@ -579,7 +579,6 @@ function resolveQuestionType(task: string, research: ResearchReport): string {
 
   if (
     normalized.includes("есть")
-    || normalized.includes("используется")
     || normalized.includes("подключен")
     || normalized.includes("подключена")
     || normalized.includes("можно ли")
@@ -593,6 +592,7 @@ function resolveQuestionType(task: string, research: ResearchReport): string {
   if (
     normalized.includes("где")
     || normalized.includes("where")
+    || normalized.includes("используется")
     || normalized.includes("хран")
     || normalized.includes("лежит")
   ) {
@@ -713,18 +713,62 @@ function buildQuestionContract(input: BuildAnswerInput): QuestionContract {
 
 function getPrioritizedEvidence(input: BuildAnswerInput): ResearchReport["evidence"] {
   const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
+  const task = input.task.toLowerCase();
+  const locationQuestion = task.includes("где") || task.includes("where");
+  const usageQuestion = task.includes("используется") || task.includes("use");
+  const storageQuestion = input.research.queryProfileKey === "storage-topology";
+  const filtered = input.research.evidence.filter((item) => {
+    const filePath = (item.filePath ?? "").toLowerCase();
+    return !(filePath.includes("/.vscode/") || filePath.startsWith(".vscode/") || filePath.endsWith("/.vscode/settings.json"));
+  });
 
   if (localeBehavior) {
-    return [...input.research.evidence].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left));
+    return [...filtered].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left));
   }
 
-  return input.research.evidence;
+  if (storageQuestion) {
+    return [...filtered].sort((left, right) => getStorageEvidenceWeight(right) - getStorageEvidenceWeight(left));
+  }
+
+  if (locationQuestion || usageQuestion) {
+    return [...filtered].sort((left, right) => getLocationEvidenceWeight(right) - getLocationEvidenceWeight(left));
+  }
+
+  return filtered;
+}
+
+function getStorageEvidenceWeight(item: ResearchReport["evidence"][number]): number {
+  const label = item.label.toLowerCase();
+  const filePath = (item.filePath ?? "").toLowerCase();
+  let score = item.score;
+
+  if (filePath.includes("/models/") && (filePath.includes("server") || label.includes("server"))) score += 32;
+  if (label.includes("credential") || label.includes("passphrase") || label.includes("private_key")) score += 26;
+  if ((filePath.includes("/repositories/") || filePath.includes("/repository/")) && filePath.includes("server")) score += 28;
+  if ((filePath.includes("/requests/") || filePath.includes("/dto/") || filePath.includes("/validators/")) && filePath.includes("server")) score += 26;
+  if (filePath.includes("migrations") && (filePath.includes("server") || label.includes("migration"))) score += 24;
+  if (filePath.includes("/observers/") || label.includes("observer")) score -= 60;
+
+  return score;
+}
+
+function getLocationEvidenceWeight(item: ResearchReport["evidence"][number]): number {
+  const label = item.label.toLowerCase();
+  const filePath = (item.filePath ?? "").toLowerCase();
+  let score = item.score;
+
+  if (filePath.length > 0) score += 24;
+  if (label.includes("migration") || label.includes("route") || label.includes("controller") || label.includes("model")) score += 8;
+  if (filePath.includes("/.vscode/")) score -= 80;
+
+  return score;
 }
 
 function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): ValidatedClaimSet {
   const strongestEvidence = getPrioritizedEvidence(input)[0];
   const runtimeFacts = collectRuntimeFacts(input);
   const caveats = input.validatedAnswerPacket?.mandatoryCaveats.slice(0, 2) ?? [];
+  const directAnswerFromScenario = buildDirectAnswerFromScenario(input, contract, strongestEvidence);
 
   const directClaim: ClaimCandidate | undefined =
     input.validatedAnswerPacket?.directAnswerAllowed === false
@@ -738,17 +782,8 @@ function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): Val
           status: "partial",
           caveats,
         }
-      : contract.questionType === "location" && strongestEvidence?.filePath
-        ? {
-            id: stableId(["claim", input.runId, "direct-location"]),
-            type: "direct-answer",
-            statement: `Главная точка для ответа находится в \`${strongestEvidence.filePath}\`.`,
-            evidence: [strongestEvidence.label, strongestEvidence.reason].filter(Boolean),
-            filePaths: [strongestEvidence.filePath],
-            supportLevel: "strong",
-            status: "supported",
-            caveats,
-          }
+      : directAnswerFromScenario
+        ? directAnswerFromScenario
         : runtimeFacts[0]
           ? {
               id: stableId(["claim", input.runId, "direct-runtime"]),
@@ -873,6 +908,52 @@ function buildClaimSet(input: BuildAnswerInput, contract: QuestionContract): Val
     limitationClaims,
     rejectedClaims,
   };
+}
+
+function buildDirectAnswerFromScenario(
+  input: BuildAnswerInput,
+  contract: QuestionContract,
+  strongestEvidence: ResearchReport["evidence"][number] | undefined,
+): ClaimCandidate | undefined {
+  const task = input.task.toLowerCase();
+
+  if (contract.questionType === "location" && strongestEvidence?.filePath) {
+    const usageQuestion = task.includes("используется") || task.includes("use");
+    return {
+      id: stableId(["claim", input.runId, "direct-location"]),
+      type: "direct-answer",
+      statement: usageQuestion
+        ? `Основные использования собраны вокруг \`${strongestEvidence.filePath}\`.`
+        : `Главная точка для ответа находится в \`${strongestEvidence.filePath}\`.`,
+      evidence: [strongestEvidence.label, strongestEvidence.reason].filter(Boolean),
+      filePaths: [strongestEvidence.filePath],
+      supportLevel: "strong",
+      status: "supported",
+      caveats: [],
+    };
+  }
+
+  if (input.research.queryProfileKey === "storage-topology") {
+    const topFiles = getPrioritizedEvidence(input)
+      .filter((item) => Boolean(item.filePath))
+      .slice(0, 3)
+      .map((item) => item.filePath as string);
+
+    if (topFiles.length > 0) {
+      return {
+        id: stableId(["claim", input.runId, "direct-storage"]),
+        type: "direct-answer",
+        statement: `Основная storage-цепочка подтверждается в ${topFiles.map((file) => `\`${file}\``).join(", ")}.`,
+        evidence: topFiles,
+        filePaths: topFiles,
+        supportLevel: "strong",
+        status: "supported",
+        caveats: [],
+      };
+    }
+  }
+
+  return undefined;
 }
 
 function buildAnswerBrief(input: BuildAnswerInput, answerMode: AnswerMode): AnswerBrief {
@@ -1907,8 +1988,9 @@ function buildStructuredFallbackExplanation(
 
 function buildHowItWorksSection(input: BuildAnswerInput, brief: AnswerBrief, mode: AnswerMode): string {
   const parts: string[] = [];
+  const locationLike = brief.questionContract.expectedAnswerShape === "location";
 
-  parts.push("## Как это работает");
+  parts.push(locationLike ? "## Что найдено" : "## Как это работает");
 
   if (brief.explanationLead.trim().length > 0) {
     parts.push(brief.explanationLead);
@@ -1925,14 +2007,14 @@ function buildHowItWorksSection(input: BuildAnswerInput, brief: AnswerBrief, mod
     }
   }
 
-  if (input.research.entryPoints.length > 0) {
+  if (!locationLike && input.research.entryPoints.length > 0) {
     parts.push(`\nС чего начинается цепочка:`);
     for (const ep of input.research.entryPoints.slice(0, 3)) {
       parts.push(`- ${ep}`);
     }
   }
 
-  if (input.research.dataSources.length > 0 && input.research.queryProfileKey !== "entrypoint-traversal") {
+  if (!locationLike && input.research.dataSources.length > 0 && input.research.queryProfileKey !== "entrypoint-traversal") {
     parts.push(`\nОткуда берутся данные:`);
     for (const ds of input.research.dataSources.slice(0, 2)) {
       parts.push(`- ${ds}`);
@@ -2134,7 +2216,7 @@ function buildEvidenceLockedSummary(input: BuildAnswerInput, brief: AnswerBrief)
   }
 
   if (topEvidence?.filePath) {
-    return `Смотрю в первую очередь на \`${topEvidence.filePath}\` — там самое сильное подтверждение. ${buildFreshnessSuffix(input)}`.trim();
+    return `Самая сильная опора сейчас в \`${topEvidence.filePath}\`. ${buildFreshnessSuffix(input)}`.trim();
   }
 
   return `Держусь только того, что реально подтверждено кодом и рантаймом — без домыслов. ${buildFreshnessSuffix(input)}`.trim();
@@ -2219,7 +2301,7 @@ function buildFreshnessExplanation(input: BuildAnswerInput): string {
   }
 
   if (input.backgroundState.freshness === "missing") {
-    return "Разбираю эту ветку впервые — по мере новых вопросов пойму её лучше.";
+    return "Эту ветку разбираю впервые, поэтому редкие боковые связи ещё могут всплыть на следующем проходе.";
   }
 
   return "";

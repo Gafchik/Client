@@ -146,7 +146,8 @@ export function registerBuiltinQuestionTypes(): void {
     label: "Existence Check",
     description: "Вопросы о наличии/существовании чего-либо в проекте",
     patterns: [
-      { regex: /\b(есть|используется|есть ли|существует|is there|does.*exist|using|use)\b/i, weight: 90 },
+      { regex: /\b(есть|есть ли|существует|is there|does.*exist|using|use)\b/i, weight: 90, excludeKeywords: ["где", "where"] },
+      { regex: /\b(используется)\b/i, weight: 82, excludeKeywords: ["где", "where"] },
       { regex: /\b(подключен|подключена|enabled|configured)\b/i, weight: 70 },
     ],
     defaultSearchProfiles: ["config-inventory", "entrypoint-traversal"],
@@ -192,6 +193,7 @@ export function registerBuiltinQuestionTypes(): void {
     label: "Location Finding",
     description: "Вопросы о местоположении кода/файлов",
     patterns: [
+      { regex: /\b(где)\b.*\b(используется|лежит|находится|обрабатывается|описан|описаны)\b/i, weight: 98 },
       { regex: /\b(где|where|в каком файле|which file|location|путь|path)\b/i, weight: 90 },
       { regex: /\b(найди|find|locate)\b/i, weight: 70 },
     ],
@@ -206,6 +208,7 @@ export function registerBuiltinQuestionTypes(): void {
     description: "Вопросы о логике работы, процессах, flow",
     patterns: [
       { regex: /\b(как работает|как происходит|что происходит|process|flow|logic|works)\b/i, weight: 90 },
+      { regex: /\b(как)\b.*\b(выбирается|определяется|резолвится|устанавливается|обрабатывается)\b/i, weight: 92 },
       { regex: /\b(алгоритм|algorithm|последовательность|sequence|шаги|steps)\b/i, weight: 80 },
       { regex: /\b(в каком случае|в каких случаях|при каких условиях|при каком условии|когда именно|in which case|in what case|under what conditions|when exactly)\b/i, weight: 90 },
       { regex: /\b(нужно|надо|необходимо|должен|должна|должны|required|must|needs? to)\b.*\b(подтвердить|подтверждение|верифицировать|верификация|confirm|verify|validate)\b/i, weight: 85 },

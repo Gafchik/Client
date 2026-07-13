@@ -196,8 +196,6 @@ const INTENT_PROFILES: IntentProfile[] = [
       "ssh-соединения",
       "хост",
       "порт",
-      "логин",
-      "приватный",
       "ключ",
       "туннель",
     ],
@@ -714,7 +712,10 @@ function selectTopEvidence(
   input: ResearchInput,
   limit = 12,
 ): ScoredReference[] {
-  const sorted = [...candidates].sort((left, right) => right.score - left.score);
+  const sorted = [...candidates]
+    .map((candidate) => classifyReferenceOrigin(candidate, input))
+    .filter((candidate) => !isNoiseEvidence(candidate, input))
+    .sort((left, right) => right.score - left.score);
   const selected: ScoredReference[] = [];
   const perFileCount = new Map<string, number>();
   let fileAnchors = 0;
@@ -724,12 +725,11 @@ function selectTopEvidence(
       break;
     }
 
-    const normalized = classifyReferenceOrigin(candidate, input);
-    const filePath = normalized.filePath ?? "";
+    const filePath = candidate.filePath ?? "";
     const currentFileCount = filePath ? perFileCount.get(filePath) ?? 0 : 0;
     const isFileBacked = Boolean(filePath);
     const isNearTopCandidate = selected.length < Math.min(6, limit);
-    const hasStrongScore = normalized.score >= 40;
+    const hasStrongScore = candidate.score >= 40;
 
     if (
       isFileBacked
@@ -741,7 +741,7 @@ function selectTopEvidence(
       continue;
     }
 
-    selected.push(normalized);
+    selected.push(candidate);
 
     if (isFileBacked) {
       perFileCount.set(filePath, currentFileCount + 1);
@@ -765,10 +765,39 @@ function selectTopEvidence(
       continue;
     }
 
-    selected.push(classifyReferenceOrigin(candidate, input));
+    selected.push(candidate);
   }
 
   return selected;
+}
+
+function isNoiseEvidence(item: ScoredReference, input: ResearchInput): boolean {
+  const filePath = (item.filePath ?? "").toLowerCase();
+  const label = item.label.toLowerCase();
+  const task = input.task.toLowerCase();
+  const infrastructureQuestion =
+    task.includes("сервер")
+    || task.includes("server")
+    || task.includes("ssh")
+    || task.includes("credential")
+    || task.includes("vault")
+    || task.includes("passphrase")
+    || task.includes("private key");
+  const localeQuestion = task.includes("locale") || task.includes("локал");
+
+  if (filePath.includes("/.vscode/") || filePath.startsWith(".vscode/") || filePath.endsWith("/.vscode/settings.json")) {
+    return true;
+  }
+
+  if (infrastructureQuestion && (filePath.includes("/observers/") || label.includes("observer"))) {
+    return true;
+  }
+
+  if (localeQuestion && label.includes("settings.json")) {
+    return true;
+  }
+
+  return false;
 }
 
 function classifyReferenceOrigin(item: ScoredReference, input: ResearchInput): ScoredReference {
@@ -978,6 +1007,23 @@ function mapClassificationToRouting(classification: ClassificationResult): Resea
       };
     }
   }
+
+  if (
+    (contextKeys.includes("server")
+      || contextKeys.includes("ssh")
+      || contextKeys.includes("vault")
+      || contextKeys.includes("credential")
+      || contextKeys.includes("host")
+      || contextKeys.includes("port")
+      || contextKeys.includes("connection"))
+    && (questionType === "flow" || questionType === "schema" || questionType === "location" || questionType === "configuration")
+  ) {
+    return {
+      intentClass: "model-schema",
+      strategyKey: "graph-storage-structure",
+      queryProfileKey: "storage-topology",
+    };
+  }
   
   // billing: existing logic
   if (contextKeys.includes("billing") || contextKeys.includes("bill") || contextKeys.includes("payment")) {
@@ -1056,7 +1102,7 @@ function buildFunctionalSummary(
   }
 
   if (ctx.localizationBehaviorFocus) {
-    return `По текущему исследованию задача "${input.task}" относится к runtime-поведению локализации, а не к inventory переводов. Основные точки входа: ${entryPointText}. Вероятные сущности, влияющие на выбор локали: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных для выбора локали: ${dataSourceText}. Система должна проверять middleware, request headers, config fallback и места, где locale устанавливается в жизненном цикле запроса.`;
+    return `Выбор локали идёт через runtime-цепочку, а не через inventory переводов. Основные точки входа: ${entryPointText}. На выбор локали сильнее всего влияют ${entityText}. Подтверждённый operational signal: ${sideEffectText}. Основной источник данных для выбора локали: ${dataSourceText}.`;
   }
 
   if (ctx.localizationInventoryFocus) {
@@ -1075,16 +1121,16 @@ function buildFunctionalSummary(
 
   if (ctx.infrastructureFocus) {
     if (isWhyQuestion) {
-      return `По текущему исследованию вопрос "${input.task}" требует объяснения причин выбора инфраструктуры. Обнаружена зона ${moduleText} (${dominantModule}). Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Найденные инфраструктурные решения: ${sideEffectText}. Основной источник данных: ${dataSourceText}. Анализ показывает выбранные технологии и их конфигурацию.`;
+      return `Инфраструктурная логика завязана на ${moduleText} (${dominantModule}). Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Подтверждённые инфраструктурные решения: ${sideEffectText}. Основной источник данных: ${dataSourceText}.`;
     }
-    return `По текущему исследованию задача "${input.task}" больше всего связана с ${moduleText}. Наиболее вероятная зона хранения: ${dominantModule}. Основные точки входа и операции: ${entryPointText}. Ключевые сущности хранения: ${entityText}. Главный подтверждённый infrastructure signal: ${sideEffectText}. Основной источник данных и секретов: ${dataSourceText}.`;
+    return `Хранение и обработка идут через ${moduleText}. Главная зона: ${dominantModule}. Основные точки входа и операции: ${entryPointText}. Ключевые сущности хранения: ${entityText}. Подтверждённый infrastructure signal: ${sideEffectText}. Основной источник данных и секретов: ${dataSourceText}.`;
   }
 
   if (isWhyQuestion) {
-    return `По текущему исследованию вопрос "${input.task}" требует объяснения причин архитектурного выбора. Задача связана с ${moduleText}. ${intentText} Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Найденные архитектурные решения: ${sideEffectText}. Основной источник данных: ${dataSourceText}. Анализ показывает зависимости, ограничения и выбранные паттерны в коде.`;
+    return `Логика вопроса завязана на ${moduleText}. ${intentText} Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Подтверждённые архитектурные решения: ${sideEffectText}. Основной источник данных: ${dataSourceText}.`;
   }
 
-  return `По текущему исследованию задача "${input.task}" больше всего связана с ${moduleText}. ${intentText} Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Главный подтверждённый operational signal: ${sideEffectText}. Основной источник данных: ${dataSourceText}.`;
+  return `Задача бьёт в ${moduleText}. ${intentText} Основные точки входа: ${entryPointText}. Ключевые сущности: ${entityText}. Подтверждённый operational signal: ${sideEffectText}. Основной источник данных: ${dataSourceText}.`;
 }
 
 function buildFindings(
@@ -1295,11 +1341,11 @@ function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): Module
         fileScore += 24;
       }
 
-      if (infrastructureFocus && profile.key === "servers" && contentText.includes("password_uuid")) {
+      if (infrastructureFocus && profile.key === "servers" && (contentText.includes("password_uuid") || contentText.includes("passphrase_uuid"))) {
         fileScore += 18;
       }
 
-      if (infrastructureFocus && profile.key === "servers" && contentText.includes("path_to_private_key")) {
+      if (infrastructureFocus && profile.key === "servers" && (contentText.includes("path_to_private_key") || contentText.includes("private_key"))) {
         fileScore += 16;
       }
 
@@ -2290,14 +2336,45 @@ function isRedisInventoryQuestion(tokens: string[]): boolean {
 
 function countAliasMatches(haystack: string, aliases: string[]): number {
   let matches = 0;
+  const normalizedHaystack = haystack.toLowerCase();
+  const haystackTokens = new Set(tokenize(normalizedHaystack));
 
   for (const alias of aliases) {
-    if (haystack.includes(alias)) {
+    const normalizedAlias = alias.toLowerCase();
+
+    if (haystackTokens.has(normalizedAlias)) {
+      matches += 1;
+      continue;
+    }
+
+    if (
+      normalizedAlias.includes("_")
+      || normalizedAlias.includes("-")
+      || normalizedAlias.includes("/")
+    ) {
+      if (normalizedHaystack.includes(normalizedAlias)) {
+        matches += 1;
+      }
+      continue;
+    }
+
+    if (normalizedAlias.length < TOKEN_MATCH_MIN_SUBSTRING_LENGTH) {
+      continue;
+    }
+
+    const boundarySafeAlias = escapeRegExp(normalizedAlias);
+    const boundaryRegex = new RegExp(`(^|[^\\p{L}\\p{N}_])${boundarySafeAlias}([^\\p{L}\\p{N}_]|$)`, "u");
+
+    if (boundaryRegex.test(normalizedHaystack)) {
       matches += 1;
     }
   }
 
   return matches;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function getModuleBoost(filePath: string, moduleIntents: ModuleIntentMatch[]): number {
@@ -2597,7 +2674,19 @@ function getInfrastructureFileBoost(
   const contentText = file.content.slice(0, 4000).toLowerCase();
   let score = 0;
 
-  if (pathText.includes("/servers/") || pathText.includes("servercredential") || pathText.includes("/models/server")) {
+  if (
+    pathText.includes("/servers/")
+    || pathText.includes("servercredential")
+    || (pathText.includes("/models/") && pathText.includes("server"))
+  ) {
+    score += 40;
+  }
+
+  if ((pathText.includes("/repositories/") || pathText.includes("/repository/")) && pathText.includes("server")) {
+    score += 38;
+  }
+
+  if ((pathText.includes("/requests/") || pathText.includes("/dto/") || pathText.includes("/validators/")) && pathText.includes("server")) {
     score += 40;
   }
 
@@ -2613,12 +2702,28 @@ function getInfrastructureFileBoost(
     score += 26;
   }
 
+  if (
+    contentText.includes("servercredentiallink")
+    || contentText.includes("server_credential_links")
+    || (contentText.includes("credential") && contentText.includes("server"))
+  ) {
+    score += 36;
+  }
+
+  if (contentText.includes("private_key")) {
+    score += 24;
+  }
+
   if (contentText.includes("path_to_private_key") || contentText.includes("forwarding_ports")) {
     score += 22;
   }
 
   if (contentText.includes("host") && contentText.includes("port") && contentText.includes("username")) {
     score += 18;
+  }
+
+  if (pathText.includes("/observers/")) {
+    score -= 34;
   }
 
   if ((pathText.includes("/auth/") || pathText.includes("web-login")) && !tokens.some((token) => ["auth", "login", "oauth", "token"].includes(token))) {
@@ -2645,12 +2750,35 @@ function getInfrastructureSymbolBoost(
     score += 24;
   }
 
+  if (
+    (label.includes("repository") && label.includes("server"))
+    || (label.includes("request") && label.includes("server"))
+    || (label.includes("validator") && label.includes("server"))
+  ) {
+    score += 22;
+  }
+
   if (label.includes("password_uuid") || label.includes("passphrase_uuid")) {
     score += 28;
   }
 
-  if (filePath.includes("/servers/") || filePath.includes("servercredential") || filePath.includes("/models/server")) {
+  if (
+    filePath.includes("/servers/")
+    || filePath.includes("servercredential")
+    || (filePath.includes("/models/") && filePath.includes("server"))
+  ) {
     score += 24;
+  }
+
+  if (
+    ((filePath.includes("/repositories/") || filePath.includes("/repository/")) && filePath.includes("server"))
+    || ((filePath.includes("/requests/") || filePath.includes("/dto/") || filePath.includes("/validators/")) && filePath.includes("server"))
+  ) {
+    score += 24;
+  }
+
+  if (filePath.includes("/observers/")) {
+    score -= 30;
   }
 
   if ((filePath.includes("/auth/") || filePath.includes("web-login")) && !tokens.some((token) => ["auth", "login", "oauth", "token"].includes(token))) {
@@ -3488,7 +3616,7 @@ function deriveAffectedModules(
   entryPoints: string[],
 ): string[] {
   const strongestScore = moduleIntents[0]?.score ?? 0;
-  const strongIntentThreshold = Math.max(strongestScore * 0.4, 300);
+  const strongIntentThreshold = Math.max(strongestScore * 0.65, 360);
   const strongIntentModules = moduleIntents.filter((item) => item.score >= strongIntentThreshold).map((item) => item.module);
   const entryPointZones = entryPoints.flatMap(extractResearchZonesFromText);
   const topFileZones = topFiles.flatMap(extractResearchZonesFromPath);
@@ -3508,16 +3636,16 @@ function deriveAffectedModules(
     }
 
     if (strongIntentModules.includes(value)) {
-      return true;
+      return !value.endsWith("-inventory") || value === dominantModule;
     }
 
     if (entryPointZones.includes(value)) {
-      return true;
+      return !value.endsWith("-inventory");
     }
 
     const presentInTopFiles = topFileZones.includes(value);
 
-    return presentInTopFiles;
+    return presentInTopFiles && !value.endsWith("-inventory");
   }).slice(0, 6);
 }
 
@@ -3537,11 +3665,11 @@ function extractResearchZonesFromText(value: string): string[] {
     zones.push("email-verification");
   }
 
-  if (normalized.includes("server") || normalized.includes("ssh") || normalized.includes("host") || normalized.includes("port")) {
+  if (/\b(server|servers|ssh|sftp|host|hostname|port|username)\b/.test(normalized)) {
     zones.push("servers");
   }
 
-  if (normalized.includes("vault") || normalized.includes("credential") || normalized.includes("password_uuid") || normalized.includes("private_key")) {
+  if (/\b(vault|credential|credentials|password_uuid|passphrase_uuid|private_key)\b/.test(normalized)) {
     zones.push("vault");
   }
 

@@ -3,6 +3,19 @@
 **Дата обновления:** 2026-07-13  
 **Текущий этап:** MVP / Slice 1
 
+## Последние изменения
+
+- Усилен quality-pass для answer/research на сценариях из `docs/state/test-scenarios.md`.
+- Исправлено ложное срабатывание `clarification-needed` для сильных functional-flow кейсов: ambiguity теперь не включается, если есть плотная file-backed evidence-концентрация, явный dominant module и подтверждённая entry-point цепочка.
+- Усилен `storage-topology` для больших enterprise-репозиториев:
+  - добавлены общие structural boosts для storage-domain сущностей: model/repository/request/validator/migration слоёв вокруг server/credential/secret/vault сигналов;
+  - добавлены penalties/filters против шумных observer-артефактов и служебных `.vscode` файлов;
+  - top evidence теперь лучше удерживается на model/request/repository/migration оси вместо бокового шума.
+- Улучшен scenario-aware answer shaping:
+  - location/usage-вопросы начинают ответ с конкретной точки использования или расположения;
+  - `storage-topology` ответы начинают с прямой storage-цепочки, а не с обзорной формулировки;
+  - runtime-locale и infrastructure summaries сокращены и переведены в более прямой инженерный тон.
+
 ## Что уже реализовано
 
 - Базовый monorepo foundation на `apps/api`, `apps/web`, `packages/*`.

@@ -415,6 +415,13 @@ export function detectResearchAmbiguity(research: ResearchReport): ResearchAmbig
   const ABSOLUTE_MIN_LEADER_SCORE = 500;
   const RELATIVE_THRESHOLD_RATIO = 0.65;
   const MAX_COMPETING_MODULES = 4;
+  const strongEvidenceCount = research.evidence.filter((item) => item.score >= 80).length;
+  const fileBackedEvidence = research.evidence.filter((item) => Boolean(item.filePath)).length;
+  const uniqueEvidenceFiles = new Set(
+    research.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)),
+  ).size;
+  const hasFunctionalChain = research.intentClass === "functional-flow" && research.entryPoints.length >= 2;
+  const hasDominantModule = research.dominantModule !== "не определён";
 
   const sorted = [...research.moduleIntents].sort((left, right) => right.score - left.score);
   const top = sorted[0];
@@ -428,6 +435,16 @@ export function detectResearchAmbiguity(research: ResearchReport): ResearchAmbig
     .filter((item) => item.score >= threshold)
     .map((item) => item.module)
     .slice(0, MAX_COMPETING_MODULES + 1);
+
+  if (
+    hasFunctionalChain
+    && hasDominantModule
+    && strongEvidenceCount >= 2
+    && fileBackedEvidence >= 3
+    && uniqueEvidenceFiles <= 6
+  ) {
+    return { ambiguous: false, competingModules: [] };
+  }
 
   return {
     ambiguous: competing.length >= 2 && competing.length <= MAX_COMPETING_MODULES,

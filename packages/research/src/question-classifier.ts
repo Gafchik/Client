@@ -110,17 +110,23 @@ export class QuestionClassifier {
     // Общие доменные ключи
     const domainKeys = [
       "auth", "oauth", "provider", "login", "session", "token", "jwt", "passport", "socialite",
+      "авторизация", "аутентификация", "логин", "вход", "токен", "сессия",
       "google", "github", "facebook", "microsoft",
       "redis", "cache", "caching", "session", "queue", "jobs", "horizon",
+      "редис", "кэш", "очередь", "джоб", "воркер",
       "websocket", "realtime", "broadcast", "pusher", "laravel-echo", "socket",
+      "вебсокет", "реалтайм", "бродкаст", "сокет",
       "mail", "email", "smtp", "notification",
       "search", "scout", "meilisearch", "algolia", "elasticsearch",
       "storage", "s3", "filesystem", "cdn",
-      "model", "migration", "database", "db",
+      "хранилище", "файловая", "файловой",
+      "model", "migration", "database", "db", "модель", "миграция", "база", "бд", "схема",
       "billing", "bill", "payment", "invoice",
-      "localization", "locale", "translation", "i18n", "lang",
-      "vault", "credential", "secret", "password",
-      "server", "ssh", "sftp", "host",
+      "биллинг", "платеж", "инвойс",
+      "localization", "locale", "translation", "i18n", "lang", "локаль", "локализация", "перевод", "язык",
+      "vault", "credential", "secret", "password", "секрет", "пароль", "креды", "ключ",
+      "server", "ssh", "sftp", "host", "port", "username", "connection",
+      "сервер", "серверу", "подключение", "подключения", "соединение", "соединения", "хост", "порт",
     ];
 
     for (const key of domainKeys) {
@@ -194,6 +200,18 @@ export class QuestionClassifier {
     if (questionType === "existence" && contextKeys.includes("auth")) {
       profiles.add("entrypoint-traversal");
       profiles.add("config-inventory");
+    }
+
+    const storageContext =
+      contextKeys.includes("server")
+      || contextKeys.includes("ssh")
+      || contextKeys.includes("vault")
+      || contextKeys.includes("credential")
+      || contextKeys.includes("host")
+      || contextKeys.includes("port")
+      || contextKeys.includes("connection");
+    if (storageContext) {
+      profiles.add("storage-topology");
     }
   }
 
