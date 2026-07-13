@@ -482,6 +482,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     research: initialResearch,
     impact: initialImpact,
     context: initialContext,
+    previousRun,
     diagnostics: [
       ...workspace.diagnostics,
       ...index.diagnostics,
@@ -778,6 +779,37 @@ function getCompletedStages(runId: string): PipelineStage[] {
   return runStore.get(runId)?.stages ?? createInitialStages();
 }
 
+// Составные PascalCase-имена ("DataEntry") дают фрагменты ("data", "entry")
+// при камелкейс-разбиении для ловли snake_case/kebab-case вариантов файлов.
+// Но по одному короткому фрагменту нельзя матчить — "data" встречается в
+// пути практически любого Laravel-контейнера (Containers/*/Data/...), и
+// такой фрагмент топит реальное совпадение шумом из сотен чужих файлов.
+// Поэтому фрагменты одного составного слова требуют совпадения ВСЕ сразу
+// (as-typed токены вроде "dataentry" остаются одиночной группой и матчатся
+// как раньше — по одному substring). Используется и для текста задачи, и
+// для свободных entity-hints от валидатора (см. deriveFocusedResearchPaths).
+function buildCompoundTokenGroups(text: string): string[][] {
+  const standaloneTokens = tokenize(text).filter((token) => token.length >= 3);
+  const compoundGroups = text
+    .split(/[^A-Za-z0-9_/-]+/)
+    .filter(Boolean)
+    .map((rawToken) =>
+      rawToken
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+        .split(/[^A-Za-z0-9а-яё]+/i)
+        .map((part) => part.trim().toLowerCase())
+        .filter((part) => part.length >= 2),
+    )
+    .filter((group) => group.length > 1);
+
+  return [...standaloneTokens.map((token) => [token]), ...compoundGroups];
+}
+
+function matchesCompoundTokenGroups(text: string, groups: string[][]): boolean {
+  return groups.some((group) => group.every((token) => text.includes(token)));
+}
+
 function buildQuestionWorkspacePlan(
   task: string,
   repository: PipelineRunResult["repository"],
@@ -796,33 +828,8 @@ function buildQuestionWorkspacePlan(
     ]),
   );
   const gitScopedPaths = deriveRepositoryScopedPaths(repository, workspace);
-  // Составные PascalCase-имена ("DataEntry") дают фрагменты ("data", "entry")
-  // при камелкейс-разбиении для ловли snake_case/kebab-case вариантов файлов.
-  // Но по одному короткому фрагменту нельзя матчить — "data" встречается в
-  // пути практически любого Laravel-контейнера (Containers/*/Data/...), и
-  // такой фрагмент топит реальное совпадение шумом из сотен чужих файлов.
-  // Поэтому фрагменты одного составного слова требуют совпадения ВСЕ сразу
-  // (as-typed токены вроде "dataentry" остаются одиночной группой и матчатся
-  // как раньше — по одному substring).
-  const standaloneTaskTokens = tokenize(task).filter((token) => token.length >= 3);
-  const compoundTaskTokenGroups = task
-    .split(/[^A-Za-z0-9_/-]+/)
-    .filter(Boolean)
-    .map((rawToken) =>
-      rawToken
-        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-        .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-        .split(/[^A-Za-z0-9а-яё]+/i)
-        .map((part) => part.trim().toLowerCase())
-        .filter((part) => part.length >= 2),
-    )
-    .filter((group) => group.length > 1);
-  const taskTokenGroups: string[][] = [
-    ...standaloneTaskTokens.map((token) => [token]),
-    ...compoundTaskTokenGroups,
-  ];
-  const matchesTaskTokens = (text: string): boolean =>
-    taskTokenGroups.some((group) => group.every((token) => text.includes(token)));
+  const taskTokenGroups = buildCompoundTokenGroups(task);
+  const matchesTaskTokens = (text: string): boolean => matchesCompoundTokenGroups(text, taskTokenGroups);
   const previousGraph = previousRun?.runtimeCache?.graph;
   const tokenMatchedPaths = availableRelativePaths
     .filter((relativePath) => matchesTaskTokens(relativePath.toLowerCase()));
@@ -1016,6 +1023,7 @@ async function runValidationLoop(input: {
   research: PipelineRunResult["research"];
   impact: PipelineRunResult["impact"];
   context: PipelineRunResult["context"];
+  previousRun: PipelineRunResult | null;
   diagnostics: string[];
 }): Promise<{
   research: PipelineRunResult["research"];
@@ -1071,6 +1079,7 @@ async function runValidationLoop(input: {
       repository: input.repository,
       currentResearch,
       currentContext,
+      previousRun: input.previousRun,
     });
     focusedResearchRequests.push(request);
     priorActions.push(...request.actions);
@@ -1165,13 +1174,17 @@ function buildFocusedResearchRequest(input: {
   repository: PipelineRunResult["repository"];
   currentResearch: PipelineRunResult["research"];
   currentContext: PipelineRunResult["context"];
+  previousRun: PipelineRunResult | null;
 }): FocusedResearchRequest {
+  const entityHints = input.validation.missingEntityHints ?? [];
   const focusPaths = deriveFocusedResearchPaths({
     workspace: input.workspace,
     repository: input.repository,
     actions: input.validation.recommendedActions,
+    entityHints,
     task: input.task,
     research: input.currentResearch,
+    previousRun: input.previousRun,
   });
   const profile = input.validation.recommendedResearchProfile ?? "focused-entrypoint-traversal";
 
@@ -1182,7 +1195,10 @@ function buildFocusedResearchRequest(input: {
     profile,
     actions: input.validation.recommendedActions.slice(0, 3),
     focusPaths,
-    targetTokens: tokenize(input.task).slice(0, 12),
+    // Реальные "что искать" от валидатора (свободный текст) важнее, чем
+    // тупое повторение исходных токенов вопроса — они уже участвовали в
+    // первом research-проходе и не объясняют, что именно пошло не так.
+    targetTokens: entityHints.length > 0 ? entityHints : tokenize(input.task).slice(0, 12),
     reason: input.validation.rationale,
     maxAdditionalFiles: profile === "focused-runtime-check" ? 40 : 60,
   };
@@ -1293,10 +1309,23 @@ function deriveFocusedResearchPaths(input: {
   workspace: Awaited<ReturnType<typeof openWorkspace>>;
   repository: PipelineRunResult["repository"];
   actions: ValidationRecommendedAction[];
+  entityHints: string[];
   task: string;
   research: PipelineRunResult["research"];
+  previousRun: PipelineRunResult | null;
 }): string[] {
-  const allPaths = input.workspace.files.map((file) => file.relativePath);
+  // Первый проход открывает только узкий selective overlay (workspace.files)
+  // — ровно тот же набор, который уже не дал ответа. Искать "чего не хватает"
+  // в нём же бессмысленно: если сущность туда не попала изначально, она не
+  // появится и здесь. Поэтому universe для focused research шире — сюда же
+  // подмешивается полный путь-лист из закэшированного baseline index, если
+  // он есть (та же логика, что в availableRelativePaths у buildQuestionWorkspacePlan).
+  const allPaths = Array.from(
+    new Set([
+      ...input.workspace.files.map((file) => file.relativePath),
+      ...(input.previousRun?.runtimeCache?.index.files.map((file) => normalizePath(file.filePath)) ?? []),
+    ]),
+  );
   const taskTokens = tokenize(input.task);
   const paths = new Set<string>();
 
@@ -1308,6 +1337,38 @@ function deriveFocusedResearchPaths(input: {
 
   for (const changed of input.repository.changedFiles.slice(0, 20)) {
     paths.add(normalizePath(changed.path));
+  }
+
+  // Свободные entity-hints от валидатора (LLM или деترминированный fallback)
+  // — это не сценарий из закрытого словаря actions, а конкретное "вот чего не
+  // хватает" по смыслу вопроса. Матчим их так же, как задачу целиком
+  // (compound-group AND-матчинг), чтобы короткий общий фрагмент составного
+  // имени не топил реальное совпадение шумом (см. buildCompoundTokenGroups).
+  for (const hint of input.entityHints) {
+    const hintGroups = buildCompoundTokenGroups(hint);
+
+    if (hintGroups.length === 0) {
+      continue;
+    }
+
+    for (const path of allPaths.filter((filePath) => matchesCompoundTokenGroups(filePath.toLowerCase(), hintGroups)).slice(0, 20)) {
+      paths.add(path);
+    }
+
+    // Путь файла — не единственное место, где сущность может "жить": связь
+    // на неё бывает символом (методом/полем) в СОВСЕМ другом по имени файле
+    // (например `Bill.chiroNotes` — relation-метод в Bill.php). Ищем и там,
+    // а не только по filePath.
+    const symbolMatches = (input.previousRun?.runtimeCache?.index.symbols ?? [])
+      .filter((symbol) => {
+        const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`.toLowerCase();
+        return matchesCompoundTokenGroups(label, hintGroups);
+      })
+      .slice(0, 20);
+
+    for (const symbol of symbolMatches) {
+      paths.add(normalizePath(symbol.filePath));
+    }
   }
 
   if (input.actions.includes("check-middleware-chain")) {

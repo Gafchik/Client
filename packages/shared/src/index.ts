@@ -709,6 +709,14 @@ export interface ValidationResult {
   contradictions: ValidationContradiction[];
   missingConfirmations: string[];
   recommendedActions: ValidationRecommendedAction[];
+  // Свободный текст — конкретные сущности/имена/концепты, которых, по мнению
+  // валидатора, не хватает в evidence, чтобы отвечать на РЕАЛЬНЫЙ вопрос
+  // пользователя. В отличие от recommendedActions (закрытый словарь общих
+  // сценариев), это не ограничено фиксированным списком — модель называет то,
+  // что она сама понимает как недостающее, исходя из смысла вопроса, а не из
+  // заранее заданного меню действий. Используется как targetTokens в
+  // FocusedResearchRequest для действительно open-ended re-search.
+  missingEntityHints: string[];
   recommendedResearchProfile?: ValidationRecommendedResearchProfile;
   recommendedStopReason?: string;
   rationale: string;

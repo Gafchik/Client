@@ -3,6 +3,7 @@ import {
   clamp,
   detectResearchAmbiguity,
   stableId,
+  tokenize,
   type AnswerEvidenceHighlight,
   type AnswerMode,
   type AnswerPackage,
@@ -92,6 +93,7 @@ interface ProviderValidatorResponse {
   contradictions?: string[];
   missingConfirmations?: string[];
   recommendedActions?: string[];
+  missingEntityHints?: string[];
   recommendedResearchProfile?: ValidationRecommendedResearchProfile;
   recommendedStopReason?: string;
   rationale?: string;
@@ -311,6 +313,7 @@ function buildDeterministicValidationResult(packet: ValidationPacket): Validatio
         : "blocked";
   const recommendedActions = buildRecommendedActions(packet, gaps, contradictionLevel);
   const recommendedResearchProfile = resolveRecommendedResearchProfile(packet, recommendedActions);
+  const missingEntityHints = buildMissingEntityHints(packet);
   const status = resolveValidationStatus({
     packet,
     readinessScore,
@@ -318,6 +321,7 @@ function buildDeterministicValidationResult(packet: ValidationPacket): Validatio
     evidenceSufficiency,
     directAnswerFeasibility,
     recommendedActions,
+    missingEntityHints,
   });
 
   if (status === "ready-for-answer" && packet.questionType === "existence" && packet.evidenceHighlights.length >= 2) {
@@ -337,6 +341,7 @@ function buildDeterministicValidationResult(packet: ValidationPacket): Validatio
     contradictions: contradictions.slice(0, VALIDATOR_MAX_CONTRADICTIONS),
     missingConfirmations: missingConfirmations.slice(0, 4),
     recommendedActions: recommendedActions.slice(0, VALIDATOR_MAX_ACTIONS),
+    missingEntityHints,
     ...(recommendedResearchProfile ? { recommendedResearchProfile } : {}),
     ...(status === "insufficient-evidence" || status === "validator-unavailable"
       ? {
@@ -364,8 +369,10 @@ async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): P
           "Ты не отвечаешь пользователю и не исследуешь проект самостоятельно.",
           "Ты оцениваешь только достаточность уже собранных артефактов.",
           "Research confidence не является истиной, это лишь один из входных сигналов.",
-          "Верни только JSON с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, recommendedResearchProfile, recommendedStopReason, rationale.",
-          "Нельзя придумывать действия вне разрешённого словаря.",
+          "Главный вопрос: реально ли собранный evidence отвечает на ТОТ вопрос, который задал пользователь — а не просто на что-то похожее по ключевым словам.",
+          "Верни только JSON с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints, recommendedResearchProfile, recommendedStopReason, rationale.",
+          "recommendedActions — закрытый словарь общих сценариев, нельзя придумывать значения вне разрешённого списка.",
+          "missingEntityHints — наоборот, свободный текст: если evidence не бьёт в суть вопроса, назови конкретные сущности/классы/файлы/понятия из вопроса, которых не хватает в evidence и которые стоит поискать отдельно. Не ограничивайся никаким списком — пиши то, что реально нужно найти, своими словами или точным именем из вопроса. Пусто, если evidence уже покрывает вопрос по существу.",
         ].join("\n"),
       },
       {
@@ -455,6 +462,13 @@ function normalizeProviderValidationResult(
       })),
     missingConfirmations: (candidate.missingConfirmations ?? []).filter(Boolean).slice(0, 4),
     recommendedActions: normalizedActions.length > 0 ? normalizedActions : fallback.recommendedActions,
+    missingEntityHints: Array.from(
+      new Set(
+        (candidate.missingEntityHints ?? [])
+          .map((hint) => hint.trim())
+          .filter((hint) => hint.length >= 2),
+      ),
+    ).slice(0, 5),
     ...(candidate.recommendedResearchProfile
       ? { recommendedResearchProfile: candidate.recommendedResearchProfile }
       : fallback.recommendedResearchProfile
@@ -467,6 +481,14 @@ function normalizeProviderValidationResult(
         : {}),
     rationale: candidate.rationale?.trim() || fallback.rationale,
   };
+
+  // Подстраховка на случай, если модель сама себе противоречит: назвала
+  // конкретную недостающую сущность, но при этом оставила статус
+  // "ready-for-answer". missingEntityHints — это прямое утверждение "evidence
+  // не покрывает вопрос", и оно должно перевешивать формальный статус.
+  if (next.missingEntityHints.length > 0 && next.status === "ready-for-answer" && packet.remainingIterationBudget > 0) {
+    next.status = "needs-focused-research";
+  }
 
   return next;
 }
@@ -1195,6 +1217,34 @@ function buildRecommendedActions(
   return Array.from(new Set(actions));
 }
 
+// Детерминированный fallback для missingEntityHints (без LLM). recommendedActions
+// — это закрытый словарь общих сценариев ("проверь middleware", "проверь
+// config"), а не конкретика вопроса. Здесь вместо этого просто ищем
+// значимые слова из формулировки задачи, которых физически нет ни в одном
+// filePath/label уже найденного evidence — то есть вопрос упоминает что-то,
+// на что research пока не наткнулся вообще. LLM-путь (synthesizeValidationWithProvider)
+// умеет то же самое, но по смыслу вопроса, а не по буквальному совпадению.
+function buildMissingEntityHints(packet: ValidationPacket): string[] {
+  const evidenceText = [
+    ...packet.evidenceHighlights.flatMap((item) => [item.label, item.filePath ?? ""]),
+    ...packet.structuralAnchors,
+  ]
+    .join(" ")
+    .toLowerCase();
+  // Код почти всегда именуется латиницей независимо от языка вопроса —
+  // кириллические слова в русском вопросе почти всегда служебные/связующие
+  // ("связаны", "обычной"), а не то, что реально можно найти в коде.
+  // Без этого фильтра сюда попадает грамматический шум практически из
+  // любого русскоязычного вопроса, и хинты становятся бесполезны.
+  const candidateTokens = tokenize(packet.task).filter(
+    (token) => token.length >= 4 && /^[a-z0-9_-]+$/.test(token),
+  );
+
+  return Array.from(new Set(candidateTokens))
+    .filter((token) => !evidenceText.includes(token))
+    .slice(0, 5);
+}
+
 function resolveRecommendedResearchProfile(
   packet: ValidationPacket,
   actions: ValidationRecommendedAction[],
@@ -1238,9 +1288,19 @@ function resolveValidationStatus(input: {
   evidenceSufficiency: ValidationResult["evidenceSufficiency"];
   directAnswerFeasibility: ValidationResult["directAnswerFeasibility"];
   recommendedActions: ValidationRecommendedAction[];
+  missingEntityHints: string[];
 }): ValidationResult["status"] {
   if (input.contradictionLevel === "major") {
     return input.packet.remainingIterationBudget > 0 ? "needs-focused-research" : "contradictory-evidence";
+  }
+
+  // readinessScore меряет объём/качество evidence, но не то, отвечает ли оно
+  // на РЕАЛЬНЫЙ вопрос — конкретную названную сущность readinessScore не
+  // видит вообще. Если она найдена как явно отсутствующая, это перебивает
+  // даже высокий score: уверенный ответ не по адресу хуже, чем ещё один
+  // проход focused research.
+  if (input.missingEntityHints.length > 0 && input.packet.remainingIterationBudget > 0) {
+    return "needs-focused-research";
   }
 
   if (input.readinessScore >= VALIDATOR_HIGH_READINESS && input.directAnswerFeasibility === "strong") {
