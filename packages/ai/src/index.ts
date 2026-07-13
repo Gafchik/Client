@@ -1852,10 +1852,20 @@ function resolveAnswerMode(input: BuildAnswerInput): AnswerMode {
 function shouldForceEvidenceLockedMode(input: BuildAnswerInput): boolean {
   const diagnosticMode = looksLikeDiagnosticTask(input.task);
   const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
-  const hasUnknowns = input.research.unknowns.length > 0;
+  // `research.unknowns` копит до 7 независимых сигналов (нет entry points,
+  // нет side effects, нет data sources, indexer diagnostics и т.д.) —
+  // почти любой широкий реальный вопрос набирает хотя бы один из них.
+  // Раньше ЛЮБОЙ (>0) unknown полностью запирал ответ в deterministic-шаблон
+  // и ни разу не пробовал LLM — на практике это означало, что почти каждый
+  // не-узкий вопрос получал робо-ответ вместо синтеза, хотя confidence уже
+  // отдельно штрафуется на -8 за каждый unknown (computeConfidence). Порог
+  // поднят до "несколько независимых сигналов сразу", иначе LLM получает
+  // шанс синтезировать честный, hedged ответ по тем же уликам — с уже
+  // выставленными warnings и валидацией через validateProviderAnswer.
+  const hasSevereUnknowns = input.research.unknowns.length >= 3;
   const lowStructuralCoverage = input.research.evidence.length < 3;
 
-  return diagnosticMode || localeBehavior || hasUnknowns || lowStructuralCoverage;
+  return diagnosticMode || localeBehavior || hasSevereUnknowns || lowStructuralCoverage;
 }
 
 function computeAnswerConfidence(input: BuildAnswerInput): number {
