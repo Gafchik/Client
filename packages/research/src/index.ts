@@ -1423,6 +1423,7 @@ function detectEntryPoints(
   }
 
   const ranked = new Map<string, number>();
+  const topFileSet = new Set(topFiles);
   const moduleRoutes = dominantModule !== "не определён" ? getRoutesForModule(input.graph, dominantModule) : [];
   const combinedRoutes = [...routeNodes, ...moduleRoutes].filter(
     (value, index, list) => list.findIndex((candidate) => candidate.id === value.id) === index,
@@ -1508,13 +1509,18 @@ function detectEntryPoints(
   }
 
   for (const routeNode of combinedRoutes) {
-    const routeScore = scoreTextGroups(routeNode.label, ctx.tokenGroups) * 6 + 4;
+    const routeTargets = getEntryPointNeighbors(input.graph, routeNode.id);
+    const routeScore =
+      scoreTextGroups(routeNode.label, ctx.tokenGroups) * 6 +
+      getExactEntityRouteBoost(routeNode.label, routeNode.filePath ?? "", ctx.exactEntityHints) +
+      getEntryPointTopFileBoost(routeNode, routeTargets, topFileSet) +
+      4;
 
     if (routeScore > 0) {
-      const routeTargets = getEntryPointNeighbors(input.graph, routeNode.id)
+      const routeTargetLabels = routeTargets
         .map((neighbor) => neighbor.label)
         .slice(0, 2);
-      const label = routeTargets.length > 0 ? `${routeNode.label} -> ${routeTargets.join(", ")}` : routeNode.label;
+      const label = routeTargetLabels.length > 0 ? `${routeNode.label} -> ${routeTargetLabels.join(", ")}` : routeNode.label;
       ranked.set(label, (ranked.get(label) ?? 0) + routeScore);
     }
   }
@@ -1523,6 +1529,23 @@ function detectEntryPoints(
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .slice(0, 6)
     .map(([label]) => label);
+}
+
+function getEntryPointTopFileBoost(
+  routeNode: GraphState["nodes"][number],
+  routeTargets: GraphState["nodes"],
+  topFileSet: Set<string>,
+): number {
+  let score = 0;
+
+  if (routeNode.filePath && topFileSet.has(routeNode.filePath)) {
+    score += 18;
+  }
+
+  const strongTargetHits = routeTargets.filter((neighbor) => neighbor.filePath && topFileSet.has(neighbor.filePath)).length;
+  score += Math.min(strongTargetHits * 12, 24);
+
+  return score;
 }
 
 function detectPrimaryEntities(input: ResearchInput, topFiles: string[], codeNodes: GraphState["nodes"], ctx: ResearchContext): string[] {

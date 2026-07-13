@@ -1859,7 +1859,6 @@ function buildStructuredFallbackExplanation(
 ): string {
   const sections: string[] = [];
   const freshnessNote = buildFreshnessExplanation(input);
-  const provenanceNote = buildEvidenceProvenanceExplanation(input.research);
 
   // Section: Как это работает
   const howItWorks = buildHowItWorksSection(input, brief, mode);
@@ -1891,17 +1890,12 @@ function buildStructuredFallbackExplanation(
     sections.push(planSection);
   }
 
-  // Provenance note
-  if (provenanceNote) {
-    sections.push(`*${provenanceNote}*`);
-  }
-
   if (freshnessNote) {
     sections.push(`*${freshnessNote}*`);
   }
 
   if (evidenceLocked) {
-    sections.push("*Держусь только доказанного — недоказанные гипотезы сюда намеренно не включил.*");
+    sections.push("*Если где-то не уверен, я это лучше не додумаю за код.*");
   }
 
   if (sections.length === 0) {
@@ -1925,29 +1919,29 @@ function buildHowItWorksSection(input: BuildAnswerInput, brief: AnswerBrief, mod
   }
 
   if (brief.claimSet.directClaim && brief.claimSet.directClaim.caveats.length > 0) {
-    parts.push(`\nСтоит иметь в виду:`);
+    parts.push(`\nНа что обратить внимание:`);
     for (const caveat of brief.claimSet.directClaim.caveats.slice(0, 2)) {
       parts.push(`- ${caveat}`);
     }
   }
 
   if (input.research.entryPoints.length > 0) {
-    parts.push(`\nКлючевые точки входа:`);
-    for (const ep of input.research.entryPoints.slice(0, 5)) {
+    parts.push(`\nС чего начинается цепочка:`);
+    for (const ep of input.research.entryPoints.slice(0, 3)) {
       parts.push(`- ${ep}`);
     }
   }
 
-  if (input.research.dataSources.length > 0) {
-    parts.push(`\nИсточники данных:`);
-    for (const ds of input.research.dataSources.slice(0, 4)) {
+  if (input.research.dataSources.length > 0 && input.research.queryProfileKey !== "entrypoint-traversal") {
+    parts.push(`\nОткуда берутся данные:`);
+    for (const ds of input.research.dataSources.slice(0, 2)) {
       parts.push(`- ${ds}`);
     }
   }
 
   if (input.research.findings.length > 0) {
-    parts.push(`\nДетали:`);
-    for (const finding of input.research.findings.slice(0, 5)) {
+    parts.push(`\nЧто особенно важно:`);
+    for (const finding of input.research.findings.slice(0, 2)) {
       parts.push(`- ${finding}`);
     }
   }
@@ -1960,7 +1954,7 @@ function buildHowItWorksSection(input: BuildAnswerInput, brief: AnswerBrief, mod
 }
 
 function buildWhereToLookSection(input: BuildAnswerInput, brief: AnswerBrief): string {
-  const evidence = getPrioritizedEvidence(input).filter((item) => item.filePath).slice(0, 6);
+  const evidence = getPrioritizedEvidence(input).filter((item) => item.filePath).slice(0, 4);
 
   if (evidence.length === 0) {
     return "";
@@ -1970,15 +1964,12 @@ function buildWhereToLookSection(input: BuildAnswerInput, brief: AnswerBrief): s
 
   for (const item of evidence) {
     const filePath = item.filePath ?? "";
-    parts.push(`- \`${filePath}\` — ${item.label}`);
-    if (item.reason) {
-      parts.push(`  ${item.reason}`);
-    }
+    parts.push(`- \`${filePath}\` — ${shortenEvidenceLabel(item.label, filePath)}`);
   }
 
   if (brief.questionContract.requiresPlan && input.plan.targetFiles.length > 0) {
-    parts.push(`\nЦелевые файлы плана (первые 5 из ${input.plan.targetFiles.length}):`);
-    for (const tf of input.plan.targetFiles.slice(0, 5)) {
+    parts.push(`\nЕсли менять код, начни отсюда:`);
+    for (const tf of input.plan.targetFiles.slice(0, 3)) {
       parts.push(`- \`${tf}\``);
     }
   }
@@ -1991,24 +1982,16 @@ function buildImpactSection(input: BuildAnswerInput, brief: AnswerBrief): string
     return "";
   }
 
-  const parts: string[] = ["## Что изменится при модификации"];
+  const parts: string[] = ["## Что это заденет"];
 
   parts.push(brief.impactLines[0] ?? input.impact.summary);
 
   if (input.impact.affectedFiles.length > 0) {
-    parts.push(`\nЗатронутые файлы (${input.impact.affectedFiles.length}):`);
-    for (const f of input.impact.affectedFiles.slice(0, 8)) {
+    parts.push(`\nОсновные файлы:`);
+    for (const f of input.impact.affectedFiles.slice(0, 4)) {
       const path = typeof f === "string" ? f : (f as { filePath?: string }).filePath ?? "?";
       parts.push(`- \`${path}\``);
     }
-
-    if (input.impact.affectedFiles.length > 8) {
-      parts.push(`- ...и ещё ${input.impact.affectedFiles.length - 8} файлов`);
-    }
-  }
-
-  if (input.impact.affectedSymbols.length > 0) {
-    parts.push(`\nЗатронутые символы (${input.impact.affectedSymbols.length}): ${input.impact.affectedSymbols.slice(0, 6).join(", ")}`);
   }
 
   return parts.join("\n");
@@ -2026,13 +2009,13 @@ function buildRisksSection(input: BuildAnswerInput, unknowns: string[]): string 
   }
 
   if (riskItems.length === 0) {
-    return "## Возможные риски\n\nЯвных рисков не вижу.";
+    return "";
   }
 
-  const parts: string[] = ["## Возможные риски"];
+  const parts: string[] = ["## Что может пойти не так"];
 
-  for (const risk of riskItems.slice(0, 6)) {
-    parts.push(`- ${risk}`);
+  for (const risk of riskItems.slice(0, 3)) {
+    parts.push(`- ${normalizeRiskText(risk)}`);
   }
 
   return parts.join("\n");
@@ -2043,10 +2026,10 @@ function buildPlanSection(input: BuildAnswerInput, brief: AnswerBrief): string {
     return "";
   }
 
-  const parts: string[] = ["## Рекомендуемый план действий"];
+  const parts: string[] = ["## Как бы я менял"];
 
   if (brief.planLines.length > 0) {
-    for (let i = 0; i < Math.min(brief.planLines.length, 6); i += 1) {
+    for (let i = 0; i < Math.min(brief.planLines.length, 4); i += 1) {
       const line = brief.planLines[i];
       if (line === undefined) {
         continue;
@@ -2054,7 +2037,7 @@ function buildPlanSection(input: BuildAnswerInput, brief: AnswerBrief): string {
       parts.push(`${i + 1}. ${line}`);
     }
   } else if (input.plan.steps.length > 0) {
-    for (let i = 0; i < Math.min(input.plan.steps.length, 6); i++) {
+    for (let i = 0; i < Math.min(input.plan.steps.length, 4); i++) {
       const step = input.plan.steps[i];
       if (step === undefined) {
         continue;
@@ -2071,6 +2054,22 @@ function buildPlanSection(input: BuildAnswerInput, brief: AnswerBrief): string {
   }
 
   return parts.join("\n");
+}
+
+function shortenEvidenceLabel(label: string, filePath: string): string {
+  if (!label || label === filePath) {
+    return "сильная опора по этой зоне";
+  }
+
+  if (label.includes(filePath)) {
+    return "сильная опора по этой зоне";
+  }
+
+  return label;
+}
+
+function normalizeRiskText(risk: string): string {
+  return risk.replace(/^⚠️\s*/u, "").trim();
 }
 
 function buildConfirmedFacts(
