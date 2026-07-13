@@ -1992,11 +1992,27 @@ function isMeaningfulAliasMatch(token: string, alias: string): boolean {
     return true;
   }
 
-  if (token.length >= TOKEN_MATCH_MIN_SUBSTRING_LENGTH && alias.includes(token)) {
+  // Раньше обе проверки были на произвольный `.includes()` (совпадение где
+  // угодно внутри строки). Это давало ложные срабатывания на совпадениях
+  // ПОСЕРЕДИНЕ слова, не имеющих отношения к морфологии: "транс-ПОРТ-ировка"
+  // содержит alias "порт" (servers-домен) как infix, хотя семантически это
+  // не про сетевой порт — живой баг на вопросе "транспортировка пациента",
+  // разогнавший servers/vault score до 1800 на пустом месте (2026-07-13,
+  // тот же класс бага, что и ранее найденный "user"/"username"). Настоящие
+  // морфологические совпадения (корень + окончание, plural, сокращение)
+  // всегда стоят В НАЧАЛЕ или В КОНЦЕ слова, поэтому проверяем
+  // startsWith/endsWith вместо includes.
+  if (
+    token.length >= TOKEN_MATCH_MIN_SUBSTRING_LENGTH
+    && (alias.startsWith(token) || alias.endsWith(token))
+  ) {
     return true;
   }
 
-  if (alias.length >= TOKEN_MATCH_MIN_SUBSTRING_LENGTH && token.includes(alias)) {
+  if (
+    alias.length >= TOKEN_MATCH_MIN_SUBSTRING_LENGTH
+    && (token.startsWith(alias) || token.endsWith(alias))
+  ) {
     return true;
   }
 

@@ -533,6 +533,15 @@ button {
   font-size: 0.92rem;
 }
 
+.answer-markdown code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.85em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-inset, rgba(127, 127, 127, 0.16));
+  color: var(--accent-2);
+}
+
 /* Компактный индикатор "система думает" — вместо большой плашки с
    развёрнутым списком стадий pipeline. */
 .thinking-indicator {

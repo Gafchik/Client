@@ -1,5 +1,5 @@
 import { startTransition, useEffect, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import type {
   BackgroundProjectState,
@@ -173,6 +173,40 @@ function safeCount(value: unknown): number {
  * абзацы и списки `- пункт`. Без внешней зависимости — формат ответа
  * ограничен и полноценный markdown-парсер не нужен.
  */
+// Модельные ответы форматируются как markdown (`**жирный**`, `` `код` ``),
+// но раньше рендерились построчно без разбора inline-разметки — звёздочки и
+// бэктики просто печатались как есть, из-за чего ответ выглядел как сырой
+// текст, а не как ответ ИИ-чата.
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /\*\*(.+?)\*\*|`([^`]+?)`|\*([^*]+?)\*/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+
+    if (match[1] !== undefined) {
+      nodes.push(<strong key={key++}>{match[1]}</strong>);
+    } else if (match[2] !== undefined) {
+      nodes.push(<code key={key++}>{match[2]}</code>);
+    } else if (match[3] !== undefined) {
+      nodes.push(<em key={key++}>{match[3]}</em>);
+    }
+
+    lastIndex = pattern.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes;
+}
+
 function AnswerMarkdown({ text }: { text: string }) {
   const trimmed = typeof text === "string" ? text.trim() : "";
 
@@ -216,20 +250,20 @@ function AnswerMarkdown({ text }: { text: string }) {
     <div className="answer-markdown">
       {blocks.map((block, index) => {
         if (block.type === "heading") {
-          return <h4 key={index}>{block.text}</h4>;
+          return <h4 key={index}>{renderInlineMarkdown(block.text)}</h4>;
         }
 
         if (block.type === "list") {
           return (
             <ul key={index}>
               {block.items.map((item, itemIndex) => (
-                <li key={itemIndex}>{item}</li>
+                <li key={itemIndex}>{renderInlineMarkdown(item)}</li>
               ))}
             </ul>
           );
         }
 
-        return <p key={index}>{block.text}</p>;
+        return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
       })}
     </div>
   );
@@ -695,6 +729,38 @@ function AssistantRunMessage({
   const needsClarification =
     completed && result?.answer?.answerMode === "clarification-needed" && clarificationRound < MAX_CLARIFICATION_ROUNDS;
 
+  // Метрики/лимиты/execution preview раньше всегда были развёрнуты прямо в
+  // теле ответа — рядом с текстом ответа одновременно висели проценты
+  // уверенности, ограничения и превью плана, из-за чего сообщение не
+  // читалось как обычный чат-ответ. Теперь это скрыто за тогглом и
+  // сворачивается заново на каждый новый ответ.
+  const [showDetails, setShowDetails] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    setShowDetails(false);
+    setCopied(false);
+  }, [result?.runId]);
+
+  async function handleCopyAnswer() {
+    const answerText = safeText(
+      result?.answer?.explanation,
+      result?.research.functionalSummary || "",
+    );
+
+    if (!answerText) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(answerText);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API недоступен (например, не-secure context) — тихо игнорируем.
+    }
+  }
+
   if (!running && !completed && !failed) {
     return (
       <div className="message assistant-message">
@@ -736,7 +802,7 @@ function AssistantRunMessage({
                 рядом с "уточните вопрос" будет показан уверенный конкретный
                 план для одной из отброшенных интерпретаций. */}
             <p className="message-label">Нужно уточнение · {safeText(result.project.name, "Проект неизвестен")}</p>
-            <h3>{safeText(result?.answer?.summary, "Уточните вопрос")}</h3>
+            <h3>{renderInlineMarkdown(safeText(result?.answer?.summary, "Уточните вопрос"))}</h3>
             <div className="chat-suggestions">
               {safeList(result?.answer?.clarificationOptions).map((moduleKey) => (
                 <button key={moduleKey} type="button" className="ghost-button" onClick={() => onSelectClarification(moduleKey)}>
@@ -750,7 +816,7 @@ function AssistantRunMessage({
         {completed && !needsClarification ? (
           <>
             <p className="message-label">Ответ подготовлен · {safeText(result.project.name, "Проект неизвестен")}</p>
-            <h3>{safeText(result.answer?.summary, result.research.summary)}</h3>
+            <h3>{renderInlineMarkdown(safeText(result.answer?.summary, result.research.summary))}</h3>
             <AnswerMarkdown
               text={safeText(
                 result.answer?.explanation,
@@ -758,47 +824,13 @@ function AssistantRunMessage({
               )}
             />
 
-            <div className="result-quick-grid">
-              <div className="result-card">
-                <strong>Ответ</strong>
-                <span>{safeCount(result.answer?.confidence)}% уверенность</span>
-              </div>
-              <div className="result-card">
-                <strong>Impact</strong>
-                <span>{safeCount(result.impact.confidence)}% уверенность</span>
-              </div>
-              <div className="result-card">
-                <strong>Context</strong>
-                <span>{safeCount(result.context.estimatedTokens)} токенов</span>
-              </div>
-              <div className="result-card">
-                <strong>Plan</strong>
-                <span>{safeList(result.plan.steps).length} шагов</span>
-              </div>
-            </div>
-
-            {safeList(result.answer?.warnings).length ? (
-              <div className="execution-preview-card">
-                <div>
-                  <p className="message-label">Ограничения</p>
-                  <strong>{safeList(result.answer?.warnings).join(" ")}</strong>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="execution-preview-card">
-              <div>
-                <p className="message-label">План реализации</p>
-                <strong>{safeText(result.executionPreview.summary)}</strong>
-              </div>
-              <div className="execution-preview-metrics">
-                <span>Файлы: {safeList(result.plan.targetFiles).length || safeList(result.impact.affectedFiles).length}</span>
-                <span>Модули: {safeList(result.plan.targetModules).length || safeList(result.research.affectedModules).length}</span>
-                <span>Шагов: {safeList(result.plan.steps).length}</span>
-              </div>
-            </div>
-
             <div className="action-row">
+              <button type="button" className="ghost-button" onClick={() => void handleCopyAnswer()}>
+                {copied ? "Скопировано" : "Копировать ответ"}
+              </button>
+              <button type="button" className="ghost-button" onClick={() => setShowDetails((value) => !value)}>
+                {showDetails ? "Скрыть детали" : "Подробнее"}
+              </button>
               <button type="button" className="ghost-button" onClick={() => onOpenInspector("overview")}>
                 Почему я так ответил
               </button>
@@ -812,6 +844,50 @@ function AssistantRunMessage({
                 Execution preview
               </button>
             </div>
+
+            {showDetails ? (
+              <>
+                <div className="result-quick-grid">
+                  <div className="result-card">
+                    <strong>Ответ</strong>
+                    <span>{safeCount(result.answer?.confidence)}% уверенность</span>
+                  </div>
+                  <div className="result-card">
+                    <strong>Impact</strong>
+                    <span>{safeCount(result.impact.confidence)}% уверенность</span>
+                  </div>
+                  <div className="result-card">
+                    <strong>Context</strong>
+                    <span>{safeCount(result.context.estimatedTokens)} токенов</span>
+                  </div>
+                  <div className="result-card">
+                    <strong>Plan</strong>
+                    <span>{safeList(result.plan.steps).length} шагов</span>
+                  </div>
+                </div>
+
+                {safeList(result.answer?.warnings).length ? (
+                  <div className="execution-preview-card">
+                    <div>
+                      <p className="message-label">Ограничения</p>
+                      <strong>{safeList(result.answer?.warnings).join(" ")}</strong>
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="execution-preview-card">
+                  <div>
+                    <p className="message-label">План реализации</p>
+                    <strong>{safeText(result.executionPreview.summary)}</strong>
+                  </div>
+                  <div className="execution-preview-metrics">
+                    <span>Файлы: {safeList(result.plan.targetFiles).length || safeList(result.impact.affectedFiles).length}</span>
+                    <span>Модули: {safeList(result.plan.targetModules).length || safeList(result.research.affectedModules).length}</span>
+                    <span>Шагов: {safeList(result.plan.steps).length}</span>
+                  </div>
+                </div>
+              </>
+            ) : null}
           </>
         ) : null}
       </div>
@@ -1645,11 +1721,14 @@ export function App() {
   // скролл без внутренней прокрутки у списка сообщений. Без авто-скролла
   // пользователь после ответа остаётся там, где был (часто вверху), и
   // середина ответа визуально прячется под композером, пока не проскроллишь
-  // руками — так обычные чаты не ведут себя. Едем к концу при новом вопросе,
-  // новом ответе и на каждом обновлении статуса стадии, пока run ещё идёт.
+  // руками — так обычные чаты не ведут себя. Едем к концу только при новом
+  // вопросе и при получении финального ответа — раньше сюда же был добавлен
+  // `runStatus?.currentStageLabel`, который меняется на каждом тике поллинга
+  // (каждые несколько секунд, 10+ раз за один run) и с `behavior: "smooth"`
+  // ощущался как страница, которая "постоянно прыгает" — убрано.
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [selectedTask, result, runStatus?.currentStageLabel]);
+  }, [selectedTask, result]);
 
   useEffect(() => {
     try {
@@ -1718,7 +1797,7 @@ export function App() {
     }
 
     const interval = window.setInterval(() => {
-      void loadProject(projectPath, selectedProjectId || undefined);
+      void loadProject(projectPath, selectedProjectId || undefined, false);
     }, 10_000);
 
     return () => {
@@ -1855,7 +1934,7 @@ export function App() {
     setInspectorOpen(true);
   }
 
-  async function loadProject(nextProjectPath?: string, nextProjectId?: string) {
+  async function loadProject(nextProjectPath?: string, nextProjectId?: string, syncResult = true) {
     setLoading(true);
     setError(null);
 
@@ -1891,20 +1970,32 @@ export function App() {
         projectPathRef.current = data.rootPath;
         const activePath = resolveSelectedProjectPath(data.projectRecord, data.rootPath);
         setSelectedProjectPathId(activePath?.id ?? "");
-        setResult((current) => {
-          if (activeRunIdRef.current) {
-            return current;
-          }
 
-          return data.latestRun ?? null;
-        });
-        setSelectedTask((current) => {
-          if (activeRunIdRef.current) {
-            return current;
-          }
+        // `syncResult=false` — это периодический (10с) или пост-run рефреш
+        // метаданных проекта, а не переключение проекта/первая загрузка.
+        // Раньше это условие проверяло только `activeRunIdRef.current`, из-за
+        // чего КАЖДЫЙ фоновый тик перезаписывал уже показанный пользователю
+        // ответ на `data.latestRun` — любой чужой/фоновый run (silent
+        // background sync, хард ресинк и т.п.), завершившийся где угодно в
+        // проекте, "телепортировался" в чат как будто пользователь его
+        // получил. Теперь `result`/`selectedTask` синхронизируются с сервером
+        // только при явном переключении проекта или первой загрузке страницы.
+        if (syncResult) {
+          setResult((current) => {
+            if (activeRunIdRef.current) {
+              return current;
+            }
 
-          return current || latestEntry?.task || "";
-        });
+            return data.latestRun ?? null;
+          });
+          setSelectedTask((current) => {
+            if (activeRunIdRef.current) {
+              return current;
+            }
+
+            return current || latestEntry?.task || "";
+          });
+        }
       });
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сводку по проекту.");
@@ -2123,7 +2214,7 @@ export function App() {
               : current,
           );
         });
-        await loadProject(resolvedProjectPath, resolvedProjectId);
+        await loadProject(resolvedProjectPath, resolvedProjectId, false);
         return;
       }
 
