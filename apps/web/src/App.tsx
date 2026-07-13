@@ -476,6 +476,7 @@ function RunHistorySidebar({
                   checked={selectedIds.has(entry.runId)}
                   onChange={() => onToggleSelect(entry.runId)}
                   onClick={(event) => event.stopPropagation()}
+                  aria-label={`Выбрать чат «${buildHistoryTitle(entry.task)}»`}
                 />
                 <button type="button" className="history-item" onClick={() => onSelectRun(entry.runId)}>
                   <strong>{buildHistoryTitle(entry.task)}</strong>
@@ -485,6 +486,7 @@ function RunHistorySidebar({
                   type="button"
                   className="history-item-delete"
                   title="Удалить чат"
+                  aria-label={`Удалить чат «${buildHistoryTitle(entry.task)}»`}
                   onClick={(event) => {
                     event.stopPropagation();
                     onDeleteOne(entry.runId);
@@ -1631,12 +1633,23 @@ export function App() {
   }
   const selectedProjectIdRef = useRef<string>("");
   const projectPathRef = useRef<string>("");
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
   const readiness = projectReadinessState(project);
   const backgroundSyncStatus = backgroundSyncState(project);
 
   useEffect(() => {
     void initializeApp();
   }, []);
+
+  // Композер зафиксирован снизу (position: sticky), а страница — один длинный
+  // скролл без внутренней прокрутки у списка сообщений. Без авто-скролла
+  // пользователь после ответа остаётся там, где был (часто вверху), и
+  // середина ответа визуально прячется под композером, пока не проскроллишь
+  // руками — так обычные чаты не ведут себя. Едем к концу при новом вопросе,
+  // новом ответе и на каждом обновлении статуса стадии, пока run ещё идёт.
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [selectedTask, result, runStatus?.currentStageLabel]);
 
   useEffect(() => {
     try {
@@ -2436,6 +2449,16 @@ export function App() {
       return;
     }
 
+    const confirmed = window.confirm(
+      runIds.length === 1
+        ? "Удалить этот чат? Действие необратимо."
+        : `Удалить ${runIds.length} чатов? Действие необратимо.`,
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
     setDeletingHistory(true);
 
     try {
@@ -2597,6 +2620,7 @@ export function App() {
                 clarificationRound={clarificationRound}
                 onSelectClarification={(moduleKey) => setTask(moduleKey)}
               />
+              <div ref={chatEndRef} />
             </div>
 
             <form className="composer" onSubmit={runPipeline}>
