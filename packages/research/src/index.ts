@@ -21,6 +21,7 @@ import {
   type RepositorySnapshot,
   scoreTextGroups,
   tokenize,
+  expandRussianTechTransliteration,
   type GraphState,
   type IndexSymbol,
   type IndexResult,
@@ -1946,7 +1947,7 @@ function isMeaningfulAliasMatch(token: string, alias: string): boolean {
 }
 
 function expandTaskTokens(task: string): string[] {
-  const baseTokens = tokenize(task);
+  const baseTokens = expandRussianTechTransliteration(tokenize(task));
   const expanded = new Set(baseTokens);
 
   for (const rawToken of task.split(/[^A-Za-z0-9_/-]+/).filter(Boolean)) {
@@ -1984,7 +1985,7 @@ function expandTaskTokens(task: string): string[] {
 // доменных профилей остаются группами из одного элемента и ведут себя как
 // раньше.
 function buildTokenGroups(task: string): string[][] {
-  const baseTokens = tokenize(task);
+  const baseTokens = expandRussianTechTransliteration(tokenize(task));
   const standaloneGroups = baseTokens.map((token) => [token]);
 
   const compoundGroups = task

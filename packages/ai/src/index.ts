@@ -94,6 +94,7 @@ interface ProviderValidatorResponse {
   missingConfirmations?: string[];
   recommendedActions?: string[];
   missingEntityHints?: string[];
+  primaryEvidenceLabel?: string;
   recommendedResearchProfile?: ValidationRecommendedResearchProfile;
   recommendedStopReason?: string;
   rationale?: string;
@@ -244,14 +245,41 @@ export function buildValidatedAnswerPacket(input: BuildValidatedAnswerPacketInpu
         .map((gap) => gap.label),
       ...input.validation.missingConfirmations.slice(0, 2),
     ].slice(0, 4),
-    validatedEvidence: input.research.evidence.slice(0, 6).map((item) => ({
-      label: item.label,
-      ...(item.filePath ? { filePath: item.filePath } : {}),
-      reason: item.reason,
-      origin: item.origin,
-    })),
+    validatedEvidence: applyPrimaryEvidenceOrder(input.research.evidence, input.validation.primaryEvidenceLabel)
+      .slice(0, 6)
+      .map((item) => ({
+        label: item.label,
+        ...(item.filePath ? { filePath: item.filePath } : {}),
+        reason: item.reason,
+        origin: item.origin,
+      })),
     validatorRationale: input.validation.rationale,
   };
+}
+
+// Ретрив находит кандидатов и расставляет их по structural score — это
+// работа алгоритма. Если валидатор (LLM) прямо назвал, какой из НАЙДЕННЫХ
+// кандидатов реально отвечает на вопрос по смыслу, этот выбор должен
+// перевешивать формальный порядок сортировки, а не теряться где-то в
+// середине списка. Без primaryEvidenceLabel порядок не меняется вообще.
+function applyPrimaryEvidenceOrder<T extends { label: string }>(evidence: T[], primaryEvidenceLabel: string | undefined): T[] {
+  if (!primaryEvidenceLabel) {
+    return evidence;
+  }
+
+  const primaryIndex = evidence.findIndex((item) => item.label === primaryEvidenceLabel);
+
+  if (primaryIndex <= 0) {
+    return evidence;
+  }
+
+  const primary = evidence[primaryIndex];
+
+  if (!primary) {
+    return evidence;
+  }
+
+  return [primary, ...evidence.slice(0, primaryIndex), ...evidence.slice(primaryIndex + 1)];
 }
 
 export function buildControlledExecutionRuntime(input: BuildControlledRuntimeInput): ControlledExecutionRuntime {
@@ -370,9 +398,10 @@ async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): P
           "Ты оцениваешь только достаточность уже собранных артефактов.",
           "Research confidence не является истиной, это лишь один из входных сигналов.",
           "Главный вопрос: реально ли собранный evidence отвечает на ТОТ вопрос, который задал пользователь — а не просто на что-то похожее по ключевым словам.",
-          "Верни только JSON с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints, recommendedResearchProfile, recommendedStopReason, rationale.",
+          "Верни только JSON с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints, primaryEvidenceLabel, recommendedResearchProfile, recommendedStopReason, rationale.",
           "recommendedActions — закрытый словарь общих сценариев, нельзя придумывать значения вне разрешённого списка.",
           "missingEntityHints — наоборот, свободный текст: если evidence не бьёт в суть вопроса, назови конкретные сущности/классы/файлы/понятия из вопроса, которых не хватает в evidence и которые стоит поискать отдельно. Не ограничивайся никаким списком — пиши то, что реально нужно найти, своими словами или точным именем из вопроса. Пусто, если evidence уже покрывает вопрос по существу.",
+          "primaryEvidenceLabel — среди Evidence в промпте выбери ОДИН элемент, чей label точнее всего отвечает на вопрос по смыслу, а не по формальному score (score — это подсчёт совпадений, не понимание вопроса). Особенно важно, когда несколько evidence одного типа/домена выглядят структурно похоже (например несколько разных Model-файлов) — тогда просто выше по score не значит правильнее по сути. Скопируй label ТОЧНО как он написан в Evidence. Пусто, если нет явного кандидата или все примерно равнозначны.",
         ].join("\n"),
       },
       {
@@ -469,6 +498,12 @@ function normalizeProviderValidationResult(
           .filter((hint) => hint.length >= 2),
       ),
     ).slice(0, 5),
+    // Доверяем только точному совпадению с уже известным evidence — модель
+    // не должна "изобретать" файл, которого не было в промпте.
+    ...(candidate.primaryEvidenceLabel
+      && packet.evidenceHighlights.some((item) => item.label === candidate.primaryEvidenceLabel)
+      ? { primaryEvidenceLabel: candidate.primaryEvidenceLabel }
+      : {}),
     ...(candidate.recommendedResearchProfile
       ? { recommendedResearchProfile: candidate.recommendedResearchProfile }
       : fallback.recommendedResearchProfile
@@ -744,19 +779,18 @@ function getPrioritizedEvidence(input: BuildAnswerInput): ResearchReport["eviden
     return !(filePath.includes("/.vscode/") || filePath.startsWith(".vscode/") || filePath.endsWith("/.vscode/settings.json"));
   });
 
-  if (localeBehavior) {
-    return [...filtered].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left));
-  }
+  const sorted = localeBehavior
+    ? [...filtered].sort((left, right) => getLocaleEvidenceWeight(right) - getLocaleEvidenceWeight(left))
+    : storageQuestion
+      ? [...filtered].sort((left, right) => getStorageEvidenceWeight(right) - getStorageEvidenceWeight(left))
+      : locationQuestion || usageQuestion
+        ? [...filtered].sort((left, right) => getLocationEvidenceWeight(right) - getLocationEvidenceWeight(left))
+        : filtered;
 
-  if (storageQuestion) {
-    return [...filtered].sort((left, right) => getStorageEvidenceWeight(right) - getStorageEvidenceWeight(left));
-  }
-
-  if (locationQuestion || usageQuestion) {
-    return [...filtered].sort((left, right) => getLocationEvidenceWeight(right) - getLocationEvidenceWeight(left));
-  }
-
-  return filtered;
+  // Что бы ни решила эвристика сортировки выше — явный выбор валидатора
+  // (когда он есть) главнее: он смотрит на смысл вопроса, а не на структурные
+  // сигналы вроде "это тоже файл модели".
+  return applyPrimaryEvidenceOrder(sorted, input.validatedAnswerPacket?.validatedEvidence[0]?.label);
 }
 
 function getStorageEvidenceWeight(item: ResearchReport["evidence"][number]): number {

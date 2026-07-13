@@ -717,6 +717,14 @@ export interface ValidationResult {
   // заранее заданного меню действий. Используется как targetTokens в
   // FocusedResearchRequest для действительно open-ended re-search.
   missingEntityHints: string[];
+  // Ретрив (какие файлы вообще рассматривать) — работа алгоритма. Финальный
+  // выбор "какой из НАЙДЕННЫХ кандидатов — реально ответ" — там, где
+  // структурный score нескольких файлов близок, а победитель очевиден только
+  // по смыслу вопроса, это работа для суждения, не для scoring-эвристики.
+  // Значение — точный label одного из evidenceHighlights (пусто, если
+  // порядок research-скоринга и так адекватен). Deterministic fallback
+  // (без LLM) это поле не трогает — алгоритмический порядок остаётся как есть.
+  primaryEvidenceLabel?: string;
   recommendedResearchProfile?: ValidationRecommendedResearchProfile;
   recommendedStopReason?: string;
   rationale: string;
@@ -1007,6 +1015,55 @@ export function tokenize(value: string): string[] {
     .split(/[^a-z0-9а-яё_/-]+/i)
     .map((token) => token.trim())
     .filter((token) => token.length >= 2);
+}
+
+// Много русской разработческой лексики — это не перевод, а фонетическая
+// транслитерация английского термина ("алиас", не "псевдоним"; "консоль",
+// не "пульт управления"). Идентификаторы/пути в коде почти всегда на
+// латинице, поэтому вопрос "как работает сохранение консольного алиаса"
+// без этого шага не находит вообще ничего похожего на `ConsoleAlias.php` —
+// не потому что скоринг слабый, а потому что "алиас" и "alias" для
+// substring-матчинга это два совершенно разных слова в разных алфавитах.
+// Список — общая dev-лексика, не привязан ни к одному конкретному проекту.
+const RUSSIAN_TECH_TRANSLIT_STEMS: Array<[stem: string, latin: string]> = [
+  ["алиас", "alias"],
+  ["консол", "console"],
+  ["контроллер", "controller"],
+  ["роут", "route"],
+  ["сервис", "service"],
+  ["компонент", "component"],
+  ["интерфейс", "interface"],
+  ["экшен", "action"],
+  ["экшн", "action"],
+  ["ивент", "event"],
+  ["хендлер", "handler"],
+  ["хэндлер", "handler"],
+  ["миграц", "migration"],
+  ["репозитор", "repository"],
+  ["валидатор", "validator"],
+  ["провайдер", "provider"],
+  ["мидлвар", "middleware"],
+  ["мидлвэр", "middleware"],
+  ["воркер", "worker"],
+  ["джоб", "job"],
+  ["токен", "token"],
+  ["сессия", "session"],
+  ["кэш", "cache"],
+  ["кеш", "cache"],
+];
+
+export function expandRussianTechTransliteration(tokens: string[]): string[] {
+  const expanded = new Set(tokens);
+
+  for (const token of tokens) {
+    for (const [stem, latin] of RUSSIAN_TECH_TRANSLIT_STEMS) {
+      if (token.startsWith(stem)) {
+        expanded.add(latin);
+      }
+    }
+  }
+
+  return [...expanded];
 }
 
 export function scoreText(haystack: string, tokens: string[]): number {

@@ -24,6 +24,7 @@ import {
   normalizePath,
   stableId,
   tokenize,
+  expandRussianTechTransliteration,
   type GraphInvalidationPlan,
   type PipelinePartialArtifacts,
   type PipelineRunMode,
@@ -830,7 +831,13 @@ function getCompletedStages(runId: string): PipelineStage[] {
 // как раньше — по одному substring). Используется и для текста задачи, и
 // для свободных entity-hints от валидатора (см. deriveFocusedResearchPaths).
 function buildCompoundTokenGroups(text: string): string[][] {
-  const standaloneTokens = tokenize(text).filter((token) => token.length >= 3);
+  // expandRussianTechTransliteration добавляет латинские формы для русских
+  // фонетических транслитераций ("алиас" -> ещё и "alias") — без этого
+  // русскоязычный вопрос про сущность с англоязычным именем в коде в
+  // принципе не может её найти: буквы разные, substring не совпадёт никогда.
+  const standaloneTokens = expandRussianTechTransliteration(
+    tokenize(text).filter((token) => token.length >= 3),
+  );
   const compoundGroups = text
     .split(/[^A-Za-z0-9_/-]+/)
     .filter(Boolean)
