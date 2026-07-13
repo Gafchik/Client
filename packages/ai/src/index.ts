@@ -2626,22 +2626,38 @@ function validateProviderAnswer(
   ]
     .join(" ")
     .toLowerCase();
+  // Только конкретные, узнаваемые технические заявления — не общая лексика
+  // веб-разработки. "session"/"cookie"/"accept-language" раньше тоже были
+  // в списке и рубили ЛЮБОЙ нормальный ответ про auth/OAuth-флоу: это самые
+  // обычные слова для объяснения такого флоу, а не "придуманные" детали —
+  // просто их не было дословно в evidence corpus (это лейблы/reasons, а не
+  // исходный код).
   const hallucinationSignals = [
-    "session",
-    "cookie",
-    "query-параметр",
-    "query param",
     "kernel.php",
     "app/http/kernel.php",
-    "accept-language",
     "redis lock",
     "queue retry",
     "transaction retry",
   ].filter((token) => combined.includes(token) && !evidenceCorpus.includes(token));
 
+  // Раньше здесь требовалось дословное совпадение первых 40 символов
+  // brief.directAnswer — а для большинства flow-вопросов directAnswer это
+  // ПРОСТО research.functionalSummary, внутренний деterministic-шаблон
+  // ("Задача бьёт в redis-inventory, auth..."). Ни одна живая модель не
+  // повторяет этот текст дословно, поэтому LLM-ответ отклонялся практически
+  // всегда, независимо от модели и качества ответа — живой прогон с 3
+  // разными моделями (nemotron/deepseek/gpt-5.4-mini) подтвердил: все три
+  // получили одинаковый reject по этой причине. Настоящая проверка на
+  // hallucination — упомянул ли ответ реальный файл/файлы, на которые
+  // опирается direct claim, а не повторил ли он текст шаблона дословно.
+  const directClaimFilePaths = brief.claimSet.directClaim?.filePaths ?? [];
   const directClaimMissing =
-    brief.directAnswer.trim().length > 0
-    && !combined.includes(brief.directAnswer.toLowerCase().slice(0, Math.min(40, brief.directAnswer.length)).trim());
+    directClaimFilePaths.length > 0
+    && !directClaimFilePaths.some((filePath) => {
+      const lowerPath = filePath.toLowerCase();
+      const basename = lowerPath.split("/").pop() ?? lowerPath;
+      return combined.includes(lowerPath) || combined.includes(basename);
+    });
 
   if (hallucinationSignals.length > 0 || directClaimMissing) {
     return {

@@ -441,7 +441,12 @@ export function detectResearchAmbiguity(research: ResearchReport): ResearchAmbig
     && hasDominantModule
     && strongEvidenceCount >= 2
     && fileBackedEvidence >= 3
-    && uniqueEvidenceFiles <= 6
+    // Живой OAuth-флоу законно касается 4+ отдельных migration-файлов
+    // (oauth_clients/oauth_access_tokens/oauth_auth_codes/oauth_refresh_tokens)
+    // плюс контроллер/модель/config — 6 было слишком строгим порогом и
+    // прибивало реально консистентный, некоммитнутый evidence (найдено
+    // живьём: 8 уникальных файлов, все по делу, ambiguity сработала зря).
+    && uniqueEvidenceFiles <= 10
   ) {
     return { ambiguous: false, competingModules: [] };
   }

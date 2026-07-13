@@ -105,6 +105,8 @@ const INTENT_PROFILES: IntentProfile[] = [
       "cashier",
       "paddle",
       "subscribed",
+      "trial",
+      "trials",
       "биллинг",
       "платеж",
       "платежи",
@@ -113,6 +115,10 @@ const INTENT_PROFILES: IntentProfile[] = [
       "инвойс",
       "подписка",
       "подписки",
+      "триал",
+      "триалы",
+      "пробный",
+      "пробник",
     ],
   },
   {
@@ -213,11 +219,19 @@ const INTENT_PROFILES: IntentProfile[] = [
       "vault",
       "credential",
       "credentials",
+      "password",
       "password_uuid",
       "passphrase_uuid",
       "passwords",
       "private_key",
       "encrypted_private_key",
+      "share",
+      "shared",
+      "sharing",
+      "envelope",
+      "encryption",
+      "encrypt",
+      "decrypt",
       "пароль",
       "пароли",
       "креды",
@@ -227,6 +241,9 @@ const INTENT_PROFILES: IntentProfile[] = [
       "секреты",
       "ключ",
       "ключи",
+      "расшар",
+      "шифр",
+      "шифрование",
     ],
   },
   {
@@ -1944,6 +1961,27 @@ const TOKEN_MATCH_STOPWORDS = new Set([
 
 /** Минимальная длина токена/alias'а для substring-матчинга (защита от false positive на коротких словах). */
 const TOKEN_MATCH_MIN_SUBSTRING_LENGTH = 4;
+// Самые частые окончания падежей/чисел для существительных и прилагательных
+// ("пароля", "паролем", "паролях" -> "парол"). Не лингвистически точный
+// стеммер — грубая отсечка, достаточная для сравнения domain-ключевых слов
+// без ложных совпадений короче MIN_STEM_LENGTH. Длинные окончания идут
+// первыми, чтобы не отрезать короткое "а" раньше многобуквенного "иями".
+const RUSSIAN_CASE_SUFFIXES = [
+  "иями", "иях", "ями", "ами", "его", "ему", "ыми", "ими",
+  "ой", "ей", "ем", "ём", "ов", "ев", "ёв", "ая", "яя", "ое", "ее", "ых", "их", "ую", "юю",
+  "ы", "и", "а", "я", "у", "ю", "е", "ь",
+];
+const RUSSIAN_STEM_MIN_LENGTH = 4;
+
+function stemRussianWord(word: string): string {
+  for (const suffix of RUSSIAN_CASE_SUFFIXES) {
+    if (word.length - suffix.length >= RUSSIAN_STEM_MIN_LENGTH && word.endsWith(suffix)) {
+      return word.slice(0, word.length - suffix.length);
+    }
+  }
+
+  return word;
+}
 
 function isMeaningfulAliasMatch(token: string, alias: string): boolean {
   if (TOKEN_MATCH_STOPWORDS.has(token) || TOKEN_MATCH_STOPWORDS.has(alias)) {
@@ -1960,6 +1998,18 @@ function isMeaningfulAliasMatch(token: string, alias: string): boolean {
 
   if (alias.length >= TOKEN_MATCH_MIN_SUBSTRING_LENGTH && token.includes(alias)) {
     return true;
+  }
+
+  // Строгий substring не видит падежи: "пароля" не содержит "пароль" как
+  // подстроку (расходятся в последней букве), хотя семантически это одно и
+  // то же слово. Сравниваем грубые стемы отдельным, более узким порогом.
+  if (/[а-яё]/i.test(token) && /[а-яё]/i.test(alias)) {
+    const tokenStem = stemRussianWord(token);
+    const aliasStem = stemRussianWord(alias);
+
+    if (tokenStem.length >= RUSSIAN_STEM_MIN_LENGTH && tokenStem === aliasStem) {
+      return true;
+    }
   }
 
   return false;
