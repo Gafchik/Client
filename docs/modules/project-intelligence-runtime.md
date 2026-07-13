@@ -651,6 +651,31 @@ User Question
 
 Это не повторный большой research. Это точечный доступ к конкретным файлам, символам или graph-fragments, если уже существующая карта не покрывает нужный локальный вопрос.
 
+### 13.6 Приоритет точной сущности над graph-neighbor expansion
+
+Для больших baseline-driven репозиториев narrow retrieval обязан соблюдать строгий порядок приоритета:
+
+1. `git-scoped overlay` и локально изменённые пути;
+2. прямые entity/symbol/path matches из вопроса;
+3. direct graph matches по label/filePath;
+4. только после этого — дозированное `graph-neighbor` expansion.
+
+Это требование появилось после живого stress-теста на большом PHP-монолите: более graph-dense соседний домен может иметь больше связей, чем реально искомая сущность, и без отдельного budget под direct match question-run начинает отвечать не на ту feature-зону, которую спросил пользователь.
+
+Следствие:
+
+- selective workspace slice должен **резервировать budget** под direct matches;
+- `graph-neighbor` не должен конкурировать с точной сущностью за весь retrieval budget;
+- graph нужен для controlled expansion вокруг уже найденного ядра, а не для подмены сущностного retrieval.
+
+Иными словами, правильная модель question-time retrieval:
+
+`сначала понять, о какой сущности спрашивает пользователь -> затем расширить контекст графом`
+
+а не:
+
+`сначала взять самый плотный graph neighborhood -> надеяться, что нужная сущность окажется внутри него`.
+
 ---
 
 ## 14. Invalidation и Refresh Rules

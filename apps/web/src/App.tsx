@@ -520,6 +520,7 @@ function EnvironmentStrip({
   providers,
   providerModels,
   project,
+  disabled,
   onProjectChange,
   onProjectPathChange,
   onProviderChange,
@@ -533,6 +534,7 @@ function EnvironmentStrip({
   providers: ProviderRecord[];
   providerModels: ProviderModelRecord[];
   project: ProjectInfo | null;
+  disabled: boolean;
   onProjectChange: (projectId: string) => void;
   onProjectPathChange: (pathId: string) => void;
   onProviderChange: (providerId: string) => void;
@@ -540,7 +542,7 @@ function EnvironmentStrip({
 }) {
   return (
     <section className="environment-strip">
-      <select className="environment-pill" value={selectedProjectId} onChange={(event) => onProjectChange(event.target.value)}>
+      <select className="environment-pill" value={selectedProjectId} onChange={(event) => onProjectChange(event.target.value)} disabled={disabled}>
         <option value="">Проект</option>
         {safeList(projects).map((projectItem) => (
           <option key={projectItem.id} value={projectItem.id}>
@@ -549,7 +551,7 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      <select className="environment-pill" value={selectedProjectPathId} onChange={(event) => onProjectPathChange(event.target.value)}>
+      <select className="environment-pill" value={selectedProjectPathId} onChange={(event) => onProjectPathChange(event.target.value)} disabled={disabled}>
         <option value="">Путь</option>
         {safeList(projects.find((item) => item.id === selectedProjectId)?.paths).map((pathItem) => (
           <option key={pathItem.id} value={pathItem.id}>
@@ -558,7 +560,7 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      <select className="environment-pill" value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)}>
+      <select className="environment-pill" value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)} disabled={disabled}>
         <option value="">Провайдер</option>
         {safeList(providers).map((provider) => (
           <option key={provider.id} value={provider.id}>
@@ -567,7 +569,7 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      <select className="environment-pill" value={providerModelDraft} onChange={(event) => onModelChange(event.target.value)}>
+      <select className="environment-pill" value={providerModelDraft} onChange={(event) => onModelChange(event.target.value)} disabled={disabled}>
         {groupModelsByVendor(safeList(providerModels)).map((group) => (
           <optgroup key={group.vendor} label={group.vendor}>
             {group.models.map((model) => (
@@ -585,6 +587,20 @@ function EnvironmentStrip({
         <span>{projectReadinessState(project).title}</span>
       </div>
     </section>
+  );
+}
+
+function isTransientPollError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("превысил лимит ожидания")
+    || message.includes("failed to fetch")
+    || message.includes("networkerror")
+    || message.includes("load failed")
   );
 }
 
@@ -2022,11 +2038,32 @@ export function App() {
         return;
       }
 
-      const status = await fetchJsonWithTimeout<PipelineRunStatus>(
-        `${API_BASE_URL}/api/pipeline/status?runId=${encodeURIComponent(runId)}`,
-        undefined,
-        8000,
-      );
+      let status: PipelineRunStatus;
+      try {
+        status = await fetchJsonWithTimeout<PipelineRunStatus>(
+          `${API_BASE_URL}/api/pipeline/status?runId=${encodeURIComponent(runId)}`,
+          undefined,
+          8000,
+        );
+      } catch (statusError) {
+        if (!isTransientPollError(statusError)) {
+          throw statusError;
+        }
+
+        startTransition(() => {
+          setRunStatus((current) =>
+            current && current.runId === runId
+              ? {
+                  ...current,
+                  currentStageLabel: current.currentStageLabel || "Изучаю проект",
+                }
+              : current,
+          );
+        });
+
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        continue;
+      }
 
       startTransition(() => {
         setRunStatus(status);
@@ -2434,13 +2471,13 @@ export function App() {
           <strong>Client</strong>
         </div>
         <div className="app-topbar-actions">
-          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={startNewChat}>
+          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={startNewChat} disabled={running}>
             Чат
           </button>
-          <button type="button" className={`top-nav-button ${activeView === "projects" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/projects")}>
+          <button type="button" className={`top-nav-button ${activeView === "projects" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/projects")} disabled={running}>
             Проекты
           </button>
-          <button type="button" className={`top-nav-button ${activeView === "providers" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/providers")}>
+          <button type="button" className={`top-nav-button ${activeView === "providers" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/providers")} disabled={running}>
             Провайдеры
           </button>
         </div>
@@ -2496,6 +2533,7 @@ export function App() {
               providers={providers}
               providerModels={providerModels}
               project={project}
+              disabled={running}
               onProjectChange={(nextProjectId) => {
                 setSelectedProjectId(nextProjectId);
                 const selectedProject = projects.find((item) => item.id === nextProjectId);
@@ -2568,6 +2606,7 @@ export function App() {
                   onChange={(event) => setTask(event.target.value)}
                   rows={4}
                   placeholder="Напиши инженерную задачу или вопрос по проекту..."
+                  disabled={running}
                 />
 
                 <div className="composer-actions">

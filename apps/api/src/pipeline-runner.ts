@@ -784,6 +784,10 @@ function buildQuestionWorkspacePlan(
   workspace: Awaited<ReturnType<typeof openWorkspace>>,
   previousRun?: PipelineRunResult | null,
 ): QuestionWorkspacePlan {
+  const MAX_PRIMARY_PATHS = 250;
+  const DIRECT_MATCH_MIN_BUDGET = 40;
+  const DIRECT_MATCH_TARGET_BUDGET = 100;
+  const GRAPH_NEIGHBOR_MAX_BUDGET = 80;
   const previousIndex = previousRun?.runtimeCache?.index;
   const availableRelativePaths = Array.from(
     new Set([
@@ -842,6 +846,14 @@ function buildQuestionWorkspacePlan(
       && (matchesTaskTokens(item.filePath) || matchesTaskTokens(item.label)),
     )
     .map((item) => item.filePath) ?? [];
+  const directMatchPaths = Array.from(
+    new Set([
+      ...previousSymbolMatchedPaths,
+      ...graphMatchedPaths,
+      ...tokenMatchedPaths,
+      ...previousIndexPaths,
+    ]),
+  );
   const graphNeighborPaths = previousGraph
     ? Array.from(
         new Set(
@@ -850,8 +862,8 @@ function buildQuestionWorkspacePlan(
             const target = previousGraph.nodes.find((node) => node.id === edge.targetId);
             const sourcePath = normalizePath(source?.filePath ?? "");
             const targetPath = normalizePath(target?.filePath ?? "");
-            const sourceMatched = sourcePath && graphMatchedPaths.includes(sourcePath);
-            const targetMatched = targetPath && graphMatchedPaths.includes(targetPath);
+            const sourceMatched = sourcePath && directMatchPaths.includes(sourcePath);
+            const targetMatched = targetPath && directMatchPaths.includes(targetPath);
 
             if (!sourceMatched && !targetMatched) {
               return [];
@@ -898,16 +910,54 @@ function buildQuestionWorkspacePlan(
         })
         .slice(0, 120)
     : [];
-  const primaryPaths = Array.from(
-    new Set([
-      ...gitScopedPaths,
-      ...previousSymbolMatchedPaths,
-      ...graphMatchedPaths,
-      ...graphNeighborPaths,
-      ...tokenMatchedPaths,
-      ...previousIndexPaths,
-    ]),
-  ).slice(0, 250);
+  const directMatchPathSet = new Set(directMatchPaths);
+  const graphNeighborOnlyPaths = graphNeighborPaths.filter((relativePath) => !directMatchPathSet.has(relativePath));
+  const primaryPaths: string[] = [];
+  const pushPathsWithBudget = (paths: string[], budget: number): void => {
+    for (const relativePath of paths) {
+      if (primaryPaths.length >= MAX_PRIMARY_PATHS) {
+        return;
+      }
+
+      if (budget <= 0) {
+        return;
+      }
+
+      if (primaryPaths.includes(relativePath)) {
+        continue;
+      }
+
+      primaryPaths.push(relativePath);
+      budget -= 1;
+    }
+  };
+
+  pushPathsWithBudget(gitScopedPaths, MAX_PRIMARY_PATHS);
+
+  const guaranteedDirectBudget = Math.min(
+    Math.max(DIRECT_MATCH_MIN_BUDGET, directMatchPaths.length),
+    MAX_PRIMARY_PATHS - primaryPaths.length,
+  );
+  pushPathsWithBudget(directMatchPaths, guaranteedDirectBudget);
+
+  const remainingAfterGuaranteedDirect = Math.max(MAX_PRIMARY_PATHS - primaryPaths.length, 0);
+  const preferredAdditionalDirectBudget = Math.min(
+    Math.max(DIRECT_MATCH_TARGET_BUDGET - guaranteedDirectBudget, 0),
+    remainingAfterGuaranteedDirect,
+  );
+  pushPathsWithBudget(directMatchPaths, preferredAdditionalDirectBudget);
+
+  const remainingAfterDirect = Math.max(MAX_PRIMARY_PATHS - primaryPaths.length, 0);
+  const graphNeighborBudget = directMatchPaths.length > 0
+    ? Math.min(GRAPH_NEIGHBOR_MAX_BUDGET, remainingAfterDirect)
+    : remainingAfterDirect;
+  pushPathsWithBudget(graphNeighborOnlyPaths, graphNeighborBudget);
+
+  const remainingBudget = Math.max(MAX_PRIMARY_PATHS - primaryPaths.length, 0);
+  if (remainingBudget > 0) {
+    pushPathsWithBudget(directMatchPaths, remainingBudget);
+    pushPathsWithBudget(graphNeighborOnlyPaths, Math.max(MAX_PRIMARY_PATHS - primaryPaths.length, 0));
+  }
 
   if (primaryPaths.length > 0) {
     const mode = hasStrongGraphSeed

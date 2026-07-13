@@ -355,6 +355,7 @@ const INTENT_PROFILES: IntentProfile[] = [
 interface ResearchContext {
   tokens: string[];
   tokenGroups: string[][];
+  exactEntityHints: ExactEntityHint[];
   classification: ClassificationResult;
   routing: ResearchRoutingDecision;
   broadFocus: boolean;
@@ -368,9 +369,16 @@ interface ResearchContext {
   redisInventoryFocus: boolean;
 }
 
+interface ExactEntityHint {
+  raw: string;
+  compact: string;
+  parts: string[];
+}
+
 export function runResearch(input: ResearchInput): ResearchReport {
   const tokens = expandTaskTokens(input.task);
   const tokenGroups = buildTokenGroups(input.task);
+  const exactEntityHints = extractExactEntityHints(input.task);
   const task = tokens.join(" ");
   const classification = questionClassifier.classify(task);
   const routing = mapClassificationToRouting(classification);
@@ -387,6 +395,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
   const ctx: ResearchContext = {
     tokens,
     tokenGroups,
+    exactEntityHints,
     classification,
     routing,
     broadFocus,
@@ -433,6 +442,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
       scoreTextGroups(file.relativePath, tokenGroups) * 6 +
       scoreTextGroups(file.content.slice(0, 4000), tokenGroups) +
       getModuleBoost(file.relativePath, moduleIntents) +
+      getExactEntityFileBoost(file.relativePath, exactEntityHints) +
       getGraphProfileFileBoost(file.relativePath, graphSeedFilePaths, graphSeedLabels, routing.queryProfileKey) +
       getRuntimeLocaleGraphFileBoost(file.relativePath, runtimeLocaleFilePaths, runtimeLocaleEdges) +
       getInfrastructureFileBoost(file, infrastructureFocus, tokens) +
@@ -464,6 +474,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
       scoreTextGroups(label, tokenGroups) * 8 +
       scoreTextGroups(symbol.filePath, tokenGroups) * 3 +
       getModuleBoost(symbol.filePath, moduleIntents) +
+      getExactEntitySymbolBoost(symbol, exactEntityHints) +
       getGraphProfileSymbolBoost(symbol, graphSeedFilePaths, graphSeedNodeIds, graphSeedLabels, routing.queryProfileKey) +
       getRuntimeLocaleGraphSymbolBoost(symbol, runtimeLocaleNodeIds, runtimeLocaleFilePaths, runtimeLocaleEdges) +
       getSymbolKindBoost(symbol.kind, functionalFocus, tokens) +
@@ -495,6 +506,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
       scoreTextGroups(routeNode.label, tokenGroups) * 10 +
       scoreTextGroups(routeNode.filePath ?? "", tokenGroups) * 4 +
       getModuleBoost(routeNode.filePath ?? "", moduleIntents) +
+      getExactEntityRouteBoost(routeNode.label, routeNode.filePath ?? "", exactEntityHints) +
       (graphSeedNodeIds.has(routeNode.id) ? 30 : 0) +
       (functionalFocus ? 36 : 12) +
       getInfrastructureRoutePenalty(routeNode.filePath ?? "", infrastructureFocus) +
@@ -526,7 +538,10 @@ export function runResearch(input: ResearchInput): ResearchReport {
   }
 
   for (const moduleNode of graphModules) {
-    const score = scoreTextGroups(moduleNode.label, tokenGroups) * 14 + (graphSeedNodeIds.has(moduleNode.id) ? 16 : 0);
+    const score =
+      scoreTextGroups(moduleNode.label, tokenGroups) * 14 +
+      getExactEntityModuleBoost(moduleNode.label, exactEntityHints) +
+      (graphSeedNodeIds.has(moduleNode.id) ? 16 : 0);
 
     if (score <= 0) {
       continue;
@@ -541,10 +556,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
     });
   }
 
-  let evidence = [...fileEvidence, ...symbolEvidence]
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 12)
-    .map((item) => classifyReferenceOrigin(item, input));
+  let evidence = selectTopEvidence([...fileEvidence, ...symbolEvidence], input);
 
   // Bolt-on Fact Store стадия — строго после classifyReferenceOrigin (иначе
   // backfill-элементы получили бы origin "baseline" вместо "recalled") и до
@@ -695,6 +707,68 @@ function applyKnownFacts(
     evidence: [...reinforced, ...backfill].sort((left, right) => right.score - left.score),
     reinforcedCount,
   };
+}
+
+function selectTopEvidence(
+  candidates: ScoredReference[],
+  input: ResearchInput,
+  limit = 12,
+): ScoredReference[] {
+  const sorted = [...candidates].sort((left, right) => right.score - left.score);
+  const selected: ScoredReference[] = [];
+  const perFileCount = new Map<string, number>();
+  let fileAnchors = 0;
+
+  for (const candidate of sorted) {
+    if (selected.length >= limit) {
+      break;
+    }
+
+    const normalized = classifyReferenceOrigin(candidate, input);
+    const filePath = normalized.filePath ?? "";
+    const currentFileCount = filePath ? perFileCount.get(filePath) ?? 0 : 0;
+    const isFileBacked = Boolean(filePath);
+    const isNearTopCandidate = selected.length < Math.min(6, limit);
+    const hasStrongScore = normalized.score >= 40;
+
+    if (
+      isFileBacked
+      && currentFileCount >= 1
+      && fileAnchors < 4
+      && isNearTopCandidate
+      && !hasStrongScore
+    ) {
+      continue;
+    }
+
+    selected.push(normalized);
+
+    if (isFileBacked) {
+      perFileCount.set(filePath, currentFileCount + 1);
+
+      if (currentFileCount === 0) {
+        fileAnchors += 1;
+      }
+    }
+  }
+
+  if (selected.length >= limit) {
+    return selected;
+  }
+
+  for (const candidate of sorted) {
+    if (selected.length >= limit) {
+      break;
+    }
+
+    if (selected.some((item) => item.id === candidate.id)) {
+      continue;
+    }
+
+    selected.push(classifyReferenceOrigin(candidate, input));
+  }
+
+  return selected;
 }
 
 function classifyReferenceOrigin(item: ScoredReference, input: ResearchInput): ScoredReference {
@@ -1873,6 +1947,34 @@ function buildTokenGroups(task: string): string[][] {
   return [...standaloneGroups, ...compoundGroups, ...aliasGroups];
 }
 
+function extractExactEntityHints(task: string): ExactEntityHint[] {
+  return task
+    .split(/[^A-Za-z0-9_/-]+/)
+    .filter(Boolean)
+    .map((rawToken) => {
+      const parts = rawToken
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+        .split(/[^A-Za-z0-9а-яё]+/i)
+        .map((part) => part.trim().toLowerCase())
+        .filter((part) => part.length >= 2);
+      const compact = parts.join("");
+
+      return {
+        raw: rawToken,
+        compact,
+        parts,
+      };
+    })
+    .filter((hint) => {
+      if (hint.parts.length >= 2) {
+        return true;
+      }
+
+      return /[A-Z]/.test(hint.raw) && hint.compact.length >= 6;
+    });
+}
+
 function isInfrastructureQuestion(tokens: string[]): boolean {
   return tokens.some((token) =>
     [
@@ -1907,6 +2009,33 @@ function isInfrastructureQuestion(tokens: string[]): boolean {
       "ключи",
     ].includes(token),
   );
+}
+
+function getExactEntityMatchStrength(text: string, hints: ExactEntityHint[]): number {
+  if (!text || hints.length === 0) {
+    return 0;
+  }
+
+  const normalized = text.toLowerCase();
+  let best = 0;
+
+  for (const hint of hints) {
+    if (hint.compact && normalized.includes(hint.compact)) {
+      best = Math.max(best, 3);
+      continue;
+    }
+
+    if (hint.parts.length >= 2 && hint.parts.every((part) => normalized.includes(part))) {
+      best = Math.max(best, 2);
+      continue;
+    }
+
+    if (hint.parts.some((part) => normalized.includes(part))) {
+      best = Math.max(best, 1);
+    }
+  }
+
+  return best;
 }
 
 function isLocalizationInventoryQuestion(tokens: string[]): boolean {
@@ -2157,6 +2286,68 @@ function getModuleBoost(filePath: string, moduleIntents: ModuleIntentMatch[]): n
     if (filePath.toLowerCase().includes(intent.module.toLowerCase())) {
       return Math.max(18 - index * 4, 4);
     }
+  }
+
+  return 0;
+}
+
+function getExactEntityFileBoost(filePath: string, hints: ExactEntityHint[]): number {
+  const strength = getExactEntityMatchStrength(filePath, hints);
+
+  if (strength >= 3) {
+    return 42;
+  }
+
+  if (strength === 2) {
+    return 20;
+  }
+
+  return 0;
+}
+
+function getExactEntitySymbolBoost(symbol: IndexSymbol, hints: ExactEntityHint[]): number {
+  const label = `${symbol.containerName ? `${symbol.containerName}.` : ""}${symbol.name}`;
+  const labelStrength = getExactEntityMatchStrength(label, hints);
+  const pathStrength = getExactEntityMatchStrength(symbol.filePath, hints);
+  const strength = Math.max(labelStrength, pathStrength);
+
+  if (strength >= 3) {
+    return 56;
+  }
+
+  if (strength === 2) {
+    return 28;
+  }
+
+  return 0;
+}
+
+function getExactEntityRouteBoost(label: string, filePath: string, hints: ExactEntityHint[]): number {
+  const strength = Math.max(
+    getExactEntityMatchStrength(label, hints),
+    getExactEntityMatchStrength(filePath, hints),
+  );
+
+  if (strength >= 3) {
+    return 26;
+  }
+
+  if (strength === 2) {
+    return 12;
+  }
+
+  return 0;
+}
+
+function getExactEntityModuleBoost(label: string, hints: ExactEntityHint[]): number {
+  const strength = getExactEntityMatchStrength(label, hints);
+
+  if (strength >= 3) {
+    return 18;
+  }
+
+  if (strength === 2) {
+    return 8;
   }
 
   return 0;
@@ -3593,4 +3784,3 @@ function deriveBroadEntryPoints(input: ResearchInput, topFiles: string[]): strin
 
   return candidates.filter((value, index, list) => list.indexOf(value) === index).slice(0, 8);
 }
-

@@ -33,7 +33,11 @@
 - Functional Research MVP поверх structural pipeline
 - Context Builder Evolution pass с explainable ranking
 - Graph core evolution toward persistent canonical model
-- Persistent graph storage в Neo4j (первый шаг Slice 4 из `008-next-generation-architecture.md`); PostgreSQL выведен из проекта, Project/Provider перенесены на Neo4j
+- Persistent graph storage в Neo4j (первый шаг Slice 4 из `008-next-generation-architecture.md`); конфигурационные сущности (`Project`, `ProjectPath`, `Provider`) остаются в PostgreSQL, а project intelligence и graph snapshot — в Neo4j
+- Question-run retrieval hardening для больших baseline-driven репозиториев:
+  - direct entity/symbol/path matches больше не тонут в широком `graph-neighbor` expansion;
+  - selective workspace slice теперь резервирует budget под точное сущностное ядро и только затем дозированно расширяется через graph neighbors;
+  - устранён перекос `ChiroNotes` vs `AcuNotes`, найденный на живом stress-тесте magendamd.
 
 ### Сейчас в фокусе
 
@@ -43,6 +47,11 @@
 - Подготовка controlled execution runtime
 - Усиление контрактов данных между API, артефактами и UI
 - Продолжение Slice 4 (`008-next-generation-architecture.md`): переход от единого перезаписываемого graph snapshot к snapshot+overlay модели по коммитам; content-addressing индексатора по git blob hash
+- Agent-like runtime/UX для длинных прогонов на больших репозиториях:
+  - чат не должен падать по client timeout во время long-running research;
+  - пользователь должен видеть живой статус работы и не терять активный run;
+  - composer и конфликтующие действия должны блокироваться, пока текущий project-thinking цикл не завершён.
+  - первый UX-hardening pass уже сделан: transient polling timeouts больше не считаются фатальным падением run, а chat surface блокируется на время активного thinking-цикла.
 
 ## Следующие этапы
 
