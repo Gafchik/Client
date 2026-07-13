@@ -172,6 +172,34 @@ export async function loadPipelineRunStatus(appRootPath: string, runId: string):
   }
 }
 
+function markStatusInterrupted(status: PipelineRunStatus, reason: string, stageDetails: string): PipelineRunStatus {
+  return {
+    ...status,
+    status: "failed",
+    updatedAt: new Date().toISOString(),
+    errorMessage: reason,
+    stages: status.stages.map((stage) =>
+      stage.status === "running"
+        ? {
+            ...stage,
+            status: "failed",
+            completedAt: new Date().toISOString(),
+            details: stageDetails,
+          }
+        : stage,
+    ),
+    resumeContext: {
+      ...(status.resumeContext ?? {
+        providerBaseUrl: "",
+        providerModel: "",
+        canResumeFromStart: true,
+        resumeAttempts: 0,
+      }),
+      canResumeFromStart: true,
+    },
+  };
+}
+
 export async function bootstrapPipelineRunStatuses(appRootPath: string): Promise<void> {
   await cleanupExpiredPipelineStatuses(appRootPath);
   const directory = getPipelineStatusDirectory(appRootPath);
@@ -188,36 +216,49 @@ export async function bootstrapPipelineRunStatuses(appRootPath: string): Promise
       const status = await loadPipelineRunStatus(appRootPath, runId);
 
       if (status && (status.status === "queued" || status.status === "running")) {
-        updateRunStatus(runId, {
-          ...status,
-          status: "failed",
-          updatedAt: new Date().toISOString(),
-          errorMessage: "API был перезапущен во время выполнения. Run можно безопасно перезапустить с начала.",
-          stages: status.stages.map((stage) =>
-            stage.status === "running"
-              ? {
-                  ...stage,
-                  status: "failed",
-                  completedAt: new Date().toISOString(),
-                  details: "Run был прерван перезапуском API. Доступен resume-from-start.",
-                }
-              : stage,
+        updateRunStatus(
+          runId,
+          markStatusInterrupted(
+            status,
+            "API был перезапущен во время выполнения. Run можно безопасно перезапустить с начала.",
+            "Run был прерван перезапуском API. Доступен resume-from-start.",
           ),
-          resumeContext: {
-            ...(status.resumeContext ?? {
-              providerBaseUrl: "",
-              providerModel: "",
-              canResumeFromStart: true,
-              resumeAttempts: 0,
-            }),
-            canResumeFromStart: true,
-          },
-        });
+        );
       }
     }
   } catch {
     // ignore missing status directory during bootstrap
   }
+}
+
+// Вызывается из обработчика SIGINT/SIGTERM (см. server.ts) до попытки
+// закрыть процесс. Синхронное завершение долгого research/graph/index на
+// большом репозитории не прерывается сигналом мгновенно (см. server.ts про
+// hard-timeout), поэтому здесь мы честно помечаем то, что уже отслеживается
+// в памяти этого процесса, как прерванное — чтобы UI не показывал "running"
+// для run'а, чей процесс на самом деле уже умер, до следующего bootstrap.
+export async function markInFlightRunsInterrupted(): Promise<void> {
+  const pending: Promise<void>[] = [];
+
+  for (const [runId, status] of runStore.entries()) {
+    if (status.status !== "queued" && status.status !== "running") {
+      continue;
+    }
+
+    const appRootPath = runAppRootStore.get(runId);
+    const interrupted = markStatusInterrupted(
+      status,
+      "Сервер был остановлен во время выполнения. Run можно безопасно перезапустить с начала.",
+      "Run был прерван остановкой сервера. Доступен resume-from-start.",
+    );
+    runStore.set(runId, interrupted);
+
+    if (appRootPath) {
+      pending.push(persistRunStatus(appRootPath, interrupted));
+    }
+  }
+
+  await Promise.allSettled(pending);
 }
 
 async function executePipelineRun(request: PipelineExecutionRequest): Promise<void> {
