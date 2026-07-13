@@ -2246,6 +2246,14 @@ function isModelSchemaQuestion(tokens: string[]): boolean {
       "свойства",
       "отношение",
       "отношения",
+      "table",
+      "tables",
+      "таблица",
+      "таблицы",
+      "таблице",
+      "таблицу",
+      "таблицей",
+      "таблиц",
     ].includes(token),
   );
 }
@@ -2378,17 +2386,26 @@ function escapeRegExp(value: string): string {
 }
 
 function getModuleBoost(filePath: string, moduleIntents: ModuleIntentMatch[]): number {
+  // Суммируем, а не возвращаем по первому совпадению: широкий домен
+  // ("model-schema" матчит вообще любой файл модели) не должен глушить более
+  // специфичный ("user") только потому, что он выше по общему score задачи.
+  // Файл, попавший сразу в оба — и есть та самая нужная сущность среди
+  // однотипных соседей, и должен получить накопленный бонус, а не только от
+  // самого широкого домена.
+  let total = 0;
+
   for (const [index, intent] of moduleIntents.entries()) {
     if (intent.matchedFiles.includes(filePath)) {
-      return Math.max(32 - index * 8, 8);
+      total += Math.max(32 - index * 8, 8);
+      continue;
     }
 
     if (filePath.toLowerCase().includes(intent.module.toLowerCase())) {
-      return Math.max(18 - index * 4, 4);
+      total += Math.max(18 - index * 4, 4);
     }
   }
 
-  return 0;
+  return total;
 }
 
 function getExactEntityFileBoost(filePath: string, hints: ExactEntityHint[]): number {

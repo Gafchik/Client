@@ -175,8 +175,9 @@ export function registerBuiltinQuestionTypes(): void {
     label: "Schema Inspection",
     description: "Вопросы о структуре данных, полях модели, миграциях",
     patterns: [
-      { regex: /\b(что хранит|поля|структура|schema|fields|columns|attributes|properties)\b/i, weight: 95 },
-      { regex: /\b(модель|model|entity)\b.*\b(хранит|содержит|имеет|has|contains)\b/i, weight: 90 },
+      { regex: /\b(что хранит|поля|структура|schema|fields|columns|attributes|properties|таблиц[а-яё]*|table|tables|колонк[а-яё]*|column)\b/i, weight: 95 },
+      { regex: /\b(модель|model|entity|таблиц[а-яё]*|table)\b.*\b(хранит|содержит|имеет|has|contains)\b/i, weight: 90 },
+      { regex: /\b(информаци[а-яё]*|данн[а-яё]*)\b.*\b(хранит[а-яё]*|содержит[а-яё]*)\b/i, weight: 88 },
       { regex: /\b(fillable|hidden|casts|relations?|relationships?)\b/i, weight: 85 },
     ],
     defaultSearchProfiles: ["storage-topology"],
