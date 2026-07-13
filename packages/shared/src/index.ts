@@ -1050,6 +1050,8 @@ const RUSSIAN_TECH_TRANSLIT_STEMS: Array<[stem: string, latin: string]> = [
   ["сессия", "session"],
   ["кэш", "cache"],
   ["кеш", "cache"],
+  ["юзер", "user"],
+  ["профил", "profile"],
 ];
 
 export function expandRussianTechTransliteration(tokens: string[]): string[] {

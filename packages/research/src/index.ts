@@ -561,7 +561,7 @@ export function runResearch(input: ResearchInput): ResearchReport {
   // backfill-элементы получили бы origin "baseline" вместо "recalled") и до
   // любых нижестоящих вычислений (findings/confidence/evidenceSummary их
   // автоматически подхватывают, т.к. читают `evidence` дальше по функции).
-  const factApplication = applyKnownFacts(evidence, input.knownFacts, dominantModule);
+  const factApplication = applyKnownFacts(evidence, input.knownFacts, dominantModule, tokenGroups);
   evidence = factApplication.evidence;
 
   const topFiles = evidence.filter((item) => item.filePath).map((item) => item.filePath as string);
@@ -633,6 +633,7 @@ function applyKnownFacts(
   evidence: ScoredReference[],
   knownFacts: ProjectFact[] | undefined,
   dominantModule: string,
+  tokenGroups: string[][],
 ): { evidence: ScoredReference[]; reinforcedCount: number } {
   if (!knownFacts || knownFacts.length === 0) {
     return { evidence, reinforcedCount: 0 };
@@ -671,11 +672,23 @@ function applyKnownFacts(
   const backfill: ScoredReference[] = [];
 
   if (reinforced.length < 4) {
+    // fact.category — это dominantModule ТОГО, более раннего вопроса, который
+    // породил факт ("model-schema" и т.п.) — широкий домен, а не конкретная
+    // сущность. Один только category === dominantModule раньше означал: любой
+    // факт из ЛЮБОГО прошлого вопроса в том же широком домене подмешивался
+    // как evidence в СОВСЕМ другой вопрос того же домена (спросили про
+    // ConsoleAlias, потом про User — оба "model-schema", факт про
+    // ConsoleAlias прорастал в ответ про User). Совпадение категории теперь
+    // только предварительный дешёвый фильтр; реально попасть в backfill факт
+    // может, только если его содержимое ещё и пересекается с конкретными
+    // токенами ТЕКУЩЕГО вопроса — то есть он действительно про то, что
+    // спросили, а не просто "того же типа".
     const relevantFacts = knownFacts.filter(
       (fact) =>
         fact.category === dominantModule
         && fact.status !== "deprecated"
-        && fact.filePaths.some((filePath) => !matchedFilePaths.has(filePath)),
+        && fact.filePaths.some((filePath) => !matchedFilePaths.has(filePath))
+        && scoreTextGroups(`${fact.statement} ${fact.filePaths.join(" ")}`, tokenGroups) > 0,
     );
 
     for (const fact of relevantFacts) {
@@ -2018,7 +2031,7 @@ function buildTokenGroups(task: string): string[][] {
 }
 
 function extractExactEntityHints(task: string): ExactEntityHint[] {
-  return task
+  const latinHints = task
     .split(/[^A-Za-z0-9_/-]+/)
     .filter(Boolean)
     .map((rawToken) => {
@@ -2043,6 +2056,20 @@ function extractExactEntityHints(task: string): ExactEntityHint[] {
 
       return /[A-Z]/.test(hint.raw) && hint.compact.length >= 6;
     });
+
+  // Латинское имя сущности в вопросе даёт точный hint автоматически (выше).
+  // Русское фонетическое заимствование ("юзера", "алиаса") — синтаксически
+  // невидимо для той логики: split режет ровно по кириллице, так что
+  // кириллическое слово даже не становится rawToken. Без отдельного прохода
+  // "модель юзера" никогда не получала бы того же приоритета, что и "User"
+  // в англоязычной формулировке того же вопроса — только потому что слово
+  // написано другим алфавитом.
+  const cyrillicTokens = tokenize(task).filter((token) => /[а-яё]/i.test(token));
+  const translitHints: ExactEntityHint[] = expandRussianTechTransliteration(cyrillicTokens)
+    .filter((token) => !cyrillicTokens.includes(token) && token.length >= 3)
+    .map((latin) => ({ raw: latin, compact: latin, parts: [latin] }));
+
+  return [...latinHints, ...translitHints];
 }
 
 function isInfrastructureQuestion(tokens: string[]): boolean {

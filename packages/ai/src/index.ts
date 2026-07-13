@@ -650,7 +650,12 @@ function resolveQuestionType(task: string, research: ResearchReport): string {
     normalized.includes("где")
     || normalized.includes("where")
     || normalized.includes("используется")
-    || normalized.includes("хран")
+    // "хран" — под "где хранится"/"что хранит", но это же substring
+    // "сохранение"/"сохраняет"/"сохранить" (save) — совсем другой смысл:
+    // не "где лежит", а "как проходит сам процесс сохранения". Без
+    // исключения "расскажи как работает сохранение X" тоже уходил в
+    // location и получал "вот файл" вместо разбора механизма.
+    || (normalized.includes("хран") && !normalized.includes("сохран"))
     || normalized.includes("лежит")
   ) {
     return "location";
