@@ -152,7 +152,14 @@ interface AnswerBrief {
 }
 
 const PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
-const PROVIDER_MAX_ATTEMPTS = 3;
+// Было 3 — но validateEvidence может вызываться до 3 раз за один run
+// (initial + MAX_VALIDATION_REFINEMENT_ITERATIONS доуточнения, см.
+// pipeline-runner.ts), и КАЖДЫЙ вызов сам по себе мог уйти в 3 попытки по
+// 25с — в худшем случае почти 4 минуты retry на один интерактивный вопрос
+// при деградации провайдера (живой репродукт: Nemotron/rout.my зависал
+// именно так). 2 попытки всё ещё переживают единичный transient-сбой, но
+// вдвое снижают worst-case задержку одного вызова.
+const PROVIDER_MAX_ATTEMPTS = 2;
 const PROVIDER_BASE_BACKOFF_MS = 1_200;
 const VALIDATOR_MAX_ACTIONS = 3;
 const VALIDATOR_HIGH_READINESS = 78;

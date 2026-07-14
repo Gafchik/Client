@@ -487,6 +487,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
             dominantModule: priorConversationTurn.research.dominantModule,
             evidence: priorConversationTurn.research.evidence,
             moduleIntents: priorConversationTurn.research.moduleIntents,
+            intentClass: priorConversationTurn.research.intentClass,
+            strategyKey: priorConversationTurn.research.strategyKey,
+            queryProfileKey: priorConversationTurn.research.queryProfileKey,
           },
         }
       : {}),
@@ -546,6 +549,14 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   });
   await yieldToEventLoop();
 
+  // Раньше у validation loop (LLM-проверка evidence + до
+  // MAX_VALIDATION_REFINEMENT_ITERATIONS раундов доуточнения, каждый —
+  // отдельный LLM-вызов с retry/backoff до PROVIDER_MAX_ATTEMPTS попыток)
+  // не было своей стадии — она "пряталась" между `context` и `plan`, и при
+  // деградации/таймаутах внешнего провайдера пользователь видел статичную
+  // метку "Контекст" сколько угодно долго без единого признака прогресса.
+  // Живой репродукт: run завис на несколько минут именно в этом промежутке.
+  const validationStartedAt = startStage(runId, "validation");
   const validationLoop = await runValidationLoop({
     runId,
     task,
@@ -569,6 +580,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       ...backgroundState.diagnostics,
     ],
   });
+  completeStage(
+    runId,
+    "validation",
+    validationStartedAt,
+    `Проверка ответа завершена за ${validationLoop.validationHistory.length} раунд(а/ов): статус ${validationLoop.validation.status}, readiness ${validationLoop.validation.readinessScore}%.`,
+  );
   updatePartialArtifacts(runId, {
     research: validationLoop.research,
     impact: validationLoop.impact,
@@ -760,6 +777,7 @@ function createInitialStages(): PipelineStage[] {
     createPendingStage("research", "Исследование", now),
     createPendingStage("impact", "Анализ влияния", now),
     createPendingStage("context", "Контекст", now),
+    createPendingStage("validation", "Проверка ответа", now),
     createPendingStage("plan", "План", now),
     createPendingStage("preview", "Превью выполнения", now),
     createPendingStage("runtime", "Execution Runtime", now),
@@ -838,6 +856,24 @@ function startStage(runId: string, stageKey: PipelineStage["key"]): string {
   });
 
   return now;
+}
+
+// Обновляет только видимую метку текущей стадии, не трогая её status/timestamps
+// (стадия остаётся "running") — для стадий с несколькими внутренними шагами
+// (см. runValidationLoop), где без этого пользователь видит статичную метку
+// сколько угодно долго, пока идёт несколько последовательных LLM-вызовов.
+function updateStageLabel(runId: string, stageKey: PipelineStage["key"], label: string): void {
+  const current = runStore.get(runId);
+
+  if (!current) {
+    return;
+  }
+
+  updateRunStatus(runId, {
+    ...current,
+    updatedAt: new Date().toISOString(),
+    currentStageLabel: label,
+  });
 }
 
 function completeStage(runId: string, stageKey: PipelineStage["key"], startedAt: string, details: string): void {
@@ -1273,6 +1309,7 @@ async function runValidationLoop(input: {
     priorActions,
     remainingIterationBudget: MAX_VALIDATION_REFINEMENT_ITERATIONS,
   });
+  updateStageLabel(input.runId, "validation", "Проверяю, отвечает ли найденное на вопрос...");
   let currentValidation = await validateEvidence({
     packet: currentPacket,
     providerBaseUrl: input.providerBaseUrl,
@@ -1285,6 +1322,12 @@ async function runValidationLoop(input: {
     if (currentValidation.status !== "needs-focused-research") {
       break;
     }
+
+    updateStageLabel(
+      input.runId,
+      "validation",
+      `Данных не хватает — доуточняю (раунд ${iteration} из ${MAX_VALIDATION_REFINEMENT_ITERATIONS})...`,
+    );
 
     const request = buildFocusedResearchRequest({
       runId: input.runId,

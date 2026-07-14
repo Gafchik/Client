@@ -60,6 +60,9 @@ interface ResearchInput {
     dominantModule: string;
     evidence: ScoredReference[];
     moduleIntents: ModuleIntentMatch[];
+    intentClass: ResearchIntentClass;
+    strategyKey: ResearchStrategyKey;
+    queryProfileKey: ResearchQueryProfileKey;
   };
 }
 
@@ -415,7 +418,26 @@ export function runResearch(input: ResearchInput): ResearchReport {
   const exactEntityHints = extractExactEntityHints(input.task);
   const task = tokens.join(" ");
   const classification = questionClassifier.classify(task);
-  const routing = mapClassificationToRouting(classification);
+  const ownRouting = mapClassificationToRouting(classification);
+  // Короткий follow-up без единого доменного слова ("что в себе хранят?")
+  // классифицируется в broad-unknown сам по себе — это верно для ОДИНОЧНОГО
+  // вопроса, но не для продолжения диалога: наследование одного только
+  // dominantModule (см. ниже) не сужает сам ОБЪЁМ поиска, потому что
+  // broadFocus управляет seed-узлами графа/scoring-режимом на уровне всей
+  // функции, а не просто текстовой меткой. Живой репродукт: "как сохраняются
+  // консольные алиасы?" (dominantModule=config) → "что в себе хранят?" без
+  // наследования strategy ушёл в broad-scan по всему репозиторию и потерял
+  // ConsoleAlias.php среди случайных auth/billing/profiles routes. Наследуем
+  // ВСЮ routing-стратегию предыдущей реплики, а не только dominantModule.
+  const routingInheritedFromPriorTurn =
+    ownRouting.intentClass === "broad-unknown" && Boolean(input.priorTurn) && input.priorTurn?.intentClass !== "broad-unknown";
+  const routing = routingInheritedFromPriorTurn && input.priorTurn
+    ? {
+        intentClass: input.priorTurn.intentClass,
+        strategyKey: input.priorTurn.strategyKey,
+        queryProfileKey: input.priorTurn.queryProfileKey,
+      }
+    : ownRouting;
   const broadFocus = routing.intentClass === "broad-unknown";
   const infrastructureFocus = isInfrastructureQuestion(tokens);
   const localizationInventoryFocus = isLocalizationInventoryQuestion(tokens);
@@ -450,9 +472,21 @@ export function runResearch(input: ResearchInput): ResearchReport {
   // tie-breaker, когда текущий вопрос сам по себе слабый/широкий (короткий
   // follow-up вроде "а нужно ли подтверждать имейл при этом?" без явных
   // доменных слов не должен терять тему, заданную предыдущим вопросом).
+  //
+  // Если routing уже унаследован от предыдущей реплики (routingInheritedFromPriorTurn) —
+  // значит собственная классификация ЭТОГО вопроса уже признана ненадёжной
+  // (broad-unknown), и moduleIntents[0] на этом же слабом сигнале — тот же
+  // шум, а не независимое подтверждение. Живой репродукт: "что в себе
+  // хранят?" после "как сохраняются консольные алиасы?" — routing корректно
+  // унаследовал config-inventory, но moduleIntents[0] на пустом сигнале
+  // качнулся в "auth", и dominantModule стал auth вместо унаследованного
+  // config, хотя question явно про то же самое. Раз routing уже унаследован —
+  // dominantModule наследуется вместе с ним безусловно, без обращения к
+  // moduleIntents вообще.
   const ownDominantModule = ctx.broadFocus ? "не определён" : moduleIntents[0]?.module ?? "не определён";
-  const dominantModule =
-    ownDominantModule === "не определён" && input.priorTurn && input.priorTurn.dominantModule !== "не определён"
+  const dominantModule = routingInheritedFromPriorTurn && input.priorTurn
+    ? input.priorTurn.dominantModule
+    : ownDominantModule === "не определён" && input.priorTurn && input.priorTurn.dominantModule !== "не определён"
       ? input.priorTurn.dominantModule
       : ownDominantModule;
   const functionalFocus = isFunctionalQuestion(ctx.tokens);
@@ -790,6 +824,7 @@ function applyPriorTurnEvidence(
     return evidence;
   }
 
+  const topicContinues = priorTurn.dominantModule !== "не определён" && priorTurn.dominantModule === dominantModule;
   const matchedFilePaths = new Set(evidence.filter((item) => item.filePath).map((item) => item.filePath as string));
   let reinforcedCount = 0;
   const reinforced = evidence.map((item) => {
@@ -798,10 +833,16 @@ function applyPriorTurnEvidence(
     }
 
     reinforcedCount += 1;
-    return { ...item, score: item.score + 5 };
+    // Слабый +5 годится, когда тема лишь ЧАСТИЧНО пересекается (та же
+    // категория, но не факт, что тот же смысл) — но когда тема ПРОДОЛЖАЕТСЯ
+    // (topicContinues), файл уже был подтверждён как релевантный ИМЕННО
+    // этому разговору, а не просто домену. Живой репродукт: "что в себе
+    // хранят?" после "как сохраняются консольные алиасы?" — ConsoleAlias.php
+    // был в топ-evidence турна 1, но +5 не хватало, чтобы перевесить общий
+    // config/app.php, который для generic config-inventory профиля почти
+    // всегда набирает высокий baseline score независимо от вопроса.
+    return { ...item, score: item.score + (topicContinues ? 30 : 5) };
   });
-
-  const topicContinues = priorTurn.dominantModule !== "не определён" && priorTurn.dominantModule === dominantModule;
 
   if (reinforcedCount >= 4 && !topicContinues) {
     return reinforced;

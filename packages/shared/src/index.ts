@@ -851,7 +851,7 @@ export interface KnowledgeSaveResult {
 }
 
 export interface PipelineStage {
-  key: "workspace" | "repository" | "index" | "graph" | "research" | "impact" | "context" | "plan" | "preview" | "runtime" | "answer" | "knowledge";
+  key: "workspace" | "repository" | "index" | "graph" | "research" | "impact" | "context" | "validation" | "plan" | "preview" | "runtime" | "answer" | "knowledge";
   label: string;
   status: "pending" | "running" | "completed" | "failed";
   startedAt: string;
