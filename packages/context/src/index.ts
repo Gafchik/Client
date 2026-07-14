@@ -20,6 +20,8 @@ interface BuildContextInput {
   graph: GraphState;
   research: ResearchReport;
   impact: ImpactReport;
+  /** includedFiles предыдущей реплики этого же диалога (см. pipeline-runner.ts) — лёгкий bias, не жёсткий приоритет. */
+  priorIncludedFiles?: string[];
 }
 
 const TOKEN_BUDGET = 6000;
@@ -264,6 +266,14 @@ function rankCandidate(
     score += 42;
   }
 
+  // Файл уже был включён в контекст предыдущей реплики этого диалога —
+  // небольшой bias в пользу continuity, а не жёсткий приоритет: если новый
+  // вопрос реально сменил тему, сильные структурные/impact-сигналы выше всё
+  // равно перевесят.
+  if (filePath && input.priorIncludedFiles?.includes(filePath)) {
+    score += 20;
+  }
+
   if (candidate.label && focusZones.some((zone) => candidate.label.toLowerCase().includes(zone.toLowerCase()))) {
     score += 34;
   }
@@ -464,10 +474,8 @@ function scoreInfrastructurePath(
     candidateText.includes("host")
     || candidateText.includes("port")
     || candidateText.includes("username")
-    || candidateText.includes("password_uuid")
-    || candidateText.includes("passphrase_uuid")
-    || candidateText.includes("path_to_private_key")
-    || candidateText.includes("forwarding_ports")
+    || candidateText.includes("private_key")
+    || (candidateText.includes("forwarding") && candidateText.includes("port"))
   ) {
     score += 28;
   }
@@ -495,8 +503,6 @@ function scoreInfrastructurePath(
   if (
     normalized.includes("/vault/")
     && !normalized.includes("credential")
-    && !candidateText.includes("password_uuid")
-    && !candidateText.includes("passphrase_uuid")
     && !candidateText.includes("private_key")
   ) {
     score -= 18;
@@ -505,14 +511,13 @@ function scoreInfrastructurePath(
   if (
     normalized.includes("/migrations/")
     && !candidateText.includes("servers")
-    && !candidateText.includes("server_credential_links")
     && !candidateText.includes("passwords")
     && !candidateText.includes("private_key")
   ) {
     score -= 26;
   }
 
-  if (candidate.label.toLowerCase().includes("servercredentiallink") || candidate.label.toLowerCase().includes("password_uuid")) {
+  if (candidate.label.toLowerCase().includes("server") && candidate.label.toLowerCase().includes("credential")) {
     score += 18;
   }
 
@@ -611,10 +616,6 @@ function extractZonesFromText(value: string): string[] {
   const normalized = value.toLowerCase();
   const zones: string[] = [];
 
-  if (normalized.includes("web-login")) {
-    zones.push("web-login");
-  }
-
   if (normalized.includes("auth")) {
     zones.push("auth");
   }
@@ -638,10 +639,6 @@ function extractZonesFromPath(filePath: string): string[] {
   const normalized = filePath.toLowerCase();
   const zones: string[] = [];
 
-  if (normalized.includes("web-login")) {
-    zones.push("web-login");
-  }
-
   if (normalized.includes("/auth/") || normalized.includes("authcontroller")) {
     zones.push("auth");
   }
@@ -657,8 +654,8 @@ function extractZonesFromPath(filePath: string): string[] {
   if (
     normalized.includes("/servers/")
     || normalized.includes("/models/server")
-    || normalized.includes("servercredential")
-    || normalized.includes("forwardingport")
+    || (normalized.includes("server") && normalized.includes("credential"))
+    || (normalized.includes("forwarding") && normalized.includes("port"))
   ) {
     zones.push("servers");
   }
@@ -947,8 +944,8 @@ function isStoragePath(filePath: string): boolean {
     || filePath.includes("/migrations/")
     || filePath.includes("/repositories/")
     || filePath.includes("/requests/")
-    || filePath.includes("servercredential")
-    || filePath.includes("forwardingport")
+    || (filePath.includes("server") && filePath.includes("credential"))
+    || (filePath.includes("forwarding") && filePath.includes("port"))
     || filePath.includes("/models/server")
     || filePath.includes("/models/password")
   );

@@ -75,6 +75,14 @@ export async function initializePostgresSchema(): Promise<void> {
       updated_at timestamptz not null
     )
   `);
+  // default_model — какая модель используется по умолчанию для этого провайдера.
+  // Раньше выбор модели нигде не сохранялся в БД и всегда падал на
+  // CLIENT_PROVIDER_MODEL из .env, если вызывающая сторона явно не передала
+  // providerModel в запросе (веб-фронт передавал, но хранил выбор только в
+  // localStorage браузера — не в БД). ALTER ... ADD COLUMN IF NOT EXISTS,
+  // а не отдельный migration runner — тот же идемпотентный подход, что и
+  // create table if not exists выше.
+  await runSql(`alter table providers add column if not exists default_model text not null default ''`);
 
   await runSql(`
     create table if not exists knowledge_catalog (
@@ -93,6 +101,15 @@ export async function initializePostgresSchema(): Promise<void> {
   `);
   await runSql(
     `create index if not exists idx_knowledge_catalog_project on knowledge_catalog(project_root_path, saved_at desc)`,
+  );
+  // conversation_id/turn_index — группировка последовательных question-run в
+  // один диалог (см. loadConversationTurns в packages/knowledge). У первой
+  // реплики conversation_id совпадает с run_id. ALTER ... ADD COLUMN IF NOT
+  // EXISTS — тот же идемпотентный подход, что и для providers.default_model выше.
+  await runSql(`alter table knowledge_catalog add column if not exists conversation_id text`);
+  await runSql(`alter table knowledge_catalog add column if not exists turn_index integer not null default 0`);
+  await runSql(
+    `create index if not exists idx_knowledge_catalog_conversation on knowledge_catalog(conversation_id, turn_index asc)`,
   );
 
   await runSql(`

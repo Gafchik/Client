@@ -12,7 +12,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -42,6 +42,7 @@ import { saveGraphSnapshot } from "./graph-store.js";
 export interface PipelineExecutionRequest {
   runId: string;
   mode: PipelineRunMode;
+  conversationId: string;
   task: string;
   projectPath: string;
   providerBaseUrl: string;
@@ -72,6 +73,7 @@ export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineR
   const initialStatus: PipelineRunStatus = {
     runId: request.runId,
     mode: request.mode,
+    conversationId: request.conversationId,
     task: request.task,
     projectPath: normalizePath(path.resolve(request.projectPath)),
     status: "queued",
@@ -311,7 +313,7 @@ async function executePipelineRun(request: PipelineExecutionRequest): Promise<vo
 }
 
 async function buildPipelineRunResult(request: PipelineExecutionRequest): Promise<PipelineRunResult> {
-  const { runId, mode, task, projectPath, providerBaseUrl, providerModel, providerApiKey, appRootPath } = request;
+  const { runId, mode, conversationId, task, projectPath, providerBaseUrl, providerModel, providerApiKey, appRootPath } = request;
   const overview = await scanWorkspaceOverview(projectPath);
   const largeRepositoryProfile = overview.summary.profile === "large-repository";
   const isQuestionRun = mode === "question-run";
@@ -336,6 +338,16 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
   const projectRootPath = overview.rootPath;
   const projectId = overview.projectId;
+  // Реплики этого же диалога, по порядку — источник prior-turn контекста для
+  // research/context/answer ниже (см. §8 плана: applyPriorTurnEvidence и
+  // conversationTranscript). Отдельно от loadBestBaselineRunArtifact — тот
+  // отвечает только за structural graph/index reuse через background-sync
+  // baseline и никогда не выбирает question-run в качестве previousRun.
+  const conversationTurns = isQuestionRun
+    ? await loadConversationTurns(appRootPath, projectRootPath, conversationId)
+    : [];
+  const priorConversationTurn = conversationTurns[conversationTurns.length - 1] ?? null;
+  const turnIndex = conversationTurns.length;
   const baselineSelection = await loadBestBaselineRunArtifact(appRootPath, projectRootPath, repository);
   const previousRun = isHardResync ? null : baselineSelection.run;
   const latestBackgroundEntry = await loadLatestBackgroundRunCatalogEntry(appRootPath, projectRootPath);
@@ -467,6 +479,17 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     repository,
     backgroundState,
     knownFacts,
+    ...(priorConversationTurn
+      ? {
+          priorTurn: {
+            task: priorConversationTurn.research.task,
+            summary: priorConversationTurn.research.summary,
+            dominantModule: priorConversationTurn.research.dominantModule,
+            evidence: priorConversationTurn.research.evidence,
+            moduleIntents: priorConversationTurn.research.moduleIntents,
+          },
+        }
+      : {}),
   };
   const primaryResearch = runResearch(researchInputForRun);
   const keywordExpansion = await maybeExpandResearchWithTranslatedKeywords(researchInputForRun, primaryResearch, {
@@ -480,7 +503,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     runId,
     "research",
     researchStartedAt,
-    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}, recalled ${initialResearch.evidenceSummary.recalledCount}.${
+    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}, recalled ${initialResearch.evidenceSummary.recalledCount}, из диалога ${initialResearch.evidenceSummary.conversationCount}.${
       keywordExpansion.keywords.length > 0
         ? ` Дополнительно запрошены англоязычные ключевые слова через LLM: ${keywordExpansion.keywords.join(", ")}.`
         : ""
@@ -515,6 +538,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     graph,
     research: initialResearch,
     impact: initialImpact,
+    ...(priorConversationTurn ? { priorIncludedFiles: priorConversationTurn.context.includedFiles } : {}),
   });
   completeStage(runId, "context", contextStartedAt, `Собран контекстный пакет: ${initialContext.selectedChunks.length} фрагментов при бюджете ${initialContext.tokenBudget}.`);
   updatePartialArtifacts(runId, {
@@ -604,6 +628,14 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   });
   await yieldToEventLoop();
 
+  // Компактная история треда для reference resolution в финальном синтезе
+  // ("при регистрации через гугл" отсылает к предыдущему вопросу про Google
+  // OAuth) — последние 3 реплики, чтобы не раздувать промпт на длинных диалогах.
+  const conversationTranscript = conversationTurns.slice(-3).map((turn) => ({
+    task: turn.research.task,
+    directAnswer: turn.answer.summary,
+  }));
+
   const answerStartedAt = startStage(runId, "answer");
   const answer = await buildAnswerPackage({
     runId,
@@ -620,6 +652,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     backgroundState,
     validation,
     validatedAnswerPacket,
+    ...(conversationTranscript.length > 0 ? { conversationTranscript } : {}),
   });
   completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);
   updatePartialArtifacts(runId, {
@@ -631,6 +664,8 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const knowledge = await saveKnowledgeArtifacts({
     runId,
     mode,
+    conversationId,
+    turnIndex,
     task,
     appRootPath,
     workspace,
@@ -664,6 +699,8 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   return {
     runId,
     mode,
+    conversationId,
+    turnIndex,
     project: {
       name: workspace.projectName,
       rootPath: workspace.rootPath,

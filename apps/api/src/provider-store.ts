@@ -14,6 +14,7 @@ export interface SaveProviderInput {
   apiKey: string;
   isActive?: boolean;
   isCurrent?: boolean;
+  defaultModel?: string;
 }
 
 export interface ProviderCatalog {
@@ -32,6 +33,7 @@ interface ProviderRow {
   api_key: string;
   is_active: boolean;
   is_current: boolean;
+  default_model: string;
   created_at: Date;
   updated_at: Date;
 }
@@ -73,6 +75,7 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderRe
   // поэтому nextApiKey здесь всегда plaintext — шифруем непосредственно перед записью.
   const existing = await getProviderById(nextId);
   const nextApiKey = input.apiKey.trim() || existing?.apiKey || "";
+  const nextDefaultModel = input.defaultModel?.trim() || existing?.defaultModel || "";
 
   await withTransaction(async (client) => {
     if (shouldBeCurrent) {
@@ -81,17 +84,18 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderRe
 
     await client.query(
       `
-        insert into providers (id, name, base_url, api_key, is_active, is_current, created_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $7)
+        insert into providers (id, name, base_url, api_key, is_active, is_current, default_model, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $8)
         on conflict (id) do update set
           name = $2,
           base_url = $3,
           api_key = $4,
           is_active = $5,
           is_current = $6,
-          updated_at = $7
+          default_model = $7,
+          updated_at = $8
       `,
-      [nextId, input.name.trim(), input.baseUrl.trim(), encryptSecret(nextApiKey), input.isActive ?? true, shouldBeCurrent, now],
+      [nextId, input.name.trim(), input.baseUrl.trim(), encryptSecret(nextApiKey), input.isActive ?? true, shouldBeCurrent, nextDefaultModel, now],
     );
   });
 
@@ -102,6 +106,25 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderRe
   }
 
   return stripApiKey(saved);
+}
+
+// Модель раньше нигде не сохранялась в БД — /api/pipeline/run всегда падал на
+// CLIENT_PROVIDER_MODEL из .env, если явно не передан providerModel (веб-фронт
+// передавал, но выбор хранился только в localStorage браузера). Отдельная
+// лёгкая функция вместо перегрузки saveProvider() из формы — вызывается
+// каждый раз при смене модели в UI, без переотправки name/baseUrl/apiKey.
+export async function setProviderDefaultModel(id: string, model: string): Promise<ProviderRecord | null> {
+  const existing = await getProviderById(id);
+
+  if (!existing) {
+    return null;
+  }
+
+  const now = new Date().toISOString();
+  await runSql(`update providers set default_model = $1, updated_at = $2 where id = $3`, [model.trim(), now, id]);
+
+  const saved = await getProviderById(id);
+  return saved ? stripApiKey(saved) : null;
 }
 
 export async function setCurrentProvider(id: string): Promise<ProviderRecord | null> {
@@ -161,10 +184,16 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
     };
   }
 
+  // Персистентный выбор модели для этого провайдера (см. setProviderDefaultModel)
+  // перевешивает статичный DEFAULT_RECOMMENDED_MODEL_ID — иначе пользователь
+  // не может реально сменить модель по умолчанию, только переопределять её
+  // на каждый запрос вручную.
+  const recommendedModelId = provider.defaultModel.trim() || DEFAULT_RECOMMENDED_MODEL_ID;
+
   if (!provider.apiKey.trim()) {
     return {
       models: buildFallbackModels(provider.id),
-      recommendedModelId: DEFAULT_RECOMMENDED_MODEL_ID,
+      recommendedModelId,
     };
   }
 
@@ -180,7 +209,7 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
     if (!response.ok) {
       return {
         models: buildFallbackModels(provider.id),
-        recommendedModelId: DEFAULT_RECOMMENDED_MODEL_ID,
+        recommendedModelId,
       };
     }
 
@@ -202,20 +231,20 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
         id,
         label: typeof item.name === "string" && item.name.trim() ? item.name : id,
         providerId: provider.id,
-        ...(id === DEFAULT_RECOMMENDED_MODEL_ID ? { isDefault: true } : {}),
+        ...(id === recommendedModelId ? { isDefault: true } : {}),
       });
     }
 
     return {
       models: models.length ? models : buildFallbackModels(provider.id),
-      recommendedModelId: models.some((item) => item.id === DEFAULT_RECOMMENDED_MODEL_ID)
-        ? DEFAULT_RECOMMENDED_MODEL_ID
-        : models[0]?.id ?? DEFAULT_RECOMMENDED_MODEL_ID,
+      recommendedModelId: models.some((item) => item.id === recommendedModelId)
+        ? recommendedModelId
+        : models[0]?.id ?? recommendedModelId,
     };
   } catch {
     return {
       models: buildFallbackModels(provider.id),
-      recommendedModelId: DEFAULT_RECOMMENDED_MODEL_ID,
+      recommendedModelId,
     };
   }
 }
@@ -228,11 +257,16 @@ async function ensureDefaultProvider(): Promise<void> {
     return;
   }
 
+  // .env здесь используется ровно один раз — как bootstrap-seed для первой
+  // строки в БД, тем же способом, что уже был для baseUrl/apiKey. После этого
+  // источник истины — БД; .env можно менять или убирать, на уже созданного
+  // провайдера это не влияет (см. setProviderDefaultModel для смены модели).
   await saveProvider({
     id: "provider-routmy-primary",
     name: "rout.my",
     baseUrl: process.env.CLIENT_PROVIDER_BASE_URL?.trim() || "https://api.rout.my/v1",
     apiKey: process.env.CLIENT_PROVIDER_API_KEY?.trim() || "",
+    defaultModel: process.env.CLIENT_PROVIDER_MODEL?.trim() || DEFAULT_RECOMMENDED_MODEL_ID,
     isActive: true,
     isCurrent: true,
   });
@@ -249,6 +283,7 @@ function mapProviderRow(row: ProviderRow): ProviderRecord {
     hasApiKey: apiKey.length > 0,
     isActive: Boolean(row.is_active),
     isCurrent: Boolean(row.is_current),
+    defaultModel: row.default_model ?? "",
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
   };

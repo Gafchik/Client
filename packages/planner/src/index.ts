@@ -574,20 +574,6 @@ function uniqueDependencies(values: PlanDependency[]): PlanDependency[] {
 function deriveSemanticPrefix(filePath: string, matchedModule: string | undefined): string | null {
   const normalized = filePath.toLowerCase();
 
-  if (normalized.includes("web-login")) {
-    return "web-login";
-  }
-
-  if (
-    normalized.includes("weblogincontroller") ||
-    normalized.includes("webloginticketservice") ||
-    normalized.includes("ticketservice") ||
-    normalized.includes("/claim") ||
-    normalized.includes("/ticket")
-  ) {
-    return "web-login";
-  }
-
   if (normalized.includes("verifyemail") || normalized.includes("emailverification")) {
     return "email-verification";
   }
@@ -607,8 +593,8 @@ function deriveSemanticPrefix(filePath: string, matchedModule: string | undefine
   if (
     normalized.includes("/servers/")
     || normalized.includes("/models/server")
-    || normalized.includes("servercredential")
-    || normalized.includes("forwardingport")
+    || (normalized.includes("server") && normalized.includes("credential"))
+    || (normalized.includes("forwarding") && normalized.includes("port"))
   ) {
     return "servers";
   }

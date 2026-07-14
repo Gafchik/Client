@@ -33,6 +33,8 @@ import {
 interface SaveKnowledgeInput {
   runId: string;
   mode: PipelineRunResult["mode"];
+  conversationId: string;
+  turnIndex: number;
   task: string;
   appRootPath: string;
   workspace: WorkspaceSnapshot;
@@ -67,6 +69,8 @@ interface PersistedWorkspaceSummary {
 interface PersistedPipelineRunArtifact {
   runId?: string;
   mode?: PipelineRunResult["mode"];
+  conversationId?: string;
+  turnIndex?: number;
   task?: string;
   savedAt?: string;
   project?: PipelineRunResult["project"];
@@ -115,6 +119,8 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
   const artifact = {
     runId: input.runId,
     mode: input.mode,
+    conversationId: input.conversationId,
+    turnIndex: input.turnIndex,
     task: input.task,
     savedAt,
     project: {
@@ -198,8 +204,8 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
   await runSql(
     `
       insert into knowledge_catalog
-        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       on conflict (run_id) do update set
         project_root_path = $2,
         task = $3,
@@ -210,7 +216,9 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
         repository_id = $8,
         branch = $9,
         head_commit = $10,
-        head_fingerprint = $11
+        head_fingerprint = $11,
+        conversation_id = $12,
+        turn_index = $13
     `,
     [
       input.runId,
@@ -224,6 +232,8 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       input.repository.branch ?? null,
       input.repository.headCommit ?? null,
       input.repository.headFingerprint ?? null,
+      input.conversationId,
+      input.turnIndex,
     ],
   );
 
@@ -241,6 +251,29 @@ interface KnowledgeCatalogRow {
   branch: string | null;
   head_commit: string | null;
   head_fingerprint: string | null;
+  conversation_id: string | null;
+  turn_index: number | null;
+}
+
+function mapKnowledgeCatalogRow(row: KnowledgeCatalogRow): KnowledgeCatalogEntry {
+  return {
+    runId: row.run_id,
+    task: row.task,
+    savedAt: new Date(row.saved_at).toISOString(),
+    storagePath: row.storage_path,
+    summary: row.summary,
+    mode: row.mode as PipelineRunMode,
+    ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
+    ...(row.branch ? { branch: row.branch } : {}),
+    ...(row.head_commit ? { headCommit: row.head_commit } : {}),
+    ...(row.head_fingerprint ? { headFingerprint: row.head_fingerprint } : {}),
+    // Старые строки, сохранённые до появления диалогов, conversation_id не
+    // имеют — считаем такую реплику началом своего собственного треда из
+    // одного хода (тем же способом, что normalizePipelineRunArtifact
+    // делает для полного артефакта).
+    conversationId: row.conversation_id ?? row.run_id,
+    turnIndex: row.turn_index ?? 0,
+  };
 }
 
 export async function loadKnowledgeCatalog(_appRootPath: string, projectRootPath: string): Promise<KnowledgeCatalogEntry[]> {
@@ -254,18 +287,59 @@ export async function loadKnowledgeCatalog(_appRootPath: string, projectRootPath
     [projectRootPath],
   );
 
-  return rows.map((row) => ({
-    runId: row.run_id,
-    task: row.task,
-    savedAt: new Date(row.saved_at).toISOString(),
-    storagePath: row.storage_path,
-    summary: row.summary,
-    mode: row.mode as PipelineRunMode,
-    ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
-    ...(row.branch ? { branch: row.branch } : {}),
-    ...(row.head_commit ? { headCommit: row.head_commit } : {}),
-    ...(row.head_fingerprint ? { headFingerprint: row.head_fingerprint } : {}),
-  }));
+  return rows.map(mapKnowledgeCatalogRow);
+}
+
+/**
+ * Все реплики одного диалога, по порядку от первой к последней. В отличие от
+ * loadKnowledgeCatalog (лимит 20, любые mode вперемешку по всему проекту),
+ * здесь фильтр по conversation_id и без общего лимита — диалог может быть
+ * длиннее 20 последних действий проекта (background-sync и другие чаты не
+ * должны вытеснять реплики этого же треда).
+ */
+export async function loadConversationTurns(
+  appRootPath: string,
+  projectRootPath: string,
+  conversationId: string,
+): Promise<PipelineRunResult[]> {
+  const rows = await runSql<KnowledgeCatalogRow>(
+    `
+      select * from knowledge_catalog
+      where project_root_path = $1 and conversation_id = $2
+      order by turn_index asc
+    `,
+    [projectRootPath, conversationId],
+  );
+
+  const results = await Promise.all(
+    rows.map((row) => loadPipelineRunArtifact(appRootPath, projectRootPath, row.run_id)),
+  );
+
+  return results.filter((item): item is PipelineRunResult => Boolean(item));
+}
+
+/** Последняя (по turn_index) уже сохранённая реплика диалога — используется как prior-turn контекст для следующей. */
+export async function loadLatestConversationTurn(
+  appRootPath: string,
+  projectRootPath: string,
+  conversationId: string,
+): Promise<PipelineRunResult | null> {
+  const rows = await runSql<KnowledgeCatalogRow>(
+    `
+      select * from knowledge_catalog
+      where project_root_path = $1 and conversation_id = $2
+      order by turn_index desc
+      limit 1
+    `,
+    [projectRootPath, conversationId],
+  );
+  const row = rows[0];
+
+  if (!row) {
+    return null;
+  }
+
+  return loadPipelineRunArtifact(appRootPath, projectRootPath, row.run_id);
 }
 
 /**
@@ -629,6 +703,10 @@ function normalizePipelineRunArtifact(
   return {
     runId: artifact.runId,
     mode: artifact.mode ?? "question-run",
+    // Старые артефакты (до появления диалогов) не имеют conversationId —
+    // трактуем такую реплику как начало собственного треда из одного хода.
+    conversationId: artifact.conversationId ?? artifact.runId,
+    turnIndex: artifact.turnIndex ?? 0,
     project,
     workspace,
     repository: artifact.repository,

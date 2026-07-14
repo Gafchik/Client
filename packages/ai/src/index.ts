@@ -45,6 +45,13 @@ interface BuildAnswerInput {
   backgroundState?: BackgroundProjectState;
   validation?: ValidationResult;
   validatedAnswerPacket?: ValidatedAnswerPacket;
+  /**
+   * Последние реплики этого же диалога (task + прежний прямой ответ),
+   * от старых к новым — нужно синтезатору, чтобы разрешать ссылки на
+   * предыдущий вопрос ("при этом", "а если так", без повторения контекста).
+   * Только для LLM-пути; deterministic fallback его не использует.
+   */
+  conversationTranscript?: Array<{ task: string; directAnswer: string }>;
 }
 
 interface BuildValidationPacketInput {
@@ -474,10 +481,19 @@ function buildDeterministicValidationResult(packet: ValidationPacket): Validatio
 
 async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): Promise<ProviderValidatorResponse> {
   const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+  // Без `response_format: json_object` — как и в expandTaskSearchKeywords,
+  // часть моделей/роутеров (живой пример: rout.my роутит nvidia/nemotron-3-ultra,
+  // deepseek/deepseek-v4-pro и openai/gpt-5.4-mini на 400 Bad Request при
+  // строгом json-mode, тогда как google/gemini-3.1-flash-lite его принимает)
+  // отвечают 400 без объяснения причины. Из-за этого validateEvidence тихо
+  // проваливался в deterministic fallback для этих моделей на КАЖДОМ вызове —
+  // сама ошибка глоталась в validateEvidence(), так что LLM-путь валидатора
+  // фактически не работал, а выглядело это как "всё ок, просто low confidence".
+  // Просим JSON текстом в промпте и парсим терпимее (вырезаем `{...}` из
+  // ответа на случай code-fence/лишнего текста вокруг), как в keyword-expansion.
   const response = await performProviderRequest(endpoint, input.providerApiKey, {
     model: input.providerModel,
     temperature: 0.1,
-    response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
@@ -487,9 +503,11 @@ async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): P
           "Ты оцениваешь только достаточность уже собранных артефактов.",
           "Research confidence не является истиной, это лишь один из входных сигналов.",
           "Главный вопрос: реально ли собранный evidence отвечает на ТОТ вопрос, который задал пользователь — а не просто на что-то похожее по ключевым словам.",
-          "Верни только JSON с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints, primaryEvidenceLabel, recommendedResearchProfile, recommendedStopReason, rationale.",
+          "Верни ТОЛЬКО JSON без пояснений и без markdown-обрамления, с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints, primaryEvidenceLabel, recommendedResearchProfile, recommendedStopReason, rationale.",
+          "readinessScore — целое число от 0 до 100 (не 0.0-1.0 доля).",
+          "gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints — ВСЕГДА JSON-массив строк, даже если пункт всего один или список пуст ([] в этом случае). Никогда не возвращай одну строку вместо массива.",
           "recommendedActions — закрытый словарь общих сценариев, нельзя придумывать значения вне разрешённого списка.",
-          "missingEntityHints — наоборот, свободный текст: если evidence не бьёт в суть вопроса, назови конкретные сущности/классы/файлы/понятия из вопроса, которых не хватает в evidence и которые стоит поискать отдельно. Не ограничивайся никаким списком — пиши то, что реально нужно найти, своими словами или точным именем из вопроса. Пусто, если evidence уже покрывает вопрос по существу.",
+          "missingEntityHints — наоборот, свободный текст в каждом элементе массива: если evidence не бьёт в суть вопроса, назови конкретные сущности/классы/файлы/понятия из вопроса, которых не хватает в evidence и которые стоит поискать отдельно. Не ограничивайся никаким списком — пиши то, что реально нужно найти, своими словами или точным именем из вопроса. Пустой массив, если evidence уже покрывает вопрос по существу.",
           "primaryEvidenceLabel — среди Evidence в промпте выбери ОДИН элемент, чей label точнее всего отвечает на вопрос по смыслу, а не по формальному score (score — это подсчёт совпадений, не понимание вопроса). Особенно важно, когда несколько evidence одного типа/домена выглядят структурно похоже (например несколько разных Model-файлов) — тогда просто выше по score не значит правильнее по сути. Скопируй label ТОЧНО как он написан в Evidence. Пусто, если нет явного кандидата или все примерно равнозначны.",
         ].join("\n"),
       },
@@ -507,7 +525,29 @@ async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): P
     throw new Error("Provider returned empty validator answer");
   }
 
-  return JSON.parse(content) as ProviderValidatorResponse;
+  const jsonMatch = /\{[\s\S]*\}/.exec(content);
+
+  if (!jsonMatch) {
+    throw new Error("Provider validator answer did not contain a JSON object");
+  }
+
+  return JSON.parse(jsonMatch[0]) as ProviderValidatorResponse;
+}
+
+// candidate.* string[] полями из провайдера мы доверять типу не можем — без
+// строгого response_format-режима модели часто присылают одну строку вместо
+// массива для "свободных" полей. Строка тоже валидный сигнал (один hint),
+// просто её нужно завернуть в массив, а не уронить на `.filter`/`.map`.
+function normalizeToStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string");
+  }
+
+  if (typeof value === "string" && value.trim().length > 0) {
+    return [value];
+  }
+
+  return [];
 }
 
 function normalizeProviderValidationResult(
@@ -543,7 +583,18 @@ function normalizeProviderValidationResult(
     "request-background-refresh",
     "request-runtime-logs",
   ]);
-  const normalizedActions = (candidate.recommendedActions ?? [])
+  // candidate.* поля типизированы как string[] в ProviderValidatorResponse,
+  // но это только TS-аннотация поверх JSON.parse — без строгого
+  // response_format-режима (см. synthesizeValidationWithProvider) модели
+  // регулярно присылают одну строку вместо массива на полях со свободным
+  // текстом (наблюдалось на nemotron-3-ultra, deepseek-v4-pro, gpt-5.4-mini
+  // через rout.my — конкретно на gapSummary и missingEntityHints). `.filter`/
+  // `.map` на строке кидают TypeError, который ловится внешним catch в
+  // validateEvidence() и откатывает ВЕСЬ результат на deterministic fallback —
+  // то есть валидные LLM-поля (recommendedActions, contradictions и т.д.)
+  // тоже терялись из-за одного нестрогого поля. normalizeToStringList терпит
+  // оба варианта.
+  const normalizedActions = normalizeToStringList(candidate.recommendedActions)
     .filter((item): item is ValidationRecommendedAction => validActions.has(item as ValidationRecommendedAction))
     .slice(0, VALIDATOR_MAX_ACTIONS);
 
@@ -560,7 +611,7 @@ function normalizeProviderValidationResult(
     contradictionLevel: isContradictionLevel(candidate.contradictionLevel)
       ? candidate.contradictionLevel
       : fallback.contradictionLevel,
-    gaps: (candidate.gapSummary ?? [])
+    gaps: normalizeToStringList(candidate.gapSummary)
       .filter(Boolean)
       .slice(0, VALIDATOR_MAX_GAPS)
       .map((gap, index) => ({
@@ -569,7 +620,7 @@ function normalizeProviderValidationResult(
         severity: "medium" as const,
         reason: gap,
       })),
-    contradictions: (candidate.contradictions ?? [])
+    contradictions: normalizeToStringList(candidate.contradictions)
       .filter(Boolean)
       .slice(0, VALIDATOR_MAX_CONTRADICTIONS)
       .map((item, index) => ({
@@ -578,11 +629,11 @@ function normalizeProviderValidationResult(
         severity: "medium" as const,
         reason: item,
       })),
-    missingConfirmations: (candidate.missingConfirmations ?? []).filter(Boolean).slice(0, 4),
+    missingConfirmations: normalizeToStringList(candidate.missingConfirmations).filter(Boolean).slice(0, 4),
     recommendedActions: normalizedActions.length > 0 ? normalizedActions : fallback.recommendedActions,
     missingEntityHints: Array.from(
       new Set(
-        (candidate.missingEntityHints ?? [])
+        normalizeToStringList(candidate.missingEntityHints)
           .map((hint) => hint.trim())
           .filter((hint) => hint.length >= 2),
       ),
@@ -2527,7 +2578,20 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
     ? input.plan.steps.slice(0, 6).map((s, i) => `- Шаг ${i + 1}: ${s.title ?? s.description ?? ""}`).join("\n")
     : "(плана нет)";
 
+  const transcriptSection = (input.conversationTranscript ?? []).length > 0
+    ? [
+        "=== 0. ИСТОРИЯ ЭТОГО ДИАЛОГА (от старых реплик к новым) ===",
+        "Текущий запрос — продолжение этого диалога. Если в нём есть ссылки на предыдущие реплики",
+        "(\"при этом\", \"а если так\", \"тот же\" и т.п.) — разрешай их по этой истории, а не проси уточнить.",
+        (input.conversationTranscript ?? [])
+          .map((turn, index) => `${index + 1}. Вопрос: ${turn.task}\n   Ответ: ${turn.directAnswer}`)
+          .join("\n"),
+        "",
+      ]
+    : [];
+
   return [
+    ...transcriptSection,
     "=== ЗАПРОС ПОЛЬЗОВАТЕЛЯ ===",
     input.task,
     "",

@@ -322,7 +322,11 @@ export interface ScoredReference {
   filePath?: string;
   // "recalled" — переиспользовано из Fact Store (см. ProjectFact): подтверждено
   // не текущим git-состоянием, а накопленным ранее знанием о проекте.
-  origin: "baseline" | "overlay" | "structural" | "recalled";
+  // "conversation" — перенесено из предыдущей реплики того же диалога (см.
+  // applyPriorTurnEvidence в packages/research) — в отличие от "recalled" это
+  // не долговременный факт о проекте, а evidence, которое было релевантно
+  // именно предыдущему вопросу в этом же треде.
+  origin: "baseline" | "overlay" | "structural" | "recalled" | "conversation";
   originDetails?: string;
   reinforcedByFactIds?: string[];
 }
@@ -382,6 +386,7 @@ export interface ResearchReport {
     overlayCount: number;
     structuralCount: number;
     recalledCount: number;
+    conversationCount: number;
     overlayInfluenced: boolean;
   };
   affectedModules: string[];
@@ -831,6 +836,10 @@ export interface KnowledgeCatalogEntry {
   branch?: string;
   headCommit?: string;
   headFingerprint?: string;
+  /** Группирует последовательные question-run в один диалог; у первой реплики совпадает с runId. */
+  conversationId?: string;
+  /** Порядковый номер реплики в диалоге, начиная с 0. */
+  turnIndex?: number;
 }
 
 export interface KnowledgeSaveResult {
@@ -870,6 +879,7 @@ export interface ProviderRecord {
   hasApiKey: boolean;
   isActive: boolean;
   isCurrent: boolean;
+  defaultModel: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -910,11 +920,20 @@ export interface ProjectCatalogResponse {
   projects: ProjectRecord[];
 }
 
+export interface ConversationTurnsResponse {
+  conversationId: string;
+  turns: PipelineRunResult[];
+}
+
 export type PipelineRunMode = "background-sync" | "question-run" | "hard-resync";
 
 export interface PipelineRunResult {
   runId: string;
   mode: PipelineRunMode;
+  /** Группирует последовательные question-run в один диалог; у первой реплики совпадает с runId. */
+  conversationId: string;
+  /** Порядковый номер реплики в диалоге, начиная с 0. */
+  turnIndex: number;
   project: {
     name: string;
     rootPath: string;
@@ -983,6 +1002,7 @@ export interface PipelinePartialArtifacts {
 export interface PipelineRunStatus {
   runId: string;
   mode: PipelineRunMode;
+  conversationId: string;
   task: string;
   projectPath: string;
   status: "queued" | "running" | "completed" | "failed";

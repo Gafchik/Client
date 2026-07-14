@@ -32,6 +32,7 @@ import {
   type ResearchReport,
   type ResearchStrategyKey,
   type ScoredReference,
+  stableId,
   type WorkspaceSnapshot,
 } from "@client/shared";
 
@@ -45,6 +46,21 @@ interface ResearchInput {
   backgroundState?: BackgroundProjectState;
   /** Факты, накопленные Fact Store для этого проекта (см. packages/knowledge/src/facts.ts). */
   knownFacts?: ProjectFact[];
+  /**
+   * Предыдущая реплика этого же диалога (см. loadConversationTurns в
+   * packages/knowledge и apps/api/src/pipeline-runner.ts). В отличие от
+   * knownFacts (долговременная память проекта, общая для всех диалогов),
+   * это одноразовый контекст конкретно предыдущего вопроса в этом треде —
+   * нужен, чтобы короткие follow-up-вопросы ("а нужно ли подтверждать
+   * имейл при этом?") не теряли тему, заданную предыдущим вопросом.
+   */
+  priorTurn?: {
+    task: string;
+    summary: string;
+    dominantModule: string;
+    evidence: ScoredReference[];
+    moduleIntents: ModuleIntentMatch[];
+  };
 }
 
 interface IntentProfile {
@@ -76,7 +92,6 @@ const INTENT_PROFILES: IntentProfile[] = [
       "jwt",
       "oauth",
       "passport",
-      "web-login",
       "verify",
       "verified",
       "авторизация",
@@ -220,11 +235,8 @@ const INTENT_PROFILES: IntentProfile[] = [
       "credential",
       "credentials",
       "password",
-      "password_uuid",
-      "passphrase_uuid",
       "passwords",
       "private_key",
-      "encrypted_private_key",
       "share",
       "shared",
       "sharing",
@@ -434,7 +446,15 @@ export function runResearch(input: ResearchInput): ResearchReport {
   const fileEvidence: ScoredReference[] = [];
   const symbolEvidence: ScoredReference[] = [];
   const moduleIntents = detectModuleIntents(input, ctx);
-  const dominantModule = ctx.broadFocus ? "не определён" : moduleIntents[0]?.module ?? "не определён";
+  // Собственный сигнал вопроса первичен; предыдущая реплика треда — только
+  // tie-breaker, когда текущий вопрос сам по себе слабый/широкий (короткий
+  // follow-up вроде "а нужно ли подтверждать имейл при этом?" без явных
+  // доменных слов не должен терять тему, заданную предыдущим вопросом).
+  const ownDominantModule = ctx.broadFocus ? "не определён" : moduleIntents[0]?.module ?? "не определён";
+  const dominantModule =
+    ownDominantModule === "не определён" && input.priorTurn && input.priorTurn.dominantModule !== "не определён"
+      ? input.priorTurn.dominantModule
+      : ownDominantModule;
   const functionalFocus = isFunctionalQuestion(ctx.tokens);
   const routeNodes = getRouteNodes(input.graph);
   const codeNodes = getCodeNodes(input.graph);
@@ -586,6 +606,13 @@ export function runResearch(input: ResearchInput): ResearchReport {
   // автоматически подхватывают, т.к. читают `evidence` дальше по функции).
   const factApplication = applyKnownFacts(evidence, input.knownFacts, dominantModule, tokenGroups);
   evidence = factApplication.evidence;
+
+  // Тот же bolt-on-паттерн, что и Fact Store выше, но источник — не
+  // долговременная память проекта, а конкретно предыдущая реплика ЭТОГО ЖЕ
+  // диалога (см. ResearchInput.priorTurn). Должен идти после applyKnownFacts,
+  // чтобы reinforcement/backfill из предыдущего хода имел то же положение в
+  // пайплайне (перед findings/confidence/evidenceSummary).
+  evidence = applyPriorTurnEvidence(evidence, input.priorTurn, dominantModule, tokenGroups);
 
   const topFiles = evidence.filter((item) => item.filePath).map((item) => item.filePath as string);
   const moduleRelations = dominantModule !== "не определён" ? getModuleRelations(input.graph, dominantModule) : [];
@@ -744,6 +771,70 @@ function applyKnownFacts(
   };
 }
 
+/**
+ * Тот же reinforcement+backfill паттерн, что applyKnownFacts, но источник —
+ * evidence предыдущей реплики ЭТОГО ЖЕ диалога, а не долговременная память
+ * проекта. Гейтинг мягче, чем у Fact Store (там намеренно строгий
+ * token-overlap guard, чтобы факты из чужого вопроса того же домена не
+ * протекали в другой) — здесь это одна непрерывная нить разговора, а не
+ * произвольная пара вопросов, так что backfill включается уже когда текущий
+ * evidence слабый ИЛИ когда тема явно продолжается (совпадает dominantModule).
+ */
+function applyPriorTurnEvidence(
+  evidence: ScoredReference[],
+  priorTurn: ResearchInput["priorTurn"],
+  dominantModule: string,
+  tokenGroups: string[][],
+): ScoredReference[] {
+  if (!priorTurn || priorTurn.evidence.length === 0) {
+    return evidence;
+  }
+
+  const matchedFilePaths = new Set(evidence.filter((item) => item.filePath).map((item) => item.filePath as string));
+  let reinforcedCount = 0;
+  const reinforced = evidence.map((item) => {
+    if (!item.filePath || !priorTurn.evidence.some((prior) => prior.filePath === item.filePath)) {
+      return item;
+    }
+
+    reinforcedCount += 1;
+    return { ...item, score: item.score + 5 };
+  });
+
+  const topicContinues = priorTurn.dominantModule !== "не определён" && priorTurn.dominantModule === dominantModule;
+
+  if (reinforcedCount >= 4 && !topicContinues) {
+    return reinforced;
+  }
+
+  const backfill: ScoredReference[] = [];
+
+  for (const priorItem of [...priorTurn.evidence].sort((left, right) => right.score - left.score)) {
+    if (backfill.length >= 3 || !priorItem.filePath || matchedFilePaths.has(priorItem.filePath)) {
+      continue;
+    }
+
+    // Без явного продолжения темы всё равно требуем хоть какое-то пересечение
+    // с текущими токенами вопроса — иначе полная смена темы внутри диалога
+    // тянула бы за собой evidence от предыдущего вопроса просто по инерции.
+    if (!topicContinues && scoreTextGroups(`${priorItem.label} ${priorItem.filePath}`, tokenGroups) <= 0) {
+      continue;
+    }
+
+    matchedFilePaths.add(priorItem.filePath);
+    backfill.push({
+      ...priorItem,
+      id: stableId(["conversation-evidence", priorItem.id]),
+      score: Math.max(18, Math.min(priorItem.score, 55)),
+      reason: `Из предыдущего вопроса в этом диалоге ("${priorTurn.task}"): ${priorItem.reason}`,
+      origin: "conversation",
+      originDetails: "Перенесено из предыдущей реплики того же диалога, не подтверждено заново текущим research-проходом.",
+    });
+  }
+
+  return [...reinforced, ...backfill].sort((left, right) => right.score - left.score);
+}
+
 function selectTopEvidence(
   candidates: ScoredReference[],
   input: ResearchInput,
@@ -874,12 +965,14 @@ function buildEvidenceSummary(evidence: ScoredReference[]): ResearchReport["evid
   const overlayCount = evidence.filter((item) => item.origin === "overlay").length;
   const structuralCount = evidence.filter((item) => item.origin === "structural").length;
   const recalledCount = evidence.filter((item) => item.origin === "recalled").length;
+  const conversationCount = evidence.filter((item) => item.origin === "conversation").length;
 
   return {
     baselineCount,
     overlayCount,
     structuralCount,
     recalledCount,
+    conversationCount,
     overlayInfluenced: overlayCount > 0,
   };
 }
@@ -1378,15 +1471,11 @@ function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): Module
         fileScore += 24;
       }
 
-      if (infrastructureFocus && profile.key === "servers" && (contentText.includes("password_uuid") || contentText.includes("passphrase_uuid"))) {
-        fileScore += 18;
-      }
-
-      if (infrastructureFocus && profile.key === "servers" && (contentText.includes("path_to_private_key") || contentText.includes("private_key"))) {
+      if (infrastructureFocus && profile.key === "servers" && contentText.includes("private_key")) {
         fileScore += 16;
       }
 
-      if (infrastructureFocus && profile.key === "vault" && (contentText.includes("credential") || contentText.includes("passwords,uuid"))) {
+      if (infrastructureFocus && profile.key === "vault" && contentText.includes("credential")) {
         fileScore += 16;
       }
 
@@ -1772,19 +1861,11 @@ function detectSideEffects(input: ResearchInput, ctx: ResearchContext): string[]
       effects.add("есть временное хранение состояния в cache для сессий, тикетов или OAuth-процесса");
     }
 
-    if (
-      infrastructureFocus
-      && (
-        content.includes("password_uuid")
-        || content.includes("passphrase_uuid")
-        || content.includes("encrypted_private_key")
-        || content.includes("path_to_private_key")
-      )
-    ) {
+    if (infrastructureFocus && (content.includes("private_key") || content.includes("passphrase"))) {
       effects.add("есть работа с чувствительными credential-ссылками, приватными ключами или passphrase для серверных подключений");
     }
 
-    if (infrastructureFocus && (content.includes("forwarding_ports") || content.includes("local_port") || content.includes("remote_port"))) {
+    if (infrastructureFocus && (content.includes("forwarding") && content.includes("port"))) {
       effects.add("есть настройка SSH port forwarding или tunnel-конфигурации");
     }
 
@@ -1874,25 +1955,13 @@ function detectDataSources(input: ResearchInput, ctx: ResearchContext): string[]
       sources.add("часть данных и identity-сигналов приходит из внешнего OAuth-провайдера");
     }
 
-    if (
-      infrastructureFocus
-      && (
-        content.includes("exists:passwords,uuid")
-        || content.includes("servercredentiallink")
-        || content.includes("credentiallinks")
-        || content.includes("belongsto(password::class)")
-      )
-    ) {
+    if (infrastructureFocus && content.includes("credential") && (content.includes("belongsto(") || content.includes("hasmany("))) {
       sources.add("секреты и credential-ссылки берутся из vault/password storage и связываются с сервером через отдельные сущности");
     }
 
     if (
       infrastructureFocus
-      && (
-        content.includes("protected $fillable")
-        || content.includes("hasmany(servercredentiallink::class)")
-        || content.includes("hasmany(forwardingport::class)")
-      )
+      && content.includes("protected $fillable")
       && file.relativePath.toLowerCase().includes("server")
     ) {
       sources.add("структура серверного подключения хранится в модельном и табличном слое приложения");
@@ -2752,11 +2821,9 @@ function isInfrastructureEntity(node: GraphState["nodes"][number]): boolean {
     label.includes("server")
     || label.includes("credential")
     || label.includes("vault")
-    || label.includes("password_uuid")
-    || label.includes("passphrase_uuid")
     || label.includes("private_key")
     || filePath.includes("/servers/")
-    || filePath.includes("servercredential")
+    || (filePath.includes("server") && filePath.includes("credential"))
     || filePath.includes("/vault/")
   );
 }
@@ -2765,7 +2832,7 @@ function getInfrastructureEntityWeight(node: GraphState["nodes"][number]): numbe
   const label = node.label.toLowerCase();
   const filePath = node.filePath?.toLowerCase() ?? "";
 
-  if (filePath.includes("servercredential") || label.includes("servercredential")) {
+  if ((filePath.includes("server") && filePath.includes("credential")) || (label.includes("server") && label.includes("credential"))) {
     return 8;
   }
 
@@ -2773,7 +2840,7 @@ function getInfrastructureEntityWeight(node: GraphState["nodes"][number]): numbe
     return 7;
   }
 
-  if (filePath.includes("forwardingport") || label.includes("forwardingport")) {
+  if ((filePath.includes("forwarding") && filePath.includes("port")) || (label.includes("forwarding") && label.includes("port"))) {
     return 6;
   }
 
@@ -2815,7 +2882,7 @@ function getInfrastructureFileBoost(
 
   if (
     pathText.includes("/servers/")
-    || pathText.includes("servercredential")
+    || (pathText.includes("server") && pathText.includes("credential"))
     || (pathText.includes("/models/") && pathText.includes("server"))
   ) {
     score += 40;
@@ -2833,19 +2900,11 @@ function getInfrastructureFileBoost(
     score += 24;
   }
 
-  if (pathText.includes("migration") && (contentText.includes("schema::create('servers'") || contentText.includes("server_credential_links"))) {
+  if (pathText.includes("migration") && contentText.includes("server")) {
     score += 36;
   }
 
-  if (contentText.includes("password_uuid") || contentText.includes("passphrase_uuid")) {
-    score += 26;
-  }
-
-  if (
-    contentText.includes("servercredentiallink")
-    || contentText.includes("server_credential_links")
-    || (contentText.includes("credential") && contentText.includes("server"))
-  ) {
+  if (contentText.includes("credential") && contentText.includes("server")) {
     score += 36;
   }
 
@@ -2853,7 +2912,7 @@ function getInfrastructureFileBoost(
     score += 24;
   }
 
-  if (contentText.includes("path_to_private_key") || contentText.includes("forwarding_ports")) {
+  if (contentText.includes("forwarding") && contentText.includes("port")) {
     score += 22;
   }
 
@@ -2865,7 +2924,7 @@ function getInfrastructureFileBoost(
     score -= 34;
   }
 
-  if ((pathText.includes("/auth/") || pathText.includes("web-login")) && !tokens.some((token) => ["auth", "login", "oauth", "token"].includes(token))) {
+  if (pathText.includes("/auth/") && !tokens.some((token) => ["auth", "login", "oauth", "token"].includes(token))) {
     score -= 30;
   }
 
@@ -2897,13 +2956,9 @@ function getInfrastructureSymbolBoost(
     score += 22;
   }
 
-  if (label.includes("password_uuid") || label.includes("passphrase_uuid")) {
-    score += 28;
-  }
-
   if (
     filePath.includes("/servers/")
-    || filePath.includes("servercredential")
+    || (filePath.includes("server") && filePath.includes("credential"))
     || (filePath.includes("/models/") && filePath.includes("server"))
   ) {
     score += 24;
@@ -2920,7 +2975,7 @@ function getInfrastructureSymbolBoost(
     score -= 30;
   }
 
-  if ((filePath.includes("/auth/") || filePath.includes("web-login")) && !tokens.some((token) => ["auth", "login", "oauth", "token"].includes(token))) {
+  if (filePath.includes("/auth/") && !tokens.some((token) => ["auth", "login", "oauth", "token"].includes(token))) {
     score -= 24;
   }
 
@@ -2938,7 +2993,7 @@ function getInfrastructureRoutePenalty(filePath: string, infrastructureFocus: bo
     return 16;
   }
 
-  if (normalized.includes("/auth/") || normalized.includes("web-login")) {
+  if (normalized.includes("/auth/")) {
     return -22;
   }
 
@@ -3162,7 +3217,7 @@ function getRuntimeLocaleGraphFileBoost(
     }
   }
 
-  if (normalized.includes("localemiddleware")) {
+  if (normalized.includes("middleware") && normalized.includes("locale")) {
     score += 50;
   }
 
@@ -3792,10 +3847,6 @@ function extractResearchZonesFromText(value: string): string[] {
   const normalized = value.toLowerCase();
   const zones: string[] = [];
 
-  if (normalized.includes("web-login")) {
-    zones.push("web-login");
-  }
-
   if (normalized.includes("auth")) {
     zones.push("auth");
   }
@@ -3808,7 +3859,7 @@ function extractResearchZonesFromText(value: string): string[] {
     zones.push("servers");
   }
 
-  if (/\b(vault|credential|credentials|password_uuid|passphrase_uuid|private_key)\b/.test(normalized)) {
+  if (/\b(vault|credential|credentials|private_key)\b/.test(normalized)) {
     zones.push("vault");
   }
 
@@ -3822,10 +3873,6 @@ function extractResearchZonesFromText(value: string): string[] {
 function extractResearchZonesFromPath(filePath: string): string[] {
   const normalized = filePath.toLowerCase();
   const zones: string[] = [];
-
-  if (normalized.includes("web-login")) {
-    zones.push("web-login");
-  }
 
   if (normalized.includes("/auth/") || normalized.includes("authcontroller")) {
     zones.push("auth");
@@ -3841,7 +3888,7 @@ function extractResearchZonesFromPath(filePath: string): string[] {
 
   if (
     normalized.includes("/servers/")
-    || normalized.includes("servercredential")
+    || (normalized.includes("server") && normalized.includes("credential"))
     || normalized.includes("/models/server")
     || normalized.includes("serverscontroller")
     || normalized.includes("serversservice")

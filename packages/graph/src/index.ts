@@ -581,8 +581,8 @@ export function getStorageTopologyNodes(graph: GraphState): GraphNode[] {
       || label.includes("private_key")
       || label.includes("forwarding")
       || filePath.includes("/servers/")
-      || filePath.includes("servercredential")
-      || filePath.includes("forwardingport")
+      || (filePath.includes("server") && filePath.includes("credential"))
+      || (filePath.includes("forwarding") && filePath.includes("port"))
       || filePath.includes("/vault/")
       || filePath.includes("/migrations/")
     ) {

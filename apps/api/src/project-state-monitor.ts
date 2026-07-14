@@ -3,15 +3,48 @@ import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type BackgroundProjectState } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { enqueuePipelineRun, findPipelineRunByRepositoryHead } from "./pipeline-runner.js";
+import { getCurrentProvider } from "./provider-store.js";
 import { listProjects } from "./project-store.js";
 
 interface ProjectStateMonitorConfig {
   appRootPath: string;
+  // Используются только если в БД ещё нет ни одного провайдера (например
+  // самый первый запуск до initializeProviderStore()) — обычный путь всегда
+  // берёт baseUrl/apiKey/model из getCurrentProvider() свежо на каждый тик,
+  // а не из значений, замороженных в момент старта процесса (см. resolveMonitorProvider).
+  fallbackProviderBaseUrl: string;
+  fallbackProviderModel: string;
+  fallbackProviderApiKey: string;
+  intervalMs?: number;
+  minAutoSyncIntervalMs?: number;
+}
+
+interface ResolvedMonitorProvider {
   providerBaseUrl: string;
   providerModel: string;
   providerApiKey: string;
-  intervalMs?: number;
-  minAutoSyncIntervalMs?: number;
+}
+
+async function resolveMonitorProvider(config: ProjectStateMonitorConfig): Promise<ResolvedMonitorProvider> {
+  try {
+    const provider = await getCurrentProvider();
+
+    if (provider) {
+      return {
+        providerBaseUrl: provider.baseUrl || config.fallbackProviderBaseUrl,
+        providerModel: provider.defaultModel || config.fallbackProviderModel,
+        providerApiKey: provider.apiKey || config.fallbackProviderApiKey,
+      };
+    }
+  } catch {
+    // БД временно недоступна — используем bootstrap-фолбэк, не роняем monitor tick.
+  }
+
+  return {
+    providerBaseUrl: config.fallbackProviderBaseUrl,
+    providerModel: config.fallbackProviderModel,
+    providerApiKey: config.fallbackProviderApiKey,
+  };
 }
 
 interface ProjectMonitorSnapshot {
@@ -66,11 +99,12 @@ async function pollProjectStates(config: ProjectStateMonitorConfig): Promise<voi
   monitorRunning = true;
 
   try {
+    const resolvedProvider = await resolveMonitorProvider(config);
     const projects = await listProjects();
 
     for (const project of projects) {
       for (const projectPath of project.paths) {
-        await observeProjectPath(config, project.id, projectPath.id, projectPath.rootPath);
+        await observeProjectPath(config, resolvedProvider, project.id, projectPath.id, projectPath.rootPath);
       }
     }
   } catch (error) {
@@ -86,6 +120,7 @@ async function pollProjectStates(config: ProjectStateMonitorConfig): Promise<voi
 
 async function observeProjectPath(
   config: ProjectStateMonitorConfig,
+  resolvedProvider: ResolvedMonitorProvider,
   projectId: string,
   projectPathId: string,
   projectPath: string,
@@ -117,7 +152,7 @@ async function observeProjectPath(
       observedAt: new Date().toISOString(),
     });
 
-    await maybeEnqueueAutoBackgroundSync(config, normalizedPath, backgroundState);
+    await maybeEnqueueAutoBackgroundSync(config, resolvedProvider, normalizedPath, backgroundState);
   } catch {
     // Monitoring must never break the API process because of one problematic project path.
   }
@@ -125,6 +160,7 @@ async function observeProjectPath(
 
 async function maybeEnqueueAutoBackgroundSync(
   config: ProjectStateMonitorConfig,
+  resolvedProvider: ResolvedMonitorProvider,
   projectPath: string,
   backgroundState: BackgroundProjectState,
 ): Promise<void> {
@@ -162,14 +198,20 @@ async function maybeEnqueueAutoBackgroundSync(
 
   recentAutoSyncAttempts.set(throttleKey, now);
 
+  const autoSyncRunId = stableId(["auto-background-sync", projectPath, backgroundState.headFingerprint, now]);
+
   enqueuePipelineRun({
-    runId: stableId(["auto-background-sync", projectPath, backgroundState.headFingerprint, now]),
+    runId: autoSyncRunId,
     mode: "background-sync",
+    // background-sync — не вопрос пользователя, диалоговая нить к нему не
+    // применима; conversationId = собственный runId, как и для старых
+    // артефактов без явного треда (см. normalizePipelineRunArtifact).
+    conversationId: autoSyncRunId,
     task: `Автоматически обнови committed baseline для ветки ${backgroundState.branch || "HEAD"} и HEAD ${backgroundState.headCommit}.`,
     projectPath,
-    providerBaseUrl: config.providerBaseUrl,
-    providerModel: config.providerModel,
-    providerApiKey: config.providerApiKey,
+    providerBaseUrl: resolvedProvider.providerBaseUrl,
+    providerModel: resolvedProvider.providerModel,
+    providerApiKey: resolvedProvider.providerApiKey,
     appRootPath: config.appRootPath,
   });
 }

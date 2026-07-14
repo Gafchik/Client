@@ -1,9 +1,10 @@
-import { startTransition, useEffect, useRef, useState } from "react";
+import { Fragment, startTransition, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import type {
   BackgroundProjectState,
   ContextCandidate,
+  ConversationTurnsResponse,
   KnowledgeCatalogEntry,
   ProjectCatalogResponse,
   ProjectPathRecord,
@@ -446,10 +447,47 @@ function buildHistoryTitle(task: string | undefined): string {
   return normalized.length > 72 ? `${normalized.slice(0, 69)}...` : normalized;
 }
 
+interface HistoryConversationGroup {
+  conversationId: string;
+  latest: KnowledgeCatalogEntry;
+  runIds: string[];
+  turnCount: number;
+}
+
+// Раньше сайдбар показывал одну строку на каждый run — теперь run'ы одного
+// диалога группируются по conversationId в одну строку (одна реплика без
+// conversationId в старых записях трактуется как тред из одного хода, см.
+// нормализацию conversationId в packages/knowledge). Группа представлена
+// самой свежей репликой; удаление/выделение действуют на все run'ы группы.
+function groupHistoryByConversation(recentRuns: KnowledgeCatalogEntry[]): HistoryConversationGroup[] {
+  const groups = new Map<string, KnowledgeCatalogEntry[]>();
+
+  for (const entry of safeList(recentRuns)) {
+    const conversationId = entry.conversationId || entry.runId;
+    const bucket = groups.get(conversationId) ?? [];
+    bucket.push(entry);
+    groups.set(conversationId, bucket);
+  }
+
+  return Array.from(groups.entries())
+    .map(([conversationId, entries]) => {
+      const sorted = [...entries].sort((left, right) => right.savedAt.localeCompare(left.savedAt));
+      const latest = sorted[0] as KnowledgeCatalogEntry;
+
+      return {
+        conversationId,
+        latest,
+        runIds: entries.map((entry) => entry.runId),
+        turnCount: entries.length,
+      };
+    })
+    .sort((left, right) => right.latest.savedAt.localeCompare(left.latest.savedAt));
+}
+
 function RunHistorySidebar({
   recentRuns,
-  activeRunId,
-  onSelectRun,
+  activeConversationId,
+  onSelectConversation,
   onStartNewChat,
   projectName,
   selectedIds,
@@ -460,19 +498,19 @@ function RunHistorySidebar({
   deleting,
 }: {
   recentRuns: KnowledgeCatalogEntry[];
-  activeRunId: string | null;
-  onSelectRun: (runId: string) => void;
+  activeConversationId: string | null;
+  onSelectConversation: (runId: string) => void;
   onStartNewChat: () => void;
   projectName: string;
   selectedIds: Set<string>;
-  onToggleSelect: (runId: string) => void;
+  onToggleSelect: (conversationId: string) => void;
   onToggleSelectAll: (allIds: string[]) => void;
   onDeleteSelected: () => void;
-  onDeleteOne: (runId: string) => void;
+  onDeleteOne: (conversationId: string) => void;
   deleting: boolean;
 }) {
-  const items = safeList(recentRuns).slice(0, 10);
-  const allIds = items.map((entry) => entry.runId);
+  const items = groupHistoryByConversation(recentRuns).slice(0, 10);
+  const allIds = items.map((group) => group.conversationId);
   const allSelected = items.length > 0 && selectedIds.size === items.length;
 
   return (
@@ -502,28 +540,34 @@ function RunHistorySidebar({
 
         <div className="chat-history-list">
           {items.length ? (
-            items.map((entry) => (
-              <div key={entry.runId} className={`history-item-row ${activeRunId === entry.runId ? "history-item-row-active" : ""}`}>
+            items.map((group) => (
+              <div
+                key={group.conversationId}
+                className={`history-item-row ${activeConversationId === group.conversationId ? "history-item-row-active" : ""}`}
+              >
                 <input
                   type="checkbox"
                   className="history-item-checkbox"
-                  checked={selectedIds.has(entry.runId)}
-                  onChange={() => onToggleSelect(entry.runId)}
+                  checked={selectedIds.has(group.conversationId)}
+                  onChange={() => onToggleSelect(group.conversationId)}
                   onClick={(event) => event.stopPropagation()}
-                  aria-label={`Выбрать чат «${buildHistoryTitle(entry.task)}»`}
+                  aria-label={`Выбрать чат «${buildHistoryTitle(group.latest.task)}»`}
                 />
-                <button type="button" className="history-item" onClick={() => onSelectRun(entry.runId)}>
-                  <strong>{buildHistoryTitle(entry.task)}</strong>
-                  <span>{formatHistoryTime(entry.savedAt)}</span>
+                <button type="button" className="history-item" onClick={() => onSelectConversation(group.latest.runId)}>
+                  <strong>{buildHistoryTitle(group.latest.task)}</strong>
+                  <span>
+                    {formatHistoryTime(group.latest.savedAt)}
+                    {group.turnCount > 1 ? ` · ${group.turnCount} реплик` : ""}
+                  </span>
                 </button>
                 <button
                   type="button"
                   className="history-item-delete"
                   title="Удалить чат"
-                  aria-label={`Удалить чат «${buildHistoryTitle(entry.task)}»`}
+                  aria-label={`Удалить чат «${buildHistoryTitle(group.latest.task)}»`}
                   onClick={(event) => {
                     event.stopPropagation();
-                    onDeleteOne(entry.runId);
+                    onDeleteOne(group.conversationId);
                   }}
                   disabled={deleting}
                 >
@@ -1692,6 +1736,11 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PipelineRunResult | null>(null);
   const [selectedTask, setSelectedTask] = useState<string>("");
+  // `turns` — реплики текущего открытого диалога, по порядку, для scrolling
+  // транскрипта в chat-body. `result`/`selectedTask` остаются как есть (последняя
+  // реплика) — вся логика Inspector-панели читает именно их и не меняется.
+  const [turns, setTurns] = useState<PipelineRunResult[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [clarificationRound, setClarificationRound] = useState(0);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set());
@@ -1995,6 +2044,14 @@ export function App() {
 
             return current || latestEntry?.task || "";
           });
+          // На холодной загрузке/переключении проекта показываем только
+          // последнюю реплику (без лишнего round-trip за полным тредом) —
+          // продолжение диалога и открытие из истории дозагружают полный
+          // транскрипт через fetchRunArtifact.
+          if (!activeRunIdRef.current) {
+            setTurns(data.latestRun ? [data.latestRun] : []);
+            setConversationId(data.latestRun?.conversationId ?? null);
+          }
         }
       });
     } catch (loadError) {
@@ -2048,6 +2105,11 @@ export function App() {
           providerApiKey: providerDraft.apiKey,
           forceRefresh,
           hardResync,
+          // Пусто — новый диалог (сервер возьмёт conversationId = runId первой
+          // реплики). Иначе — продолжение уже открытого треда, follow-up-вопрос
+          // получит доступ к evidence/контексту предыдущей реплики (см. §7-8
+          // в apps/api/src/pipeline-runner.ts).
+          conversationId: !hardResync && !forceRefresh ? conversationId ?? undefined : undefined,
         }),
       });
 
@@ -2187,6 +2249,14 @@ export function App() {
 
         startTransition(() => {
           setResult(status.result ?? null);
+          if (status.result) {
+            const completedResult = status.result;
+            setConversationId(completedResult.conversationId);
+            // dedupe на случай повторного поллинга того же runId (не должно
+            // происходить в норме — pollPipelineStatus возвращается сразу после
+            // completed — но дешёвая защита от задвоения реплики в транскрипте).
+            setTurns((current) => [...current.filter((turn) => turn.runId !== completedResult.runId), completedResult]);
+          }
           updateActiveRunId(null);
           setProject((current) =>
             current
@@ -2204,6 +2274,9 @@ export function App() {
                           savedAt: status.result.knowledge.savedAt,
                           storagePath: status.result.knowledge.storagePath,
                           summary: status.result.research.summary,
+                          mode: status.result.mode,
+                          conversationId: status.result.conversationId,
+                          turnIndex: status.result.turnIndex,
                         },
                         ...safeList(current.recentRuns).filter((entry) => entry.runId !== status.result?.runId),
                       ].slice(0, 20)
@@ -2305,6 +2378,33 @@ export function App() {
       });
     } catch (selectError) {
       setError(selectError instanceof Error ? selectError.message : "Не удалось выбрать провайдера.");
+    }
+  }
+
+  // Раньше выбор модели жил только в providerModelDraft/localStorage — на
+  // сервере не сохранялся вообще, поэтому любой не-веб вызывающий (фоновый
+  // monitor, другой клиент) всегда падал на CLIENT_PROVIDER_MODEL из .env.
+  // Теперь смена модели сразу персистится в БД через providers.default_model
+  // (см. setProviderDefaultModel в apps/api/src/provider-store.ts).
+  async function changeProviderModel(modelId: string) {
+    setProviderModelDraft(modelId);
+
+    if (!selectedProviderId || !modelId) {
+      return;
+    }
+
+    try {
+      await fetchJsonWithTimeout<ProviderRecord>(
+        `${API_BASE_URL}/api/providers/${encodeURIComponent(selectedProviderId)}/default-model`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: modelId }),
+        },
+      );
+    } catch {
+      // Не блокируем UI на сбое персистентности — draft уже обновлён локально,
+      // следующий явный providerModel в запросе всё равно победит.
     }
   }
 
@@ -2483,11 +2583,35 @@ export function App() {
       });
       const artifact = await fetchJsonWithTimeout<PipelineRunResult>(`${API_BASE_URL}/api/runs/selected?${params.toString()}`);
 
+      // Открытие одного run'а из истории/по прямой ссылке теперь подтягивает
+      // весь диалог, к которому он принадлежит (для транскрипта в chat-body),
+      // а не только этот один run. Inspector-панель по-прежнему показывает
+      // именно запрошенный run (result/selectedTask), даже если это не
+      // последняя реплика треда — так deep-link на конкретный ответ остаётся точным.
+      let conversationTurns: PipelineRunResult[] = [artifact];
+
+      try {
+        const conversationParams = new URLSearchParams({
+          projectPath,
+          conversationId: artifact.conversationId,
+        });
+        const conversationResponse = await fetchJsonWithTimeout<ConversationTurnsResponse>(
+          `${API_BASE_URL}/api/runs/conversation?${conversationParams.toString()}`,
+        );
+        conversationTurns = conversationResponse.turns;
+      } catch {
+        // Диалог из одной реплики (старый артефакт без conversationId) или
+        // сеть подвела — транскрипт из одного уже загруженного run'а всё
+        // равно лучше, чем пустой экран.
+      }
+
       startTransition(() => {
         setResult(artifact);
         setRunStatus(null);
         updateActiveRunId(null);
         setSelectedTask(artifact.knowledge?.runId ? safeText(artifact.research?.summary, selectedTask) : selectedTask);
+        setTurns(conversationTurns);
+        setConversationId(artifact.conversationId);
       });
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось открыть запуск из истории.");
@@ -2513,6 +2637,8 @@ export function App() {
       setError(null);
       setSelectedHistoryIds(new Set());
       setClarificationRound(0);
+      setTurns([]);
+      setConversationId(null);
     });
     navigate("/chat");
   }
@@ -2535,15 +2661,27 @@ export function App() {
     setSelectedHistoryIds((previous) => (previous.size === allRunIds.length ? new Set() : new Set(allRunIds)));
   }
 
-  async function deleteHistoryEntries(runIds: string[]) {
-    if (!runIds.length || !projectPath) {
+  // Сайдбар выделяет/удаляет по conversationId (одна строка = один диалог),
+  // но API удаления (`/api/runs/delete`) работает по runId — разворачиваем
+  // выбранные диалоги в полный список их реплик перед вызовом.
+  async function deleteHistoryEntries(conversationIds: string[]) {
+    if (!conversationIds.length || !projectPath) {
+      return;
+    }
+
+    const groups = groupHistoryByConversation(project?.recentRuns ?? []);
+    const runIds = groups
+      .filter((group) => conversationIds.includes(group.conversationId))
+      .flatMap((group) => group.runIds);
+
+    if (!runIds.length) {
       return;
     }
 
     const confirmed = window.confirm(
-      runIds.length === 1
+      conversationIds.length === 1
         ? "Удалить этот чат? Действие необратимо."
-        : `Удалить ${runIds.length} чатов? Действие необратимо.`,
+        : `Удалить ${conversationIds.length} чатов? Действие необратимо.`,
     );
 
     if (!confirmed) {
@@ -2568,7 +2706,7 @@ export function App() {
       );
       setSelectedHistoryIds(new Set());
 
-      if (activeRunId && runIds.includes(activeRunId)) {
+      if (conversationId && conversationIds.includes(conversationId)) {
         startNewChat();
       }
     } catch (deleteError) {
@@ -2601,15 +2739,15 @@ export function App() {
         {activeView === "chat" ? (
           <RunHistorySidebar
             recentRuns={safeList(project?.recentRuns)}
-            activeRunId={routeRunId ?? activeRunId ?? result?.runId ?? null}
-            onSelectRun={(runId) => void openRunFromHistory(runId)}
+            activeConversationId={conversationId}
+            onSelectConversation={(runId) => void openRunFromHistory(runId)}
             onStartNewChat={startNewChat}
             projectName={safeText(project?.name, "Проект")}
             selectedIds={selectedHistoryIds}
             onToggleSelect={toggleHistorySelection}
             onToggleSelectAll={toggleSelectAllHistory}
             onDeleteSelected={() => void deleteHistoryEntries([...selectedHistoryIds])}
-            onDeleteOne={(runId) => void deleteHistoryEntries([runId])}
+            onDeleteOne={(conversationIdToDelete) => void deleteHistoryEntries([conversationIdToDelete])}
             deleting={deletingHistory}
           />
         ) : null}
@@ -2664,7 +2802,7 @@ export function App() {
                 void loadProject(selectedPath?.rootPath, selectedProjectId || undefined);
               }}
               onProviderChange={(providerId) => void selectProvider(providerId)}
-              onModelChange={setProviderModelDraft}
+              onModelChange={(modelId) => void changeProviderModel(modelId)}
             />
 
             <div className="chat-body">
@@ -2681,7 +2819,7 @@ export function App() {
                     </button>
                   </div>
                 </div>
-              ) : !selectedTask && !running && !result ? (
+              ) : !selectedTask && !running && !result && turns.length === 0 ? (
                 <div className="chat-hero">
                   <p className="section-kicker">Chat</p>
                   <h2>Понимание проекта за минуты, а не за часы</h2>
@@ -2702,15 +2840,46 @@ export function App() {
                 </div>
               ) : null}
 
-              {selectedTask ? <UserTaskMessage task={selectedTask} projectName={safeText(project?.name, "")} projectPath={projectPath} /> : null}
+              {turns.map((turn) => (
+                <Fragment key={turn.runId}>
+                  <UserTaskMessage task={turn.research.task} projectName={safeText(project?.name, "")} projectPath={projectPath} />
+                  <AssistantRunMessage
+                    runStatus={null}
+                    result={turn}
+                    // Inspector-панель читает состояние `result`, общее для всей
+                    // страницы — при открытии инспектора у конкретной (не
+                    // обязательно последней) реплики треда сначала переключаем
+                    // `result` на неё, иначе панель показала бы последнюю реплику
+                    // независимо от того, по какой из них кликнули.
+                    onOpenInspector={(tab) => {
+                      setResult(turn);
+                      openInspector(tab);
+                    }}
+                    clarificationRound={0}
+                    onSelectClarification={(moduleKey) => setTask(moduleKey)}
+                  />
+                </Fragment>
+              ))}
 
-              <AssistantRunMessage
-                runStatus={runStatus}
-                result={result}
-                onOpenInspector={openInspector}
-                clarificationRound={clarificationRound}
-                onSelectClarification={(moduleKey) => setTask(moduleKey)}
-              />
+              {/*
+                "Живая" реплика: пока идёт run (running=true) или последний
+                целевой result/selectedTask ещё не осел в turns (например run
+                упал с ошибкой и не был сохранён как реплика треда) — показываем
+                её отдельно поверх уже отрисованного транскрипта, а не через turns,
+                чтобы не дублировать одну и ту же реплику дважды после завершения.
+              */}
+              {selectedTask && !turns.some((turn) => turn.runId === result?.runId) ? (
+                <Fragment>
+                  <UserTaskMessage task={selectedTask} projectName={safeText(project?.name, "")} projectPath={projectPath} />
+                  <AssistantRunMessage
+                    runStatus={runStatus}
+                    result={result}
+                    onOpenInspector={openInspector}
+                    clarificationRound={clarificationRound}
+                    onSelectClarification={(moduleKey) => setTask(moduleKey)}
+                  />
+                </Fragment>
+              ) : null}
               <div ref={chatEndRef} />
             </div>
 

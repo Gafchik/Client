@@ -1,9 +1,9 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, deleteKnowledgeRuns, loadBestBaselineRunArtifact, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { buildBackgroundProjectState, deleteKnowledgeRuns, loadBestBaselineRunArtifact, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
-import { normalizePath, stableId, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse } from "@client/shared";
+import { normalizePath, stableId, type ConversationTurnsResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
@@ -11,7 +11,7 @@ import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity
 import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus } from "./pipeline-runner.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
-import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider } from "./provider-store.js";
+import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
 
 interface PipelineRunRequest {
@@ -24,6 +24,8 @@ interface PipelineRunRequest {
   providerId?: string;
   forceRefresh?: boolean;
   hardResync?: boolean;
+  /** Продолжение существующего диалога — если не передан, стартует новый (см. §7 в pipeline-runner.ts). */
+  conversationId?: string;
 }
 
 interface BackgroundBaselineInfo {
@@ -101,9 +103,9 @@ export function createApp() {
     await initializeGraphStore();
     startProjectStateMonitor({
       appRootPath,
-      providerBaseUrl: defaultProviderBaseUrl,
-      providerModel: defaultProviderModel,
-      providerApiKey: defaultProviderApiKey,
+      fallbackProviderBaseUrl: defaultProviderBaseUrl,
+      fallbackProviderModel: defaultProviderModel,
+      fallbackProviderApiKey: defaultProviderApiKey,
     });
   });
 
@@ -158,6 +160,26 @@ export function createApp() {
 
   app.post<{ Params: { id: string } }>("/api/providers/:id/select", async (request, reply) => {
     const provider = await setCurrentProvider(request.params.id);
+
+    if (!provider) {
+      return reply.code(404).send({
+        message: "Провайдер не найден.",
+      });
+    }
+
+    return provider;
+  });
+
+  app.post<{ Params: { id: string }; Body: { model?: string } }>("/api/providers/:id/default-model", async (request, reply) => {
+    const model = request.body.model?.trim();
+
+    if (!model) {
+      return reply.code(400).send({
+        message: "Нужно указать модель.",
+      });
+    }
+
+    const provider = await setProviderDefaultModel(request.params.id, model);
 
     if (!provider) {
       return reply.code(404).send({
@@ -348,6 +370,39 @@ export function createApp() {
     return artifact;
   });
 
+  app.get<{
+    Querystring: {
+      projectPath?: string;
+      conversationId?: string;
+    };
+  }>("/api/runs/conversation", async (request, reply) => {
+    const projectPath = request.query.projectPath?.trim() || "";
+    const conversationId = request.query.conversationId?.trim();
+
+    if (!conversationId) {
+      return reply.code(400).send({
+        message: "Нужно указать conversationId.",
+      });
+    }
+
+    if (!projectPath) {
+      return reply.code(400).send({
+        message: "Нужно явно передать projectPath.",
+      });
+    }
+
+    const normalizedProjectPath = normalizePath(path.resolve(projectPath));
+    const turns = await loadConversationTurns(appRootPath, normalizedProjectPath, conversationId);
+
+    if (turns.length === 0) {
+      return reply.code(404).send({
+        message: "Диалог не найден.",
+      });
+    }
+
+    return { conversationId, turns } satisfies ConversationTurnsResponse;
+  });
+
   /**
    * Удаление чатов (run/history entries) — одного или пачкой.
    * projectPath передаётся явно и обязательно: удаление деструктивно,
@@ -480,7 +535,11 @@ export function createApp() {
     }
 
     const providerBaseUrl = explicitProviderBaseUrl || effectiveProvider?.baseUrl || defaultProviderBaseUrl;
-    const providerModel = explicitProviderModel || defaultProviderModel;
+    // effectiveProvider?.defaultModel — персистентный выбор модели в БД (см.
+    // provider-store.ts). Раньше эта ветка отсутствовала: выбор модели никогда
+    // не читался из БД и всегда падал на CLIENT_PROVIDER_MODEL из .env, если
+    // вызывающая сторона явно не передала providerModel в теле запроса.
+    const providerModel = explicitProviderModel || effectiveProvider?.defaultModel || defaultProviderModel;
     const providerApiKey = explicitProviderApiKey || effectiveProvider?.apiKey || defaultProviderApiKey;
     const mode: PipelineRunMode = request.body.hardResync
       ? "hard-resync"
@@ -527,9 +586,14 @@ export function createApp() {
     }
 
     const runId = stableId(["run", mode, projectPath, normalizedTask, Date.now()]);
+    // Пустой/отсутствующий conversationId — новый тред, стартующий с этой
+    // реплики (её runId и становится conversationId, см. соглашение в
+    // normalizePipelineRunArtifact для обратной совместимости старых артефактов).
+    const conversationId = request.body.conversationId?.trim() || runId;
     const acceptedStatus = enqueuePipelineRun({
       runId,
       mode,
+      conversationId,
       task: normalizedTask,
       projectPath,
       providerBaseUrl,
