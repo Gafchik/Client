@@ -627,6 +627,29 @@
   - умеет ли система не склеивать два далеких домена в фальшивую картину.
 - Текущий статус: `red`
 
+## 8. Multi-turn Dialogue
+
+Проверяет `conversationId`-механику (см. `docs/state/project-state.md`, запись "Многоходовой диалог"): follow-up-вопрос в том же диалоге должен переиспользовать evidence/dominantModule предыдущей реплики, а не начинать research с нуля.
+
+### 8.1 Follow-up про email-верификацию после Google auth
+
+- Запрос (реплика 1): `Есть ли авторизация через Google?`
+- Запрос (реплика 2, тот же `conversationId`): `нужно ли при регистрации через гугл подтверждать имейл?`
+- Класс: `multi-turn`
+- Benchmark project: `slay-api`
+- Что проверяет:
+  - переносится ли evidence первой реплики во вторую (`research.evidenceSummary.conversationCount`);
+  - удерживается ли `dominantModule` между репликами;
+  - не зависит ли механика переноса от выбора модели (перенос evidence — детерминированный код, не LLM-вызов).
+- Ожидаемый результат:
+  - реплика 2: `turnIndex: 1`, `evidenceSummary.conversationCount >= 1`;
+  - evidence с `origin: "conversation"` содержит явную ссылку на вопрос предыдущей реплики в `reason`;
+  - `dominantModule` реплики 2 совпадает с репликой 1 (`auth`).
+- Текущий статус: `green`
+- Комментарий:
+  - живой прогон 2026-07-14 подтвердил на трёх моделях (`nvidia/nemotron-3-ultra`, `google/gemini-3.1-flash-lite`, `openai/gpt-5.4-mini`) идентичный результат переноса evidence (2 файла: `success_google.blade.php`, `create_google_accounts_table.php` migration) — подтверждает, что механика не зависит от модели;
+  - итоговый `answer.answerMode` на этом конкретном вопросе — `clarification-needed` (вопрос действительно затрагивает сразу auth и email-verification зоны) — это не баг диалоговой механики, а отдельное, корректное срабатывание `detectResearchAmbiguity`.
+
 ## Приоритет следующего прогона
 
 Если идти по полезности для развития системы, я бы гонял сценарии в таком порядке:

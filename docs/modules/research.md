@@ -959,6 +959,8 @@ Research Engine должен уметь переиспользовать:
 - knowledge bundles по определённым модулям;
 - historical module profiles.
 
+**Реализовано (2026-07-14):** переиспользование evidence непосредственно предыдущей реплики того же диалога (`conversationId`) — отдельный, более узкий механизм, чем project-wide Knowledge/Fact Store. `ResearchInput.priorTurn` несёт task/summary/dominantModule/evidence/moduleIntents предыдущей реплики; `applyPriorTurnEvidence` применяет тот же reinforcement+backfill паттерн, что уже используется для Fact Store (`applyKnownFacts`), но с более мягким гейтингом — это непрерывный разговор, а не произвольная пара исторических вопросов. `dominantModule` также наследуется от предыдущей реплики, если текущий вопрос сам по себе слабый (короткий follow-up без явных доменных слов). Evidence, перенесённое таким образом, помечается `origin: "conversation"` — отдельно от `"recalled"` (Fact Store), чтобы Research Report оставался explicit о происхождении каждого факта (принцип из §10.10: traceable, source-backed).
+
 ### 12.3 Инвалидация
 
 Исследовательские кэши должны инвалидироваться при:
