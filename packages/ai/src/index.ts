@@ -1163,12 +1163,27 @@ function computeEvidenceQualityScore(packet: ValidationPacket): number {
   const fileAnchors = packet.evidenceHighlights.filter((item) => Boolean(item.filePath)).length;
   const originDiversity = new Set(packet.evidenceHighlights.map((item) => item.origin)).size;
   const anchorDensity = packet.structuralAnchors.length;
+  const flowQuestionBoost =
+    packet.questionType === "flow" && packet.graphCoverage.entryPointCount >= 2 && highScoreEvidence >= 3
+      ? 12
+      : 0;
+  const locationQuestionBoost =
+    packet.questionType === "location" && fileAnchors >= 3
+      ? 10
+      : 0;
+  const existenceQuestionBoost =
+    packet.questionType === "existence" && highScoreEvidence >= 2 && fileAnchors >= 2
+      ? 8
+      : 0;
 
   return (
     highScoreEvidence * 8
     + fileAnchors * 3
     + originDiversity * 4
     + Math.min(anchorDensity, 6) * 4
+    + flowQuestionBoost
+    + locationQuestionBoost
+    + existenceQuestionBoost
   );
 }
 
@@ -1454,6 +1469,18 @@ function resolveValidationStatus(input: {
   recommendedActions: ValidationRecommendedAction[];
   missingEntityHints: string[];
 }): ValidationResult["status"] {
+  const questionTypeAllowsFastAnswer =
+    input.packet.questionType === "flow"
+    || input.packet.questionType === "location"
+    || input.packet.questionType === "existence";
+  const strongFastPathSignal =
+    questionTypeAllowsFastAnswer
+    && input.packet.evidenceHighlights.filter((item) => Boolean(item.filePath)).length >= 3
+    && input.packet.graphCoverage.entryPointCount >= 1
+    && input.packet.remainingIterationBudget > 0
+    && input.missingEntityHints.length === 0
+    && input.contradictionLevel === "none";
+
   if (input.contradictionLevel === "major") {
     return input.packet.remainingIterationBudget > 0 ? "needs-focused-research" : "contradictory-evidence";
   }
@@ -1472,6 +1499,10 @@ function resolveValidationStatus(input: {
   }
 
   if (input.readinessScore >= VALIDATOR_PARTIAL_READINESS && input.directAnswerFeasibility !== "blocked") {
+    if (strongFastPathSignal) {
+      return "ready-for-answer";
+    }
+
     return input.packet.remainingIterationBudget > 0 && input.recommendedActions.length > 0
       ? "needs-focused-research"
       : "partial-answer-allowed";
@@ -1785,6 +1816,10 @@ function buildAnswerSystemPrompt(contract: QuestionContract): string {
     "- Не упоминай внутренние названия артефактов (Research, Impact, Context, Plan) в ответе.",
     "- Не пересказывай артефакты дословно — синтезируй ответ своими словами.",
     "- Пиши по-русски, в стиле опытного инженера, который отвечает коллеге в чате, а не пишет отчёт.",
+    "- Начинай сразу с сути. Не используй канцелярские формулы вроде 'подтверждается', 'наблюдается', 'можно сделать вывод'. Лучше: 'да, здесь это сделано так-то' или 'нет, такого механизма не видно'.",
+    "- Если вопрос yes/no, первая фраза должна прямо начинаться с 'Да', 'Нет' или 'Похоже, что да/нет', а не с описания процесса вокруг.",
+    "- Если вопрос про location, в первой фразе назови главное место в коде, а не общий обзор модуля.",
+    "- Не пиши человеку про confidence, readiness, validation, baseline, artifacts, synthesis, fallback и другие внутренние слова системы.",
     "- Никогда не начинай ответ и не строй его вокруг служебных фраз про происхождение данных ('ответ опирается на committed baseline', 'по происхождению фактов', 'baseline source exact-head', 'evidence-locked режим' и подобных) — это внутренняя механика системы, а не то, что интересует человека. Если нужно упомянуть неуверенность — скажи это одной обычной фразой ('не до конца уверен, но похоже, что...'), а не терминами системы.",
     "- Пиши как человек, а не как система, описывающая саму себя: не 'система ограничивает вывод', а прямо по делу.",
     "",
@@ -2081,19 +2116,11 @@ function buildWarnings(input: BuildAnswerInput): string[] {
     warnings.push("Ответ опирается на неполный набор данных, часть unknowns остаётся открытой.");
   }
 
-  if (input.runtime.status === "blocked") {
-    warnings.push("Execution runtime заблокирован: для автоматического изменения проекта нужно дополнительное подтверждение или уточнение.");
-  }
-
   if (input.research.queryProfileKey === "broad-scan") {
     warnings.push("Запрос слишком широкий, поэтому вывод может быть менее точным, чем у узкосфокусированного вопроса.");
   }
 
-  if (shouldForceEvidenceLockedMode(input)) {
-    warnings.push("Держусь только доказанного — недоказанные гипотезы сюда намеренно не попали.");
-  }
-
-  return warnings.slice(0, 3);
+  return Array.from(new Set(warnings)).slice(0, 3);
 }
 
 function buildNextActions(input: BuildAnswerInput, mode: AnswerMode): string[] {
@@ -2113,10 +2140,6 @@ function buildNextActions(input: BuildAnswerInput, mode: AnswerMode): string[] {
 
   if (input.research.unknowns.length > 0) {
     actions.push("При необходимости можно сузить вопрос или добавить runtime-логи для более точного вывода.");
-  }
-
-  if (input.plan.targetFiles.length > 0) {
-    actions.push("Можно открыть Inspector и посмотреть затронутые файлы и evidence.");
   }
 
   if (actions.length === 0) {

@@ -22,6 +22,7 @@ import {
   type FocusedResearchRequest,
   type FocusedResearchResult,
   type GraphState,
+  detectResearchAmbiguity,
   normalizePath,
   stableId,
   tokenize,
@@ -56,6 +57,8 @@ interface QuestionWorkspacePlan {
   mode: "baseline-graph-first" | "baseline-discovery-slice" | "repository-scoped" | "structural-fallback" | "empty";
   summary: string;
 }
+
+type QuestionRuntimeMode = "chat-fast-path" | "deep-research-path";
 
 const runStore = new Map<string, PipelineRunStatus>();
 const runAppRootStore = new Map<string, string>();
@@ -173,6 +176,39 @@ export async function loadPipelineRunStatus(appRootPath: string, runId: string):
     return parsed;
   } catch {
     return null;
+  }
+}
+
+export async function waitForPipelineRunCompletion(
+  appRootPath: string,
+  runId: string,
+  options?: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+  },
+): Promise<PipelineRunStatus | null> {
+  const timeoutMs = options?.timeoutMs ?? 1000 * 60 * 4;
+  const pollIntervalMs = options?.pollIntervalMs ?? 700;
+  const startedAt = Date.now();
+
+  for (;;) {
+    const status = await loadPipelineRunStatus(appRootPath, runId);
+
+    if (!status) {
+      return null;
+    }
+
+    if (status.status === "completed" || status.status === "failed") {
+      return status;
+    }
+
+    if (Date.now() - startedAt >= timeoutMs) {
+      return status;
+    }
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, pollIntervalMs);
+    });
   }
 }
 
@@ -532,6 +568,21 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   });
   await yieldToEventLoop();
 
+  const questionRuntimeMode: QuestionRuntimeMode =
+    isQuestionRun && shouldUseChatFastPath({
+      task,
+      research: initialResearch,
+      impact: initialImpact,
+      diagnostics: [
+        ...workspace.diagnostics,
+        ...index.diagnostics,
+        ...repository.diagnostics,
+        ...backgroundState.diagnostics,
+      ],
+    })
+      ? "chat-fast-path"
+      : "deep-research-path";
+
   const contextStartedAt = startStage(runId, "context");
   const initialContext = buildContextPackage({
     runId,
@@ -579,12 +630,13 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       ...repository.diagnostics,
       ...backgroundState.diagnostics,
     ],
+    runtimeMode: questionRuntimeMode,
   });
   completeStage(
     runId,
     "validation",
     validationStartedAt,
-    `Проверка ответа завершена за ${validationLoop.validationHistory.length} раунд(а/ов): статус ${validationLoop.validation.status}, readiness ${validationLoop.validation.readinessScore}%.`,
+    `${questionRuntimeMode === "chat-fast-path" ? "Chat fast-path." : "Deep research path."} Проверка ответа завершена за ${validationLoop.validationHistory.length} раунд(а/ов): статус ${validationLoop.validation.status}, readiness ${validationLoop.validation.readinessScore}%.`,
   );
   updatePartialArtifacts(runId, {
     research: validationLoop.research,
@@ -1278,6 +1330,7 @@ async function runValidationLoop(input: {
   context: PipelineRunResult["context"];
   previousRun: PipelineRunResult | null;
   diagnostics: string[];
+  runtimeMode: QuestionRuntimeMode;
 }): Promise<{
   research: PipelineRunResult["research"];
   impact: PipelineRunResult["impact"];
@@ -1289,6 +1342,47 @@ async function runValidationLoop(input: {
   focusedResearchResults: FocusedResearchResult[];
   validatedAnswerPacket: ReturnType<typeof buildValidatedAnswerPacket>;
 }> {
+  if (input.runtimeMode === "chat-fast-path") {
+    const fastPacket = buildValidationPacket({
+      runId: input.runId,
+      task: input.task,
+      research: input.research,
+      impact: input.impact,
+      context: input.context,
+      graph: input.graph,
+      diagnostics: input.diagnostics,
+      backgroundState: input.backgroundState,
+      iteration: 0,
+      priorActions: [],
+      remainingIterationBudget: 0,
+    });
+    updateStageLabel(input.runId, "validation", "Сигнал сильный — пропускаю глубокую проверку и собираю быстрый ответ...");
+    const fastValidation = await validateEvidence({
+      packet: fastPacket,
+      providerBaseUrl: "",
+      providerModel: "",
+      providerApiKey: "",
+    });
+    const validatedAnswerPacket = buildValidatedAnswerPacket({
+      runId: input.runId,
+      questionType: fastPacket.questionType,
+      validation: fastValidation,
+      research: input.research,
+    });
+
+    return {
+      research: input.research,
+      impact: input.impact,
+      context: input.context,
+      validation: fastValidation,
+      validationHistory: [fastValidation],
+      validationPacket: fastPacket,
+      focusedResearchRequests: [],
+      focusedResearchResults: [],
+      validatedAnswerPacket,
+    };
+  }
+
   let currentResearch = input.research;
   let currentImpact = input.impact;
   let currentContext = input.context;
@@ -1310,11 +1404,12 @@ async function runValidationLoop(input: {
     remainingIterationBudget: MAX_VALIDATION_REFINEMENT_ITERATIONS,
   });
   updateStageLabel(input.runId, "validation", "Проверяю, отвечает ли найденное на вопрос...");
+  const shouldBypassProviderOnInitialValidation = shouldUseFastValidationPath(currentPacket, currentResearch);
   let currentValidation = await validateEvidence({
     packet: currentPacket,
-    providerBaseUrl: input.providerBaseUrl,
-    providerModel: input.providerModel,
-    providerApiKey: input.providerApiKey,
+    providerBaseUrl: shouldBypassProviderOnInitialValidation ? "" : input.providerBaseUrl,
+    providerModel: shouldBypassProviderOnInitialValidation ? "" : input.providerModel,
+    providerApiKey: shouldBypassProviderOnInitialValidation ? "" : input.providerApiKey,
   });
   validationHistory.push(currentValidation);
 
@@ -1422,6 +1517,102 @@ async function runValidationLoop(input: {
     focusedResearchResults,
     validatedAnswerPacket,
   };
+}
+
+function shouldUseChatFastPath(input: {
+  task: string;
+  diagnostics: string[];
+  research: PipelineRunResult["research"];
+  impact: PipelineRunResult["impact"];
+}): boolean {
+  if (looksLikeHighRiskChangeTask(input.task, input.impact)) {
+    return false;
+  }
+
+  if (input.research.confidence < 72) {
+    return false;
+  }
+
+  if (input.research.evidence.length < 4) {
+    return false;
+  }
+
+  if (input.research.unknowns.length >= 2) {
+    return false;
+  }
+
+  if (input.diagnostics.length >= 2) {
+    return false;
+  }
+
+  if (detectResearchAmbiguity(input.research).ambiguous) {
+    return false;
+  }
+
+  const summaryText = `${input.research.summary} ${input.research.functionalSummary}`.toLowerCase();
+
+  if (
+    summaryText.includes("частично")
+    || summaryText.includes("эврист")
+    || summaryText.includes("не найдено")
+    || summaryText.includes("не удалось")
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function looksLikeHighRiskChangeTask(task: string, impact: PipelineRunResult["impact"]): boolean {
+  const normalized = task.toLowerCase();
+
+  if (
+    normalized.includes("измени")
+    || normalized.includes("передел")
+    || normalized.includes("реализ")
+    || normalized.includes("добавь")
+    || normalized.includes("исправ")
+    || normalized.includes("refactor")
+    || normalized.includes("implement")
+    || normalized.includes("change")
+    || normalized.includes("rewrite")
+  ) {
+    return true;
+  }
+
+  return impact.risks.length >= 2 || impact.affectedFiles.length >= 10;
+}
+
+function shouldUseFastValidationPath(
+  packet: ReturnType<typeof buildValidationPacket>,
+  research: PipelineRunResult["research"],
+): boolean {
+  if (research.intentClass === "broad-unknown") {
+    return false;
+  }
+
+  if (research.queryProfileKey === "broad-scan") {
+    return false;
+  }
+
+  const fileBackedEvidenceCount = packet.evidenceHighlights.filter((item) => Boolean(item.filePath)).length;
+  const strongEvidenceCount = packet.evidenceHighlights.filter((item) => item.score >= 16).length;
+  const hasRoutingAnchor =
+    packet.graphCoverage.entryPointCount >= 2
+    || packet.graphCoverage.relevantAnchorCount >= 4;
+  const lowNoise =
+    packet.diagnostics.length === 0
+    && research.unknowns.length <= 1
+    && research.confidence >= 80;
+
+  return (
+    packet.remainingIterationBudget === MAX_VALIDATION_REFINEMENT_ITERATIONS
+    && packet.evidenceHighlights.length >= 4
+    && fileBackedEvidenceCount >= 3
+    && strongEvidenceCount >= 3
+    && hasRoutingAnchor
+    && lowNoise
+  );
 }
 
 function buildFocusedResearchRequest(input: {

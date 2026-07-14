@@ -735,7 +735,7 @@ function UserTaskMessage({ task, projectName, projectPath }: { task: string; pro
       <div className="message-card">
         <p className="message-label">Задача · {safeText(projectName, "Проект не выбран")}</p>
         <p>{safeText(task)}</p>
-        <p className="message-footnote">Путь: {safeText(projectPath)}</p>
+        {projectPath ? null : <p className="message-footnote">Проект не выбран</p>}
       </div>
     </div>
   );
@@ -895,15 +895,6 @@ function AssistantRunMessage({
               </button>
               <button type="button" className="ghost-button" onClick={() => onOpenInspector("overview")}>
                 Почему я так ответил
-              </button>
-              <button type="button" className="ghost-button" onClick={() => onOpenInspector("research")}>
-                Открыть исследование
-              </button>
-              <button type="button" className="ghost-button" onClick={() => onOpenInspector("plan")}>
-                Посмотреть план
-              </button>
-              <button type="button" className="ghost-button" onClick={() => onOpenInspector("execution")}>
-                Execution preview
               </button>
             </div>
 
@@ -2432,7 +2423,7 @@ export function App() {
         throw new Error(status.errorMessage || "Pipeline завершился ошибкой.");
       }
 
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      await new Promise((resolve) => window.setTimeout(resolve, 700));
     }
   }
 

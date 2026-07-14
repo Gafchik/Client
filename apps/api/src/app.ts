@@ -8,7 +8,7 @@ import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
 import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
-import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus } from "./pipeline-runner.js";
+import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus, waitForPipelineRunCompletion } from "./pipeline-runner.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
@@ -26,6 +26,49 @@ interface PipelineRunRequest {
   hardResync?: boolean;
   /** Продолжение существующего диалога — если не передан, стартует новый (см. §7 в pipeline-runner.ts). */
   conversationId?: string;
+}
+
+interface CompactPipelineRunStatusResponse {
+  runId: string;
+  status: PipelineRunStatus["status"];
+  updatedAt: string;
+  currentStageKey?: PipelineRunStatus["currentStageKey"];
+  currentStageLabel?: PipelineRunStatus["currentStageLabel"];
+  errorMessage?: string;
+  result?: {
+    answer?: {
+      answerMode?: string;
+      summary?: string;
+      explanation?: string;
+      warnings?: string[];
+      synthesis?: string;
+    };
+    validation?: {
+      status?: string;
+      readinessScore?: number;
+    };
+    provider?: {
+      model?: string;
+    };
+    stages?: Array<{
+      key: string;
+      label: string;
+      status: string;
+      details: string;
+    }>;
+  };
+}
+
+interface EvalScenarioRequest {
+  id?: string;
+  task?: string;
+  projectPath?: string;
+}
+
+interface EvalRunRequest {
+  scenarios?: EvalScenarioRequest[];
+  models?: string[];
+  timeoutMs?: number;
 }
 
 interface BackgroundBaselineInfo {
@@ -76,6 +119,83 @@ async function resolveProjectRecord(input: {
   }
 
   return projectRecord;
+}
+
+function buildCompactPipelineRunStatus(status: PipelineRunStatus): CompactPipelineRunStatusResponse {
+  return {
+    runId: status.runId,
+    status: status.status,
+    updatedAt: status.updatedAt,
+    ...(status.currentStageKey ? { currentStageKey: status.currentStageKey } : {}),
+    ...(status.currentStageLabel ? { currentStageLabel: status.currentStageLabel } : {}),
+    ...(status.errorMessage ? { errorMessage: status.errorMessage } : {}),
+    ...(status.result
+      ? {
+          result: {
+            ...(status.result.answer
+              ? {
+                  answer: {
+                    ...(status.result.answer.answerMode ? { answerMode: status.result.answer.answerMode } : {}),
+                    ...(status.result.answer.summary ? { summary: status.result.answer.summary } : {}),
+                    ...(status.result.answer.explanation ? { explanation: status.result.answer.explanation } : {}),
+                    ...(status.result.answer.warnings ? { warnings: status.result.answer.warnings } : {}),
+                    ...(status.result.answer.synthesis ? { synthesis: status.result.answer.synthesis } : {}),
+                  },
+                }
+              : {}),
+            ...(status.result.validation
+              ? {
+                  validation: {
+                    ...(status.result.validation.status ? { status: status.result.validation.status } : {}),
+                    ...(typeof status.result.validation.readinessScore === "number"
+                      ? { readinessScore: status.result.validation.readinessScore }
+                      : {}),
+                  },
+                }
+              : {}),
+            ...(status.result.provider?.model
+              ? {
+                  provider: {
+                    model: status.result.provider.model,
+                  },
+                }
+              : {}),
+            stages: status.stages.map((stage) => ({
+              key: stage.key,
+              label: stage.label,
+              status: stage.status,
+              details: stage.details,
+            })),
+          },
+        }
+      : {}),
+  };
+}
+
+function buildEvalSummary(status: PipelineRunStatus | null, elapsedMs: number, model: string, scenario: EvalScenarioRequest) {
+  return {
+    scenarioId: scenario.id?.trim() || "scenario",
+    task: scenario.task?.trim() || "",
+    projectPath: scenario.projectPath?.trim() || "",
+    model,
+    elapsedMs,
+    runId: status?.runId ?? null,
+    status: status?.status ?? "failed",
+    currentStageLabel: status?.currentStageLabel ?? null,
+    answerMode: status?.result?.answer?.answerMode ?? null,
+    synthesis: status?.result?.answer?.synthesis ?? null,
+    summary: status?.result?.answer?.summary ?? null,
+    explanation: status?.result?.answer?.explanation ?? null,
+    warnings: status?.result?.answer?.warnings ?? [],
+    validationStatus: status?.result?.validation?.status ?? null,
+    validationReadiness: status?.result?.validation?.readinessScore ?? null,
+    stageDetails: status?.stages.map((stage) => ({
+      key: stage.key,
+      status: stage.status,
+      details: stage.details,
+    })) ?? [],
+    errorMessage: status?.errorMessage ?? null,
+  };
 }
 
 export function createApp() {
@@ -442,6 +562,7 @@ export function createApp() {
   app.get<{
     Querystring: {
       runId?: string;
+      compact?: string;
     };
   }>("/api/pipeline/status", async (request, reply) => {
     const runId = request.query.runId?.trim();
@@ -460,7 +581,12 @@ export function createApp() {
       });
     }
 
-    return status;
+    const compactRequested =
+      request.query.compact === "1"
+      || request.query.compact === "true"
+      || request.query.compact === "yes";
+
+    return compactRequested ? buildCompactPipelineRunStatus(status) : status;
   });
 
   app.post<{ Body: PipelineRunRequest }>("/api/pipeline/run", async (request, reply) => {
@@ -603,6 +729,76 @@ export function createApp() {
     });
 
     return reply.code(202).send(acceptedStatus);
+  });
+
+  app.post<{ Body: EvalRunRequest }>("/api/pipeline/eval", async (request, reply) => {
+    const scenarios = Array.isArray(request.body.scenarios)
+      ? request.body.scenarios
+        .map((scenario) => ({
+          id: scenario.id?.trim() || "",
+          task: scenario.task?.trim() || "",
+          projectPath: scenario.projectPath?.trim() || "",
+        }))
+        .filter((scenario) => scenario.task && scenario.projectPath)
+      : [];
+    const models = Array.isArray(request.body.models)
+      ? request.body.models.map((model) => model.trim()).filter(Boolean)
+      : [];
+    const timeoutMs = Math.max(5_000, Math.min(request.body.timeoutMs ?? 240_000, 600_000));
+
+    if (!scenarios.length) {
+      return reply.code(400).send({
+        message: "Нужно передать хотя бы один eval scenario с task и projectPath.",
+      });
+    }
+
+    if (!models.length) {
+      return reply.code(400).send({
+        message: "Нужно передать хотя бы одну модель для eval.",
+      });
+    }
+
+    const currentProvider = await getCurrentProvider();
+    const providerBaseUrl = currentProvider?.baseUrl || defaultProviderBaseUrl;
+    const providerApiKey = currentProvider?.apiKey || defaultProviderApiKey;
+
+    if (!providerBaseUrl || !providerApiKey) {
+      return reply.code(400).send({
+        message: "Для eval нужен активный provider с baseUrl и apiKey.",
+      });
+    }
+
+    const results: Array<ReturnType<typeof buildEvalSummary>> = [];
+
+    for (const scenario of scenarios) {
+      for (const model of models) {
+        const runId = stableId(["eval-run", scenario.projectPath, scenario.task, model, Date.now(), Math.random()]);
+        const startedAt = Date.now();
+        enqueuePipelineRun({
+          runId,
+          mode: "question-run",
+          conversationId: runId,
+          task: scenario.task!,
+          projectPath: scenario.projectPath!,
+          providerBaseUrl,
+          providerModel: model,
+          providerApiKey,
+          appRootPath,
+        });
+        const status = await waitForPipelineRunCompletion(appRootPath, runId, {
+          timeoutMs,
+          pollIntervalMs: 700,
+        });
+        results.push(buildEvalSummary(status, Date.now() - startedAt, model, scenario));
+      }
+    }
+
+    return {
+      generatedAt: new Date().toISOString(),
+      timeoutMs,
+      resultCount: results.length,
+      results,
+    };
   });
 
   return app;
