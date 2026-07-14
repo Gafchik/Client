@@ -2,8 +2,8 @@
 
 **Статус:** Спецификация
 **Автор:** Principal Architecture Specification
-**Дата:** 2026-07-08
-**Версия:** 1.0.0
+**Дата:** 2026-07-15
+**Версия:** 1.1.0
 **Зависимости:** [000-overview.md](../architecture/000-overview.md), [001-domain-model.md](../architecture/001-domain-model.md), [002-storage.md](../architecture/002-storage.md), [003-event-system.md](../architecture/003-event-system.md), [004-dependency-map.md](../architecture/004-dependency-map.md), [005-contract-gaps.md](../architecture/005-contract-gaps.md)
 
 ---
@@ -353,6 +353,16 @@ Consumer → формулирует запрос (LLM/Embedding/Search) → Prov
 **Capabilities:** `chat`, `structured_output`, `function_calling`, `streaming`, `long_context`.
 **Ограничения:** Agent не знает провайдера/ключи, не реализует retry, соблюдает бюджет Run. Обрабатывает `AIRateLimited`/`AIRequestFailed`.
 **Ответы:** `ModelResponse`, streaming `StreamChunk`.
+
+### 10.6 Team (реализовано 2026-07-15) — назначение модели на роль поверх Provider
+
+Provider (этот документ) отвечает только за credentials (`baseUrl`/`apiKey`) — ровно одна пара на весь пайплайн. Модель как таковая — это отдельное, ортогональное измерение, которое теперь явно управляется через новую сущность **Team** (`apps/api/src/team-store.ts`, таблица `teams`, `/api/teams*`, страница `/teams`): три роли, каждая закреплена за своим `model` id (свободная строка, без отдельной регистрации/allowlist со стороны Provider — подтверждено, `model` просто передаётся как есть в тело запроса):
+
+- **Researcher** — модель, которая ведёт agentic tool-loop исследование (`packages/agentic-research`) и пишет финальный ответ через существующий синтезатор.
+- **Critic** — кросс-вендорная модель (см. `009-model-catalog-and-role-profiles.md`, принцип "Validator ≠ vendor of Synthesizer"), проверяющая предложенный ответ Researcher перед принятием.
+- **Observer** — модель фонового обхода (`apps/api/src/observer-monitor.ts`), намеренно медленная/бесплатная, никогда не участвует в интерактивном пути.
+
+Это не полноценный "Capability Router"/"Cost Profile" в смысле разделов 5-9 выше (той инфраструктуры пока нет) — просто явное, персистентное сопоставление роль → model id, с одним выбранным (`is_selected`) Team на инсталляцию, тем же transactional clear-then-set паттерном, что и `providers.is_current`.
 
 ---
 

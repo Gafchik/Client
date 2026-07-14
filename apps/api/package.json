@@ -10,6 +10,7 @@
     "build": "npm run typecheck"
   },
   "dependencies": {
+    "@client/agentic-research": "0.1.0",
     "@client/ai": "0.1.0",
     "@client/context": "0.1.0",
     "@client/graph": "0.1.0",

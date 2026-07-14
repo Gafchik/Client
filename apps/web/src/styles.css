@@ -638,6 +638,31 @@ button {
   color: var(--text-faint);
 }
 
+.field-hint {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.team-role-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.team-role-card {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated-1, var(--bg-elevated-2));
+}
+
+.team-role-card strong {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
 .composer-box {
   display: grid;
   gap: 10px;

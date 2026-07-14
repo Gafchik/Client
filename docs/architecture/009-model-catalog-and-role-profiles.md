@@ -2,8 +2,8 @@
 
 **Статус:** Proposed (Reference Catalog — операционный документ поверх целевой архитектуры)
 **Автор:** Principal Architecture Specification
-**Дата:** 2026-07-14
-**Версия:** 1.1.0
+**Дата:** 2026-07-15
+**Версия:** 1.2.0
 **Зависимости:** [008-next-generation-architecture.md](./008-next-generation-architecture.md) (разделы 11, 13, 14, 15), [provider-system.md](/Users/evgenii/Desktop/client/docs/modules/provider-system.md)
 
 ---
@@ -259,6 +259,16 @@ max_average_multiplier_for_near-full-continuous_mode = 51 / 50 = 1.02x
 | Test-failure interpreter | Micro | нет |
 
 Роли `Structural Analyst`, `Cost Governor` — не-LLM, моделей не требуют (напоминание из `008`).
+
+### 5.1 Реализовано (2026-07-15): Team — конкретное воплощение части ролей выше
+
+В отличие от остального документа (Proposed reference catalog, ролевая матрица без реального кода), три роли из таблицы выше теперь реально реализованы как явная, персистентная сущность **Team** (`apps/api/src/team-store.ts`, `packages/agentic-research`, `docs/modules/provider-system.md` §10.6):
+
+- **Researcher** — по сути объединяет то, что здесь описано как Answer Synthesizer + значительную часть Research/Planner: ведёт agentic tool-loop исследование и пишет финальный ответ.
+- **Critic** — прямая реализация Evidence Validator/Critic, кросс-вендорное требование (принцип 1 ниже) соблюдается по конструкции: дефолтная Team использует `google/gemini-3.1-flash-lite` как Critic при `openai/gpt-5.4-mini` как Researcher.
+- **Observer** — новая роль, не описанная в таблице выше: медленный фоновый обход проекта для накопления персистентного графа бизнес-логики (`business_graph_entries`), намеренно не участвует в интерактивном пути. Ближе всего по духу к Semantic Enricher (`008`, §7 L2), но с более простой, директорийной единицей работы, а не graph-cluster.
+
+Это не заменяет Router/Clarifying Agent/Planner/Developer Agent/Reviewer Agent из таблицы — они остаются нереализованными на момент записи.
 
 ---
 

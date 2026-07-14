@@ -898,6 +898,22 @@ export interface ProviderCatalogResponse {
   recommendedModelId?: string;
 }
 
+export interface TeamRecord {
+  id: string;
+  name: string;
+  researcherModel: string;
+  criticModel: string;
+  observerModel: string;
+  isSelected: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TeamCatalogResponse {
+  teams: TeamRecord[];
+  selectedTeam: TeamRecord | null;
+}
+
 export interface ProjectPathRecord {
   id: string;
   projectId: string;

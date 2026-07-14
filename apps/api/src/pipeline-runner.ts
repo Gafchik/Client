@@ -12,7 +12,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntries, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -38,7 +38,9 @@ import {
   type ValidationResult,
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
+import { runAgenticResearch } from "@client/agentic-research";
 import { saveGraphSnapshot } from "./graph-store.js";
+import { getSelectedTeam } from "./team-store.js";
 
 export interface PipelineExecutionRequest {
   runId: string;
@@ -58,7 +60,7 @@ interface QuestionWorkspacePlan {
   summary: string;
 }
 
-type QuestionRuntimeMode = "chat-fast-path" | "deep-research-path";
+type QuestionRuntimeMode = "chat-fast-path" | "deep-research-path" | "team-mode";
 
 const runStore = new Map<string, PipelineRunStatus>();
 const runAppRootStore = new Map<string, string>();
@@ -506,48 +508,81 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
   const researchStartedAt = startStage(runId, "research");
   const knownFacts = await queryRelevantFacts(projectRootPath, index, repository);
-  const researchInputForRun = {
-    runId,
-    task,
-    workspace,
-    index,
-    graph,
-    repository,
-    backgroundState,
-    knownFacts,
-    ...(priorConversationTurn
-      ? {
-          priorTurn: {
-            task: priorConversationTurn.research.task,
-            summary: priorConversationTurn.research.summary,
-            dominantModule: priorConversationTurn.research.dominantModule,
-            evidence: priorConversationTurn.research.evidence,
-            moduleIntents: priorConversationTurn.research.moduleIntents,
-            intentClass: priorConversationTurn.research.intentClass,
-            strategyKey: priorConversationTurn.research.strategyKey,
-            queryProfileKey: priorConversationTurn.research.queryProfileKey,
-          },
-        }
-      : {}),
-  };
-  const primaryResearch = runResearch(researchInputForRun);
-  const keywordExpansion = await maybeExpandResearchWithTranslatedKeywords(researchInputForRun, primaryResearch, {
-    isQuestionRun,
-    providerBaseUrl,
-    providerModel,
-    providerApiKey,
-  });
-  const initialResearch = keywordExpansion.research;
-  completeStage(
-    runId,
-    "research",
-    researchStartedAt,
-    `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}, recalled ${initialResearch.evidenceSummary.recalledCount}, из диалога ${initialResearch.evidenceSummary.conversationCount}.${
-      keywordExpansion.keywords.length > 0
-        ? ` Дополнительно запрошены англоязычные ключевые слова через LLM: ${keywordExpansion.keywords.join(", ")}.`
-        : ""
-    }`,
-  );
+  // Team-mode: если для вопроса выбрана команда (Researcher/Critic/Observer,
+  // см. team-store.ts), agentic-исследование (packages/agentic-research)
+  // заменяет детерминированный runResearch целиком — сама модель ходит
+  // list_dir/grep_content/read_file по проекту вместо готового промпта от
+  // алгоритма. Kill-switch по конструкции: без выбранной команды пайплайн
+  // работает ровно как раньше.
+  const selectedTeam = isQuestionRun ? await getSelectedTeam() : null;
+  let initialResearch: PipelineRunResult["research"];
+  let teamValidation: ValidationResult | null = null;
+
+  if (selectedTeam) {
+    updateStageLabel(runId, "research", `Команда «${selectedTeam.name}»: Researcher исследует проект инструментами...`);
+    const observerHint = await buildObserverHintSuffix(projectRootPath, task);
+    const agenticResult = await runAgenticResearch({
+      runId,
+      task: observerHint ? `${task}\n\n${observerHint}` : task,
+      projectRootPath,
+      researcherModel: selectedTeam.researcherModel,
+      criticModel: selectedTeam.criticModel,
+      providerBaseUrl,
+      providerApiKey,
+    });
+    initialResearch = agenticResult.research;
+    teamValidation = agenticResult.validation;
+    completeStage(
+      runId,
+      "research",
+      researchStartedAt,
+      `Команда «${selectedTeam.name}»: изучено ${agenticResult.raw.touchedFiles.length} файлов за ${agenticResult.raw.turnsUsed} ход(а/ов), критик: ${agenticResult.raw.criticVerdict}.`,
+    );
+  } else {
+    const researchInputForRun = {
+      runId,
+      task,
+      workspace,
+      index,
+      graph,
+      repository,
+      backgroundState,
+      knownFacts,
+      ...(priorConversationTurn
+        ? {
+            priorTurn: {
+              task: priorConversationTurn.research.task,
+              summary: priorConversationTurn.research.summary,
+              dominantModule: priorConversationTurn.research.dominantModule,
+              evidence: priorConversationTurn.research.evidence,
+              moduleIntents: priorConversationTurn.research.moduleIntents,
+              intentClass: priorConversationTurn.research.intentClass,
+              strategyKey: priorConversationTurn.research.strategyKey,
+              queryProfileKey: priorConversationTurn.research.queryProfileKey,
+            },
+          }
+        : {}),
+    };
+    const primaryResearch = runResearch(researchInputForRun);
+    const keywordExpansion = await maybeExpandResearchWithTranslatedKeywords(researchInputForRun, primaryResearch, {
+      isQuestionRun,
+      providerBaseUrl,
+      providerModel,
+      providerApiKey,
+    });
+    initialResearch = keywordExpansion.research;
+    completeStage(
+      runId,
+      "research",
+      researchStartedAt,
+      `Подготовлено ${initialResearch.evidence.length} опорных ссылок с уверенностью ${initialResearch.confidence}%: baseline ${initialResearch.evidenceSummary.baselineCount}, overlay ${initialResearch.evidenceSummary.overlayCount}, structural ${initialResearch.evidenceSummary.structuralCount}, recalled ${initialResearch.evidenceSummary.recalledCount}, из диалога ${initialResearch.evidenceSummary.conversationCount}.${
+        keywordExpansion.keywords.length > 0
+          ? ` Дополнительно запрошены англоязычные ключевые слова через LLM: ${keywordExpansion.keywords.join(", ")}.`
+          : ""
+      }`,
+    );
+  }
+
   updatePartialArtifacts(runId, {
     research: initialResearch,
   });
@@ -568,8 +603,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   });
   await yieldToEventLoop();
 
-  const questionRuntimeMode: QuestionRuntimeMode =
-    isQuestionRun && shouldUseChatFastPath({
+  const questionRuntimeMode: QuestionRuntimeMode = selectedTeam
+    ? "team-mode"
+    : isQuestionRun && shouldUseChatFastPath({
       task,
       research: initialResearch,
       impact: initialImpact,
@@ -631,12 +667,13 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       ...backgroundState.diagnostics,
     ],
     runtimeMode: questionRuntimeMode,
+    ...(teamValidation ? { precomputedTeamValidation: teamValidation } : {}),
   });
   completeStage(
     runId,
     "validation",
     validationStartedAt,
-    `${questionRuntimeMode === "chat-fast-path" ? "Chat fast-path." : "Deep research path."} Проверка ответа завершена за ${validationLoop.validationHistory.length} раунд(а/ов): статус ${validationLoop.validation.status}, readiness ${validationLoop.validation.readinessScore}%.`,
+    `${questionRuntimeMode === "team-mode" ? "Команда уже проверила ответ критиком." : questionRuntimeMode === "chat-fast-path" ? "Chat fast-path." : "Deep research path."} Проверка ответа завершена за ${validationLoop.validationHistory.length} раунд(а/ов): статус ${validationLoop.validation.status}, readiness ${validationLoop.validation.readinessScore}%.`,
   );
   updatePartialArtifacts(runId, {
     research: validationLoop.research,
@@ -710,7 +747,10 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     runId,
     task,
     providerBaseUrl: isQuestionRun ? providerBaseUrl : "",
-    providerModel: isQuestionRun ? providerModel : "",
+    // Team-mode: финальная прозa всё ещё идёт через существующий, уже
+    // настроенный "человеческий" system prompt (buildAnswerSystemPrompt) —
+    // просто моделью Researcher выбранной команды, а не общей моделью пайплайна.
+    providerModel: isQuestionRun ? (selectedTeam?.researcherModel || providerModel) : "",
     providerApiKey: isQuestionRun ? providerApiKey : "",
     research,
     impact,
@@ -1313,6 +1353,47 @@ function buildQuestionWorkspacePlan(
   };
 }
 
+const OBSERVER_HINT_MIN_TOKEN_LENGTH = 4;
+const OBSERVER_HINT_MAX_ENTRIES = 2;
+
+// Observer's накопленные записи (packages/knowledge graph-entries) — не
+// подтверждённый факт, а подсказка ("похоже, было здесь"): живой Researcher
+// сам решает, доверять ли ей, после проверки по актуальному коду. Именно
+// поэтому формулировка ниже явно говорит "проверь", а не "вот факт".
+async function buildObserverHintSuffix(projectRootPath: string, task: string): Promise<string> {
+  try {
+    const entries = await queryBusinessGraphEntries(projectRootPath);
+    const freshEntries = entries.filter((entry) => !entry.isStale && entry.featureSummary.trim());
+
+    if (freshEntries.length === 0) {
+      return "";
+    }
+
+    const taskTokens = tokenize(task).filter((token) => token.length >= OBSERVER_HINT_MIN_TOKEN_LENGTH);
+    const relevant = freshEntries
+      .filter((entry) => {
+        const haystack = `${entry.unitPath} ${entry.featureSummary}`.toLowerCase();
+        return taskTokens.some((token) => haystack.includes(token));
+      })
+      .slice(0, OBSERVER_HINT_MAX_ENTRIES);
+
+    if (relevant.length === 0) {
+      return "";
+    }
+
+    const hintLines = relevant.map(
+      (entry) => `- "${entry.unitPath}": ${entry.featureSummary}`,
+    );
+
+    return [
+      "Подсказка от фонового обхода проекта (Observer) — НЕ подтверждённый факт, а наводка откуда стоит начать. Обязательно проверь по актуальному коду перед тем как на неё полагаться, код мог измениться с момента обхода:",
+      ...hintLines,
+    ].join("\n");
+  } catch {
+    return "";
+  }
+}
+
 async function runValidationLoop(input: {
   runId: string;
   task: string;
@@ -1331,6 +1412,7 @@ async function runValidationLoop(input: {
   previousRun: PipelineRunResult | null;
   diagnostics: string[];
   runtimeMode: QuestionRuntimeMode;
+  precomputedTeamValidation?: ValidationResult;
 }): Promise<{
   research: PipelineRunResult["research"];
   impact: PipelineRunResult["impact"];
@@ -1342,6 +1424,48 @@ async function runValidationLoop(input: {
   focusedResearchResults: FocusedResearchResult[];
   validatedAnswerPacket: ReturnType<typeof buildValidatedAnswerPacket>;
 }> {
+  if (input.runtimeMode === "team-mode" && input.precomputedTeamValidation) {
+    // Team-mode's own critic gate (packages/agentic-research) already
+    // validated the answer before it was ever returned here - re-running
+    // the deterministic validateEvidence loop on top would be a redundant
+    // second opinion, not a real safety improvement. Still build a real
+    // ValidationPacket (cheap, no LLM call) purely to get a consistent
+    // questionType for buildValidatedAnswerPacket, same as every other path.
+    const teamPacket = buildValidationPacket({
+      runId: input.runId,
+      task: input.task,
+      research: input.research,
+      impact: input.impact,
+      context: input.context,
+      graph: input.graph,
+      diagnostics: input.diagnostics,
+      backgroundState: input.backgroundState,
+      iteration: 0,
+      priorActions: [],
+      remainingIterationBudget: 0,
+    });
+    updateStageLabel(input.runId, "validation", "Команда уже проверила ответ критиком — пропускаю отдельный validation loop...");
+    const teamValidation = input.precomputedTeamValidation;
+    const validatedAnswerPacket = buildValidatedAnswerPacket({
+      runId: input.runId,
+      questionType: teamPacket.questionType,
+      validation: teamValidation,
+      research: input.research,
+    });
+
+    return {
+      research: input.research,
+      impact: input.impact,
+      context: input.context,
+      validation: teamValidation,
+      validationHistory: [teamValidation],
+      validationPacket: teamPacket,
+      focusedResearchRequests: [],
+      focusedResearchResults: [],
+      validatedAnswerPacket,
+    };
+  }
+
   if (input.runtimeMode === "chat-fast-path") {
     const fastPacket = buildValidationPacket({
       runId: input.runId,

@@ -3,16 +3,18 @@ import Fastify from "fastify";
 import path from "node:path";
 import { buildBackgroundProjectState, deleteKnowledgeRuns, loadBestBaselineRunArtifact, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
-import { normalizePath, stableId, type ConversationTurnsResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse } from "@client/shared";
+import { normalizePath, stableId, type ConversationTurnsResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
 import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
 import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus, waitForPipelineRunCompletion } from "./pipeline-runner.js";
+import { startObserverMonitor, stopObserverMonitor } from "./observer-monitor.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
+import { deleteTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -89,6 +91,15 @@ interface SaveProviderRequest {
   apiKey?: string;
   isActive?: boolean;
   isCurrent?: boolean;
+}
+
+interface SaveTeamRequest {
+  id?: string;
+  name?: string;
+  researcherModel?: string;
+  criticModel?: string;
+  observerModel?: string;
+  isSelected?: boolean;
 }
 
 interface SaveProjectRequest {
@@ -219,6 +230,7 @@ export function createApp() {
     await initializePostgresSchema();
     await initializeSecretCrypto(appRootPath);
     await initializeProviderStore();
+    await initializeTeamStore();
     await initializeProjectStore();
     await initializeGraphStore();
     startProjectStateMonitor({
@@ -227,10 +239,12 @@ export function createApp() {
       fallbackProviderModel: defaultProviderModel,
       fallbackProviderApiKey: defaultProviderApiKey,
     });
+    startObserverMonitor();
   });
 
   app.addHook("onClose", async () => {
     stopProjectStateMonitor();
+    stopObserverMonitor();
     await closeNeo4jDriver();
     await closePostgresPool();
   });
@@ -316,6 +330,58 @@ export function createApp() {
     if (!deleted) {
       return reply.code(404).send({
         message: "Провайдер не найден.",
+      });
+    }
+
+    return { ok: true };
+  });
+
+  app.get("/api/teams", async () => {
+    const teams = await listTeams();
+    const selectedTeam = teams.find((team) => team.isSelected) ?? null;
+
+    return { teams, selectedTeam } satisfies TeamCatalogResponse;
+  });
+
+  app.post<{ Body: SaveTeamRequest }>("/api/teams", async (request, reply) => {
+    const name = request.body.name?.trim();
+
+    if (!name) {
+      return reply.code(400).send({
+        message: "Нужно указать имя команды.",
+      });
+    }
+
+    const team = await saveTeam({
+      ...(request.body.id?.trim() ? { id: request.body.id.trim() } : {}),
+      name,
+      researcherModel: request.body.researcherModel?.trim() || "",
+      criticModel: request.body.criticModel?.trim() || "",
+      observerModel: request.body.observerModel?.trim() || "",
+      isSelected: request.body.isSelected ?? false,
+    });
+
+    return reply.code(200).send(team);
+  });
+
+  app.post<{ Params: { id: string } }>("/api/teams/:id/select", async (request, reply) => {
+    const team = await setSelectedTeam(request.params.id);
+
+    if (!team) {
+      return reply.code(404).send({
+        message: "Команда не найдена.",
+      });
+    }
+
+    return team;
+  });
+
+  app.delete<{ Params: { id: string } }>("/api/teams/:id", async (request, reply) => {
+    const deleted = await deleteTeam(request.params.id);
+
+    if (!deleted) {
+      return reply.code(404).send({
+        message: "Команда не найдена.",
       });
     }
 

@@ -148,12 +148,12 @@ Inspector открывается как `right drawer` поверх контен
 - `Project`
 - `Path`
 - `Provider`
-- `Model`
+- `Team` (реализовано 2026-07-15: заменил отдельный выбор модели — Team назначает модель сразу на три роли, Researcher/Critic/Observer, см. `docs/modules/provider-system.md` §10.6)
 - справа status pill проекта
 
 Пример:
 
-`[ Magenda ] [ Backend ] [ Rout ] [ GPT-5.4 ] [ Карта актуальна ]`
+`[ Magenda ] [ Backend ] [ Rout ] [ Проверенная тройка ] [ Карта актуальна ]`
 
 Чего не должно быть:
 

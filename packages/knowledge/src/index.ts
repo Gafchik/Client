@@ -3,6 +3,13 @@ import path from "node:path";
 import { runSql } from "./postgres-client.js";
 
 export { promoteFactsFromResearch, queryRelevantFacts } from "./facts.js";
+export {
+  hashFiles,
+  queryBusinessGraphEntries,
+  upsertBusinessGraphEntry,
+  type BusinessGraphEntry,
+  type UpsertBusinessGraphEntryInput,
+} from "./graph-entries.js";
 import type { PipelineRunMode } from "@client/shared";
 import {
   type AnswerPackage,

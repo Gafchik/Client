@@ -132,6 +132,50 @@ export async function initializePostgresSchema(): Promise<void> {
   await runSql(
     `create index if not exists idx_project_facts_lookup on project_facts(project_root_path, status, category)`,
   );
+
+  // business_graph_entries — накопительная память Observer'а (см.
+  // observer-monitor.ts): по одной записи на "unit" (директория/модуль
+  // проекта верхнего уровня, НЕ то же самое, что IndexedSymbol.containerName
+  // — отсюда unit_path, а не container_path, во избежание путаницы).
+  // Свежесть — тот же content-hash идиом, что и у project_facts
+  // (source_file_hashes сравнивается с текущим индексом на лету при чтении,
+  // см. queryBusinessGraphEntries), не по дате/коммиту — переключение веток
+  // назад по времени не должно ломать проверку.
+  await runSql(`
+    create table if not exists business_graph_entries (
+      id text primary key,
+      project_root_path text not null,
+      unit_path text not null,
+      feature_summary text not null default '',
+      key_mechanisms text[] not null default '{}',
+      gotchas text[] not null default '{}',
+      source_file_hashes jsonb not null default '{}',
+      confidence integer not null default 50,
+      created_at timestamptz not null,
+      last_crawled_at timestamptz not null
+    )
+  `);
+  await runSql(
+    `create index if not exists idx_business_graph_entries_project on business_graph_entries(project_root_path, unit_path)`,
+  );
+
+  // teams — Researcher/Critic/Observer роли, каждая закреплена за моделью
+  // (свободная строка, отправляется как есть в /chat/completions текущего
+  // выбранного Provider — здесь нет отдельных credentials, см. team-store.ts).
+  // is_selected — тот же singleton-паттерн, что и providers.is_current
+  // (clear-then-set в транзакции, без отдельного unique index).
+  await runSql(`
+    create table if not exists teams (
+      id text primary key,
+      name text not null,
+      researcher_model text not null default '',
+      critic_model text not null default '',
+      observer_model text not null default '',
+      is_selected boolean not null default false,
+      created_at timestamptz not null,
+      updated_at timestamptz not null
+    )
+  `);
 }
 
 /**

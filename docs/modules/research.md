@@ -2,8 +2,8 @@
 
 **Статус:** Draft  
 **Автор:** Principal Engineering Specification  
-**Дата:** 2026-07-08  
-**Версия:** 1.0.0  
+**Дата:** 2026-07-15  
+**Версия:** 1.1.0  
 **Зависимости:** [000-overview.md](/Users/evgenii/Desktop/client/docs/architecture/000-overview.md), [001-domain-model.md](/Users/evgenii/Desktop/client/docs/architecture/001-domain-model.md), [002-storage.md](/Users/evgenii/Desktop/client/docs/architecture/002-storage.md), [003-event-system.md](/Users/evgenii/Desktop/client/docs/architecture/003-event-system.md), [indexer.md](/Users/evgenii/Desktop/client/docs/modules/indexer.md), [graph.md](/Users/evgenii/Desktop/client/docs/modules/graph.md)
 
 ---
@@ -1092,6 +1092,22 @@ Research Engine всегда должен помнить, что он:
 ### 14.4 Стратегический результат
 
 Зрелый Research Engine должен стать модулем, который превращает задачу из расплывчатого намерения в инженерно понятную область исследования.
+
+### 14.5 Реализовано (2026-07-15): agentic-режим как альтернативный продюсер Research Report
+
+В отличие от разделов 1-13 (описывают только детерминированный `runResearch`, который остаётся неизменным и полностью синхронным/без LLM-вызовов), теперь существует второй, полностью реализованный путь построения `ResearchReport` — пакет `@client/agentic-research`. Он не заменяет и не модифицирует `packages/research` — это отдельный продюсер того же контракта (`ResearchReport`), используемый вместо `runResearch` только когда для вопроса выбрана **Team** (см. `apps/api/src/team-store.ts`, `docs/architecture/009-model-catalog-and-role-profiles.md`).
+
+Мотивация: живое тестирование показало, что детерминированный scorer систематически не находит файлы, чьё имя лексически не совпадает ни с одним доменным профилем (`CardAuthorization`, `ProfileAccessService` — 0 из 6 живых попыток), тогда как модель с прямым доступом к `list_dir`/`grep_content`/`read_file` без предварительной алгоритмической фильтрации находит их напрямую, без единой доменной эвристики.
+
+Ключевые отличия agentic-режима от разделов выше:
+
+- "Источники данных" (раздел 3) — не Graph/Workspace/Knowledge заранее собранные слои, а прямой, пошаговый обход файловой системы самой моделью (ReAct-цикл, текстовый ACTION-протокол, не нативный tool-calling — роутер `rout.my` уже 400-ит на строгий `response_format` для части моделей).
+- Второй, кросс-вендорный Critic-проход (см. Team) проверяет предложенный ответ перед принятием — независимый механизм, не описанный в разделе 11 (Confidence Model), которая относится только к детерминированному пути.
+- "Когда Research должен остановить углубление" (13.4) для agentic-режима решается не эвристикой, а объективным критерием: конечный список инструментов/бюджет токенов (safety valve, не turn-count-нудж — экспериментально подтверждено, что давление "поторопись" ухудшает глубину без выигрыша в надёжности).
+- Team-режим намеренно пропускает `runValidationLoop`'s LLM-уточнение (раздел 5) — критик уже отработал внутри agentic-цикла; строится минимальный `ValidationResult` напрямую.
+- Kill-switch по конструкции: без выбранной команды весь этот раздел неприменим, пайплайн работает ровно как описано в разделах 1-13.
+
+Подробности реализации и живой верификации — `docs/state/project-state.md` (запись от 2026-07-15).
 
 Он должен обеспечивать:
 

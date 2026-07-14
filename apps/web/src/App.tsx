@@ -15,6 +15,8 @@ import type {
   ProviderModelRecord,
   ProviderRecord,
   RepositorySnapshot,
+  TeamCatalogResponse,
+  TeamRecord,
 } from "@client/shared";
 
 interface ProjectInfo {
@@ -51,6 +53,20 @@ type ProviderDraft = {
   apiKey: string;
 };
 
+type TeamDraft = {
+  id: string;
+  name: string;
+  researcherModel: string;
+  criticModel: string;
+  observerModel: string;
+};
+
+const TEAM_ROLE_DESCRIPTIONS = {
+  researcher: "Исследует кодовую базу и ищет доказательства для ответа.",
+  critic: "Проверяет ответ Researcher перед тем как показать его пользователю.",
+  observer: "Изучает проект в фоне между вопросами, чтобы будущие ответы были быстрее.",
+} as const;
+
 type ProjectDraftPath = {
   id: string;
   name: string;
@@ -64,7 +80,7 @@ type ProjectDraft = {
   paths: ProjectDraftPath[];
 };
 
-type AppView = "chat" | "providers" | "projects";
+type AppView = "chat" | "providers" | "projects" | "teams";
 
 type InspectorTab = "overview" | "research" | "impact" | "context" | "plan" | "execution" | "knowledge" | "git" | "diagnostics";
 
@@ -401,6 +417,13 @@ function normalizeProviderCatalog(data: ProviderCatalogResponse): ProviderCatalo
   };
 }
 
+function normalizeTeamCatalog(data: TeamCatalogResponse): TeamCatalogResponse {
+  return {
+    teams: safeList(data.teams),
+    selectedTeam: data.selectedTeam ?? null,
+  };
+}
+
 function formatDateTime(value: string | undefined | null): string {
   if (!value) {
     return "Недоступно";
@@ -605,29 +628,29 @@ function EnvironmentStrip({
   selectedProjectId,
   selectedProjectPathId,
   selectedProviderId,
-  providerModelDraft,
   providers,
-  providerModels,
+  teams,
+  selectedTeamId,
   project,
   disabled,
   onProjectChange,
   onProjectPathChange,
   onProviderChange,
-  onModelChange,
+  onTeamChange,
 }: {
   projects: ProjectRecord[];
   selectedProjectId: string;
   selectedProjectPathId: string;
   selectedProviderId: string;
-  providerModelDraft: string;
   providers: ProviderRecord[];
-  providerModels: ProviderModelRecord[];
+  teams: TeamRecord[];
+  selectedTeamId: string;
   project: ProjectInfo | null;
   disabled: boolean;
   onProjectChange: (projectId: string) => void;
   onProjectPathChange: (pathId: string) => void;
   onProviderChange: (providerId: string) => void;
-  onModelChange: (modelId: string) => void;
+  onTeamChange: (teamId: string) => void;
 }) {
   return (
     <section className="environment-strip">
@@ -658,17 +681,13 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      <select className="environment-pill" value={providerModelDraft} onChange={(event) => onModelChange(event.target.value)} disabled={disabled}>
-        {groupModelsByVendor(safeList(providerModels)).map((group) => (
-          <optgroup key={group.vendor} label={group.vendor}>
-            {group.models.map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.label}
-              </option>
-            ))}
-          </optgroup>
+      <select className="environment-pill" value={selectedTeamId} onChange={(event) => onTeamChange(event.target.value)} disabled={disabled}>
+        <option value="">Команда</option>
+        {safeList(teams).map((team) => (
+          <option key={team.id} value={team.id}>
+            {team.name}
+          </option>
         ))}
-        {!providerModels.length ? <option value={DEFAULT_MODEL_ID}>{DEFAULT_MODEL_ID}</option> : null}
       </select>
 
       <div className="environment-status-pill">
@@ -1709,7 +1728,9 @@ export function App() {
     ? "projects"
     : location.pathname.startsWith("/providers")
       ? "providers"
-      : "chat";
+      : location.pathname.startsWith("/teams")
+        ? "teams"
+        : "chat";
   const routeRunId = routeParams.runId ?? null;
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
@@ -1747,6 +1768,15 @@ export function App() {
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [providerModels, setProviderModels] = useState<ProviderModelRecord[]>([]);
   const [selectedProviderId, setSelectedProviderId] = useState<string>("");
+  const [teamDraft, setTeamDraft] = useState<TeamDraft>({
+    id: "",
+    name: "",
+    researcherModel: "",
+    criticModel: "",
+    observerModel: "",
+  });
+  const [teams, setTeams] = useState<TeamRecord[]>([]);
+  const [selectedTeamId, setSelectedTeamId] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [runStatus, setRunStatus] = useState<PipelineRunStatus | null>(null);
@@ -1927,7 +1957,7 @@ export function App() {
       // независимых запроса (ни один не зависит от результата другого), но
       // общее время ожидания было суммой обоих вместо максимума. На старте
       // приложения это и ощущалось как "долго не прилетают проекты/провайдеры".
-      const [loadedProjects] = await Promise.all([loadProjects(), loadProviders()]);
+      const [loadedProjects] = await Promise.all([loadProjects(), loadProviders(), loadTeams()]);
       const preferredProjectId =
         selectedProjectIdRef.current && loadedProjects.some((projectItem) => projectItem.id === selectedProjectIdRef.current)
           ? selectedProjectIdRef.current
@@ -2006,6 +2036,29 @@ export function App() {
     });
 
     return providerData;
+  }
+
+  async function loadTeams() {
+    const teamResponse = await fetchJsonWithTimeout<TeamCatalogResponse>(`${API_BASE_URL}/api/teams`);
+    const teamData = normalizeTeamCatalog(teamResponse);
+
+    startTransition(() => {
+      setTeams(teamData.teams);
+      setSelectedTeamId(teamData.selectedTeam?.id ?? "");
+      const selectedTeam = teamData.selectedTeam;
+
+      if (selectedTeam) {
+        setTeamDraft({
+          id: selectedTeam.id,
+          name: selectedTeam.name,
+          researcherModel: selectedTeam.researcherModel,
+          criticModel: selectedTeam.criticModel,
+          observerModel: selectedTeam.observerModel,
+        });
+      }
+    });
+
+    return teamData;
   }
 
   function openInspector(tab: InspectorTab = "overview") {
@@ -2560,6 +2613,96 @@ export function App() {
     }
   }
 
+  async function saveTeamDraft() {
+    setError(null);
+
+    try {
+      const saved = await fetchJsonWithTimeout<TeamRecord>(`${API_BASE_URL}/api/teams`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id: teamDraft.id,
+          name: teamDraft.name,
+          researcherModel: teamDraft.researcherModel,
+          criticModel: teamDraft.criticModel,
+          observerModel: teamDraft.observerModel,
+          isSelected: true,
+        }),
+      });
+
+      const teamData = normalizeTeamCatalog(await fetchJsonWithTimeout<TeamCatalogResponse>(`${API_BASE_URL}/api/teams`));
+
+      startTransition(() => {
+        setTeams(teamData.teams);
+        setSelectedTeamId(saved.id);
+        setTeamDraft((current) => ({ ...current, id: saved.id }));
+      });
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Не удалось сохранить команду.");
+    }
+  }
+
+  async function selectTeam(teamId: string) {
+    if (!teamId) {
+      setSelectedTeamId("");
+      return;
+    }
+
+    setError(null);
+
+    try {
+      await fetchJsonWithTimeout<TeamRecord>(`${API_BASE_URL}/api/teams/${encodeURIComponent(teamId)}/select`, {
+        method: "POST",
+      });
+      const teamData = normalizeTeamCatalog(await fetchJsonWithTimeout<TeamCatalogResponse>(`${API_BASE_URL}/api/teams`));
+      const selected = safeList(teamData.teams).find((team) => team.id === teamId) ?? null;
+
+      startTransition(() => {
+        setTeams(teamData.teams);
+        setSelectedTeamId(teamId);
+        if (selected) {
+          setTeamDraft({
+            id: selected.id,
+            name: selected.name,
+            researcherModel: selected.researcherModel,
+            criticModel: selected.criticModel,
+            observerModel: selected.observerModel,
+          });
+        }
+      });
+    } catch (selectError) {
+      setError(selectError instanceof Error ? selectError.message : "Не удалось выбрать команду.");
+    }
+  }
+
+  async function removeTeam(teamId: string) {
+    setError(null);
+
+    try {
+      await fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/teams/${encodeURIComponent(teamId)}`, {
+        method: "DELETE",
+      });
+      const teamData = normalizeTeamCatalog(await fetchJsonWithTimeout<TeamCatalogResponse>(`${API_BASE_URL}/api/teams`));
+      const selected = teamData.selectedTeam;
+
+      startTransition(() => {
+        setTeams(teamData.teams);
+        setSelectedTeamId(selected?.id ?? "");
+        setTeamDraft({
+          id: selected?.id ?? "",
+          name: selected?.name ?? "",
+          researcherModel: selected?.researcherModel ?? "",
+          criticModel: selected?.criticModel ?? "",
+          observerModel: selected?.observerModel ?? "",
+        });
+      });
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : "Не удалось удалить команду.");
+    }
+  }
+
   function resetProjectDraft() {
     setProjectDraft({
       id: "",
@@ -2880,6 +3023,9 @@ export function App() {
           <button type="button" className={`top-nav-button ${activeView === "providers" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/providers")} disabled={running}>
             Провайдеры
           </button>
+          <button type="button" className={`top-nav-button ${activeView === "teams" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/teams")} disabled={running}>
+            Команды
+          </button>
         </div>
       </header>
 
@@ -2903,13 +3049,23 @@ export function App() {
         <section className="chat-shell chat-shell-full">
           <header className="chat-header">
           <div>
-            <h1>{activeView === "chat" ? "Чат по проекту" : activeView === "projects" ? "Проекты" : "Провайдеры"}</h1>
+            <h1>
+              {activeView === "chat"
+                ? "Чат по проекту"
+                : activeView === "projects"
+                  ? "Проекты"
+                  : activeView === "providers"
+                    ? "Провайдеры"
+                    : "Команды"}
+            </h1>
             <p className="chat-subtitle">
               {activeView === "chat"
                 ? "Задай вопрос и получи инженерный ответ поверх уже собранной карты проекта."
                 : activeView === "projects"
                   ? "Редко используемый экран настройки проектов и их путей."
-                  : "Редко используемый экран настройки AI-провайдеров."}
+                  : activeView === "providers"
+                    ? "Редко используемый экран настройки AI-провайдеров."
+                    : "Researcher/Critic/Observer — кто ищет, кто проверяет, кто изучает проект в фоне."}
             </p>
           </div>
 
@@ -2929,9 +3085,9 @@ export function App() {
               selectedProjectId={selectedProjectId}
               selectedProjectPathId={selectedProjectPathId}
               selectedProviderId={selectedProviderId}
-              providerModelDraft={providerModelDraft}
               providers={providers}
-              providerModels={providerModels}
+              teams={teams}
+              selectedTeamId={selectedTeamId}
               project={project}
               disabled={running}
               onProjectChange={(nextProjectId) => {
@@ -2950,7 +3106,7 @@ export function App() {
                 void loadProject(selectedPath?.rootPath, selectedProjectId || undefined);
               }}
               onProviderChange={(providerId) => void selectProvider(providerId)}
-              onModelChange={(modelId) => void changeProviderModel(modelId)}
+              onTeamChange={(teamId) => void selectTeam(teamId)}
             />
 
             <div className="chat-body">
@@ -3134,6 +3290,152 @@ export function App() {
                         Выбрать
                       </button>
                       <button type="button" className="ghost-button danger-button" onClick={() => void removeProvider(provider.id)}>
+                        Удалить
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </article>
+          </section>
+        ) : null}
+
+        {activeView === "teams" ? (
+          <section className="settings-layout">
+            <article className="settings-card">
+              <div className="section-head">
+                <div>
+                  <p className="section-kicker">Команды</p>
+                  <h2>CRUD команд</h2>
+                </div>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "" })}
+                >
+                  Новая
+                </button>
+              </div>
+
+              <div className="stack">
+                <label className="field">
+                  <span>Имя команды</span>
+                  <input value={teamDraft.name} onChange={(event) => setTeamDraft((current) => ({ ...current, name: event.target.value }))} />
+                </label>
+                <label className="field">
+                  <span>Researcher</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.researcher}</span>
+                  <select
+                    value={teamDraft.researcherModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, researcherModel: event.target.value }))}
+                  >
+                    <option value="">Модель не выбрана</option>
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Critic</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.critic}</span>
+                  <select
+                    value={teamDraft.criticModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, criticModel: event.target.value }))}
+                  >
+                    <option value="">Модель не выбрана</option>
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Observer</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.observer}</span>
+                  <select
+                    value={teamDraft.observerModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, observerModel: event.target.value }))}
+                  >
+                    <option value="">Модель не выбрана</option>
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <div className="action-row">
+                  <button type="button" className="primary-button" onClick={() => void saveTeamDraft()}>
+                    Сохранить команду
+                  </button>
+                </div>
+              </div>
+            </article>
+
+            <article className="settings-card">
+              <div className="section-head">
+                <div>
+                  <p className="section-kicker">Список</p>
+                  <h2>Доступные команды</h2>
+                </div>
+              </div>
+              <div className="list">
+                {safeList(teams).map((team) => (
+                  <div key={team.id} className="list-item">
+                    <strong>{team.name}</strong>
+                    <span>{team.isSelected ? "Выбрана" : "Не выбрана"}</span>
+                    <div className="team-role-cards">
+                      <div className="team-role-card">
+                        <strong>Researcher</strong>
+                        <span>{team.researcherModel || "—"}</span>
+                        <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.researcher}</span>
+                      </div>
+                      <div className="team-role-card">
+                        <strong>Critic</strong>
+                        <span>{team.criticModel || "—"}</span>
+                        <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.critic}</span>
+                      </div>
+                      <div className="team-role-card">
+                        <strong>Observer</strong>
+                        <span>{team.observerModel || "—"}</span>
+                        <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.observer}</span>
+                      </div>
+                    </div>
+                    <div className="action-row">
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() =>
+                          setTeamDraft({
+                            id: team.id,
+                            name: team.name,
+                            researcherModel: team.researcherModel,
+                            criticModel: team.criticModel,
+                            observerModel: team.observerModel,
+                          })
+                        }
+                      >
+                        Редактировать
+                      </button>
+                      <button type="button" className="ghost-button" onClick={() => void selectTeam(team.id)}>
+                        Выбрать
+                      </button>
+                      <button type="button" className="ghost-button danger-button" onClick={() => void removeTeam(team.id)}>
                         Удалить
                       </button>
                     </div>
