@@ -105,6 +105,10 @@ export async function saveProvider(input: SaveProviderInput): Promise<ProviderRe
     throw new Error("Не удалось загрузить провайдера после сохранения.");
   }
 
+  // baseUrl/apiKey могли поменяться — закэшированный список моделей мог
+  // быть получен от совсем другого endpoint'а/аккаунта.
+  modelListCache.delete(nextId);
+
   return stripApiKey(saved);
 }
 
@@ -174,6 +178,16 @@ export async function deleteProvider(id: string): Promise<boolean> {
   return true;
 }
 
+// Список моделей провайдера меняется редко (по сути только когда сам вендор
+// добавляет/убирает модели), но раньше fetchProviderModels() дёргал живой
+// внешний `GET /models` НА КАЖДЫЙ вызов `/api/providers` — то есть на каждую
+// загрузку страницы. Если внешний roundtrip медленный (или сеть моргнула),
+// это напрямую тормозило старт приложения ("долго не прилетают провайдеры").
+// TTL-кэш в памяти процесса убирает внешний вызов из горячего пути — вплоть
+// до следующего протухания кэша данные приходят мгновенно с диска процесса.
+const MODEL_LIST_CACHE_TTL_MS = 5 * 60 * 1000;
+const modelListCache = new Map<string, { models: ProviderModelRecord[]; fetchedAt: number }>();
+
 export async function fetchProviderModels(providerId?: string): Promise<ProviderCatalog> {
   const provider = providerId ? await getProviderById(providerId) : await getCurrentProvider();
 
@@ -187,13 +201,25 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
   // Персистентный выбор модели для этого провайдера (см. setProviderDefaultModel)
   // перевешивает статичный DEFAULT_RECOMMENDED_MODEL_ID — иначе пользователь
   // не может реально сменить модель по умолчанию, только переопределять её
-  // на каждый запрос вручную.
+  // на каждый запрос вручную. Читается свежо на каждый вызов (не кэшируется) —
+  // кэшируется только сам список моделей от внешнего провайдера.
   const recommendedModelId = provider.defaultModel.trim() || DEFAULT_RECOMMENDED_MODEL_ID;
 
   if (!provider.apiKey.trim()) {
     return {
       models: buildFallbackModels(provider.id),
       recommendedModelId,
+    };
+  }
+
+  const cached = modelListCache.get(provider.id);
+
+  if (cached && Date.now() - cached.fetchedAt < MODEL_LIST_CACHE_TTL_MS) {
+    return {
+      models: cached.models,
+      recommendedModelId: cached.models.some((item) => item.id === recommendedModelId)
+        ? recommendedModelId
+        : cached.models[0]?.id ?? recommendedModelId,
     };
   }
 
@@ -235,8 +261,11 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
       });
     }
 
+    const resolvedModels = models.length ? models : buildFallbackModels(provider.id);
+    modelListCache.set(provider.id, { models: resolvedModels, fetchedAt: Date.now() });
+
     return {
-      models: models.length ? models : buildFallbackModels(provider.id),
+      models: resolvedModels,
       recommendedModelId: models.some((item) => item.id === recommendedModelId)
         ? recommendedModelId
         : models[0]?.id ?? recommendedModelId,

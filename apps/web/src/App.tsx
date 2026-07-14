@@ -70,6 +70,15 @@ type InspectorTab = "overview" | "research" | "impact" | "context" | "plan" | "e
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
 const PROVIDER_STORAGE_KEY = "client.provider-config";
+const PROJECT_STORAGE_KEY = "client.selected-project";
+
+function readPersistedProjectId(): string {
+  try {
+    return window.localStorage.getItem(PROJECT_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
 const REQUEST_TIMEOUT_MS = 15000;
 const DEFAULT_MODEL_ID = "nvidia/nemotron-3-ultra";
 // Circuit breaker для цепочки уточняющих вопросов — после этого числа
@@ -757,12 +766,14 @@ function AssistantRunMessage({
   onOpenInspector,
   clarificationRound,
   onSelectClarification,
+  onRetry,
 }: {
   runStatus: PipelineRunStatus | null;
   result: PipelineRunResult | null;
   onOpenInspector: (tab?: InspectorTab) => void;
   clarificationRound: number;
   onSelectClarification: (moduleKey: string) => void;
+  onRetry: () => void;
 }) {
   const running = runStatus && (runStatus.status === "queued" || runStatus.status === "running");
   const completed = hasRunArtifacts(result) && (!runStatus || runStatus.runId === result.runId);
@@ -837,6 +848,13 @@ function AssistantRunMessage({
             <p className="message-label">Run завершился ошибкой</p>
             <h3>Нужно проверить сервер или пересоздать запуск</h3>
             <p>{safeText(runStatus?.errorMessage, "Причина ошибки недоступна.")}</p>
+            {runStatus?.resumeContext?.canResumeFromStart ? (
+              <div className="action-row">
+                <button type="button" className="primary-button" onClick={onRetry}>
+                  Повторить вопрос
+                </button>
+              </div>
+            ) : null}
           </>
         ) : null}
 
@@ -1706,7 +1724,15 @@ export function App() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [task, setTask] = useState("");
   const [projectPath, setProjectPath] = useState("");
-  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
+  // Раньше выбор проекта нигде не сохранялся — любой remount (перезагрузка
+  // страницы, HMR в деве) стартовал с пустого selectedProjectId, и
+  // `initializeApp` безусловно откатывался на `loadedProjects[0]` (первый
+  // проект в списке). Отсюда и жалоба "проект сам переключился на первый" —
+  // это не гонка во время печати, а потеря состояния при любом remount.
+  // Читаем сразу в initial state, а не через useEffect — initializeApp
+  // читает `selectedProjectIdRef.current` в своём собственном эффекте,
+  // который может сработать раньше отдельного эффекта синхронизации ref.
+  const [selectedProjectId, setSelectedProjectId] = useState<string>(readPersistedProjectId);
   const [selectedProjectPathId, setSelectedProjectPathId] = useState<string>("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>({
     id: "",
@@ -1756,7 +1782,7 @@ export function App() {
     activeRunIdRef.current = nextRunId;
     setActiveRunId(nextRunId);
   }
-  const selectedProjectIdRef = useRef<string>("");
+  const selectedProjectIdRef = useRef<string>(readPersistedProjectId());
   const projectPathRef = useRef<string>("");
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const readiness = projectReadinessState(project);
@@ -1813,6 +1839,16 @@ export function App() {
 
   useEffect(() => {
     selectedProjectIdRef.current = selectedProjectId;
+
+    try {
+      if (selectedProjectId) {
+        window.localStorage.setItem(PROJECT_STORAGE_KEY, selectedProjectId);
+      } else {
+        window.localStorage.removeItem(PROJECT_STORAGE_KEY);
+      }
+    } catch {
+      // localStorage недоступен (приватный режим и т.п.) — переживём без персистентности.
+    }
   }, [selectedProjectId]);
 
   useEffect(() => {
@@ -1896,8 +1932,11 @@ export function App() {
     setError(null);
 
     try {
-      const loadedProjects = await loadProjects();
-      await loadProviders();
+      // Раньше проекты и провайдеры грузились строго последовательно — два
+      // независимых запроса (ни один не зависит от результата другого), но
+      // общее время ожидания было суммой обоих вместо максимума. На старте
+      // приложения это и ощущалось как "долго не прилетают проекты/провайдеры".
+      const [loadedProjects] = await Promise.all([loadProjects(), loadProviders()]);
       const preferredProjectId =
         selectedProjectIdRef.current && loadedProjects.some((projectItem) => projectItem.id === selectedProjectIdRef.current)
           ? selectedProjectIdRef.current
@@ -1984,8 +2023,16 @@ export function App() {
   }
 
   async function loadProject(nextProjectPath?: string, nextProjectId?: string, syncResult = true) {
-    setLoading(true);
-    setError(null);
+    // `syncResult=false` — тихий фоновый рефреш (10с polling, пост-run
+    // синк), не действие пользователя. Раньше `setLoading(true)` вызывался
+    // безусловно — Send-кнопка (`disabled={running || loading || ...}`)
+    // мигала disabled каждые 10 секунд без всякого объяснения пользователю.
+    // Пулинг не должен быть заметен вообще — loading/error видимы только для
+    // настоящей навигации (смена проекта, первая загрузка).
+    if (syncResult) {
+      setLoading(true);
+      setError(null);
+    }
 
     try {
       const params = new URLSearchParams();
@@ -2044,20 +2091,34 @@ export function App() {
 
             return current || latestEntry?.task || "";
           });
-          // На холодной загрузке/переключении проекта показываем только
-          // последнюю реплику (без лишнего round-trip за полным тредом) —
-          // продолжение диалога и открытие из истории дозагружают полный
-          // транскрипт через fetchRunArtifact.
+          // На холодной загрузке/переключении проекта показываем последнюю
+          // реплику ТОЛЬКО для просмотра ("на чём проект остановился") — не
+          // для продолжения. `conversationId` НАМЕРЕННО не берём из
+          // `data.latestRun`: это последний run проекта вообще, а не обязательно
+          // диалог этого пользователя/этой сессии (например, чужой live-тест
+          // через API). Раньше conversationId наследовался отсюда — реальный
+          // живой баг: сообщение пользователя тихо приклеивалось как
+          // "уточнение" к чужому диалогу и утекало не в тот чат. Продолжение
+          // треда включается только явным действием — своей отправкой
+          // сообщения в этой сессии или открытием конкретного чата из истории
+          // (fetchRunArtifact).
           if (!activeRunIdRef.current) {
             setTurns(data.latestRun ? [data.latestRun] : []);
-            setConversationId(data.latestRun?.conversationId ?? null);
           }
         }
       });
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сводку по проекту.");
+      if (syncResult) {
+        setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить сводку по проекту.");
+      } else {
+        // Тихий фоновый тик — не показываем ошибку пользователю, следующий
+        // тик через 10с попробует снова.
+        console.warn("[loadProject] background refresh failed:", loadError);
+      }
     } finally {
-      setLoading(false);
+      if (syncResult) {
+        setLoading(false);
+      }
     }
   }
 
@@ -2075,12 +2136,16 @@ export function App() {
     setRunning(true);
     setError(null);
 
-    // Нет backend-модели "продолжения диалога" — уточнение реализовано как
-    // склейка строки на клиенте перед независимым pipeline run. Не
-    // применяется к hardResync/background-sync (это системные операции, не
-    // продолжение вопроса пользователя).
+    // Уточнение реализовано как склейка строки на клиенте перед pipeline run
+    // (продолжающим тот же conversationId). Обязательно требует уже принятого
+    // в этой сессии `conversationId` — раньше проверялся только `result`,
+    // который на холодной загрузке мог быть чужим/старым run'ом проекта
+    // (см. loadProject) — сообщение пользователя тогда приклеивалось как
+    // "уточнение" к чужому диалогу. Не применяется к hardResync/background-sync
+    // (это системные операции, не продолжение вопроса пользователя).
     const isFollowUpClarification =
       !hardResync
+      && Boolean(conversationId)
       && result?.answer?.answerMode === "clarification-needed"
       && clarificationRound < MAX_CLARIFICATION_ROUNDS;
     const composedTask = isFollowUpClarification
@@ -2120,12 +2185,67 @@ export function App() {
         updateActiveRunId(accepted.runId);
         setResult(null);
         setInspectorOpen(false);
+        setTask("");
       });
       navigate(`/chat/${encodeURIComponent(accepted.runId)}`);
 
       await pollPipelineStatus(accepted.runId);
     } catch (runError) {
       setError(runError instanceof Error ? runError.message : "Не удалось выполнить pipeline.");
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  // Бэкенд уже помечает прерванные сервером run'ы `resumeContext.canResumeFromStart:
+  // true` (см. markInFlightRunsInterrupted в apps/api/src/pipeline-runner.ts) —
+  // раньше фронт этот сигнал вообще не читал, и единственным способом
+  // повторить вопрос после сбоя было перепечатать его заново вручную.
+  // Повторяет тот же task в том же диалоге (тот же conversationId), не
+  // трогая текущий текст в композере.
+  async function retryFailedRun() {
+    if (!runStatus || runStatus.status !== "failed") {
+      return;
+    }
+
+    if (!selectedProjectId && !projectPath.trim()) {
+      setError("Нужно выбрать проект перед отправкой вопроса.");
+      return;
+    }
+
+    setRunning(true);
+    setError(null);
+
+    try {
+      const accepted = await fetchJsonWithTimeout<PipelineRunStatus>(`${API_BASE_URL}/api/pipeline/run`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          task: runStatus.task,
+          projectPath,
+          projectId: selectedProjectId || undefined,
+          providerId: selectedProviderId || undefined,
+          providerBaseUrl: providerDraft.baseUrl,
+          providerModel: providerModelDraft,
+          providerApiKey: providerDraft.apiKey,
+          conversationId: runStatus.conversationId || undefined,
+        }),
+      });
+
+      startTransition(() => {
+        setRunStatus(accepted);
+        setSelectedTask(runStatus.task);
+        updateActiveRunId(accepted.runId);
+        setResult(null);
+        setInspectorOpen(false);
+      });
+      navigate(`/chat/${encodeURIComponent(accepted.runId)}`);
+
+      await pollPipelineStatus(accepted.runId);
+    } catch (runError) {
+      setError(runError instanceof Error ? runError.message : "Не удалось повторить запуск.");
     } finally {
       setRunning(false);
     }
@@ -2229,6 +2349,20 @@ export function App() {
 
         await new Promise((resolve) => window.setTimeout(resolve, 1500));
         continue;
+      }
+
+      // Раньше проверка `activeRunIdRef.current !== runId` стояла только в
+      // начале цикла (см. выше) — если пользователь переключал чат ПОКА
+      // fetch уже летел, между стартом запроса и получением ответа, эта
+      // проверка не срабатывала: уже устаревший run всё равно применялся к
+      // тому чату, который открыт СЕЙЧАС (`setResult`/`setTurns` ниже читают
+      // только `runId`, не привязаны к тому, какой чат был активен в момент
+      // запуска поллинга). Живой репродукт: ответ одного чата "утекал" в
+      // другой, если переключение произошло в узком окне между тиками.
+      // Повторная проверка сразу после получения ответа, перед ЛЮБЫМ
+      // применением статуса — не только completed-веткой.
+      if (activeRunIdRef.current !== runId) {
+        return;
       }
 
       startTransition(() => {
@@ -2614,7 +2748,19 @@ export function App() {
         setConversationId(artifact.conversationId);
       });
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Не удалось открыть запуск из истории.");
+      // Ссылка на run, которого больше нет (удалённый чат, протухший deep
+      // link) — раньше это оставляло пользователя на мёртвом URL с голым
+      // текстом ошибки "Запуск не найден", хотя он ничего не делал: просто
+      // открыл/перезагрузил страницу на старой ссылке. Откатываемся на
+      // чистый новый чат вместо ошибки, которую пользователь не вызывал сам.
+      const message = loadError instanceof Error ? loadError.message : "Не удалось открыть запуск из истории.";
+
+      if (message === "Запуск не найден.") {
+        startNewChat();
+        return;
+      }
+
+      setError(message);
     }
   }
 
@@ -2706,7 +2852,18 @@ export function App() {
       );
       setSelectedHistoryIds(new Set());
 
-      if (conversationId && conversationIds.includes(conversationId)) {
+      // Раньше проверялся только `conversationId` (state для ПРОДОЛЖЕНИЯ
+      // треда) — но после фикса "чаты перемешиваются" отображение (`turns`)
+      // намеренно отвязано от него: холодная загрузка показывает последний
+      // run проекта в `turns`, не трогая `conversationId`. Из-за этого
+      // удаление ИМЕННО показанного сейчас диалога не проходило по условию
+      // ниже и переписка оставалась на экране, хотя в истории (и в БД) её
+      // уже не было — репродукт пользователя.
+      const deletedConversationIsShown =
+        (conversationId && conversationIds.includes(conversationId))
+        || turns.some((turn) => conversationIds.includes(turn.conversationId));
+
+      if (deletedConversationIsShown) {
         startNewChat();
       }
     } catch (deleteError) {
@@ -2827,14 +2984,14 @@ export function App() {
                     Выбери проект, задай вопрос и получи инженерный ответ поверх уже собранной карты проекта.
                   </p>
                   <div className="chat-suggestions">
-                    <button type="button" className="ghost-button" onClick={() => setTask("Где начинается авторизация в проекте?")}>
-                      Где начинается авторизация?
+                    <button type="button" className="ghost-button" onClick={() => setTask("Как устроен этот проект и из каких основных модулей состоит?")}>
+                      Как устроен проект?
                     </button>
-                    <button type="button" className="ghost-button" onClick={() => setTask("Что затронет изменение billing flow?")}>
-                      Что затронет изменение billing?
+                    <button type="button" className="ghost-button" onClick={() => setTask("Где основные точки входа приложения?")}>
+                      Где точки входа?
                     </button>
-                    <button type="button" className="ghost-button" onClick={() => setTask("Можно ли авторизоваться через Google?")}>
-                      Можно ли войти через Google?
+                    <button type="button" className="ghost-button" onClick={() => setTask("Какие конфигурационные файлы и env-переменные использует проект?")}>
+                      Какая конфигурация у проекта?
                     </button>
                   </div>
                 </div>
@@ -2857,6 +3014,7 @@ export function App() {
                     }}
                     clarificationRound={0}
                     onSelectClarification={(moduleKey) => setTask(moduleKey)}
+                    onRetry={() => {}}
                   />
                 </Fragment>
               ))}
@@ -2877,6 +3035,7 @@ export function App() {
                     onOpenInspector={openInspector}
                     clarificationRound={clarificationRound}
                     onSelectClarification={(moduleKey) => setTask(moduleKey)}
+                    onRetry={() => void retryFailedRun()}
                   />
                 </Fragment>
               ) : null}
@@ -2888,8 +3047,17 @@ export function App() {
                 <textarea
                   value={task}
                   onChange={(event) => setTask(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+
+                      if (!running && selectedProjectId && task.trim()) {
+                        void submitPipelineRun(false);
+                      }
+                    }
+                  }}
                   rows={4}
-                  placeholder="Напиши инженерную задачу или вопрос по проекту..."
+                  placeholder="Напиши инженерную задачу или вопрос по проекту... (Enter — отправить, Shift+Enter — новая строка)"
                   disabled={running}
                 />
 
