@@ -1,5 +1,6 @@
 import { crawlUnit, listWorkUnits } from "@client/agentic-research";
 import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
+import { hasAnyActiveQuestionRun } from "./pipeline-runner.js";
 import { getCurrentProvider } from "./provider-store.js";
 import { listProjects } from "./project-store.js";
 import { getSelectedTeam } from "./team-store.js";
@@ -56,6 +57,15 @@ async function tick(): Promise<void> {
   monitorRunning = true;
 
   try {
+    // A background crawl shares the same provider/API key as live
+    // interactive requests - live testing showed message-sending degrading
+    // exactly when a crawl was in flight. Never even start one while a real
+    // user question-run is active; shouldAbort (passed to crawlUnit below)
+    // covers the case where one starts mid-crawl.
+    if (hasAnyActiveQuestionRun()) {
+      return;
+    }
+
     // Resolved fresh every tick, never cached - same rationale as
     // resolveMonitorProvider in project-state-monitor.ts: an operator can
     // change the selected team/provider between ticks.
@@ -132,7 +142,15 @@ async function crawlOneStaleUnit(
       providerBaseUrl: models.providerBaseUrl,
       providerApiKey: models.providerApiKey,
       maxTurns: CRAWL_MAX_TURNS,
+      shouldAbort: hasAnyActiveQuestionRun,
     });
+
+    // Yielded to a live user request before doing any real work - not worth
+    // a diagnostic row (it would just be noise), and not "this project made
+    // progress" either, so the tick doesn't treat it as done.
+    if (result.raw.stopped === "aborted") {
+      return false;
+    }
 
     const sourceFileHashes = await hashFiles(projectRootPath, result.touchedFiles);
 

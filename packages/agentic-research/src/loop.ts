@@ -26,6 +26,15 @@ export interface AgenticRunOptions {
   providerBaseUrl: string;
   providerApiKey: string;
   maxTurns?: number;
+  /**
+   * Checked before every turn - lets a caller (e.g. the Observer background
+   * crawler) yield immediately once it returns true, rather than only
+   * checking once before the whole run starts. A background crawl and a
+   * live interactive question-run share the same provider/API key, so a
+   * many-turn background loop can otherwise degrade a real user's request
+   * mid-conversation with no way to back off once started.
+   */
+  shouldAbort?: () => boolean;
 }
 
 export interface AgenticRunResult {
@@ -38,7 +47,7 @@ export interface AgenticRunResult {
   turnsUsed: number;
   totalPromptTokens: number;
   totalCompletionTokens: number;
-  stopped: "final_answer" | "max_turns" | "parse_error" | "error";
+  stopped: "final_answer" | "max_turns" | "parse_error" | "error" | "aborted";
   error?: string;
 }
 
@@ -326,6 +335,11 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   }
 
   for (let turn = 1; turn <= maxTurns; turn += 1) {
+    if (options.shouldAbort?.()) {
+      actionsLog.push(`[turn ${turn}] ABORTED: yielding to a live interactive request.`);
+      return finalize({ turnsUsed: turn, stopped: "aborted" });
+    }
+
     let content: string;
     let usage: ProviderUsage | null;
 

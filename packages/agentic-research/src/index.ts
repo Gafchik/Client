@@ -15,6 +15,7 @@ export interface CrawlUnitInput {
   providerBaseUrl: string;
   providerApiKey: string;
   maxTurns?: number;
+  shouldAbort?: () => boolean;
 }
 
 export interface CrawlUnitResult {
@@ -44,6 +45,7 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
     providerBaseUrl: input.providerBaseUrl,
     providerApiKey: input.providerApiKey,
     ...(input.maxTurns ? { maxTurns: input.maxTurns } : {}),
+    ...(input.shouldAbort ? { shouldAbort: input.shouldAbort } : {}),
   });
 
   const featureSummary = raw.finalAnswer

@@ -108,6 +108,18 @@ export function getPipelineRunStatus(runId: string): PipelineRunStatus | null {
   return runStore.get(runId) ?? null;
 }
 
+// Наблюдатель (observer-monitor.ts) не должен запускать обход, пока живой
+// пользователь ведёт интерактивный диалог с ЛЮБЫМ проектом — они делят один
+// и тот же provider (baseUrl/apiKey), и агрессивный многоходовой agentic-обход
+// реально конкурирует за rate limit/соединения с обычным вопросом
+// пользователя. Живой репродукт: "сообщения не отправляются" совпадал по
+// времени с фоновым обходом.
+export function hasAnyActiveQuestionRun(): boolean {
+  return Array.from(runStore.values()).some(
+    (status) => status.mode === "question-run" && (status.status === "queued" || status.status === "running"),
+  );
+}
+
 export function findActivePipelineRun(projectPath: string, mode: PipelineRunMode): PipelineRunStatus | null {
   const normalizedProjectPath = normalizePath(path.resolve(projectPath));
   const candidates = Array.from(runStore.values())
