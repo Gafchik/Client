@@ -11,6 +11,7 @@ import type {
   ProjectRecord,
   PipelineRunResult,
   PipelineRunStatus,
+  ObserverStatusResponse,
   ProviderCatalogResponse,
   ProviderModelRecord,
   ProviderRecord,
@@ -623,6 +624,37 @@ function RunHistorySidebar({
   );
 }
 
+function describeObserverStatus(
+  status: ObserverStatusResponse | null,
+  projectPath: string,
+): { title: string; description: string; running: boolean } | null {
+  const entry = status?.observers.find((observer) => observer.projectPath === projectPath);
+
+  if (!entry) {
+    return null;
+  }
+
+  const progressText = `изучено ${entry.progress.percent}% (${entry.progress.freshUnits}/${entry.progress.totalUnits})`;
+
+  if (entry.status === "running" && entry.activity) {
+    return { title: "Observer изучает проект", description: `${entry.activity.unitPath} · ${progressText}`, running: true };
+  }
+
+  if (entry.status === "running") {
+    return { title: "Observer запущен", description: `ищет, что ещё не изучено... · ${progressText}`, running: true };
+  }
+
+  if (entry.progress.percent >= 100) {
+    return { title: "Observer остановлен", description: "карта проекта полная (100%)", running: false };
+  }
+
+  return {
+    title: "Observer остановлен",
+    description: progressText,
+    running: false,
+  };
+}
+
 function EnvironmentStrip({
   projects,
   selectedProjectId,
@@ -631,12 +663,14 @@ function EnvironmentStrip({
   providers,
   teams,
   selectedTeamId,
-  project,
+  projectPath,
+  observerStatus,
   disabled,
   onProjectChange,
   onProjectPathChange,
   onProviderChange,
   onTeamChange,
+  onObserverToggle,
 }: {
   projects: ProjectRecord[];
   selectedProjectId: string;
@@ -645,13 +679,16 @@ function EnvironmentStrip({
   providers: ProviderRecord[];
   teams: TeamRecord[];
   selectedTeamId: string;
-  project: ProjectInfo | null;
+  projectPath: string;
+  observerStatus: ObserverStatusResponse | null;
   disabled: boolean;
   onProjectChange: (projectId: string) => void;
   onProjectPathChange: (pathId: string) => void;
   onProviderChange: (providerId: string) => void;
   onTeamChange: (teamId: string) => void;
+  onObserverToggle: (projectPath: string, nextRunning: boolean) => void;
 }) {
+  const observerState = describeObserverStatus(observerStatus, projectPath);
   return (
     <section className="environment-strip">
       <select className="environment-pill" value={selectedProjectId} onChange={(event) => onProjectChange(event.target.value)} disabled={disabled}>
@@ -690,11 +727,67 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      <div className="environment-status-pill">
-        <strong>{backgroundSyncState(project).title}</strong>
-        <span>{projectReadinessState(project).title}</span>
-      </div>
+      {projectPath ? (
+        <button
+          type="button"
+          className="environment-status-pill environment-status-pill-button"
+          title={observerState?.description ?? "Ещё не запускался для этого проекта"}
+          onClick={() => onObserverToggle(projectPath, !(observerState?.running ?? false))}
+        >
+          <strong>{observerState?.title ?? "Observer остановлен"}</strong>
+          <span>{observerState?.running ? "Остановить" : "Запустить"} · {observerState?.description ?? "нет данных"}</span>
+        </button>
+      ) : null}
     </section>
+  );
+}
+
+function shortProjectLabel(projectPath: string): string {
+  const segments = projectPath.split("/").filter(Boolean);
+  return segments[segments.length - 1] ?? projectPath;
+}
+
+// Видно на любом чате независимо от того, какой проект сейчас выбран -
+// по прямому запросу: "2 обсервера параллельно изучают, и было видно на
+// всех чатах, что работают обсерверы по проектам". Плюс быстрый способ
+// остановить все разом перед важным вопросом и запустить снова после.
+function ObserverGlobalBar({
+  observerStatus,
+  pausedCount,
+  onStopAll,
+  onResume,
+}: {
+  observerStatus: ObserverStatusResponse | null;
+  pausedCount: number;
+  onStopAll: () => void;
+  onResume: () => void;
+}) {
+  const running = observerStatus?.observers.filter((observer) => observer.status === "running") ?? [];
+
+  if (running.length === 0 && pausedCount === 0) {
+    return null;
+  }
+
+  return (
+    <div className="observer-global-bar">
+      {running.length > 0 ? (
+        <>
+          <span className="observer-global-bar-label">
+            Observer работает:{" "}
+            {running
+              .map((observer) => `${shortProjectLabel(observer.projectPath)} (${observer.progress.percent}%${observer.activity ? `, изучает ${observer.activity.unitPath}` : ""})`)
+              .join(" · ")}
+          </span>
+          <button type="button" className="ghost-button" onClick={onStopAll}>
+            Остановить все
+          </button>
+        </>
+      ) : (
+        <button type="button" className="ghost-button" onClick={onResume}>
+          Запустить снова ({pausedCount})
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -936,6 +1029,12 @@ function AssistantRunMessage({
                     <strong>Plan</strong>
                     <span>{safeList(result.plan.steps).length} шагов</span>
                   </div>
+                  {result.usage ? (
+                    <div className="result-card">
+                      <strong>Токены</strong>
+                      <span>{result.usage.totalTokens.toLocaleString("ru-RU")} ({result.usage.callCount} вызовов)</span>
+                    </div>
+                  ) : null}
                 </div>
 
                 {safeList(result.answer?.warnings).length ? (
@@ -1777,6 +1876,10 @@ export function App() {
   });
   const [teams, setTeams] = useState<TeamRecord[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState<string>("");
+  const [observerStatus, setObserverStatus] = useState<ObserverStatusResponse | null>(null);
+  // Запоминает, какие проекты были активны на момент "Остановить все", чтобы
+  // "Запустить снова" перезапускала именно их, а не все проекты подряд.
+  const [pausedObserverProjects, setPausedObserverProjects] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [runStatus, setRunStatus] = useState<PipelineRunStatus | null>(null);
@@ -1910,6 +2013,34 @@ export function App() {
       window.clearInterval(interval);
     };
   }, [activeView, projectPath, selectedProjectId]);
+
+  // Observer работает по-настоящему в фоне (см. apps/api/src/observer-monitor.ts)
+  // - без этого пользователь не может отличить "сейчас изучает проект" от
+  // "стоит и ничего не делает", по прямому запросу пользователя. Глобальный
+  // список (не привязан к текущему projectPath) - должно быть видно на любом
+  // чате, какие проекты Observer сейчас изучает, а не только для открытого
+  // прямо сейчас.
+  useEffect(() => {
+    if (activeView !== "chat") {
+      return;
+    }
+
+    void loadObserverStatus();
+    const interval = window.setInterval(() => void loadObserverStatus(), 10_000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [activeView]);
+
+  async function loadObserverStatus() {
+    try {
+      const status = await fetchJsonWithTimeout<ObserverStatusResponse>(`${API_BASE_URL}/api/observer/status`);
+      setObserverStatus(status);
+    } catch {
+      // Тихая деградация - статус Observer'а не критичен для остального UI.
+    }
+  }
 
   useEffect(() => {
     if (activeView !== "chat") {
@@ -2703,6 +2834,49 @@ export function App() {
     }
   }
 
+  async function toggleObserver(observerProjectPath: string, nextRunning: boolean) {
+    try {
+      await fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/observer/${nextRunning ? "start" : "stop"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectPath: observerProjectPath }),
+      });
+      await loadObserverStatus();
+    } catch (toggleError) {
+      setError(toggleError instanceof Error ? toggleError.message : "Не удалось переключить Observer.");
+    }
+  }
+
+  async function stopAllObserversNow() {
+    try {
+      const result = await fetchJsonWithTimeout<{ ok: true; stopped: string[] }>(`${API_BASE_URL}/api/observer/stop-all`, {
+        method: "POST",
+      });
+      setPausedObserverProjects(result.stopped);
+      await loadObserverStatus();
+    } catch (stopError) {
+      setError(stopError instanceof Error ? stopError.message : "Не удалось остановить Observer'ы.");
+    }
+  }
+
+  async function resumeObservers() {
+    try {
+      await Promise.all(
+        pausedObserverProjects.map((observerProjectPath) =>
+          fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/observer/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ projectPath: observerProjectPath }),
+          }),
+        ),
+      );
+      setPausedObserverProjects([]);
+      await loadObserverStatus();
+    } catch (resumeError) {
+      setError(resumeError instanceof Error ? resumeError.message : "Не удалось запустить Observer'ы заново.");
+    }
+  }
+
   function resetProjectDraft() {
     setProjectDraft({
       id: "",
@@ -3088,7 +3262,8 @@ export function App() {
               providers={providers}
               teams={teams}
               selectedTeamId={selectedTeamId}
-              project={project}
+              projectPath={projectPath}
+              observerStatus={observerStatus}
               disabled={running}
               onProjectChange={(nextProjectId) => {
                 setSelectedProjectId(nextProjectId);
@@ -3107,6 +3282,14 @@ export function App() {
               }}
               onProviderChange={(providerId) => void selectProvider(providerId)}
               onTeamChange={(teamId) => void selectTeam(teamId)}
+              onObserverToggle={(observerProjectPath, nextRunning) => void toggleObserver(observerProjectPath, nextRunning)}
+            />
+
+            <ObserverGlobalBar
+              observerStatus={observerStatus}
+              pausedCount={pausedObserverProjects.length}
+              onStopAll={() => void stopAllObserversNow()}
+              onResume={() => void resumeObservers()}
             />
 
             <div className="chat-body">

@@ -111,6 +111,15 @@ export async function initializePostgresSchema(): Promise<void> {
   await runSql(
     `create index if not exists idx_knowledge_catalog_conversation on knowledge_catalog(conversation_id, turn_index asc)`,
   );
+  // Реальный расход токенов провайдера за run (2026-07-15) — раньше нигде не
+  // считался в проде; каждый "сколько токенов это стоило" вопрос в этой
+  // сессии приходилось отвечать вручную, throwaway-скриптами. Один запрос
+  // (например `select sum(total_tokens) from knowledge_catalog where
+  // saved_at > now() - interval '1 day'`) теперь отвечает на это напрямую.
+  await runSql(`alter table knowledge_catalog add column if not exists prompt_tokens integer not null default 0`);
+  await runSql(`alter table knowledge_catalog add column if not exists completion_tokens integer not null default 0`);
+  await runSql(`alter table knowledge_catalog add column if not exists total_tokens integer not null default 0`);
+  await runSql(`alter table knowledge_catalog add column if not exists provider_call_count integer not null default 0`);
 
   await runSql(`
     create table if not exists project_facts (

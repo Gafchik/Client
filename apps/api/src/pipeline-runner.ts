@@ -5,8 +5,11 @@ import {
   buildControlledExecutionRuntime,
   buildValidatedAnswerPacket,
   buildValidationPacket,
+  createUsageAccumulator,
   expandTaskSearchKeywords,
+  summarizeProviderUsage,
   validateEvidence,
+  type ProviderUsageAccumulator,
 } from "@client/ai";
 import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
@@ -368,6 +371,10 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const largeRepositoryProfile = overview.summary.profile === "large-repository";
   const isQuestionRun = mode === "question-run";
   const isHardResync = mode === "hard-resync";
+  // One accumulator per run (local variable, never module-level state) -
+  // covers every LLM call made anywhere in this run, deterministic or
+  // agentic path, keyword-expansion/validation/answer-synthesis alike.
+  const usageAccumulator = createUsageAccumulator();
 
   const workspaceStartedAt = startStage(runId, "workspace");
   const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
@@ -533,6 +540,14 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   if (selectedTeam) {
     updateStageLabel(runId, "research", `Команда «${selectedTeam.name}»: Researcher исследует проект инструментами...`);
     const observerHint = await buildObserverHintSuffix(projectRootPath, task);
+    // Тот же conversationTurns, что уже питает приоритетную evidence для
+    // детерминированного пути (см. priorTurn чуть ниже) - agentic-путь
+    // раньше вообще не участвовал в этом механизме, из-за чего каждая
+    // следующая реплика диалога заново исследовала с нуля вместо того чтобы
+    // опереться на уже найденные в прошлой реплике файлы.
+    const priorTurnFiles = priorConversationTurn
+      ? [...new Set(priorConversationTurn.research.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)))]
+      : [];
     const agenticResult = await runAgenticResearch({
       runId,
       task: observerHint ? `${task}\n\n${observerHint}` : task,
@@ -541,9 +556,20 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       criticModel: selectedTeam.criticModel,
       providerBaseUrl,
       providerApiKey,
+      ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
     });
     initialResearch = agenticResult.research;
     teamValidation = agenticResult.validation;
+    // The agentic loop already tracks its own (Researcher + Critic) usage
+    // internally (packages/agentic-research) - merge it into the same
+    // per-run accumulator that the deterministic path's calls feed, so
+    // usage reflects the true total regardless of which path answered.
+    usageAccumulator.promptTokens += agenticResult.raw.totalPromptTokens;
+    usageAccumulator.completionTokens += agenticResult.raw.totalCompletionTokens;
+    // turnsUsed = Researcher calls, criticRounds = Critic calls - an exact
+    // count, not an approximation from actionsLog (which also logs non-LLM
+    // tool observations).
+    usageAccumulator.callCount += agenticResult.raw.turnsUsed + agenticResult.raw.criticRounds;
     completeStage(
       runId,
       "research",
@@ -581,6 +607,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       providerBaseUrl,
       providerModel,
       providerApiKey,
+      usage: usageAccumulator,
     });
     initialResearch = keywordExpansion.research;
     completeStage(
@@ -680,6 +707,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     ],
     runtimeMode: questionRuntimeMode,
     ...(teamValidation ? { precomputedTeamValidation: teamValidation } : {}),
+    usage: usageAccumulator,
   });
   completeStage(
     runId,
@@ -774,6 +802,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     validation,
     validatedAnswerPacket,
     ...(conversationTranscript.length > 0 ? { conversationTranscript } : {}),
+    usage: usageAccumulator,
   });
   completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);
   updatePartialArtifacts(runId, {
@@ -814,6 +843,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     focusedResearchResults,
     validatedAnswerPacket,
     answer,
+    usage: summarizeProviderUsage(usageAccumulator),
   });
   completeStage(runId, "knowledge", knowledgeStartedAt, `Артефакты сохранены в центральное knowledge-хранилище: ${knowledge.artifactCount} групп.`);
 
@@ -868,6 +898,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       index,
       graph,
     },
+    usage: summarizeProviderUsage(usageAccumulator),
   };
 }
 
@@ -1153,6 +1184,7 @@ async function maybeExpandResearchWithTranslatedKeywords(
     providerBaseUrl: string;
     providerModel: string;
     providerApiKey: string;
+    usage?: ProviderUsageAccumulator;
   },
 ): Promise<{ research: ReturnType<typeof runResearch>; keywords: string[] }> {
   const looksWeak = research.intentClass === "broad-unknown" || research.dominantModule === "не определён";
@@ -1172,6 +1204,7 @@ async function maybeExpandResearchWithTranslatedKeywords(
     providerBaseUrl: options.providerBaseUrl,
     providerModel: options.providerModel,
     providerApiKey: options.providerApiKey,
+    ...(options.usage ? { usage: options.usage } : {}),
   });
 
   if (keywords.length === 0) {
@@ -1425,6 +1458,7 @@ async function runValidationLoop(input: {
   diagnostics: string[];
   runtimeMode: QuestionRuntimeMode;
   precomputedTeamValidation?: ValidationResult;
+  usage?: ProviderUsageAccumulator;
 }): Promise<{
   research: PipelineRunResult["research"];
   impact: PipelineRunResult["impact"];
@@ -1498,6 +1532,7 @@ async function runValidationLoop(input: {
       providerBaseUrl: "",
       providerModel: "",
       providerApiKey: "",
+      ...(input.usage ? { usage: input.usage } : {}),
     });
     const validatedAnswerPacket = buildValidatedAnswerPacket({
       runId: input.runId,
@@ -1546,6 +1581,7 @@ async function runValidationLoop(input: {
     providerBaseUrl: shouldBypassProviderOnInitialValidation ? "" : input.providerBaseUrl,
     providerModel: shouldBypassProviderOnInitialValidation ? "" : input.providerModel,
     providerApiKey: shouldBypassProviderOnInitialValidation ? "" : input.providerApiKey,
+    ...(input.usage ? { usage: input.usage } : {}),
   });
   validationHistory.push(currentValidation);
 
@@ -1621,6 +1657,7 @@ async function runValidationLoop(input: {
       providerBaseUrl: input.providerBaseUrl,
       providerModel: input.providerModel,
       providerApiKey: input.providerApiKey,
+      ...(input.usage ? { usage: input.usage } : {}),
     });
     validationHistory.push(currentValidation);
 

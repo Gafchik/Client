@@ -3,13 +3,13 @@ import Fastify from "fastify";
 import path from "node:path";
 import { buildBackgroundProjectState, deleteKnowledgeRuns, loadBestBaselineRunArtifact, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
-import { normalizePath, stableId, type ConversationTurnsResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type TeamCatalogResponse } from "@client/shared";
+import { normalizePath, stableId, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
 import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
 import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus, waitForPipelineRunCompletion } from "./pipeline-runner.js";
-import { startObserverMonitor, stopObserverMonitor } from "./observer-monitor.js";
+import { getObserverProgress, listObserverRunners, startObserver, stopAllObservers, stopObserver } from "./observer-monitor.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
@@ -58,6 +58,7 @@ interface CompactPipelineRunStatusResponse {
       status: string;
       details: string;
     }>;
+    usage?: ProviderUsageSummary;
   };
 }
 
@@ -171,6 +172,7 @@ function buildCompactPipelineRunStatus(status: PipelineRunStatus): CompactPipeli
                   },
                 }
               : {}),
+            ...(status.result.usage ? { usage: status.result.usage } : {}),
             stages: status.stages.map((stage) => ({
               key: stage.key,
               label: stage.label,
@@ -239,12 +241,14 @@ export function createApp() {
       fallbackProviderModel: defaultProviderModel,
       fallbackProviderApiKey: defaultProviderApiKey,
     });
-    startObserverMonitor();
+    // Observer no longer auto-starts (2026-07-15) - it's a per-project
+    // runner the user explicitly starts/stops, like a runner, not an
+    // always-on background monitor. See /api/observer/*.
   });
 
   app.addHook("onClose", async () => {
     stopProjectStateMonitor();
-    stopObserverMonitor();
+    stopAllObservers();
     await closeNeo4jDriver();
     await closePostgresPool();
   });
@@ -341,6 +345,61 @@ export function createApp() {
     const selectedTeam = teams.find((team) => team.isSelected) ?? null;
 
     return { teams, selectedTeam } satisfies TeamCatalogResponse;
+  });
+
+  // Global by design (2026-07-15, per direct request): shown the same way
+  // in every chat regardless of which project is currently selected, not
+  // scoped to one projectPath - the point is to see at a glance which
+  // projects have a runner going right now.
+  app.get("/api/observer/status", async () => {
+    const projects = await listProjects();
+    // Not normalized/resolved on purpose - matches the raw rootPath string
+    // stored on the project record and used as-is throughout
+    // observer-monitor.ts, so status/start/stop all agree on the same key.
+    const allPaths = [...new Set(projects.flatMap((project) => project.paths.map((projectPath) => projectPath.rootPath)))];
+    const runnerByPath = new Map(listObserverRunners().map((runner) => [runner.projectPath, runner]));
+
+    const observers = await Promise.all(
+      allPaths.map(async (projectPath) => {
+        const runner = runnerByPath.get(projectPath);
+
+        return {
+          projectPath,
+          status: runner?.status ?? ("stopped" as const),
+          activity: runner?.activity ?? null,
+          progress: await getObserverProgress(projectPath),
+        };
+      }),
+    );
+
+    return { observers } satisfies ObserverStatusResponse;
+  });
+
+  app.post<{ Body: { projectPath?: string } }>("/api/observer/start", async (request, reply) => {
+    const projectPath = request.body.projectPath?.trim();
+
+    if (!projectPath) {
+      return reply.code(400).send({ message: "Нужно указать projectPath." });
+    }
+
+    startObserver(projectPath);
+    return { ok: true };
+  });
+
+  app.post<{ Body: { projectPath?: string } }>("/api/observer/stop", async (request, reply) => {
+    const projectPath = request.body.projectPath?.trim();
+
+    if (!projectPath) {
+      return reply.code(400).send({ message: "Нужно указать projectPath." });
+    }
+
+    stopObserver(projectPath);
+    return { ok: true };
+  });
+
+  app.post("/api/observer/stop-all", async () => {
+    const stopped = stopAllObservers();
+    return { ok: true, stopped };
   });
 
   app.post<{ Body: SaveTeamRequest }>("/api/teams", async (request, reply) => {

@@ -367,6 +367,18 @@ export interface ResearchReport {
   runId: string;
   task: string;
   summary: string;
+  /**
+   * "agentic" - produced by packages/agentic-research (Team-mode: a model
+   * drove its own tool-loop exploration and a critic already vetted the
+   * result) rather than the deterministic keyword/domain-profile scorer.
+   * Heuristics tuned around deterministic evidence characteristics (e.g. "a
+   * low evidence count means weak research" - true when the scorer casts a
+   * wide net, false when an agent read exactly the 1-2 files it needed for
+   * a narrow question) must check this before applying, or they punish the
+   * agentic path's efficiency as if it were a red flag. Omitted/absent =
+   * deterministic, the long-standing default.
+   */
+  researchMode?: "deterministic" | "agentic";
   intentClass: ResearchIntentClass;
   strategyKey: ResearchStrategyKey;
   queryProfileKey: ResearchQueryProfileKey;
@@ -914,6 +926,42 @@ export interface TeamCatalogResponse {
   selectedTeam: TeamRecord | null;
 }
 
+export interface ObserverActivityInfo {
+  projectPath: string;
+  unitPath: string;
+  startedAt: string;
+}
+
+export interface ObserverProgressInfo {
+  totalUnits: number;
+  freshUnits: number;
+  percent: number;
+}
+
+export interface ObserverRunnerInfo {
+  projectPath: string;
+  status: "running" | "stopped";
+  activity: ObserverActivityInfo | null;
+  progress: ObserverProgressInfo;
+}
+
+export interface ObserverStatusResponse {
+  observers: ObserverRunnerInfo[];
+}
+
+// Real, measured provider token usage for one pipeline run - added
+// 2026-07-15 because the production pipeline had never tracked this at all
+// (every "how many tokens did that cost" question this project asked
+// earlier had to be answered by hand, in throwaway scripts). Covers both
+// the deterministic path's LLM calls (keyword expansion, validation,
+// answer synthesis) and the agentic path's (Researcher + Critic).
+export interface ProviderUsageSummary {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+}
+
 export interface ProjectPathRecord {
   id: string;
   projectId: string;
@@ -985,6 +1033,7 @@ export interface PipelineRunResult {
   knowledge: KnowledgeSaveResult;
   backgroundState?: BackgroundProjectState;
   runtimeCache?: PipelineRuntimeCache;
+  usage?: ProviderUsageSummary;
 }
 
 export interface PipelineRuntimeCache {

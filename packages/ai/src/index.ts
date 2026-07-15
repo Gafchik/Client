@@ -52,6 +52,7 @@ interface BuildAnswerInput {
    * Только для LLM-пути; deterministic fallback его не использует.
    */
   conversationTranscript?: Array<{ task: string; directAnswer: string }>;
+  usage?: ProviderUsageAccumulator;
 }
 
 interface BuildValidationPacketInput {
@@ -73,6 +74,7 @@ interface ValidateEvidenceInput {
   providerBaseUrl: string;
   providerModel: string;
   providerApiKey: string;
+  usage?: ProviderUsageAccumulator;
 }
 
 interface BuildValidatedAnswerPacketInput {
@@ -88,6 +90,51 @@ interface ProviderChatResponse {
       content?: string | Array<{ type?: string; text?: string }>;
     };
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+  };
+}
+
+// Mutable, passed by reference into whichever LLM-calling functions run
+// during one pipeline run - a local instance per run (never module-level
+// state), so concurrent runs never cross-contaminate each other's totals.
+// Added 2026-07-15: the production pipeline had never tracked real token
+// usage at all: every "how many tokens did that cost" question this
+// project asked had to be answered by hand, in throwaway scripts, for the
+// whole session before this.
+export interface ProviderUsageAccumulator {
+  promptTokens: number;
+  completionTokens: number;
+  callCount: number;
+}
+
+export function createUsageAccumulator(): ProviderUsageAccumulator {
+  return { promptTokens: 0, completionTokens: 0, callCount: 0 };
+}
+
+export function summarizeProviderUsage(accumulator: ProviderUsageAccumulator): {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  callCount: number;
+} {
+  return {
+    promptTokens: accumulator.promptTokens,
+    completionTokens: accumulator.completionTokens,
+    totalTokens: accumulator.promptTokens + accumulator.completionTokens,
+    callCount: accumulator.callCount,
+  };
+}
+
+function recordUsage(accumulator: ProviderUsageAccumulator | undefined, payload: ProviderChatResponse): void {
+  if (!accumulator) {
+    return;
+  }
+
+  accumulator.promptTokens += payload.usage?.prompt_tokens ?? 0;
+  accumulator.completionTokens += payload.usage?.completion_tokens ?? 0;
+  accumulator.callCount += 1;
 }
 
 interface ProviderValidatorResponse {
@@ -247,6 +294,7 @@ export interface ExpandTaskSearchKeywordsInput {
   providerBaseUrl: string;
   providerModel: string;
   providerApiKey: string;
+  usage?: ProviderUsageAccumulator;
 }
 
 // Детерминированный поиск (packages/research) — это substring/prefix/suffix
@@ -302,6 +350,7 @@ export async function expandTaskSearchKeywords(input: ExpandTaskSearchKeywordsIn
     });
 
     const payload = (await response.json()) as ProviderChatResponse;
+    recordUsage(input.usage, payload);
     const content = extractProviderContent(payload);
 
     if (!content) {
@@ -526,6 +575,7 @@ async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): P
   });
 
   const payload = (await response.json()) as ProviderChatResponse;
+  recordUsage(input.usage, payload);
   const content = extractProviderContent(payload);
 
   if (!content) {
@@ -1865,6 +1915,7 @@ async function synthesizeAnswerWithProvider(
     ],
   });
   const payload = (await response.json()) as ProviderChatResponse;
+  recordUsage(input.usage, payload);
   const content = extractProviderContent(payload);
 
   if (!content) {
@@ -2023,7 +2074,15 @@ function shouldForceEvidenceLockedMode(input: BuildAnswerInput): boolean {
   // шанс синтезировать честный, hedged ответ по тем же уликам — с уже
   // выставленными warnings и валидацией через validateProviderAnswer.
   const hasSevereUnknowns = input.research.unknowns.length >= 3;
-  const lowStructuralCoverage = input.research.evidence.length < 3;
+  // "Few files in evidence" means something different depending on who
+  // produced the research: for the deterministic scorer it means the wide
+  // net came back nearly empty (a real weak-evidence signal); for the
+  // agentic path (packages/agentic-research) it just means the model read
+  // exactly the 1-2 files it needed for a narrow question - efficient, not
+  // weak. A critic already vetted that answer before it got here, so this
+  // deterministic-tuned heuristic must not apply to it (see
+  // ResearchReport.researchMode).
+  const lowStructuralCoverage = input.research.researchMode !== "agentic" && input.research.evidence.length < 3;
 
   return diagnosticMode || localeBehavior || hasSevereUnknowns || lowStructuralCoverage;
 }

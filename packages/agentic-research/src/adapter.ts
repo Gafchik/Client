@@ -99,6 +99,7 @@ export function toResearchReport(runId: string, task: string, result: AgenticRun
     runId,
     task,
     summary: functionalSummary,
+    researchMode: "agentic",
     intentClass: AGENTIC_INTENT_CLASS,
     strategyKey: AGENTIC_STRATEGY_KEY,
     queryProfileKey: AGENTIC_QUERY_PROFILE_KEY,
@@ -109,8 +110,17 @@ export function toResearchReport(runId: string, task: string, result: AgenticRun
     primaryEntities,
     sideEffects: [],
     dataSources: [],
-    findings: result.finalAnswer ? [result.finalAnswer] : [],
-    baselineFindings: result.finalAnswer ? [result.finalAnswer] : [],
+    // Deliberately NOT [finalAnswer] here: functionalSummary already carries
+    // the full narrative, and packages/ai's answer template renders findings
+    // as a SEPARATE "Что особенно важно" section after functionalSummary -
+    // duplicating the same text into both produced a visibly repeated
+    // paragraph in every agentic-mode deterministic-fallback answer (live
+    // repro: 2026-07-15 "что мы знаем о юзере" conversation). findings is
+    // meant to be distinct granular facts, which the agentic loop doesn't
+    // produce as a separate structure - leaving it empty cleanly omits the
+    // section instead of repeating the narrative.
+    findings: [],
+    baselineFindings: [],
     overlayFindings: [],
     evidence,
     evidenceSummary: {

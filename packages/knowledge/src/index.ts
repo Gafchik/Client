@@ -28,6 +28,7 @@ import {
   type PipelineWorkspaceDetails,
   type PipelineRunResult,
   type ProviderRuntimeConfig,
+  type ProviderUsageSummary,
   type RepositorySnapshot,
   type ResearchReport,
   stableId,
@@ -65,6 +66,7 @@ interface SaveKnowledgeInput {
   focusedResearchResults?: FocusedResearchResult[];
   validatedAnswerPacket?: ValidatedAnswerPacket;
   answer: AnswerPackage;
+  usage?: ProviderUsageSummary;
 }
 
 interface PersistedWorkspaceSummary {
@@ -105,6 +107,7 @@ interface PersistedPipelineRunArtifact {
   answer?: AnswerPackage;
   knowledge?: KnowledgeSaveResult;
   runtimeCache?: PipelineRunResult["runtimeCache"];
+  usage?: ProviderUsageSummary;
 }
 
 export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise<KnowledgeSaveResult> {
@@ -200,6 +203,7 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       index: input.index,
       graph: input.graph,
     },
+    ...(input.usage ? { usage: input.usage } : {}),
   };
 
   await fs.writeFile(storagePath, JSON.stringify(artifact, null, 2));
@@ -211,8 +215,8 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
   await runSql(
     `
       insert into knowledge_catalog
-        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index, prompt_tokens, completion_tokens, total_tokens, provider_call_count)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       on conflict (run_id) do update set
         project_root_path = $2,
         task = $3,
@@ -225,7 +229,11 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
         head_commit = $10,
         head_fingerprint = $11,
         conversation_id = $12,
-        turn_index = $13
+        turn_index = $13,
+        prompt_tokens = $14,
+        completion_tokens = $15,
+        total_tokens = $16,
+        provider_call_count = $17
     `,
     [
       input.runId,
@@ -241,6 +249,10 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       input.repository.headFingerprint ?? null,
       input.conversationId,
       input.turnIndex,
+      input.usage?.promptTokens ?? 0,
+      input.usage?.completionTokens ?? 0,
+      input.usage?.totalTokens ?? 0,
+      input.usage?.callCount ?? 0,
     ],
   );
 
@@ -808,6 +820,7 @@ function normalizePipelineRunArtifact(
           },
         }
       : {}),
+    ...(artifact.usage ? { usage: artifact.usage } : {}),
   };
 }
 

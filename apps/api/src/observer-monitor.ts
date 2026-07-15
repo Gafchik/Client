@@ -1,127 +1,140 @@
 import { crawlUnit, listWorkUnits } from "@client/agentic-research";
 import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
+import type { ObserverActivityInfo, ObserverProgressInfo } from "@client/shared";
 import { hasAnyActiveQuestionRun } from "./pipeline-runner.js";
 import { getCurrentProvider } from "./provider-store.js";
-import { listProjects } from "./project-store.js";
 import { getSelectedTeam } from "./team-store.js";
 
-interface ObserverMonitorConfig {
-  intervalMs?: number;
-}
-
-// Deliberately much slower than project-state-monitor's 15s tick - this is
-// background, non-interactive, low-priority work (nvidia/nemotron-3-ultra by
-// default: free, but rate-limited to 15 req/min and, confirmed by direct
-// testing, never self-terminates an open-ended task). One bounded crawl per
-// tick, on a genuinely finite worklist item, is what gives it an objective
-// stopping point - not a turn budget or a nudge.
-const DEFAULT_INTERVAL_MS = 5 * 60_000;
+// Per-user request (2026-07-15): Observer moved from one automatic global
+// timer to per-project runners the user explicitly starts/stops, like a
+// runner - open project A, start it; open project B, start it too, both
+// crawl in parallel; stop-all before an important interactive question,
+// start again after. No auto-start on server boot - runners begin stopped.
 const CRAWL_MAX_TURNS = 40;
+// How long a running-but-currently-idle runner waits before rechecking
+// (nothing stale right now, or waiting out the interactive-contention gate)
+// rather than busy-looping.
+const IDLE_RECHECK_MS = 20_000;
 
-let monitorTimer: NodeJS.Timeout | null = null;
-let monitorRunning = false;
-// Round-robin start position across the flattened (project, path) list -
-// without this, a project with many units (e.g. 144 containers) would keep
-// winning every tick until fully fresh before any OTHER project ever got a
-// single crawl, starving every other project for potentially many hours.
-let nextPathIndex = 0;
-
-export function startObserverMonitor(config: ObserverMonitorConfig = {}): void {
-  if (monitorTimer) {
-    return;
-  }
-
-  const intervalMs = config.intervalMs ?? DEFAULT_INTERVAL_MS;
-  void tick();
-
-  monitorTimer = setInterval(() => {
-    void tick();
-  }, intervalMs);
-  monitorTimer.unref?.();
+interface ObserverRunner {
+  projectRootPath: string;
+  stopRequested: boolean;
+  activity: ObserverActivityInfo | null;
 }
 
-export function stopObserverMonitor(): void {
-  if (!monitorTimer) {
+const runners = new Map<string, ObserverRunner>();
+
+export function startObserver(projectRootPath: string): void {
+  const existing = runners.get(projectRootPath);
+
+  if (existing && !existing.stopRequested) {
     return;
   }
 
-  clearInterval(monitorTimer);
-  monitorTimer = null;
+  const runner: ObserverRunner = { projectRootPath, stopRequested: false, activity: null };
+  runners.set(projectRootPath, runner);
+  void runnerLoop(runner);
 }
 
-async function tick(): Promise<void> {
-  if (monitorRunning) {
-    return;
+export function stopObserver(projectRootPath: string): void {
+  const runner = runners.get(projectRootPath);
+
+  if (runner) {
+    runner.stopRequested = true;
+  }
+}
+
+/** Returns the project paths that were actually running (so the caller/UI can offer to resume exactly those). */
+export function stopAllObservers(): string[] {
+  const stopped: string[] = [];
+
+  for (const runner of runners.values()) {
+    if (!runner.stopRequested) {
+      runner.stopRequested = true;
+      stopped.push(runner.projectRootPath);
+    }
   }
 
-  monitorRunning = true;
+  return stopped;
+}
 
-  try {
+export function listObserverRunners(): Array<{ projectPath: string; status: "running" | "stopped"; activity: ObserverActivityInfo | null }> {
+  return Array.from(runners.values()).map((runner) => ({
+    projectPath: runner.projectRootPath,
+    status: runner.stopRequested ? "stopped" : "running",
+    activity: runner.activity,
+  }));
+}
+
+/** Cheap, no LLM call - just compares the worklist against what's already fresh. */
+export async function getObserverProgress(projectRootPath: string): Promise<ObserverProgressInfo> {
+  const [units, entries] = await Promise.all([
+    listWorkUnits(projectRootPath),
+    queryBusinessGraphEntries(projectRootPath),
+  ]);
+  const freshUnitPaths = new Set(entries.filter((entry) => !entry.isStale).map((entry) => entry.unitPath));
+  const freshUnits = units.filter((unit) => freshUnitPaths.has(unit)).length;
+
+  return {
+    totalUnits: units.length,
+    freshUnits,
+    percent: units.length === 0 ? 100 : Math.round((freshUnits / units.length) * 100),
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runnerLoop(runner: ObserverRunner): Promise<void> {
+  while (!runner.stopRequested) {
     // A background crawl shares the same provider/API key as live
     // interactive requests - live testing showed message-sending degrading
-    // exactly when a crawl was in flight. Never even start one while a real
-    // user question-run is active; shouldAbort (passed to crawlUnit below)
-    // covers the case where one starts mid-crawl.
+    // exactly when a crawl was in flight. Wait out any active question-run
+    // rather than starting a new unit while one is in progress; shouldAbort
+    // (passed to crawlUnit below) covers one starting mid-crawl.
     if (hasAnyActiveQuestionRun()) {
-      return;
+      await sleep(IDLE_RECHECK_MS);
+      continue;
     }
 
-    // Resolved fresh every tick, never cached - same rationale as
-    // resolveMonitorProvider in project-state-monitor.ts: an operator can
-    // change the selected team/provider between ticks.
+    // Resolved fresh every loop iteration, never cached - an operator can
+    // change the selected team/provider while a runner is active.
     const selectedTeam = await getSelectedTeam();
 
     if (!selectedTeam?.observerModel.trim()) {
-      return;
+      await sleep(IDLE_RECHECK_MS);
+      continue;
     }
 
     const provider = await getCurrentProvider();
 
     if (!provider?.baseUrl || !provider.apiKey) {
-      return;
+      await sleep(IDLE_RECHECK_MS);
+      continue;
     }
 
-    const projects = await listProjects();
-    const allPaths = projects.flatMap((project) => project.paths.map((projectPath) => projectPath.rootPath));
+    const crawled = await crawlOneStaleUnit(runner, {
+      observerModel: selectedTeam.observerModel,
+      criticModel: selectedTeam.criticModel,
+      providerBaseUrl: provider.baseUrl,
+      providerApiKey: provider.apiKey,
+    });
 
-    if (allPaths.length === 0) {
-      return;
+    if (!crawled) {
+      // Nothing stale right now (or a transient issue) - don't busy-loop
+      // re-checking the same, already-fresh worklist.
+      await sleep(IDLE_RECHECK_MS);
     }
-
-    // Always advance the rotation by one path per tick, regardless of
-    // outcome, so a project with nothing stale right now doesn't get
-    // re-checked first again before every other project has had a turn.
-    const startIndex = nextPathIndex % allPaths.length;
-    nextPathIndex = (nextPathIndex + 1) % allPaths.length;
-
-    for (let offset = 0; offset < allPaths.length; offset += 1) {
-      const rootPath = allPaths[(startIndex + offset) % allPaths.length]!;
-      const crawled = await crawlOneStaleUnit(rootPath, {
-        observerModel: selectedTeam.observerModel,
-        criticModel: selectedTeam.criticModel,
-        providerBaseUrl: provider.baseUrl,
-        providerApiKey: provider.apiKey,
-      });
-
-      // One crawl per tick, total - crawling is much heavier than a status
-      // poll, and letting more than one run per tick risks pile-up if a
-      // crawl outlasts the interval (monitorRunning only guards against
-      // overlapping ticks, not a slow one delaying the next).
-      if (crawled) {
-        return;
-      }
-    }
-  } catch (error) {
-    console.warn("[observer-monitor] tick failed, will retry next interval:", error);
-  } finally {
-    monitorRunning = false;
   }
 }
 
 async function crawlOneStaleUnit(
-  projectRootPath: string,
+  runner: ObserverRunner,
   models: { observerModel: string; criticModel: string; providerBaseUrl: string; providerApiKey: string },
 ): Promise<boolean> {
+  const projectRootPath = runner.projectRootPath;
+
   try {
     const [units, entries] = await Promise.all([
       listWorkUnits(projectRootPath),
@@ -134,6 +147,8 @@ async function crawlOneStaleUnit(
       return false;
     }
 
+    runner.activity = { projectPath: projectRootPath, unitPath: nextUnit, startedAt: new Date().toISOString() };
+
     const result = await crawlUnit({
       projectRootPath,
       unitPath: nextUnit,
@@ -142,12 +157,17 @@ async function crawlOneStaleUnit(
       providerBaseUrl: models.providerBaseUrl,
       providerApiKey: models.providerApiKey,
       maxTurns: CRAWL_MAX_TURNS,
-      shouldAbort: hasAnyActiveQuestionRun,
+      // Checked every turn, not just before starting - an explicit user
+      // stop (or a question-run that started mid-crawl) yields within one
+      // turn instead of running to completion regardless.
+      shouldAbort: () => runner.stopRequested || hasAnyActiveQuestionRun(),
+    }).finally(() => {
+      runner.activity = null;
     });
 
-    // Yielded to a live user request before doing any real work - not worth
-    // a diagnostic row (it would just be noise), and not "this project made
-    // progress" either, so the tick doesn't treat it as done.
+    // Yielded before doing real work - not worth a diagnostic row (just
+    // noise), and not "progress" either, so the loop doesn't skip its idle
+    // backoff on the next iteration.
     if (result.raw.stopped === "aborted") {
       return false;
     }
@@ -156,11 +176,7 @@ async function crawlOneStaleUnit(
 
     // Written either way (cheap diagnostic breadcrumb, and isStale is always
     // true when sourceFileHashes is empty, so a failed attempt self-heals on
-    // the next pass rather than looking like a trusted, empty result). But an
-    // outright transport/provider failure (e.g. the free-tier 15rpm limit)
-    // isn't "this project made progress" - it shouldn't stop this tick's
-    // rotation from reaching the NEXT project, unlike a real (even if
-    // incomplete) crawl attempt.
+    // the next pass rather than looking like a trusted, empty result).
     await upsertBusinessGraphEntry({
       projectRootPath,
       unitPath: nextUnit,

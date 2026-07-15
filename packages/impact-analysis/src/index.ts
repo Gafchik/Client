@@ -320,10 +320,14 @@ function buildRisks(files: string[], symbols: string[], research: ResearchReport
     risks.push("Локализационный scope требует проверки полноты языковых каталогов и согласованности translation keys.");
   }
 
-  if (risks.length === 0) {
-    risks.push("Текущая зона влияния выглядит локальной, но точное runtime-поведение всё ещё зависит от будущей интеграции execution-слоя.");
-  }
-
+  // No generic filler risk here on purpose (removed 2026-07-15): this used
+  // to unconditionally push a boilerplate "execution layer" line whenever
+  // no specific risk condition matched - which leaked into plain read-only
+  // questions ("what fields does this model have") that have no real risk
+  // to report at all. buildRisksSection (packages/ai) already only renders
+  // the "Что может пойти не так" section when risks is non-empty - a
+  // genuinely empty array correctly omits the section instead of inventing
+  // a platitude to fill it.
   return risks;
 }
 

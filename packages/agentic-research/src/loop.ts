@@ -35,6 +35,19 @@ export interface AgenticRunOptions {
    * mid-conversation with no way to back off once started.
    */
   shouldAbort?: () => boolean;
+  /**
+   * Workspace-relative paths of files already read in the PREVIOUS turn of
+   * this same conversation (see pipeline-runner.ts's priorConversationTurn).
+   * Without this, every follow-up question in an ongoing conversation starts
+   * a brand-new loop with no memory of what the last turn already found -
+   * live testing showed a 3-turn conversation about the same User model
+   * re-discovering (and re-failing to fully read) app/Models/User.php's
+   * location on every single turn instead of building on the last one.
+   * Seeds seenDirs (so the list-before-read guard doesn't force a redundant
+   * listing) and is surfaced to the model as a hint to jump to, not a fact
+   * to blindly trust - the question may have moved on to something else.
+   */
+  priorTurnFiles?: string[];
 }
 
 export interface AgenticRunResult {
@@ -47,7 +60,7 @@ export interface AgenticRunResult {
   turnsUsed: number;
   totalPromptTokens: number;
   totalCompletionTokens: number;
-  stopped: "final_answer" | "max_turns" | "parse_error" | "error" | "aborted";
+  stopped: "final_answer" | "max_turns" | "error" | "aborted";
   error?: string;
 }
 
@@ -274,16 +287,20 @@ async function callCritic(input: {
 
 export async function runAgenticLoop(options: AgenticRunOptions): Promise<AgenticRunResult> {
   const maxTurns = options.maxTurns ?? DEFAULT_SAFETY_CEILING_TURNS;
+  const priorTurnFiles = [...new Set(options.priorTurnFiles ?? [])];
+  const priorTurnHint = priorTurnFiles.length > 0
+    ? `\n\nВ предыдущей реплике этого диалога ты уже находил и читал такие файлы: ${priorTurnFiles.join(", ")}. Если новый вопрос продолжает ту же тему - начни с чтения этих файлов (read_file) вместо повторного исследования с нуля. Если вопрос явно про другое - проверь их актуальность или ищи заново, не полагайся на них вслепую.`
+    : "";
   const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: `Проект: ${options.projectRootPath}\nВопрос: ${options.task}` },
+    { role: "user", content: `Проект: ${options.projectRootPath}\nВопрос: ${options.task}${priorTurnHint}` },
   ];
 
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
   const actionsLog: string[] = [];
   const touchedFiles = new Set<string>();
-  const seenDirs = new Set<string>([normalizeDirKey(".")]);
+  const seenDirs = new Set<string>([normalizeDirKey("."), ...priorTurnFiles.map((filePath) => dirnameOf(filePath))]);
   let criticRounds = 0;
   let criticVerdict: AgenticRunResult["criticVerdict"] = "not-run";
 
@@ -374,7 +391,18 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
         continue;
       }
 
-      return { ...verdict, stopped: "parse_error" };
+      // Bug fix (2026-07-15): this used to force stopped:"parse_error" here
+      // regardless of the critic's verdict, discarding a genuinely good,
+      // critic-approved answer just because the model skipped the
+      // ACTION: final_answer(...) wrapper. Downstream (toValidationResult)
+      // reads stopped === "final_answer" to decide whether an answer exists
+      // at all - the override silently turned confirmed-good answers into
+      // "insufficient-evidence", which skipped the LLM answer-polish pass
+      // entirely and surfaced the raw, duplicated deterministic-fallback
+      // template to the user instead. `verdict` already carries the correct
+      // "final_answer" stopped value from evaluateProposedAnswer - trust it,
+      // exactly like the explicit ACTION: final_answer(...) branch below does.
+      return verdict;
     }
 
     messages.push({ role: "assistant", content });
