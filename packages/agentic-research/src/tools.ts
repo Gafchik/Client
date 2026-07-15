@@ -60,15 +60,21 @@ export async function listDir(projectRoot: string, relPath: string): Promise<str
 
 export async function grepContent(projectRoot: string, pattern: string): Promise<string> {
   try {
+    // Live evidence (2026-07-15): "!storage/*" only excludes storage's direct
+    // children, not nested ones (ripgrep's gitignore-style globs need "**"
+    // for that) - a real project's storage/updated/*.csv and
+    // storage/converted/*.csv data dumps flooded every grep with row-level
+    // noise ahead of the actual matching source files, which only survived
+    // because they happened to still land inside the match cap.
     const { stdout } = await execFileAsync("rg", [
       "-n",
       "-i",
       "--max-count", "2",
-      "--glob", "!vendor/*",
-      "--glob", "!node_modules/*",
-      "--glob", "!storage/*",
-      "--glob", "!.git/*",
-      "--glob", "!bootstrap/cache/*",
+      "--glob", "!vendor/**",
+      "--glob", "!node_modules/**",
+      "--glob", "!storage/**",
+      "--glob", "!.git/**",
+      "--glob", "!bootstrap/cache/**",
       pattern,
       projectRoot,
     ], { maxBuffer: 10 * 1024 * 1024 });

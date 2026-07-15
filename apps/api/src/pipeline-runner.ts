@@ -1414,7 +1414,16 @@ async function buildObserverHintSuffix(projectRootPath: string, task: string): P
       return "";
     }
 
-    const taskTokens = tokenize(task).filter((token) => token.length >= OBSERVER_HINT_MIN_TOKEN_LENGTH);
+    // Live evidence (2026-07-15): "папка w9" never matched a real, relevant
+    // entry because "w9" (length 2) was dropped by the length>=4 filter,
+    // while generic 4+ char words let an unrelated entry (Lambda/scripts)
+    // through. Short alphanumeric identifiers (w9, s3, oauth2) are exactly
+    // the tokens most likely to be a real, distinctive match - length alone
+    // is the wrong signal here, so a digit anywhere in the token bypasses
+    // the length floor instead of being penalized by it.
+    const taskTokens = tokenize(task).filter(
+      (token) => token.length >= OBSERVER_HINT_MIN_TOKEN_LENGTH || /\d/.test(token),
+    );
     const relevant = freshEntries
       .filter((entry) => {
         const haystack = `${entry.unitPath} ${entry.featureSummary}`.toLowerCase();

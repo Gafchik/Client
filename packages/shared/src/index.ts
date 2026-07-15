@@ -943,6 +943,8 @@ export interface ObserverRunnerInfo {
   status: "running" | "stopped";
   activity: ObserverActivityInfo | null;
   progress: ObserverProgressInfo;
+  /** True once a full pass found nothing stale - still "running" (watching for changes), just not actively crawling. */
+  resting: boolean;
 }
 
 export interface ObserverStatusResponse {

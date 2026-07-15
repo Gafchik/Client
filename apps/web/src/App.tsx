@@ -640,6 +640,13 @@ function describeObserverStatus(
     return { title: "Observer изучает проект", description: `${entry.activity.unitPath} · ${progressText}`, running: true };
   }
 
+  // "resting" - a full pass found nothing stale, so it's not actually
+  // searching right now, just watching for changes (see observer-monitor.ts) -
+  // showing "ищет, что ещё не изучено" here would be dishonest at 100%.
+  if (entry.status === "running" && entry.resting) {
+    return { title: "Observer изучил всё, что нашёл", description: `следит за изменениями · ${progressText}`, running: true };
+  }
+
   if (entry.status === "running") {
     return { title: "Observer запущен", description: `ищет, что ещё не изучено... · ${progressText}`, running: true };
   }
@@ -775,7 +782,7 @@ function ObserverGlobalBar({
           <span className="observer-global-bar-label">
             Observer работает:{" "}
             {running
-              .map((observer) => `${shortProjectLabel(observer.projectPath)} (${observer.progress.percent}%${observer.activity ? `, изучает ${observer.activity.unitPath}` : ""})`)
+              .map((observer) => `${shortProjectLabel(observer.projectPath)} (${observer.progress.percent}%${observer.activity ? `, изучает ${observer.activity.unitPath}` : observer.resting ? ", отдыхает" : ""})`)
               .join(" · ")}
           </span>
           <button type="button" className="ghost-button" onClick={onStopAll}>
@@ -2026,7 +2033,11 @@ export function App() {
     }
 
     void loadObserverStatus();
-    const interval = window.setInterval(() => void loadObserverStatus(), 10_000);
+    // 4с, не 10 - плашка с процентом изучения должна чувствоваться "живой"
+    // (просьба пользователя). Безопасно на бэкенде за счёт TTL-кэша в
+    // getObserverProgress (observer-monitor.ts) - без него более частый опрос
+    // означал бы более частый обход файлов и хэширование на каждый тик.
+    const interval = window.setInterval(() => void loadObserverStatus(), 4_000);
 
     return () => {
       window.clearInterval(interval);

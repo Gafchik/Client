@@ -7,6 +7,16 @@ const PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
 const PROVIDER_MAX_ATTEMPTS = 2;
 const PROVIDER_BASE_BACKOFF_MS = 1_200;
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+// Live evidence (2026-07-15): every single business_graph_entries row across
+// 4 real projects (67/67) turned out to be a stored 429 error message - the
+// free Observer model's rate limit (~15 req/min, confirmed earlier this
+// session) was blowing straight through 2 attempts at ~1.2s/2.4s backoff.
+// 429 specifically gets a much more patient retry budget; other retryable
+// statuses (500/502/503/504 - real server-side failures, not "you're going
+// too fast") keep the original tight budget so a genuinely broken provider
+// still fails fast instead of hanging a live interactive question.
+const RATE_LIMIT_MAX_ATTEMPTS = 5;
+const RATE_LIMIT_BASE_BACKOFF_MS = 5_000;
 
 // No turn-count pressure/nudge on purpose (reverted mid-session after live
 // testing showed it just pressures models to conclude before they actually
@@ -100,9 +110,83 @@ const CRITIC_SYSTEM_PROMPT = [
   "Ответь СТРОГО одной строкой: либо \"APPROVED\", либо \"REJECTED: <короткое конкретное указание, что именно нужно проверить перед тем как отвечать снова>\".",
 ].join("\n");
 
+// Live evidence (2026-07-15): asked "что такое папка w9" against a real
+// project - the model explored only 2 root files across 48 turns and never
+// once grepped the literal word "w9", even though `grep -ril "w9"` finds the
+// whole feature (AttachW9DocumentsToGeneratedBillAction.php,
+// EdocumentFolderController, a migration) in under a second. Business terms
+// in a user's own question routinely don't match any folder/file name at all
+// (the same "DME hidden under Suplay" shape from day one of this project) -
+// a plain-language question gives no reason for the model to think "grep for
+// this exact word" is the obvious first move, so it's done automatically
+// instead of hoping the model reaches for it on its own.
+const DISTINCTIVE_TOKEN_PATTERN = /[A-Za-z][A-Za-z0-9_-]*/g;
+const MAX_SEED_GREP_TERMS = 3;
+
+function extractDistinctiveTokens(task: string): string[] {
+  const candidates = task.match(DISTINCTIVE_TOKEN_PATTERN) ?? [];
+  const seen = new Set<string>();
+  const distinctive: string[] = [];
+
+  for (const token of candidates) {
+    const hasDigit = /\d/.test(token);
+    const isAcronym = /^[A-Z]{2,6}$/.test(token);
+    const isMixedCase = /[a-z]/.test(token) && /[A-Z]/.test(token) && token.length >= 3;
+
+    if (!hasDigit && !isAcronym && !isMixedCase) {
+      continue;
+    }
+
+    const key = token.toLowerCase();
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    distinctive.push(token);
+  }
+
+  return distinctive.slice(0, MAX_SEED_GREP_TERMS);
+}
+
+async function buildSeedGrepObservation(projectRootPath: string, task: string): Promise<string> {
+  const terms = extractDistinctiveTokens(task);
+
+  if (terms.length === 0) {
+    return "";
+  }
+
+  // Bounded per-term, not on the joined block - a fixed overall cap would
+  // let noise in an earlier term's results push a later term's real matches
+  // out of the budget entirely instead of just trimming each fairly.
+  const perTermCap = Math.floor(MAX_OBSERVATION_CHARS / terms.length);
+  const results = await Promise.all(
+    terms.map(async (term) => {
+      const raw = await grepContent(projectRootPath, term);
+      const bounded = raw.length > perTermCap ? `${raw.slice(0, perTermCap)}\n... (truncated)` : raw;
+      return `grep_content("${term}"):\n${bounded}`;
+    }),
+  );
+
+  return [
+    "Автоматический предварительный поиск по буквальным словам вопроса (до твоего первого хода). Это только отправная точка, не факт — но часто нужное лежит не там, где ожидаешь по названию папки (бизнес-термин из вопроса может быть полем/сущностью в коде, а не директорией), так что стоит свериться с этим перед тем как исследовать вслепую:",
+    ...results,
+  ].join("\n\n");
+}
+
+function getStatusCode(error: unknown): number | null {
+  if (error instanceof Error) {
+    const match = /^Provider request failed with (\d+)/.exec(error.message);
+    return match ? Number(match[1]) : null;
+  }
+  return null;
+}
+
 function isRetryableError(error: unknown): boolean {
-  if (error instanceof Error && /^Provider request failed with (\d+)/.test(error.message)) {
-    const status = Number(/^Provider request failed with (\d+)/.exec(error.message)?.[1]);
+  const status = getStatusCode(error);
+
+  if (status !== null) {
     return RETRYABLE_STATUS_CODES.has(status);
   }
   return error instanceof Error && /fetch failed|ECONNRESET|ETIMEDOUT/i.test(error.message);
@@ -164,17 +248,23 @@ async function callModel(
 ): Promise<{ content: string; usage: ProviderUsage | null }> {
   let lastError: unknown = null;
 
-  for (let attempt = 1; attempt <= PROVIDER_MAX_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= RATE_LIMIT_MAX_ATTEMPTS; attempt += 1) {
     try {
       return await performCall(providerBaseUrl, providerApiKey, model, messages);
     } catch (error) {
       lastError = error;
 
-      if (!isRetryableError(error) || attempt === PROVIDER_MAX_ATTEMPTS) {
+      const isRateLimited = getStatusCode(error) === 429;
+      const maxAttempts = isRateLimited ? RATE_LIMIT_MAX_ATTEMPTS : PROVIDER_MAX_ATTEMPTS;
+
+      if (!isRetryableError(error) || attempt >= maxAttempts) {
         throw error;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, PROVIDER_BASE_BACKOFF_MS * attempt));
+      const backoffMs = isRateLimited
+        ? RATE_LIMIT_BASE_BACKOFF_MS * attempt
+        : PROVIDER_BASE_BACKOFF_MS * attempt;
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
     }
   }
 
@@ -296,13 +386,34 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     { role: "user", content: `Проект: ${options.projectRootPath}\nВопрос: ${options.task}${priorTurnHint}` },
   ];
 
+  const seedGrepObservation = await buildSeedGrepObservation(options.projectRootPath, options.task);
+
+  if (seedGrepObservation) {
+    messages.push({ role: "user", content: seedGrepObservation });
+  }
+
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
   const actionsLog: string[] = [];
   const touchedFiles = new Set<string>();
   const seenDirs = new Set<string>([normalizeDirKey("."), ...priorTurnFiles.map((filePath) => dirnameOf(filePath))]);
+  const grepTermsSeen = new Set<string>();
   let criticRounds = 0;
   let criticVerdict: AgenticRunResult["criticVerdict"] = "not-run";
+  // Live evidence (2026-07-15): a run burned 48 calls / ~300K tokens (hit the
+  // hard safety ceiling) while reading only 2 files total - most turns were
+  // repeating the same ground, not genuine exploration, because the loop
+  // resends the full accumulated history every turn regardless of whether
+  // new information is actually coming in. This is deliberately NOT a
+  // turn-count nudge (rejected earlier this session - it pressured models to
+  // conclude before they actually knew enough): it only fires when the
+  // explored surface (new dirs/files/grep terms) has genuinely stopped
+  // growing for many turns straight, which is the "runaway, not thorough"
+  // case the safety ceiling already exists to catch, just sooner.
+  const STUCK_TURNS_THRESHOLD = 8;
+  let stuckTurns = 0;
+  let stuckNudgeSent = false;
+  let lastSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size;
 
   const finalize = (
     overrides: Partial<AgenticRunResult> & Pick<AgenticRunResult, "turnsUsed" | "stopped">,
@@ -385,7 +496,24 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     if (!action) {
       actionsLog.push(`[turn ${turn}] NO ACTION PARSED (treated as implicit final answer). raw content: ${content.slice(0, 300)}`);
       messages.push({ role: "assistant", content });
-      const verdict = await evaluateProposedAnswer(content.trim(), turn);
+
+      // The model may have genuinely tried ACTION: final_answer(...), but
+      // parseAction's balanced-paren scanner never found a matching close
+      // (a stray unbalanced paren anywhere in a long markdown answer is
+      // enough) and correctly returned null - verified live: this leaked the
+      // literal "ACTION: final_answer(" protocol prefix into a stored
+      // Observer business-graph hint, which then got shown to the user
+      // verbatim as if it were a clean answer. Strip that prefix (and a
+      // trailing lone close-paren, if the model's text happened to end with
+      // one) before treating the rest as the candidate - otherwise this is
+      // genuinely free-form prose with no ACTION attempt, left as-is.
+      const finalAnswerPrefixPattern = /ACTION:\s*final_answer\s*\(/;
+      const prefixMatch = finalAnswerPrefixPattern.exec(content);
+      const rawCandidate = prefixMatch
+        ? content.slice(prefixMatch.index + prefixMatch[0].length).replace(/\)\s*$/, "")
+        : content;
+
+      const verdict = await evaluateProposedAnswer(rawCandidate.trim(), turn);
 
       if (verdict === "continue-loop") {
         continue;
@@ -425,6 +553,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       seenDirs.add(normalizeDirKey(action.arg));
     } else if (action.tool === "grep_content") {
       observation = await grepContent(options.projectRootPath, action.arg);
+      grepTermsSeen.add(action.arg.toLowerCase());
     } else {
       const parentDir = dirnameOf(action.arg);
 
@@ -446,6 +575,31 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       : observation;
 
     messages.push({ role: "user", content: `OBSERVATION:\n${boundedObservation}` });
+
+    const currentSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size;
+
+    if (currentSurfaceSize === lastSurfaceSize) {
+      stuckTurns += 1;
+    } else {
+      stuckTurns = 0;
+      stuckNudgeSent = false;
+      lastSurfaceSize = currentSurfaceSize;
+    }
+
+    if (stuckTurns >= STUCK_TURNS_THRESHOLD + 4) {
+      // Nudged below and still no new ground covered several turns later -
+      // genuinely stuck (not "thorough"), stop paying for it.
+      actionsLog.push(`[turn ${turn}] SAFETY ABORT: no new directory/file/grep term for ${stuckTurns} turns straight.`);
+      return finalize({ turnsUsed: turn, stopped: "max_turns" });
+    }
+
+    if (stuckTurns >= STUCK_TURNS_THRESHOLD && !stuckNudgeSent) {
+      stuckNudgeSent = true;
+      messages.push({
+        role: "user",
+        content: `Уже ${STUCK_TURNS_THRESHOLD} шагов подряд без новой директории/файла/поискового запроса — похоже, ты застрял, а не действительно основательно исследуешь. Дай финальный ответ прямо сейчас через ACTION: final_answer(...), опираясь на то, что реально нашёл, и честно укажи, чего не хватает — это лучше, чем продолжать блуждать по кругу.`,
+      });
+    }
   }
 
   return finalize({ turnsUsed: maxTurns, stopped: "max_turns" });

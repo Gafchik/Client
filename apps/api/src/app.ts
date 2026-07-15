@@ -368,6 +368,7 @@ export function createApp() {
           status: runner?.status ?? ("stopped" as const),
           activity: runner?.activity ?? null,
           progress: await getObserverProgress(projectPath),
+          resting: runner?.resting ?? false,
         };
       }),
     );

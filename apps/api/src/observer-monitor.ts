@@ -1,9 +1,13 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { crawlUnit, listWorkUnits } from "@client/agentic-research";
 import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
 import type { ObserverActivityInfo, ObserverProgressInfo } from "@client/shared";
 import { hasAnyActiveQuestionRun } from "./pipeline-runner.js";
 import { getCurrentProvider } from "./provider-store.js";
 import { getSelectedTeam } from "./team-store.js";
+
+const execFileAsync = promisify(execFile);
 
 // Per-user request (2026-07-15): Observer moved from one automatic global
 // timer to per-project runners the user explicitly starts/stops, like a
@@ -15,11 +19,31 @@ const CRAWL_MAX_TURNS = 40;
 // (nothing stale right now, or waiting out the interactive-contention gate)
 // rather than busy-looping.
 const IDLE_RECHECK_MS = 20_000;
+// Once a full pass finds nothing stale, the expensive check (directory walk
+// + per-file content hashing, confirmed live to run on every tick regardless
+// of project size) backs off to this instead of repeating every 20s forever
+// - the user's own point: git HEAD gets checked every IDLE_RECHECK_MS
+// regardless (cheap, ~10ms), so switching to an old branch is still caught
+// within ~20s even while the expensive re-hash pass itself is resting.
+const RESTING_RECHECK_MS = 90_000;
 
 interface ObserverRunner {
   projectRootPath: string;
   stopRequested: boolean;
   activity: ObserverActivityInfo | null;
+  /** HEAD at the last full stale-check pass - a change forces an immediate re-check even while resting. */
+  lastCheckedHead: string | null;
+  /** Set once a full pass finds nothing stale; cleared the moment HEAD moves. */
+  resting: boolean;
+}
+
+async function getCurrentHead(projectRootPath: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: projectRootPath });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 const runners = new Map<string, ObserverRunner>();
@@ -31,7 +55,13 @@ export function startObserver(projectRootPath: string): void {
     return;
   }
 
-  const runner: ObserverRunner = { projectRootPath, stopRequested: false, activity: null };
+  const runner: ObserverRunner = {
+    projectRootPath,
+    stopRequested: false,
+    activity: null,
+    lastCheckedHead: null,
+    resting: false,
+  };
   runners.set(projectRootPath, runner);
   void runnerLoop(runner);
 }
@@ -58,16 +88,32 @@ export function stopAllObservers(): string[] {
   return stopped;
 }
 
-export function listObserverRunners(): Array<{ projectPath: string; status: "running" | "stopped"; activity: ObserverActivityInfo | null }> {
+export function listObserverRunners(): Array<{ projectPath: string; status: "running" | "stopped"; activity: ObserverActivityInfo | null; resting: boolean }> {
   return Array.from(runners.values()).map((runner) => ({
     projectPath: runner.projectRootPath,
     status: runner.stopRequested ? "stopped" : "running",
     activity: runner.activity,
+    resting: runner.resting,
   }));
 }
 
-/** Cheap, no LLM call - just compares the worklist against what's already fresh. */
+// No LLM call, but listWorkUnits (directory walk) + queryBusinessGraphEntries
+// (per-file content hashing for staleness) both do real disk I/O - too
+// pricey to redo unconditionally on every frontend poll of every project
+// (including stopped runners) once the poll interval got tightened for a
+// snappier UI. A few seconds of staleness is invisible next to how long a
+// single crawl unit actually takes (well over a minute), so a short TTL
+// cache is free correctness-wise.
+const PROGRESS_CACHE_TTL_MS = 4_000;
+const progressCache = new Map<string, { expiresAt: number; value: ObserverProgressInfo }>();
+
 export async function getObserverProgress(projectRootPath: string): Promise<ObserverProgressInfo> {
+  const cached = progressCache.get(projectRootPath);
+
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
   const [units, entries] = await Promise.all([
     listWorkUnits(projectRootPath),
     queryBusinessGraphEntries(projectRootPath),
@@ -75,11 +121,14 @@ export async function getObserverProgress(projectRootPath: string): Promise<Obse
   const freshUnitPaths = new Set(entries.filter((entry) => !entry.isStale).map((entry) => entry.unitPath));
   const freshUnits = units.filter((unit) => freshUnitPaths.has(unit)).length;
 
-  return {
+  const value: ObserverProgressInfo = {
     totalUnits: units.length,
     freshUnits,
     percent: units.length === 0 ? 100 : Math.round((freshUnits / units.length) * 100),
   };
+
+  progressCache.set(projectRootPath, { expiresAt: Date.now() + PROGRESS_CACHE_TTL_MS, value });
+  return value;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -87,6 +136,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function runnerLoop(runner: ObserverRunner): Promise<void> {
+  let lastFullCheckAt = 0;
+
   while (!runner.stopRequested) {
     // A background crawl shares the same provider/API key as live
     // interactive requests - live testing showed message-sending degrading
@@ -114,12 +165,31 @@ async function runnerLoop(runner: ObserverRunner): Promise<void> {
       continue;
     }
 
+    // Once fully caught up, the expensive check (directory walk + per-file
+    // content hashing) backs off to RESTING_RECHECK_MS instead of repeating
+    // every IDLE_RECHECK_MS forever - but a plain `git rev-parse HEAD`
+    // (~10ms) is cheap enough to still poll at the short interval, so
+    // switching to a branch with different content is still caught within
+    // ~IDLE_RECHECK_MS even while the expensive pass itself is resting.
+    if (runner.resting) {
+      const currentHead = await getCurrentHead(runner.projectRootPath);
+      const headChanged = currentHead !== null && currentHead !== runner.lastCheckedHead;
+      const restIntervalElapsed = Date.now() - lastFullCheckAt >= RESTING_RECHECK_MS;
+
+      if (!headChanged && !restIntervalElapsed) {
+        await sleep(IDLE_RECHECK_MS);
+        continue;
+      }
+    }
+
     const crawled = await crawlOneStaleUnit(runner, {
       observerModel: selectedTeam.observerModel,
       criticModel: selectedTeam.criticModel,
       providerBaseUrl: provider.baseUrl,
       providerApiKey: provider.apiKey,
     });
+    lastFullCheckAt = Date.now();
+    runner.lastCheckedHead = await getCurrentHead(runner.projectRootPath);
 
     if (!crawled) {
       // Nothing stale right now (or a transient issue) - don't busy-loop
@@ -144,9 +214,11 @@ async function crawlOneStaleUnit(
     const nextUnit = units.find((unit) => !freshUnitPaths.has(unit));
 
     if (!nextUnit) {
+      runner.resting = true;
       return false;
     }
 
+    runner.resting = false;
     runner.activity = { projectPath: projectRootPath, unitPath: nextUnit, startedAt: new Date().toISOString() };
 
     const result = await crawlUnit({
@@ -172,7 +244,18 @@ async function crawlOneStaleUnit(
       return false;
     }
 
-    const sourceFileHashes = await hashFiles(projectRootPath, result.touchedFiles);
+    // Real evidence: 24/25 units of a live test project ended up "fresh"
+    // forever with a literal error message as their featureSummary, because
+    // this used to hash whatever files got touched before a crawl failed
+    // (e.g. read one file, then hit a 429) regardless of outcome - a file's
+    // content hash doesn't change just because the crawl that read it later
+    // failed, so isStale (empty-hashes-only) never re-triggered and the
+    // failure was permanently mistaken for a completed, trustworthy result.
+    // Only a genuine final_answer counts as "learned this unit" - anything
+    // else stores empty hashes so it stays stale and gets retried next pass.
+    const sourceFileHashes = result.raw.stopped === "final_answer"
+      ? await hashFiles(projectRootPath, result.touchedFiles)
+      : {};
 
     // Written either way (cheap diagnostic breadcrumb, and isStale is always
     // true when sourceFileHashes is empty, so a failed attempt self-heals on
