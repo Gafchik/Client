@@ -593,13 +593,21 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     // const graphHintTerms = await findGraphSymbolHints(graphProjectId, computeTaskSearchTokens(task));
     const agenticResult = await runAgenticResearch({
       runId,
-      task: observerHint ? `${task}\n\n${observerHint}` : task,
+      // Bug fix (2026-07-15): task used to have observerHint concatenated
+      // straight into it - this flows into ResearchReport.task, which the
+      // chat UI renders verbatim as "Задача", so the hint text ("Подсказка
+      // от фонового обхода проекта...") was leaking into what the user sees
+      // as their own question. observerHint is now passed as its own field
+      // (AgenticRunOptions.observerHint) - still reaches the model, just
+      // appended to the LLM-facing message only, not the visible task.
+      task,
       projectRootPath,
       researcherModel: selectedTeam.researcherModel,
       criticModel: selectedTeam.criticModel,
       providerBaseUrl,
       providerApiKey,
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
+      ...(observerHint ? { observerHint } : {}),
     });
     initialResearch = agenticResult.research;
     teamValidation = agenticResult.validation;
@@ -1495,14 +1503,19 @@ async function buildObserverHintSuffix(projectRootPath: string, task: string): P
     // not just decoration on the schema. Rendered as their own labeled lines
     // so the live Researcher can weigh "confirmed mechanism" vs "watch out
     // for" separately from the free-text summary.
+    // Translated to English (2026-07-16, user's request) - this whole block
+    // is appended to the agentic loop's LLM-facing message
+    // (AgenticRunOptions.observerHint, loop.ts), never shown to the human
+    // user directly (see the 2026-07-15 fix that stopped it from leaking
+    // into ResearchReport.task/"Задача").
     const hintLines = relevant.flatMap((entry) => [
       `- "${entry.unitPath}": ${entry.featureSummary}`,
-      ...(entry.keyMechanisms.length ? [`  Механизмы: ${entry.keyMechanisms.join("; ")}`] : []),
-      ...(entry.gotchas.length ? [`  Подводные камни: ${entry.gotchas.join("; ")}`] : []),
+      ...(entry.keyMechanisms.length ? [`  Mechanisms: ${entry.keyMechanisms.join("; ")}`] : []),
+      ...(entry.gotchas.length ? [`  Gotchas: ${entry.gotchas.join("; ")}`] : []),
     ]);
 
     return [
-      "Подсказка от фонового обхода проекта (Observer) — НЕ подтверждённый факт, а наводка откуда стоит начать. Обязательно проверь по актуальному коду перед тем как на неё полагаться, код мог измениться с момента обхода:",
+      "Hint from the project's background scan (Observer) - NOT a confirmed fact, just a lead on where to start. Make sure to verify it against the current code before relying on it, the code may have changed since the scan:",
       ...hintLines,
     ].join("\n");
   } catch {

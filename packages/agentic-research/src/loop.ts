@@ -91,6 +91,16 @@ export interface AgenticRunOptions {
    */
   priorTurnFiles?: string[];
   /**
+   * Observer's business-graph hint text (pipeline-runner.ts's
+   * buildObserverHintSuffix) - kept OUT of `task` on purpose (2026-07-15 bug
+   * fix): task flows straight into ResearchReport.task, which the chat UI
+   * renders verbatim as "Задача" - concatenating the hint into it leaked
+   * Observer's internal "ищи здесь, но проверь" text into the user-visible
+   * question. Appended to the LLM-facing message only, same as
+   * priorTurnHint below.
+   */
+  observerHint?: string;
+  /**
    * Symbol names (class/function names, not paths) found by matching task
    * keywords against the FULL persisted code graph (packages/graph, built by
    * background-sync - see apps/api/src/graph-store.ts's
@@ -135,26 +145,35 @@ interface ParsedAction {
   arg: string;
 }
 
+// Translated to English (2026-07-16, user's explicit request - weaker
+// models parse English instructions more reliably). The one exception is
+// final_answer's own content: it must stay in Russian, since it flows into
+// ResearchReport.functionalSummary and can end up user-visible directly in a
+// fallback path (verified live earlier this session: a raw, unsynthesized
+// agentic answer leaking to the user is a real failure mode, not
+// hypothetical) - the downstream answer-synthesis prompt (packages/ai) also
+// demands Russian, but this is a deliberate second safety net, not
+// redundant.
 const SYSTEM_PROMPT = [
-  "Ты — опытный senior fullstack разработчик, который исследует незнакомую кодовую базу, чтобы честно ответить на инженерный вопрос.",
-  "У тебя есть инструменты. Каждое действие пиши отдельной строкой в таком виде (без markdown-обрамления):",
-  "ACTION: list_dir(относительный/путь)",
-  "ACTION: grep_content(строка или regex для поиска по содержимому файлов)",
-  "ACTION: read_file(относительный/путь/к/файлу.php)",
-  "ACTION: final_answer(твой финальный ответ на человеческом языке, с указанием конкретных файлов, если ты их нашёл, или честное признание, что не нашёл)",
-  `Если хочешь исследовать несколько мест сразу — можешь написать до ${MAX_ACTIONS_PER_TURN} ACTION-строк подряд в одном ответе, они выполнятся по порядку и результаты вернутся вместе одним пакетом. Если вызываешь final_answer — вызови ТОЛЬКО его, без других ACTION в этом же ответе (сначала посмотри результаты, потом отвечай).`,
-  "Перед ACTION можешь коротко (1-2 предложения) написать, что и зачем делаешь.",
-  "Начинай с list_dir(\".\") если не знаешь структуру. Ищи буквальные, семантически близкие названия директорий/файлов — не только по-русски, а и переводы на английский.",
-  "ВАЖНО: прежде чем читать конкретный файл в папке, которую ты ещё не листал (list_dir) в этом диалоге, сначала сделай list_dir этой папки. Соседний файл с похожим именем может оказаться тем самым, что реально отвечает на вопрос — угадывание имени файла вслепую эту находку пропускает.",
-  "У тебя есть время подумать основательно. Не спеши с final_answer, пока не проверил все реалистичные места, включая соседние по смыслу файлы (например: Service рядом может быть не один — проверь директорию целиком).",
-  "Когда готов — вызови final_answer один раз. Не выдумывай факты, которых не видел в observations. Если что-то не проверил — прямо скажи, что не проверил, а не утверждай наверняка.",
+  "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
+  "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
+  "ACTION: list_dir(relative/path)",
+  "ACTION: grep_content(string or regex to search file contents for)",
+  "ACTION: read_file(relative/path/to/file.php)",
+  "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not)",
+  `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Write several ACTION lines in a row in one response (up to ${MAX_ACTIONS_PER_TURN} per turn), they execute in order and the results come back together in one batch. One ACTION per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: if you call it, call ONLY it, with no other ACTION in the same response (look at the results first, then answer).`,
+  "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
+  "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
+  "IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet in this conversation, list_dir that directory first. A neighboring file with a similar name might be the one that actually answers the question - blindly guessing a filename skips that discovery.",
+  "You have time to think it through properly. Do not rush to final_answer before checking all realistic places, including neighboring files with related meaning (e.g. there may be more than one Service nearby - check the whole directory).",
+  "When ready, call final_answer exactly once. Do not invent facts you have not seen in the observations. If you did not check something, say so plainly instead of asserting it with confidence.",
 ].join("\n");
 
 const CRITIC_SYSTEM_PROMPT = [
-  "Ты — независимый критик-валидатор (другая модель, не та, что исследовала код).",
-  "Тебе дан: инженерный вопрос, полная стенограмма действий другой модели (какие файлы она смотрела и что видела), и её предложенный финальный ответ.",
-  "Проверь строго: (1) каждое утверждение в ответе должно быть напрямую подтверждено тем, что реально есть в стенограмме - не выдумано и не додумано; (2) если ответ сам упоминает, что что-то 'нужно проверить' или 'не проверено', а по стенограмме видно, что это НЕ проверили перед финальным ответом - это повод отклонить; (3) если ответ уверенно утверждает что-то, для чего в стенограмме недостаточно оснований (например, только один файл из цепочки), это тоже повод отклонить.",
-  "Ответь СТРОГО одной строкой: либо \"APPROVED\", либо \"REJECTED: <короткое конкретное указание, что именно нужно проверить перед тем как отвечать снова>\".",
+  "You are an independent critic-validator (a different model from the one that researched the code).",
+  "You are given: an engineering question, a full transcript of another model's actions (which files it looked at and what it saw), and its proposed final answer.",
+  "Check strictly: (1) every claim in the answer must be directly confirmed by what is actually in the transcript - not invented, not guessed; (2) if the answer itself mentions that something 'needs checking' or 'was not checked', but the transcript shows this was NOT checked before the final answer - that is grounds for rejection; (3) if the answer confidently asserts something for which the transcript has insufficient grounds (e.g. only one file out of a chain), that is also grounds for rejection.",
+  "Reply STRICTLY in one line: either \"APPROVED\", or \"REJECTED: <a short, specific note IN RUSSIAN on exactly what needs to be checked before answering again>\".",
 ].join("\n");
 
 // Live evidence (2026-07-15): asked "что такое папка w9" against a real
@@ -239,7 +258,7 @@ async function buildSeedGrepObservation(projectRootPath: string, task: string, g
   );
 
   return [
-    "Автоматический предварительный поиск по буквальным словам вопроса (до твоего первого хода). Это только отправная точка, не факт — но часто нужное лежит не там, где ожидаешь по названию папки (бизнес-термин из вопроса может быть полем/сущностью в коде, а не директорией), так что стоит свериться с этим перед тем как исследовать вслепую:",
+    "Automatic preliminary search for the literal words of the question (before your first turn). This is only a starting point, not a fact - but the thing you need often is not where you'd expect from a folder name (a business term from the question can be a field/entity in code, not a directory), so it is worth checking this before exploring blindly:",
     ...results,
   ].join("\n\n");
 }
@@ -335,10 +354,14 @@ async function callModel(
         throw error;
       }
 
-      const backoffMs = isRateLimited
+      const baseBackoffMs = isRateLimited
         ? RATE_LIMIT_BASE_BACKOFF_MS * attempt
         : PROVIDER_BASE_BACKOFF_MS * attempt;
-      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      // Random jitter (+/-20%) per rout.my's error-handling docs: several
+      // Observer/Researcher runs can hit the same rate limit at once, and a
+      // purely deterministic backoff makes them all retry in lockstep.
+      const jitterMs = baseBackoffMs * 0.2 * (Math.random() * 2 - 1);
+      await new Promise((resolve) => setTimeout(resolve, baseBackoffMs + jitterMs));
     }
   }
 
@@ -434,12 +457,12 @@ async function callCritic(input: {
     {
       role: "user",
       content: [
-        `Вопрос: ${input.task}`,
+        `Question: ${input.task}`,
         "",
-        "Стенограмма действий другой модели:",
+        "Transcript of the other model's actions:",
         input.transcript,
         "",
-        `Предложенный финальный ответ: ${input.proposedAnswer}`,
+        `Proposed final answer: ${input.proposedAnswer}`,
       ].join("\n"),
     },
   ];
@@ -450,6 +473,11 @@ async function callCritic(input: {
     const approved = /^APPROVED/i.test(trimmed);
     const reasonMatch = /^REJECTED:\s*(.*)/is.exec(trimmed);
 
+    // Kept in Russian, not translated (2026-07-16 prompt sweep): this is the
+    // fallback for when the critic's own reply is malformed/empty - the
+    // NORMAL case (the model's own REJECTED: reason) is Russian per
+    // CRITIC_SYSTEM_PROMPT, so this stays consistent with it rather than
+    // mixing languages in the same field the Researcher reads next turn.
     return {
       approved,
       reason: approved ? "" : (reasonMatch?.[1]?.trim() || trimmed || "Критик отклонил ответ без указанной причины."),
@@ -472,11 +500,12 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   const maxTurns = options.maxTurns ?? DEFAULT_SAFETY_CEILING_TURNS;
   const priorTurnFiles = [...new Set(options.priorTurnFiles ?? [])];
   const priorTurnHint = priorTurnFiles.length > 0
-    ? `\n\nВ предыдущей реплике этого диалога ты уже находил и читал такие файлы: ${priorTurnFiles.join(", ")}. Если новый вопрос продолжает ту же тему - начни с чтения этих файлов (read_file) вместо повторного исследования с нуля. Если вопрос явно про другое - проверь их актуальность или ищи заново, не полагайся на них вслепую.`
+    ? `\n\nIn the previous turn of this conversation you already found and read these files: ${priorTurnFiles.join(", ")}. If the new question continues the same topic - start by reading these files (read_file) instead of researching from scratch. If the question is clearly about something else - check whether they are still relevant or search anew, do not rely on them blindly.`
     : "";
+  const observerHintBlock = options.observerHint ? `\n\n${options.observerHint}` : "";
   const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: `Проект: ${options.projectRootPath}\nВопрос: ${options.task}${priorTurnHint}` },
+    { role: "user", content: `Project: ${options.projectRootPath}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}` },
   ];
 
   const seedGrepObservation = await buildSeedGrepObservation(
@@ -553,7 +582,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
     messages.push({
       role: "user",
-      content: `Критик отклонил твой ответ: ${criticResult.reason}\nПроверь это и потом снова вызови final_answer.`,
+      content: `The critic rejected your answer: ${criticResult.reason}\nCheck this, then call final_answer again.`,
     });
 
     return "continue-loop";
@@ -669,7 +698,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
           // full round-trip instead of bouncing the model back empty-handed.
           const dirListing = await listDir(options.projectRootPath, parentDir);
           seenDirs.add(normalizeDirKey(parentDir));
-          observation = `Ты попросил прочитать файл в папке "${parentDir}", которую ещё не листал — вот её содержимое (соседний файл с похожим именем может отвечать точнее); прочитай нужный файл следующим действием:\n${dirListing}`;
+          observation = `You asked to read a file in the "${parentDir}" directory, which you have not listed yet - here is its content (a neighboring file with a similar name might answer more precisely); read the file you need as your next action:\n${dirListing}`;
         } else {
           observation = await readFile(options.projectRootPath, action.arg);
 
@@ -712,7 +741,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       stuckNudgeSent = true;
       messages.push({
         role: "user",
-        content: `Уже ${STUCK_TURNS_THRESHOLD} шагов подряд без новой директории/файла/поискового запроса — похоже, ты застрял, а не действительно основательно исследуешь. Дай финальный ответ прямо сейчас через ACTION: final_answer(...), опираясь на то, что реально нашёл, и честно укажи, чего не хватает — это лучше, чем продолжать блуждать по кругу.`,
+        content: `${STUCK_TURNS_THRESHOLD} turns in a row now with no new directory/file/search term - it looks like you are stuck, not genuinely researching further. Give a final answer right now via ACTION: final_answer(...), based on what you have actually found, and honestly state what is missing - that is better than continuing to wander in circles.`,
       });
     }
   }

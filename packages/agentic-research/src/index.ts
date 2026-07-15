@@ -33,17 +33,23 @@ export interface CrawlUnitResult {
 // directory) is what gives it an objective stopping point, not a turn
 // budget or a nudge.
 export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult> {
+  // Translated to English (2026-07-16, user's request) - this text is never
+  // shown to the human user directly (it feeds business_graph_entries, then
+  // buildObserverHintSuffix's hint block for the live Researcher, which
+  // re-labels it with its own Russian headers), so there is no Russian-output
+  // requirement here the way there is for the interactive Researcher's
+  // final_answer.
   const task = [
-    `Опиши бизнес-логику директории "${input.unitPath}" для другого разработчика, который впервые сюда зайдёт.`,
-    "Что она реализует, с какими другими модулями/директориями реально связана (по коду, не по догадке), и на что стоит обратить внимание — например, соседние директории с похожим именем, но другим назначением.",
-    `Исследуй именно "${input.unitPath}" и то, что она реально использует - не весь проект целиком.`,
+    `Describe the business logic of the directory "${input.unitPath}" for another developer coming here for the first time.`,
+    "What it implements, which other modules/directories it is actually connected to (by code, not by guessing), and what to watch out for - e.g. neighboring directories with a similar name but a different purpose.",
+    `Investigate specifically "${input.unitPath}" and what it actually uses - not the whole project.`,
     // Structured output (2026-07-15) - previously the whole answer was one
     // flat paragraph, so business_graph_entries.key_mechanisms/gotchas (real
     // columns in the schema) were always saved empty. Reuses the same
     // "## Section Name" convention packages/ai's answer synthesizer already
     // uses (parseMarkdownSections/extractSectionBullets, moved to
     // packages/shared) instead of inventing a new format.
-    "Ответь в формате: сначала \"## Резюме\" (2-3 предложения по сути), затем \"## Ключевые механизмы\" (маркированный список конкретных механизмов/поведений, до 5 пунктов), затем \"## Подводные камни\" (маркированный список того, на что разработчик может наткнуться неожиданно - до 5 пунктов, пустой список нормален если ничего примечательного не нашёл).",
+    "Answer in this format: first \"## Summary\" (2-3 sentences on the substance), then \"## Key mechanisms\" (a bulleted list of concrete mechanisms/behaviors, up to 5 items), then \"## Gotchas\" (a bulleted list of things a developer might unexpectedly run into - up to 5 items, an empty list is fine if nothing noteworthy was found).",
   ].join(" ");
 
   const raw = await runAgenticLoop({
@@ -75,11 +81,11 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
   }
 
   const sections = parseMarkdownSections(raw.finalAnswer);
-  const summaryFromSections = extractSectionText(sections, "Резюме");
-  const keyMechanisms = extractSectionBullets(sections, "Ключевые механизмы", 5);
-  const gotchas = extractSectionBullets(sections, "Подводные камни", 5);
+  const summaryFromSections = extractSectionText(sections, "Summary");
+  const keyMechanisms = extractSectionBullets(sections, "Key mechanisms", 5);
+  const gotchas = extractSectionBullets(sections, "Gotchas", 5);
   // Falls back to the raw answer verbatim when the model didn't follow the
-  // "## Резюме" structure (e.g. an implicit-answer turn with no headings at
+  // "## Summary" structure (e.g. an implicit-answer turn with no headings at
   // all) - a slightly messier hint beats silently losing the answer.
   const featureSummary = summaryFromSections || raw.finalAnswer;
 
@@ -99,6 +105,8 @@ export interface RunAgenticResearchInput {
   priorTurnFiles?: string[];
   /** See AgenticRunOptions.graphHintTerms - symbol names from the persisted code graph matching the task. */
   graphHintTerms?: string[];
+  /** See AgenticRunOptions.observerHint - kept separate from `task` so it never leaks into ResearchReport.task (the chat UI's "Задача" display). */
+  observerHint?: string;
 }
 
 export interface RunAgenticResearchResult {
@@ -119,6 +127,7 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     ...(input.maxTurns ? { maxTurns: input.maxTurns } : {}),
     ...(input.priorTurnFiles?.length ? { priorTurnFiles: input.priorTurnFiles } : {}),
     ...(input.graphHintTerms?.length ? { graphHintTerms: input.graphHintTerms } : {}),
+    ...(input.observerHint ? { observerHint: input.observerHint } : {}),
   };
 
   const raw = await runAgenticLoop(options);

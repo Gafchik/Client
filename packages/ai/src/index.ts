@@ -337,12 +337,12 @@ export async function expandTaskSearchKeywords(input: ExpandTaskSearchKeywordsIn
         {
           role: "system",
           content: [
-            "Ты помогаешь построить поисковые термины для substring-поиска по исходному коду.",
-            "Пользователь задаёт инженерный вопрос о кодовой базе, обычно на русском.",
-            "Кодовая база обычно называет сущности английскими словами (классы, директории, поля, таблицы).",
-            "Придумай до 6 английских слов/коротких словосочетаний — переводов, синонимов и распространённых технических терминов, которыми в коде могла бы называться сущность или процесс из вопроса.",
-            "Не отвечай на сам вопрос. Не придумывай конкретные имена классов конкретного проекта — только обычные словарные английские слова по смыслу вопроса.",
-            "Ответь ТОЛЬКО одной строкой JSON без пояснений и без markdown-обрамления, ровно в таком виде: {\"keywords\": string[]}.",
+            "You help build search terms for substring search over source code.",
+            "The user asks an engineering question about a codebase, usually in Russian.",
+            "The codebase usually names its entities with English words (classes, directories, fields, tables).",
+            "Come up with up to 6 English words/short phrases - translations, synonyms, and common technical terms the entity or process from the question could be named in code.",
+            "Do not answer the question itself. Do not invent specific class names for a specific project - only ordinary dictionary English words matching the meaning of the question.",
+            "Reply with ONLY one line of JSON, no explanations, no markdown wrapping, in exactly this shape: {\"keywords\": string[]}.",
           ].join("\n"),
         },
         {
@@ -557,17 +557,17 @@ async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): P
       {
         role: "system",
         content: [
-          "Ты выступаешь как engineering evidence validator.",
-          "Ты не отвечаешь пользователю и не исследуешь проект самостоятельно.",
-          "Ты оцениваешь только достаточность уже собранных артефактов.",
-          "Research confidence не является истиной, это лишь один из входных сигналов.",
-          "Главный вопрос: реально ли собранный evidence отвечает на ТОТ вопрос, который задал пользователь — а не просто на что-то похожее по ключевым словам.",
-          "Верни ТОЛЬКО JSON без пояснений и без markdown-обрамления, с полями validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints, primaryEvidenceLabel, recommendedResearchProfile, recommendedStopReason, rationale.",
-          "readinessScore — целое число от 0 до 100 (не 0.0-1.0 доля).",
-          "gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints — ВСЕГДА JSON-массив строк, даже если пункт всего один или список пуст ([] в этом случае). Никогда не возвращай одну строку вместо массива.",
-          "recommendedActions — закрытый словарь общих сценариев, нельзя придумывать значения вне разрешённого списка.",
-          "missingEntityHints — наоборот, свободный текст в каждом элементе массива: если evidence не бьёт в суть вопроса, назови конкретные сущности/классы/файлы/понятия из вопроса, которых не хватает в evidence и которые стоит поискать отдельно. Не ограничивайся никаким списком — пиши то, что реально нужно найти, своими словами или точным именем из вопроса. Пустой массив, если evidence уже покрывает вопрос по существу.",
-          "primaryEvidenceLabel — среди Evidence в промпте выбери ОДИН элемент, чей label точнее всего отвечает на вопрос по смыслу, а не по формальному score (score — это подсчёт совпадений, не понимание вопроса). Особенно важно, когда несколько evidence одного типа/домена выглядят структурно похоже (например несколько разных Model-файлов) — тогда просто выше по score не значит правильнее по сути. Скопируй label ТОЧНО как он написан в Evidence. Пусто, если нет явного кандидата или все примерно равнозначны.",
+          "You act as an engineering evidence validator.",
+          "You do not answer the user and you do not research the project yourself.",
+          "You only assess whether the artifacts already gathered are sufficient.",
+          "Research confidence is not ground truth, it is only one input signal.",
+          "The main question: does the gathered evidence actually answer THIS SPECIFIC question the user asked - not just something that looks similar by keywords.",
+          "Return ONLY JSON, no explanations, no markdown wrapping, with fields validationStatus, readinessScore, directAnswerFeasibility, evidenceSufficiency, contradictionLevel, gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints, primaryEvidenceLabel, recommendedResearchProfile, recommendedStopReason, rationale.",
+          "readinessScore - an integer from 0 to 100 (not a 0.0-1.0 fraction).",
+          "gapSummary, contradictions, missingConfirmations, recommendedActions, missingEntityHints - ALWAYS a JSON array of strings, even for a single item or an empty list ([] in that case). Never return a single string instead of an array.",
+          "recommendedActions - a closed vocabulary of general scenarios, do not invent values outside the allowed list.",
+          "missingEntityHints - the opposite: free text in each array element. If the evidence misses the actual point of the question, name the specific entities/classes/files/concepts from the question that are missing from the evidence and worth searching for separately. Do not restrict yourself to any fixed list - write what genuinely needs to be found, in your own words or the exact name from the question. Empty array if the evidence already covers the question's substance.",
+          "primaryEvidenceLabel - among the Evidence in the prompt, pick ONE item whose label answers the question most precisely by meaning, not by raw score (score is a match count, not question comprehension). This matters especially when several evidence items of the same type/domain look structurally similar (e.g. several different Model files) - a higher score alone does not mean it is the more correct one. Copy the label EXACTLY as written in Evidence. Leave empty if there is no clear candidate or all are roughly equivalent.",
         ].join("\n"),
       },
       {
@@ -1830,28 +1830,34 @@ function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
   };
 }
 
+// Section header labels below ("## Краткий ответ" etc.) stay in Russian on
+// purpose - the model copies them verbatim into the final answer the
+// Russian-speaking user reads, so translating them would produce a
+// half-English, half-Russian answer. Only the surrounding instructions
+// (English per user's 2026-07-16 request: weaker models parse English
+// instructions more reliably) got translated.
 function buildAnswerSystemPrompt(contract: QuestionContract): string {
-  const sections: string[] = ["## Краткий ответ\n1-2 предложения по сути вопроса. Никаких вступлений."];
+  const sections: string[] = ["## Краткий ответ\n1-2 sentences addressing the core of the question. No introductions."];
 
   if (contract.expectedAnswerShape !== "yes-no") {
     sections.push(
-      "## Как это работает\nМеханизм по делу, без пересказа очевидного. 2-4 предложения максимум.",
+      "## Как это работает\nThe actual mechanism, no restating the obvious. 2-4 sentences max.",
     );
   }
 
   sections.push(
-    "## Где искать код\nТолько конкретные файлы/классы/методы из evidence, bullet-список, без пояснений на пункт.",
+    "## Где искать код\nOnly specific files/classes/methods from the evidence, a bullet list, no per-item explanations.",
   );
 
   if (contract.requiresImpact) {
     sections.push(
-      "## Риски и что затронет\nТолько если реально подтверждено claims/impact-анализом. 2-3 пункта максимум.",
+      "## Риски и что затронет\nOnly if genuinely confirmed by claims/impact analysis. 2-3 bullets max.",
     );
   }
 
   if (contract.requiresPlan) {
     sections.push(
-      "## Рекомендуемый план действий\nШаги в порядке выполнения, только подтверждённые plan claims. Не больше 6 шагов.",
+      "## Рекомендуемый план действий\nSteps in execution order, only confirmed plan claims. No more than 6 steps.",
     );
   }
 
@@ -1859,32 +1865,32 @@ function buildAnswerSystemPrompt(contract: QuestionContract): string {
   const wordBudget = contract.requiresImpact || contract.requiresPlan ? "220" : "130";
 
   return [
-    "Ты senior software engineer, который разбирается в кодовой базе проекта и помогает коллегам в чате.",
+    "You are a senior software engineer who knows this project's codebase and is helping colleagues in chat.",
     "",
-    "Твоя задача — дать чёткий ответ на вопрос пользователя, опираясь исключительно на переданные тебе validated claims и supporting materials.",
+    "Your task is to give a clear answer to the user's question, relying exclusively on the validated claims and supporting materials given to you.",
     "",
-    "Правила по содержанию:",
-    "- Не выдумывай факты, которых нет в артефактах.",
-    "- Если данных недостаточно — честно скажи об этом одной фразой, не растягивай.",
-    "- Не упоминай внутренние названия артефактов (Research, Impact, Context, Plan) в ответе.",
-    "- Не пересказывай артефакты дословно — синтезируй ответ своими словами.",
-    "- Пиши по-русски, в стиле опытного инженера, который отвечает коллеге в чате, а не пишет отчёт.",
-    "- Начинай сразу с сути. Не используй канцелярские формулы вроде 'подтверждается', 'наблюдается', 'можно сделать вывод'. Лучше: 'да, здесь это сделано так-то' или 'нет, такого механизма не видно'.",
-    "- Если вопрос yes/no, первая фраза должна прямо начинаться с 'Да', 'Нет' или 'Похоже, что да/нет', а не с описания процесса вокруг.",
-    "- Если вопрос про location, в первой фразе назови главное место в коде, а не общий обзор модуля.",
-    "- Не пиши человеку про confidence, readiness, validation, baseline, artifacts, synthesis, fallback и другие внутренние слова системы.",
-    "- Никогда не начинай ответ и не строй его вокруг служебных фраз про происхождение данных ('ответ опирается на committed baseline', 'по происхождению фактов', 'baseline source exact-head', 'evidence-locked режим' и подобных) — это внутренняя механика системы, а не то, что интересует человека. Если нужно упомянуть неуверенность — скажи это одной обычной фразой ('не до конца уверен, но похоже, что...'), а не терминами системы.",
-    "- Пиши как человек, а не как система, описывающая саму себя: не 'система ограничивает вывод', а прямо по делу.",
+    "Content rules:",
+    "- Do not invent facts that are not in the artifacts.",
+    "- If the data is insufficient, say so honestly in one sentence, do not pad it out.",
+    "- Do not mention internal artifact names (Research, Impact, Context, Plan) in the answer.",
+    "- Do not restate the artifacts verbatim - synthesize the answer in your own words.",
+    "- Write in Russian, in the style of an experienced engineer replying to a colleague in chat, not writing a report.",
+    "- Start directly with the substance. Do not use bureaucratic phrasing like 'it is confirmed that', 'it can be observed that', 'one can conclude that'. Prefer: 'yes, here it's done like this' or 'no, no such mechanism is visible'.",
+    "- If the question is yes/no, the first sentence must start directly with 'Да', 'Нет', or 'Похоже, что да/нет', not with a description of the surrounding process.",
+    "- If the question is about a location, name the main place in the code in the first sentence, not a general overview of the module.",
+    "- Do not write to the human about confidence, readiness, validation, baseline, artifacts, synthesis, fallback, or other internal system words.",
+    "- Never start the answer with, or build it around, boilerplate phrases about data provenance ('the answer relies on the committed baseline', 'by fact provenance', 'baseline source exact-head', 'evidence-locked mode', and similar) - that's internal system mechanics, not what the human cares about. If uncertainty needs mentioning, say it in one ordinary sentence ('not fully sure, but it looks like...'), not in system terminology.",
+    "- Write like a human, not like a system describing itself: not 'the system limits the output', just get to the point.",
     "",
-    "Правила по объёму и форме (это критично, ответы регулярно получаются слишком длинными и неструктурированными):",
-    `- Пиши ТОЛЬКО перечисленные ниже разделы: ${sectionNames}. Больше никаких разделов не создавай, даже если кажется, что "для полноты" стоит что-то добавить.`,
-    "- Если раздел неприменим или по нему нет данных — не пиши ни заголовок, ни заглушку вида 'недостаточно данных'. Просто пропусти раздел целиком.",
-    `- Общий объём ответа — не больше ${wordBudget} слов суммарно по всем разделам. Это жёсткий лимит, а не ориентир.`,
-    "- Никакой воды: без вступлений, без 'таким образом', без повторения вопроса, без заключений и резюме в конце.",
-    "- Каждый пункт списка — максимум одна строка. Не объясняй каждый файл отдельным абзацем.",
-    "- Заголовки строго в формате Markdown `## Название`, каждый список — строки, начинающиеся с `- `.",
+    "Length and format rules (critical - answers regularly come out too long and unstructured):",
+    `- Write ONLY the sections listed below: ${sectionNames}. Do not create any other sections, even if it seems like something should be added "for completeness".`,
+    "- If a section does not apply or there is no data for it - do not write the heading or a placeholder like 'insufficient data'. Just skip the whole section.",
+    `- Total answer length - no more than ${wordBudget} words across all sections combined. This is a hard limit, not a guideline.`,
+    "- No filler: no introductions, no 'thus', no repeating the question, no conclusions or summaries at the end.",
+    "- Each list item - at most one line. Do not explain each file in a separate paragraph.",
+    "- Headings strictly in Markdown format `## Title`, every list as lines starting with `- `.",
     "",
-    "Структура ответа (используй ровно эти разделы, в этом порядке, ничего лишнего):",
+    "Answer structure (use exactly these sections, in this order, nothing extra):",
     "",
     sections.join("\n\n"),
   ].join("\n");
@@ -2573,15 +2579,15 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
     ? getPrioritizedEvidence(input).slice(0, 8).map((item) =>
         `- \`${item.filePath ?? "?"}\`: ${item.label} — ${item.reason}`,
       ).join("\n")
-    : "(нет evidence)";
+    : "(no evidence)";
 
   const provenanceLine = [
-    `baseline-фактов: ${input.research.evidenceSummary.baselineCount}`,
-    `overlay-фактов: ${input.research.evidenceSummary.overlayCount}`,
-    `structural-опор: ${input.research.evidenceSummary.structuralCount}`,
+    `baseline facts: ${input.research.evidenceSummary.baselineCount}`,
+    `overlay facts: ${input.research.evidenceSummary.overlayCount}`,
+    `structural anchors: ${input.research.evidenceSummary.structuralCount}`,
     input.research.evidenceSummary.overlayInfluenced
-      ? "Локальные незакоммиченные изменения materially влияют на вывод."
-      : "Вывод опирается прежде всего на committed baseline.",
+      ? "Local uncommitted changes materially affect the conclusion."
+      : "The conclusion relies primarily on the committed baseline.",
   ].join(" | ");
 
   const freshnessLine = input.backgroundState
@@ -2589,30 +2595,30 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
         `freshness: ${input.backgroundState.freshness}`,
         `baselineSource: ${input.backgroundState.baselineSource}`,
         input.backgroundState.hasLocalChanges
-          ? `Есть ${input.backgroundState.changedFileCount} незакоммиченных изменений в worktree — это overlay, а не baseline.`
-          : "Worktree чист, все факты из committed baseline.",
+          ? `There are ${input.backgroundState.changedFileCount} uncommitted changes in the worktree - this is overlay, not baseline.`
+          : "Worktree is clean, all facts are from the committed baseline.",
       ].join(" | ")
-    : "backgroundState отсутствует";
+    : "backgroundState is absent";
 
   const unknownsLine = input.research.unknowns.length > 0
     ? input.research.unknowns.slice(0, 4).map((u) => `- ${u}`).join("\n")
-    : "(нет unknowns)";
+    : "(no unknowns)";
 
   const risksLine = input.impact.risks.length > 0
     ? input.impact.risks.slice(0, 5).map((r) => `- ${r}`).join("\n")
-    : "(риски не выявлены)";
+    : "(no risks identified)";
 
   const planStepsLine = input.plan.steps.length > 0
-    ? input.plan.steps.slice(0, 6).map((s, i) => `- Шаг ${i + 1}: ${s.title ?? s.description ?? ""}`).join("\n")
-    : "(плана нет)";
+    ? input.plan.steps.slice(0, 6).map((s, i) => `- Step ${i + 1}: ${s.title ?? s.description ?? ""}`).join("\n")
+    : "(no plan)";
 
   const transcriptSection = (input.conversationTranscript ?? []).length > 0
     ? [
-        "=== 0. ИСТОРИЯ ЭТОГО ДИАЛОГА (от старых реплик к новым) ===",
-        "Текущий запрос — продолжение этого диалога. Если в нём есть ссылки на предыдущие реплики",
-        "(\"при этом\", \"а если так\", \"тот же\" и т.п.) — разрешай их по этой истории, а не проси уточнить.",
+        "=== 0. THIS CONVERSATION'S HISTORY (oldest to newest turn) ===",
+        "The current request continues this conversation. If it references previous turns",
+        "(\"and also\", \"what if instead\", \"the same one\", etc.) - resolve them against this history instead of asking for clarification.",
         (input.conversationTranscript ?? [])
-          .map((turn, index) => `${index + 1}. Вопрос: ${turn.task}\n   Ответ: ${turn.directAnswer}`)
+          .map((turn, index) => `${index + 1}. Question: ${turn.task}\n   Answer: ${turn.directAnswer}`)
           .join("\n"),
         "",
       ]
@@ -2620,13 +2626,13 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
 
   return [
     ...transcriptSection,
-    "=== ЗАПРОС ПОЛЬЗОВАТЕЛЯ ===",
+    "=== USER REQUEST ===",
     input.task,
     "",
     "=== 1. QUESTION CONTRACT ===",
     `Question type: ${brief.questionContract.questionType}`,
     `Expected shape: ${brief.questionContract.expectedAnswerShape}`,
-    `Proof obligations: ${brief.questionContract.proofObligations.join(" | ") || "(нет)"}`,
+    `Proof obligations: ${brief.questionContract.proofObligations.join(" | ") || "(none)"}`,
     "",
     "=== 2. VALIDATED CLAIM SET ===",
     `Direct claim: ${brief.directAnswer}`,
@@ -2634,32 +2640,32 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
     "Supporting claims:",
     brief.claimSet.supportingClaims.length > 0
       ? brief.claimSet.supportingClaims.slice(0, 4).map((claim) => `- ${claim.statement}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     "Location claims:",
     brief.claimSet.locationClaims.length > 0
       ? brief.claimSet.locationClaims.slice(0, 4).map((claim) => `- ${claim.filePaths[0] ?? "?"}: ${claim.statement}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     "Impact claims:",
     brief.impactLines.length > 0
       ? brief.impactLines.map((line) => `- ${line}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     "Plan claims:",
     brief.planLines.length > 0
       ? brief.planLines.map((line) => `- ${line}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     "Rejected or unsafe claims:",
     brief.claimSet.rejectedClaims.length > 0
       ? brief.claimSet.rejectedClaims.slice(0, 3).map((claim) => `- ${claim.statement}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     "Material unknowns:",
     brief.materialUnknowns.length > 0
       ? brief.materialUnknowns.map((item) => `- ${item}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     "=== 3. SUPPORTING EVIDENCE ===",
     evidenceList,
@@ -2667,43 +2673,43 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
     "Entry points:",
     input.research.entryPoints.length > 0
       ? input.research.entryPoints.slice(0, 6).map((ep) => `- ${ep}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     "Data sources:",
     input.research.dataSources.length > 0
       ? input.research.dataSources.slice(0, 6).map((ds) => `- ${ds}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
     `Provenance: ${provenanceLine}`,
     "",
     `Freshness: ${freshnessLine}`,
     "",
-    "=== 4. IMPACT (что будет затронуто при изменениях) ===",
+    "=== 4. IMPACT (what will be affected by changes) ===",
     `Impact summary: ${input.impact.summary}`,
     `Affected files: ${input.impact.affectedFiles.length}`,
     input.impact.affectedFiles.length > 0
       ? input.impact.affectedFiles.slice(0, 8).map((f) => `- ${typeof f === "string" ? f : (f as { filePath?: string }).filePath ?? "?"}`).join("\n")
-      : "(нет)",
+      : "(none)",
     "",
-    "Риски:",
+    "Risks:",
     risksLine,
     "",
-    "=== 5. CONTEXT (релевантные фрагменты кода) ===",
+    "=== 5. CONTEXT (relevant code fragments) ===",
     `Context confidence: ${input.context.confidence}%`,
     `Token budget: ${input.context.tokenBudget}`,
     `Selected chunks: ${input.context.selectedChunks.length}`,
     input.context.functionalHighlights.length > 0
       ? `Highlights: ${input.context.functionalHighlights.slice(0, 5).join(" | ")}`
-      : "(нет highlights)",
+      : "(no highlights)",
     input.context.rankingSummary
       ? `Ranking: ${input.context.rankingSummary}`
       : "",
     "",
-    "=== 6. PLAN (план действий) ===",
+    "=== 6. PLAN (action plan) ===",
     `Plan summary: ${input.plan.summary}`,
-    `Target modules: ${input.plan.targetModules.join(", ") || "(нет)"}`,
+    `Target modules: ${input.plan.targetModules.join(", ") || "(none)"}`,
     `Target files: ${input.plan.targetFiles.length}`,
-    `Approval required: ${input.plan.approvalRequired ? "да" : "нет"}`,
+    `Approval required: ${input.plan.approvalRequired ? "yes" : "no"}`,
     input.plan.planningNotes
       ? `Planning notes: ${input.plan.planningNotes}`
       : "",
@@ -2715,18 +2721,18 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
     `Preview summary: ${input.preview.summary}`,
     `Allowed actions: ${input.preview.allowedActions.length}`,
     "",
-    "=== UNKNOWNS (чего система НЕ знает) ===",
+    "=== UNKNOWNS (what the system does NOT know) ===",
     unknownsLine,
     "",
-    "=== ИНСТРУКЦИЯ ===",
-    `Режим ответа: ${fallback.answerMode}`,
-    "Сформируй ответ по-русски строго по структуре из system prompt.",
-    "Используй только claims и факты, прямо подтверждённые в секциях выше.",
-    "Если факт только из overlay findings — явно обозначь: «это обнаружено в незакоммиченных изменениях».",
-    "Не добавляй типичные догадки про Laravel, middleware order, session, cookie, query params, kernel registration — если они не подтверждены выше.",
-    "Если по разделу данных недостаточно — честно напиши об этом.",
-    "Не упоминай слова Research, Impact, Context, Plan в ответе.",
-    "Пиши как senior-разработчик, который объясняет коллеге.",
+    "=== INSTRUCTION ===",
+    `Answer mode: ${fallback.answerMode}`,
+    "Produce the answer in Russian, strictly following the structure from the system prompt.",
+    "Use only claims and facts directly confirmed in the sections above.",
+    "If a fact comes only from overlay findings - explicitly mark it: \"this was found in uncommitted changes\".",
+    "Do not add typical guesses about Laravel, middleware order, session, cookie, query params, kernel registration - unless confirmed above.",
+    "If a section lacks sufficient data - state that honestly.",
+    "Do not mention the words Research, Impact, Context, Plan in the answer.",
+    "Write like a senior developer explaining to a colleague.",
   ]
     .filter((line) => line !== "")
     .join("\n");
@@ -2884,7 +2890,10 @@ function isTransientError(error: unknown): boolean {
 }
 
 function computeBackoffMs(attempt: number): number {
-  return PROVIDER_BASE_BACKOFF_MS * attempt;
+  const baseMs = PROVIDER_BASE_BACKOFF_MS * attempt;
+  // Random jitter (+/-20%) per rout.my's error-handling docs - avoids
+  // multiple concurrent requests retrying in lockstep against the same limit.
+  return baseMs + baseMs * 0.2 * (Math.random() * 2 - 1);
 }
 
 function parseRetryAfterMs(value: string | null): number | null {
