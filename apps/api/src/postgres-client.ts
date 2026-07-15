@@ -200,6 +200,24 @@ export async function initializePostgresSchema(): Promise<void> {
       saved_at timestamptz not null
     )
   `);
+
+  // Semantic code search (2026-07-16, per rout.my's embeddings endpoint -
+  // see project-state.md's docs-research entry). One row per file, not
+  // per-chunk - an MVP deliberately kept simple, matching how the codebase
+  // already caps file reads (MAX_READ_FILE_CHARS) rather than chunking.
+  // id = stableId([projectRootPath, filePath]) so re-embedding the same file
+  // is a plain upsert, no separate unique index needed.
+  await runSql(`
+    create table if not exists code_embeddings (
+      id text primary key,
+      project_root_path text not null,
+      file_path text not null,
+      content_hash text not null,
+      embedding jsonb not null,
+      updated_at timestamptz not null
+    )
+  `);
+  await runSql(`create index if not exists code_embeddings_project_idx on code_embeddings (project_root_path)`);
 }
 
 /**

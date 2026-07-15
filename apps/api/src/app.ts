@@ -5,6 +5,7 @@ import { buildBackgroundProjectState, deleteKnowledgeRuns, loadBestBaselineRunAr
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
+import { startEmbeddingIndexer, stopEmbeddingIndexer } from "./embedding-indexer.js";
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
 import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
@@ -255,6 +256,13 @@ export function createApp() {
       fallbackProviderModel: defaultProviderModel,
       fallbackProviderApiKey: defaultProviderApiKey,
     });
+    // Semantic code search index (2026-07-16) - background-only, like the
+    // Observer's graph crawl: never blocks a live question, just opportunistically
+    // keeps an embeddings index warm so semantic_search has something to query.
+    startEmbeddingIndexer({
+      fallbackProviderBaseUrl: defaultProviderBaseUrl,
+      fallbackProviderApiKey: defaultProviderApiKey,
+    });
     // Observer no longer auto-starts (2026-07-15) - it's a per-project
     // runner the user explicitly starts/stops, like a runner, not an
     // always-on background monitor. See /api/observer/*.
@@ -262,6 +270,7 @@ export function createApp() {
 
   app.addHook("onClose", async () => {
     stopProjectStateMonitor();
+    stopEmbeddingIndexer();
     stopAllObservers();
     await closeNeo4jDriver();
     await closePostgresPool();

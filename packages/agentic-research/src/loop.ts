@@ -59,6 +59,13 @@ const MAX_COMPLETION_TOKENS = 4000;
 // comes with each turn) on exploration-heavy questions. Capped so one turn
 // can't balloon into an unbounded batch.
 const MAX_ACTIONS_PER_TURN = 4;
+// A/B test (2026-07-16, per rout.my docs confirming this parameter is
+// accepted and has a real latency effect): applies only to the Researcher's
+// own turn-by-turn tool-selection calls in this loop, never to the critic
+// (kept at full effort - it is the quality gate) and never to the final
+// user-facing answer synthesis prompt (packages/ai, a separate call). Unset
+// (undefined) reproduces the exact current behavior.
+const RESEARCHER_REASONING_EFFORT: string | undefined = undefined;
 
 export interface AgenticRunOptions {
   task: string;
@@ -114,6 +121,20 @@ export interface AgenticRunOptions {
    * out, so the model's own grep_content resolves these to real files.
    */
   graphHintTerms?: string[];
+  /**
+   * Embeddings-backed semantic search over the project's code (packages/knowledge's
+   * code-embeddings.ts + packages/ai's embedTexts) - injected by the caller
+   * (apps/api/src/pipeline-runner.ts) rather than called directly here, so
+   * this package stays free of any DB/provider-embeddings dependency, same
+   * as shouldAbort. Finds files by MEANING, not literal substring - the
+   * thing grep_content structurally cannot do (a business term from the
+   * question is rarely the identifier used in code). Returns a formatted
+   * observation string, same shape as list_dir/grep_content/read_file's
+   * return values. Optional: when absent (e.g. Observer's crawlUnit, or no
+   * embedding index built yet for this project), the tool is not advertised
+   * to the model at all.
+   */
+  semanticSearch?: (query: string) => Promise<string>;
 }
 
 export interface AgenticRunResult {
@@ -141,7 +162,7 @@ interface ChatMessage {
 }
 
 interface ParsedAction {
-  tool: "list_dir" | "grep_content" | "read_file" | "final_answer";
+  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "final_answer";
   arg: string;
 }
 
@@ -154,20 +175,28 @@ interface ParsedAction {
 // hypothetical) - the downstream answer-synthesis prompt (packages/ai) also
 // demands Russian, but this is a deliberate second safety net, not
 // redundant.
-const SYSTEM_PROMPT = [
-  "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
-  "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
-  "ACTION: list_dir(relative/path)",
-  "ACTION: grep_content(string or regex to search file contents for)",
-  "ACTION: read_file(relative/path/to/file.php)",
-  "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not)",
-  `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Write several ACTION lines in a row in one response (up to ${MAX_ACTIONS_PER_TURN} per turn), they execute in order and the results come back together in one batch. One ACTION per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: if you call it, call ONLY it, with no other ACTION in the same response (look at the results first, then answer).`,
-  "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
-  "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
-  "IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet in this conversation, list_dir that directory first. A neighboring file with a similar name might be the one that actually answers the question - blindly guessing a filename skips that discovery.",
-  "You have time to think it through properly. Do not rush to final_answer before checking all realistic places, including neighboring files with related meaning (e.g. there may be more than one Service nearby - check the whole directory).",
-  "When ready, call final_answer exactly once. Do not invent facts you have not seen in the observations. If you did not check something, say so plainly instead of asserting it with confidence.",
-].join("\n");
+function buildSystemPrompt(hasSemanticSearch: boolean): string {
+  return [
+    "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
+    "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
+    "ACTION: list_dir(relative/path)",
+    "ACTION: grep_content(string or regex to search file contents for)",
+    "ACTION: read_file(relative/path/to/file.php)",
+    ...(hasSemanticSearch
+      ? [
+        "ACTION: semantic_search(a plain-language description of what you are looking for)",
+        "semantic_search finds files by MEANING, not literal text - use it when the business term from the question (e.g. \"relation cases\", \"profile access\") does not obviously match any file/directory name or grep hit, instead of guessing blindly.",
+      ]
+      : []),
+    "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not)",
+    `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Write several ACTION lines in a row in one response (up to ${MAX_ACTIONS_PER_TURN} per turn), they execute in order and the results come back together in one batch. One ACTION per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: if you call it, call ONLY it, with no other ACTION in the same response (look at the results first, then answer).`,
+    "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
+    "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
+    "IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet in this conversation, list_dir that directory first. A neighboring file with a similar name might be the one that actually answers the question - blindly guessing a filename skips that discovery.",
+    "You have time to think it through properly. Do not rush to final_answer before checking all realistic places, including neighboring files with related meaning (e.g. there may be more than one Service nearby - check the whole directory).",
+    "When ready, call final_answer exactly once. Do not invent facts you have not seen in the observations. If you did not check something, say so plainly instead of asserting it with confidence.",
+  ].join("\n");
+}
 
 const CRITIC_SYSTEM_PROMPT = [
   "You are an independent critic-validator (a different model from the one that researched the code).",
@@ -290,6 +319,7 @@ async function performCall(
   providerApiKey: string,
   model: string,
   messages: ChatMessage[],
+  reasoningEffort?: string,
 ): Promise<{ content: string; usage: ProviderUsage | null }> {
   const endpoint = `${providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
   const controller = new AbortController();
@@ -308,6 +338,7 @@ async function performCall(
         temperature: 0.1,
         max_tokens: MAX_COMPLETION_TOKENS,
         messages,
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       }),
     });
 
@@ -338,12 +369,13 @@ async function callModel(
   providerApiKey: string,
   model: string,
   messages: ChatMessage[],
+  reasoningEffort?: string,
 ): Promise<{ content: string; usage: ProviderUsage | null }> {
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= RATE_LIMIT_MAX_ATTEMPTS; attempt += 1) {
     try {
-      return await performCall(providerBaseUrl, providerApiKey, model, messages);
+      return await performCall(providerBaseUrl, providerApiKey, model, messages, reasoningEffort);
     } catch (error) {
       lastError = error;
 
@@ -376,7 +408,7 @@ async function callModel(
 // parens, e.g. grep regex groups), stopping once MAX_ACTIONS_PER_TURN is
 // reached or no further match/close-paren is found.
 function parseActions(content: string): ParsedAction[] {
-  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|final_answer)\s*\(/g;
+  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|final_answer)\s*\(/g;
   const actions: ParsedAction[] = [];
   let searchFrom = 0;
 
@@ -504,7 +536,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     : "";
   const observerHintBlock = options.observerHint ? `\n\n${options.observerHint}` : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch)) },
     { role: "user", content: `Project: ${options.projectRootPath}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}` },
   ];
 
@@ -598,7 +630,13 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     let usage: ProviderUsage | null;
 
     try {
-      const result = await callModel(options.providerBaseUrl, options.providerApiKey, options.researcherModel, messages);
+      const result = await callModel(
+        options.providerBaseUrl,
+        options.providerApiKey,
+        options.researcherModel,
+        messages,
+        RESEARCHER_REASONING_EFFORT,
+      );
       content = result.content;
       usage = result.usage;
     } catch (error) {
@@ -688,6 +726,10 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       } else if (action.tool === "grep_content") {
         observation = await grepContent(options.projectRootPath, action.arg);
         grepTermsSeen.add(action.arg.toLowerCase());
+      } else if (action.tool === "semantic_search") {
+        observation = options.semanticSearch
+          ? await options.semanticSearch(action.arg)
+          : "(semantic search is not available for this project)";
       } else {
         const parentDir = dirnameOf(action.arg);
 

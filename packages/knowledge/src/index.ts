@@ -24,6 +24,14 @@ export {
   type BusinessGraphEntry,
   type UpsertBusinessGraphEntryInput,
 } from "./graph-entries.js";
+export {
+  findSemanticMatches,
+  getCodeEmbeddingContentHashes,
+  pruneCodeEmbeddings,
+  upsertCodeEmbedding,
+  type CodeEmbeddingMatch,
+  type UpsertCodeEmbeddingInput,
+} from "./code-embeddings.js";
 import type { PipelineRunMode } from "@client/shared";
 import {
   type AnswerPackage,

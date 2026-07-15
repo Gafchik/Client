@@ -6,6 +6,7 @@ import {
   buildValidatedAnswerPacket,
   buildValidationPacket,
   createUsageAccumulator,
+  embedTexts,
   expandTaskSearchKeywords,
   summarizeProviderUsage,
   validateEvidence,
@@ -15,7 +16,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntries, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, findSemanticMatches, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntries, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -608,6 +609,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       providerApiKey,
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
       ...(observerHint ? { observerHint } : {}),
+      semanticSearch: buildSemanticSearchTool(projectRootPath, providerBaseUrl, providerApiKey),
     });
     initialResearch = agenticResult.research;
     teamValidation = agenticResult.validation;
@@ -1477,6 +1479,46 @@ function computeTaskSearchTokens(task: string): string[] {
 // подтверждённый факт, а подсказка ("похоже, было здесь"): живой Researcher
 // сам решает, доверять ли ей, после проверки по актуальному коду. Именно
 // поэтому формулировка ниже явно говорит "проверь", а не "вот факт".
+const SEMANTIC_SEARCH_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b";
+
+// Injected into AgenticRunOptions.semanticSearch (2026-07-16) - kept here,
+// not in packages/agentic-research, so that package stays free of any
+// DB/provider-embeddings dependency (mirrors how shouldAbort is injected).
+// Queries whatever apps/api/src/embedding-indexer.ts has built so far in the
+// background; never builds/blocks on an index itself, so a project with no
+// embeddings yet just degrades to an honest "nothing indexed yet" message
+// rather than stalling a live question.
+function buildSemanticSearchTool(
+  projectRootPath: string,
+  providerBaseUrl: string,
+  providerApiKey: string,
+): (query: string) => Promise<string> {
+  return async (query: string): Promise<string> => {
+    try {
+      const [queryEmbedding] = await embedTexts({
+        providerBaseUrl,
+        providerApiKey,
+        embeddingModel: SEMANTIC_SEARCH_EMBEDDING_MODEL,
+        texts: [query],
+      });
+
+      if (!queryEmbedding) {
+        return "(semantic search failed: no embedding returned)";
+      }
+
+      const matches = await findSemanticMatches(projectRootPath, queryEmbedding, 8);
+
+      if (matches.length === 0) {
+        return "(no semantic index built yet for this project, or no match found - try list_dir/grep_content instead)";
+      }
+
+      return matches.map((match) => `${match.filePath} (similarity ${match.score.toFixed(2)})`).join("\n");
+    } catch (error) {
+      return `(semantic search error: ${error instanceof Error ? error.message : String(error)})`;
+    }
+  };
+}
+
 async function buildObserverHintSuffix(projectRootPath: string, task: string): Promise<string> {
   try {
     const entries = await queryBusinessGraphEntries(projectRootPath);

@@ -107,6 +107,8 @@ export interface RunAgenticResearchInput {
   graphHintTerms?: string[];
   /** See AgenticRunOptions.observerHint - kept separate from `task` so it never leaks into ResearchReport.task (the chat UI's "Задача" display). */
   observerHint?: string;
+  /** See AgenticRunOptions.semanticSearch. */
+  semanticSearch?: (query: string) => Promise<string>;
 }
 
 export interface RunAgenticResearchResult {
@@ -128,6 +130,7 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     ...(input.priorTurnFiles?.length ? { priorTurnFiles: input.priorTurnFiles } : {}),
     ...(input.graphHintTerms?.length ? { graphHintTerms: input.graphHintTerms } : {}),
     ...(input.observerHint ? { observerHint: input.observerHint } : {}),
+    ...(input.semanticSearch ? { semanticSearch: input.semanticSearch } : {}),
   };
 
   const raw = await runAgenticLoop(options);

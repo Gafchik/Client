@@ -383,6 +383,35 @@ export async function expandTaskSearchKeywords(input: ExpandTaskSearchKeywordsIn
   }
 }
 
+export interface EmbedTextsInput {
+  providerBaseUrl: string;
+  providerApiKey: string;
+  embeddingModel: string;
+  texts: string[];
+}
+
+// Added 2026-07-16 as part of the semantic code search feature (embeddings
+// index, packages/knowledge's code-embeddings.ts) - rout.my's /embeddings
+// endpoint is a standard OpenAI-compatible shape (confirmed live:
+// {data: [{embedding, index}], usage}), so this reuses performProviderRequest
+// exactly like the chat/completions calls above rather than a bespoke client.
+export async function embedTexts(input: EmbedTextsInput): Promise<number[][]> {
+  if (input.texts.length === 0) {
+    return [];
+  }
+
+  const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/embeddings`;
+  const response = await performProviderRequest(endpoint, input.providerApiKey, {
+    model: input.embeddingModel,
+    input: input.texts,
+  });
+
+  const payload = (await response.json()) as { data?: Array<{ embedding?: number[]; index?: number }> };
+  const rows = [...(payload.data ?? [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+
+  return rows.map((row) => row.embedding ?? []);
+}
+
 export function buildValidatedAnswerPacket(input: BuildValidatedAnswerPacketInput): ValidatedAnswerPacket {
   return {
     packetId: stableId(["validated-answer-packet", input.runId, input.validation.validationId]),
