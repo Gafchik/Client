@@ -1109,6 +1109,74 @@ export function tokenize(value: string): string[] {
     .filter((token) => token.length >= 2);
 }
 
+// Moved here from packages/ai (2026-07-15) so packages/agentic-research can
+// reuse the same "## Section Name" markdown-heading convention instead of
+// re-inventing a parser - generic text structuring, not tied to any one
+// caller's prompt.
+export function parseMarkdownSections(content: string): Map<string, string> {
+  const result = new Map<string, string>();
+  const lines = content.split("\n");
+
+  let currentSection = "";
+  let currentLines: string[] = [];
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    const headingMatch = /^##\s+(.+)/.exec(line);
+
+    if (headingMatch && headingMatch[1] !== undefined) {
+      if (currentSection && currentLines.length > 0) {
+        result.set(currentSection, currentLines.join("\n").trim());
+      }
+
+      currentSection = headingMatch[1].trim();
+      currentLines = [];
+      continue;
+    }
+
+    if (currentSection) {
+      currentLines.push(raw);
+    }
+  }
+
+  if (currentSection && currentLines.length > 0) {
+    result.set(currentSection, currentLines.join("\n").trim());
+  }
+
+  return result;
+}
+
+export function extractSectionText(sections: Map<string, string>, sectionName: string): string {
+  const raw = sections.get(sectionName);
+
+  if (!raw) {
+    return "";
+  }
+
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !/^[-*•]/.test(line))
+    .join(" ")
+    .trim();
+}
+
+export function extractSectionBullets(sections: Map<string, string>, sectionName: string, maxBullets = 4): string[] {
+  const raw = sections.get(sectionName);
+
+  if (!raw) {
+    return [];
+  }
+
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^[-*•]/.test(line))
+    .map((line) => line.replace(/^[-*•]\s*/, "").trim())
+    .filter(Boolean)
+    .slice(0, maxBullets);
+}
+
 // Много русской разработческой лексики — это не перевод, а фонетическая
 // транслитерация английского термина ("алиас", не "псевдоним"; "консоль",
 // не "пульт управления"). Идентификаторы/пути в коде почти всегда на
@@ -1144,6 +1212,14 @@ const RUSSIAN_TECH_TRANSLIT_STEMS: Array<[stem: string, latin: string]> = [
   ["кеш", "cache"],
   ["юзер", "user"],
   ["профил", "profile"],
+  ["релейш", "relation"],
+  ["репликейт", "replicate"],
+  ["репликейш", "replicat"],
+  ["кейс", "case"],
+  ["флоу", "flow"],
+  ["эквайр", "acquir"],
+  ["гугл", "google"],
+  ["подписк", "subscription"],
 ];
 
 export function expandRussianTechTransliteration(tokens: string[]): string[] {

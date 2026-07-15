@@ -8,7 +8,13 @@ const execFileAsync = promisify(execFile);
 
 const MAX_LIST_ENTRIES = 150;
 const MAX_GREP_MATCHES = 25;
-const MAX_READ_FILE_CHARS = 3000;
+// Live evidence (2026-07-15): a real 6.5KB controller got silently truncated
+// at 3000 chars, cutting off exactly the line that answered the question
+// (Google-login branch setting email_verified_at) - the model read the file,
+// just never saw the part that mattered. Ordinary controllers/services
+// routinely exceed 3000 chars; the cap exists to bound cost, not to fit
+// "typical" files.
+const MAX_READ_FILE_CHARS = 7000;
 
 export const IGNORED_DIRS = new Set([
   ".git", ".idea", ".vscode", ".client", "node_modules", "vendor", "dist", "build",

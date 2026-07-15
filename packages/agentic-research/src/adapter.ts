@@ -88,7 +88,16 @@ export function toResearchReport(runId: string, task: string, result: AgenticRun
   const unknowns: string[] = [];
 
   if (result.stopped !== "final_answer") {
-    unknowns.push("Agentic-исследование не завершилось финальным ответом в рамках бюджета шагов.");
+    // Live evidence (2026-07-15): a real run failed on turn 1 with a
+    // provider timeout (AbortError), but this generic line made it
+    // indistinguishable from "the model genuinely couldn't find the answer"
+    // - only findable by digging into the separately-built ValidationResult's
+    // rationale. Surfacing result.error here means an infra failure and a
+    // genuine research dead-end no longer look identical to whoever reads
+    // the answer (or debugs it later).
+    unknowns.push(
+      `Agentic-исследование не завершилось финальным ответом в рамках бюджета шагов (${result.stopped}${result.error ? `: ${result.error}` : ""}).`,
+    );
   }
 
   if (result.criticVerdict === "rejected-budget-exhausted") {

@@ -1,10 +1,19 @@
+import { expandRussianTechTransliteration, tokenize } from "@client/shared";
 import { dirnameOf, grepContent, listDir, normalizeDirKey, readFile, toWorkspaceRelativePath } from "./tools.js";
 
 // Matches packages/ai's documented provider-call convention (timeout,
 // attempts, backoff) rather than inventing new constants - see
 // packages/ai/src/index.ts's performProviderRequest.
-const PROVIDER_REQUEST_TIMEOUT_MS = 25_000;
-const PROVIDER_MAX_ATTEMPTS = 2;
+// Live evidence (2026-07-15): claude-sonnet-4.6's very first turn on a real
+// question exceeded the old 25s timeout, got aborted, and - because
+// AbortError wasn't in isRetryableError's patterns - failed the ENTIRE run
+// immediately with zero retries, zero files read, reported as "insufficient
+// data" (a verdict about the model's research, when it was actually a
+// one-off infra timeout). Raised for headroom (observations got bigger this
+// same session, MAX_OBSERVATION_CHARS 3500->7000) and aborts are now retried
+// like any other transient failure instead of killing the run outright.
+const PROVIDER_REQUEST_TIMEOUT_MS = 45_000;
+const PROVIDER_MAX_ATTEMPTS = 3;
 const PROVIDER_BASE_BACKOFF_MS = 1_200;
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 // Live evidence (2026-07-15): every single business_graph_entries row across
@@ -24,8 +33,19 @@ const RATE_LIMIT_BASE_BACKOFF_MS = 5_000;
 // SAFETY_CEILING_TURNS/RUN_TOKEN_SAFETY_LIMIT exist only to stop a genuinely
 // runaway loop, not to shape when the model decides it's done.
 const DEFAULT_SAFETY_CEILING_TURNS = 40;
-const RUN_TOKEN_SAFETY_LIMIT = 300_000;
-const MAX_OBSERVATION_CHARS = 3500;
+// Live evidence (2026-07-15): two different strong models, asked a genuinely
+// wide multi-file business question (CaseData's relation-case flow, 8-10
+// legitimately relevant files), both got cut off by this exact ceiling while
+// still actively finding new files each turn - not stuck, not runaway, just
+// a thorough investigation of a wide feature that needed more room. Raised
+// rather than left at the point where it was silently acting as turn-pressure
+// on hard questions (the thing this project explicitly does not want) while
+// contributing nothing on easy ones, which already converge naturally well
+// under the old ceiling (42K-84K tokens observed on the slay-api questions).
+const RUN_TOKEN_SAFETY_LIMIT = 450_000;
+// Matches tools.ts's MAX_READ_FILE_CHARS (7000) - raising the read cap alone
+// without this would just move the same truncation from readFile to here.
+const MAX_OBSERVATION_CHARS = 7000;
 const MAX_COMPLETION_TOKENS = 2500;
 
 export interface AgenticRunOptions {
@@ -121,7 +141,7 @@ const CRITIC_SYSTEM_PROMPT = [
 // this exact word" is the obvious first move, so it's done automatically
 // instead of hoping the model reaches for it on its own.
 const DISTINCTIVE_TOKEN_PATTERN = /[A-Za-z][A-Za-z0-9_-]*/g;
-const MAX_SEED_GREP_TERMS = 3;
+const MAX_SEED_GREP_TERMS = 5;
 
 function extractDistinctiveTokens(task: string): string[] {
   const candidates = task.match(DISTINCTIVE_TOKEN_PATTERN) ?? [];
@@ -147,11 +167,29 @@ function extractDistinctiveTokens(task: string): string[] {
     distinctive.push(token);
   }
 
-  return distinctive.slice(0, MAX_SEED_GREP_TERMS);
+  return distinctive;
+}
+
+// Live evidence (2026-07-15): "релейшн кейс"/"репликейтед кейс" are
+// PHONETIC TRANSLITERATIONS written in Cyrillic ("relation case", "replicated
+// case"), not the Latin words themselves - extractDistinctiveTokens above
+// only scans Latin script, so a fully-Cyrillic question yields zero seed
+// terms and the model falls back to guessing (it landed on Eloquent's own
+// generic withRelations()/loadRelations() plumbing instead of the real
+// CaseData/LinkCasesDataDTO feature). expandRussianTechTransliteration
+// (packages/shared) already exists for exactly this gap in the deterministic
+// path's tokenizer - reused here rather than duplicating a stem list.
+function extractTransliteratedTokens(task: string): string[] {
+  const cyrillicTokens = tokenize(task).filter((token) => /[а-яё]/i.test(token));
+  const expanded = expandRussianTechTransliteration(cyrillicTokens);
+  return expanded.filter((token) => !cyrillicTokens.includes(token));
 }
 
 async function buildSeedGrepObservation(projectRootPath: string, task: string): Promise<string> {
-  const terms = extractDistinctiveTokens(task);
+  const terms = [...new Set([...extractDistinctiveTokens(task), ...extractTransliteratedTokens(task)])].slice(
+    0,
+    MAX_SEED_GREP_TERMS,
+  );
 
   if (terms.length === 0) {
     return "";
@@ -189,6 +227,11 @@ function isRetryableError(error: unknown): boolean {
   if (status !== null) {
     return RETRYABLE_STATUS_CODES.has(status);
   }
+
+  if (error instanceof Error && (error.name === "AbortError" || /aborted/i.test(error.message))) {
+    return true;
+  }
+
   return error instanceof Error && /fetch failed|ECONNRESET|ETIMEDOUT/i.test(error.message);
 }
 

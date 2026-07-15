@@ -2,6 +2,9 @@ import {
   type BackgroundProjectState,
   clamp,
   detectResearchAmbiguity,
+  extractSectionBullets,
+  extractSectionText,
+  parseMarkdownSections,
   stableId,
   tokenize,
   type AnswerEvidenceHighlight,
@@ -1978,70 +1981,6 @@ function parseProviderAnswer(
     nextActions: planSteps.length > 0 ? planSteps : fallback.nextActions,
     warnings: fallback.warnings,
   };
-}
-
-function parseMarkdownSections(content: string): Map<string, string> {
-  const result = new Map<string, string>();
-  const lines = content.split("\n");
-
-  let currentSection = "";
-  let currentLines: string[] = [];
-
-  for (const raw of lines) {
-    const line = raw.trim();
-    const headingMatch = /^##\s+(.+)/.exec(line);
-
-    if (headingMatch && headingMatch[1] !== undefined) {
-      if (currentSection && currentLines.length > 0) {
-        result.set(currentSection, currentLines.join("\n").trim());
-      }
-
-      currentSection = headingMatch[1].trim();
-      currentLines = [];
-      continue;
-    }
-
-    if (currentSection) {
-      currentLines.push(raw);
-    }
-  }
-
-  if (currentSection && currentLines.length > 0) {
-    result.set(currentSection, currentLines.join("\n").trim());
-  }
-
-  return result;
-}
-
-function extractSectionText(sections: Map<string, string>, sectionName: string): string {
-  const raw = sections.get(sectionName);
-
-  if (!raw) {
-    return "";
-  }
-
-  return raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !/^[-*•]/.test(line))
-    .join(" ")
-    .trim();
-}
-
-function extractSectionBullets(sections: Map<string, string>, sectionName: string): string[] {
-  const raw = sections.get(sectionName);
-
-  if (!raw) {
-    return [];
-  }
-
-  return raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => /^[-*•]/.test(line))
-    .map((line) => line.replace(/^[-*•]\s*/, "").trim())
-    .filter(Boolean)
-    .slice(0, 4);
 }
 
 function resolveAnswerMode(input: BuildAnswerInput): AnswerMode {

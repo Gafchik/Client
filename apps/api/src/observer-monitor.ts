@@ -264,8 +264,8 @@ async function crawlOneStaleUnit(
       projectRootPath,
       unitPath: nextUnit,
       featureSummary: result.featureSummary,
-      keyMechanisms: [],
-      gotchas: [],
+      keyMechanisms: result.keyMechanisms,
+      gotchas: result.gotchas,
       sourceFileHashes,
       confidence: result.confidence,
     });

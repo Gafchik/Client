@@ -1426,7 +1426,7 @@ async function buildObserverHintSuffix(projectRootPath: string, task: string): P
     );
     const relevant = freshEntries
       .filter((entry) => {
-        const haystack = `${entry.unitPath} ${entry.featureSummary}`.toLowerCase();
+        const haystack = `${entry.unitPath} ${entry.featureSummary} ${entry.keyMechanisms.join(" ")} ${entry.gotchas.join(" ")}`.toLowerCase();
         return taskTokens.some((token) => haystack.includes(token));
       })
       .slice(0, OBSERVER_HINT_MAX_ENTRIES);
@@ -1435,9 +1435,16 @@ async function buildObserverHintSuffix(projectRootPath: string, task: string): P
       return "";
     }
 
-    const hintLines = relevant.map(
-      (entry) => `- "${entry.unitPath}": ${entry.featureSummary}`,
-    );
+    // Structured layers (2026-07-15) - keyMechanisms/gotchas are now real,
+    // separately-populated fields (see observer-monitor.ts's crawlUnit call),
+    // not just decoration on the schema. Rendered as their own labeled lines
+    // so the live Researcher can weigh "confirmed mechanism" vs "watch out
+    // for" separately from the free-text summary.
+    const hintLines = relevant.flatMap((entry) => [
+      `- "${entry.unitPath}": ${entry.featureSummary}`,
+      ...(entry.keyMechanisms.length ? [`  Механизмы: ${entry.keyMechanisms.join("; ")}`] : []),
+      ...(entry.gotchas.length ? [`  Подводные камни: ${entry.gotchas.join("; ")}`] : []),
+    ]);
 
     return [
       "Подсказка от фонового обхода проекта (Observer) — НЕ подтверждённый факт, а наводка откуда стоит начать. Обязательно проверь по актуальному коду перед тем как на неё полагаться, код мог измениться с момента обхода:",
