@@ -46,7 +46,19 @@ const RUN_TOKEN_SAFETY_LIMIT = 450_000;
 // Matches tools.ts's MAX_READ_FILE_CHARS (7000) - raising the read cap alone
 // without this would just move the same truncation from readFile to here.
 const MAX_OBSERVATION_CHARS = 7000;
-const MAX_COMPLETION_TOKENS = 2500;
+// Raised (2026-07-15) - the Observer's new structured output (summary + up
+// to 5 mechanisms + up to 5 gotchas) and a fully-traced deep answer can both
+// run long; a response truncated mid-generation before it closes
+// "final_answer(...)" looks identical to the unbalanced-paren parse failure
+// already patched around, but the real fix is not cutting it off to begin
+// with.
+const MAX_COMPLETION_TOKENS = 4000;
+// Models frequently want to explore several things at once (list a dir, grep
+// two terms) - letting them batch several ACTION lines into one turn instead
+// of one per round-trip cuts turn count (and the resent-context cost that
+// comes with each turn) on exploration-heavy questions. Capped so one turn
+// can't balloon into an unbounded batch.
+const MAX_ACTIONS_PER_TURN = 4;
 
 export interface AgenticRunOptions {
   task: string;
@@ -78,6 +90,20 @@ export interface AgenticRunOptions {
    * to blindly trust - the question may have moved on to something else.
    */
   priorTurnFiles?: string[];
+  /**
+   * Symbol names (class/function names, not paths) found by matching task
+   * keywords against the FULL persisted code graph (packages/graph, built by
+   * background-sync - see apps/api/src/graph-store.ts's
+   * findGraphSymbolHints). Precise where a raw content grep for a generic
+   * word ("relation") is not: live evidence showed the graph resolving
+   * "relation cases" to real symbols like UnlinkRelatedCasesAction with none
+   * of the Eloquent withRelations()/relationLoaded() noise a text grep pulls
+   * in. Merged into the seed-grep step as additional terms, not resolved to
+   * a file path here - namespace-to-path conventions are project-specific
+   * and would be exactly the hardcoding this project has repeatedly ruled
+   * out, so the model's own grep_content resolves these to real files.
+   */
+  graphHintTerms?: string[];
 }
 
 export interface AgenticRunResult {
@@ -111,11 +137,12 @@ interface ParsedAction {
 
 const SYSTEM_PROMPT = [
   "Ты — опытный senior fullstack разработчик, который исследует незнакомую кодовую базу, чтобы честно ответить на инженерный вопрос.",
-  "У тебя есть инструменты. На каждом шаге вызывай РОВНО одно действие, последней строкой в ответе, в таком виде (без markdown-обрамления):",
+  "У тебя есть инструменты. Каждое действие пиши отдельной строкой в таком виде (без markdown-обрамления):",
   "ACTION: list_dir(относительный/путь)",
   "ACTION: grep_content(строка или regex для поиска по содержимому файлов)",
   "ACTION: read_file(относительный/путь/к/файлу.php)",
   "ACTION: final_answer(твой финальный ответ на человеческом языке, с указанием конкретных файлов, если ты их нашёл, или честное признание, что не нашёл)",
+  `Если хочешь исследовать несколько мест сразу — можешь написать до ${MAX_ACTIONS_PER_TURN} ACTION-строк подряд в одном ответе, они выполнятся по порядку и результаты вернутся вместе одним пакетом. Если вызываешь final_answer — вызови ТОЛЬКО его, без других ACTION в этом же ответе (сначала посмотри результаты, потом отвечай).`,
   "Перед ACTION можешь коротко (1-2 предложения) написать, что и зачем делаешь.",
   "Начинай с list_dir(\".\") если не знаешь структуру. Ищи буквальные, семантически близкие названия директорий/файлов — не только по-русски, а и переводы на английский.",
   "ВАЖНО: прежде чем читать конкретный файл в папке, которую ты ещё не листал (list_dir) в этом диалоге, сначала сделай list_dir этой папки. Соседний файл с похожим именем может оказаться тем самым, что реально отвечает на вопрос — угадывание имени файла вслепую эту находку пропускает.",
@@ -141,7 +168,9 @@ const CRITIC_SYSTEM_PROMPT = [
 // this exact word" is the obvious first move, so it's done automatically
 // instead of hoping the model reaches for it on its own.
 const DISTINCTIVE_TOKEN_PATTERN = /[A-Za-z][A-Za-z0-9_-]*/g;
-const MAX_SEED_GREP_TERMS = 5;
+// Raised from 5 - graph-derived symbol names (findGraphSymbolHints) are now
+// a third term source alongside Latin/transliterated tokens.
+const MAX_SEED_GREP_TERMS = 7;
 
 function extractDistinctiveTokens(task: string): string[] {
   const candidates = task.match(DISTINCTIVE_TOKEN_PATTERN) ?? [];
@@ -185,11 +214,13 @@ function extractTransliteratedTokens(task: string): string[] {
   return expanded.filter((token) => !cyrillicTokens.includes(token));
 }
 
-async function buildSeedGrepObservation(projectRootPath: string, task: string): Promise<string> {
-  const terms = [...new Set([...extractDistinctiveTokens(task), ...extractTransliteratedTokens(task)])].slice(
-    0,
-    MAX_SEED_GREP_TERMS,
-  );
+async function buildSeedGrepObservation(projectRootPath: string, task: string, graphHintTerms: string[]): Promise<string> {
+  // Graph-derived symbol names go first - precise (real class/function names
+  // from the persisted code graph), so if the term budget is tight they
+  // should win over generic transliterated words like "case"/"relation".
+  const terms = [
+    ...new Set([...graphHintTerms, ...extractDistinctiveTokens(task), ...extractTransliteratedTokens(task)]),
+  ].slice(0, MAX_SEED_GREP_TERMS);
 
   if (terms.length === 0) {
     return "";
@@ -314,61 +345,80 @@ async function callModel(
   throw lastError;
 }
 
-// Models routinely ignore "call exactly one action" and emit several
-// ACTION(...) calls back to back in one completion, sometimes with no
-// newlines between them at all. This scans for the first "ACTION: tool("
-// occurrence anywhere in the raw text and walks paren depth from there to
-// find its matching close-paren (handles nested parens, e.g. grep regex
-// groups) - everything after that point is discarded, whatever it is.
-function parseAction(content: string): ParsedAction | null {
-  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|final_answer)\s*\(/;
-  const match = actionPattern.exec(content);
+// Models routinely ignore "one action per turn" and emit several ACTION(...)
+// calls back to back in one completion, sometimes with no newlines between
+// them at all - and now they're explicitly invited to (multi-action turns,
+// 2026-07-15). Scans for each "ACTION: tool(" occurrence in order and walks
+// paren depth from each to find its matching close-paren (handles nested
+// parens, e.g. grep regex groups), stopping once MAX_ACTIONS_PER_TURN is
+// reached or no further match/close-paren is found.
+function parseActions(content: string): ParsedAction[] {
+  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|final_answer)\s*\(/g;
+  const actions: ParsedAction[] = [];
+  let searchFrom = 0;
 
-  if (!match || match.index === undefined) {
-    return null;
-  }
+  while (actions.length < MAX_ACTIONS_PER_TURN) {
+    actionPattern.lastIndex = searchFrom;
+    const match = actionPattern.exec(content);
 
-  const tool = match[1] as ParsedAction["tool"];
-  const openParenIndex = match.index + match[0].length - 1;
-  let depth = 0;
-  let closeParenIndex = -1;
-
-  // grep_content patterns often contain backslash-escaped literal parens
-  // (e.g. "authorize\(" to match the literal string "authorize(") - a naive
-  // depth count treats those as real nesting and never finds a matching
-  // close, silently dropping the whole action. A single preceding backslash
-  // means "this paren is a literal character in the pattern, not a scope
-  // boundary" and must not affect depth.
-  for (let i = openParenIndex; i < content.length; i += 1) {
-    const isEscaped = content[i - 1] === "\\" && content[i - 2] !== "\\";
-
-    if (isEscaped) {
-      continue;
+    if (!match || match.index === undefined) {
+      break;
     }
 
-    if (content[i] === "(") {
-      depth += 1;
-    } else if (content[i] === ")") {
-      depth -= 1;
+    const tool = match[1] as ParsedAction["tool"];
+    const openParenIndex = match.index + match[0].length - 1;
+    let depth = 0;
+    let closeParenIndex = -1;
 
-      if (depth === 0) {
-        closeParenIndex = i;
-        break;
+    // grep_content patterns often contain backslash-escaped literal parens
+    // (e.g. "authorize\(" to match the literal string "authorize(") - a naive
+    // depth count treats those as real nesting and never finds a matching
+    // close, silently dropping the whole action. A single preceding backslash
+    // means "this paren is a literal character in the pattern, not a scope
+    // boundary" and must not affect depth.
+    for (let i = openParenIndex; i < content.length; i += 1) {
+      const isEscaped = content[i - 1] === "\\" && content[i - 2] !== "\\";
+
+      if (isEscaped) {
+        continue;
+      }
+
+      if (content[i] === "(") {
+        depth += 1;
+      } else if (content[i] === ")") {
+        depth -= 1;
+
+        if (depth === 0) {
+          closeParenIndex = i;
+          break;
+        }
       }
     }
+
+    if (closeParenIndex === -1) {
+      break;
+    }
+
+    let arg = content.slice(openParenIndex + 1, closeParenIndex).trim();
+
+    if ((arg.startsWith('"') && arg.endsWith('"')) || (arg.startsWith("'") && arg.endsWith("'"))) {
+      arg = arg.slice(1, -1);
+    }
+
+    actions.push({ tool, arg });
+
+    if (tool === "final_answer") {
+      // Conclusive - a batch mixing final_answer with unexecuted tool
+      // requests makes no sense (the model hasn't seen their results yet).
+      break;
+    }
+
+    searchFrom = closeParenIndex + 1;
   }
 
-  if (closeParenIndex === -1) {
-    return null;
-  }
-
-  let arg = content.slice(openParenIndex + 1, closeParenIndex).trim();
-
-  if ((arg.startsWith('"') && arg.endsWith('"')) || (arg.startsWith("'") && arg.endsWith("'"))) {
-    arg = arg.slice(1, -1);
-  }
-
-  return { tool, arg };
+  // Whether final_answer came first, last, or mixed in - it wins alone.
+  const finalAnswerIndex = actions.findIndex((action) => action.tool === "final_answer");
+  return finalAnswerIndex === -1 ? actions : [actions[finalAnswerIndex] as ParsedAction];
 }
 
 async function callCritic(input: {
@@ -429,7 +479,11 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     { role: "user", content: `Проект: ${options.projectRootPath}\nВопрос: ${options.task}${priorTurnHint}` },
   ];
 
-  const seedGrepObservation = await buildSeedGrepObservation(options.projectRootPath, options.task);
+  const seedGrepObservation = await buildSeedGrepObservation(
+    options.projectRootPath,
+    options.task,
+    options.graphHintTerms ?? [],
+  );
 
   if (seedGrepObservation) {
     messages.push({ role: "user", content: seedGrepObservation });
@@ -534,14 +588,14 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       return finalize({ turnsUsed: turn, stopped: "max_turns" });
     }
 
-    const action = parseAction(content);
+    const actions = parseActions(content);
 
-    if (!action) {
+    if (actions.length === 0) {
       actionsLog.push(`[turn ${turn}] NO ACTION PARSED (treated as implicit final answer). raw content: ${content.slice(0, 300)}`);
       messages.push({ role: "assistant", content });
 
       // The model may have genuinely tried ACTION: final_answer(...), but
-      // parseAction's balanced-paren scanner never found a matching close
+      // parseActions's balanced-paren scanner never found a matching close
       // (a stray unbalanced paren anywhere in a long markdown answer is
       // enough) and correctly returned null - verified live: this leaked the
       // literal "ACTION: final_answer(" protocol prefix into a stored
@@ -578,9 +632,10 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
     messages.push({ role: "assistant", content });
 
-    if (action.tool === "final_answer") {
+    if (actions[0]?.tool === "final_answer") {
+      // parseActions guarantees final_answer is alone when present.
       actionsLog.push(`[turn ${turn}] final_answer (proposed)`);
-      const verdict = await evaluateProposedAnswer(action.arg, turn);
+      const verdict = await evaluateProposedAnswer(actions[0].arg, turn);
 
       if (verdict === "continue-loop") {
         continue;
@@ -589,35 +644,52 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       return verdict;
     }
 
-    let observation: string;
+    // Batch executed sequentially, not in parallel - a later action in the
+    // same batch (e.g. read_file right after list_dir on its parent) must see
+    // seenDirs/touchedFiles updates from earlier ones in this same turn, the
+    // same ordering guarantee a single action always had.
+    const observationBlocks: string[] = [];
 
-    if (action.tool === "list_dir") {
-      observation = await listDir(options.projectRootPath, action.arg);
-      seenDirs.add(normalizeDirKey(action.arg));
-    } else if (action.tool === "grep_content") {
-      observation = await grepContent(options.projectRootPath, action.arg);
-      grepTermsSeen.add(action.arg.toLowerCase());
-    } else {
-      const parentDir = dirnameOf(action.arg);
+    for (const action of actions) {
+      let observation: string;
 
-      if (!seenDirs.has(parentDir)) {
-        observation = `Сначала посмотри содержимое папки: ACTION: list_dir(${parentDir}) - ты ещё не листал эту директорию, там может быть файл с похожим, но другим именем, отвечающий на вопрос точнее.`;
+      if (action.tool === "list_dir") {
+        observation = await listDir(options.projectRootPath, action.arg);
+        seenDirs.add(normalizeDirKey(action.arg));
+      } else if (action.tool === "grep_content") {
+        observation = await grepContent(options.projectRootPath, action.arg);
+        grepTermsSeen.add(action.arg.toLowerCase());
       } else {
-        observation = await readFile(options.projectRootPath, action.arg);
+        const parentDir = dirnameOf(action.arg);
 
-        if (!observation.startsWith("Error")) {
-          touchedFiles.add(toWorkspaceRelativePath(options.projectRootPath, action.arg));
+        if (!seenDirs.has(parentDir)) {
+          // Auto-perform the list_dir instead of just instructing the model
+          // to do it next turn (2026-07-15 speed pass) - we already know
+          // exactly which directory needs listing, so doing it now saves a
+          // full round-trip instead of bouncing the model back empty-handed.
+          const dirListing = await listDir(options.projectRootPath, parentDir);
+          seenDirs.add(normalizeDirKey(parentDir));
+          observation = `Ты попросил прочитать файл в папке "${parentDir}", которую ещё не листал — вот её содержимое (соседний файл с похожим именем может отвечать точнее); прочитай нужный файл следующим действием:\n${dirListing}`;
+        } else {
+          observation = await readFile(options.projectRootPath, action.arg);
+
+          if (!observation.startsWith("Error")) {
+            touchedFiles.add(toWorkspaceRelativePath(options.projectRootPath, action.arg));
+          }
         }
       }
+
+      actionsLog.push(`[turn ${turn}] ${action.tool}(${action.arg}) -> ${observation.split("\n").length} lines`);
+
+      const boundedObservation = observation.length > MAX_OBSERVATION_CHARS
+        ? `${observation.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`
+        : observation;
+
+      observationBlocks.push(`ACTION ${action.tool}(${action.arg}):\n${boundedObservation}`);
     }
 
-    actionsLog.push(`[turn ${turn}] ${action.tool}(${action.arg}) -> ${observation.split("\n").length} lines`);
-
-    const boundedObservation = observation.length > MAX_OBSERVATION_CHARS
-      ? `${observation.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`
-      : observation;
-
-    messages.push({ role: "user", content: `OBSERVATION:\n${boundedObservation}` });
+    const observationHeader = observationBlocks.length > 1 ? `OBSERVATIONS (${observationBlocks.length}):\n` : "OBSERVATION:\n";
+    messages.push({ role: "user", content: observationHeader + observationBlocks.join("\n\n---\n\n") });
 
     const currentSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size;
 

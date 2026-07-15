@@ -8,6 +8,7 @@ import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
 import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
+import { closeRedisClient, verifyRedisConnectivity } from "./redis-client.js";
 import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus, waitForPipelineRunCompletion } from "./pipeline-runner.js";
 import { getObserverProgress, listObserverRunners, startObserver, stopAllObservers, stopObserver } from "./observer-monitor.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
@@ -234,7 +235,20 @@ export function createApp() {
     await initializeProviderStore();
     await initializeTeamStore();
     await initializeProjectStore();
-    await initializeGraphStore();
+    // Live incident (2026-07-15): Neo4j got OOM-killed by Docker's shared VM
+    // memory ceiling more than once this session, and this call had no error
+    // handling - a Neo4j outage at boot meant the WHOLE API failed to start,
+    // not just the graph feature degrading. The persisted code graph is
+    // already confirmed secondary (Task 25 investigation: it only feeds
+    // Impact/Context side-panel metadata, not the actual agentic research
+    // that produces the answer) - not worth being a single point of failure
+    // for the rest of the app (Postgres/Redis/providers/teams/the real
+    // pipeline) that don't depend on it at all.
+    try {
+      await initializeGraphStore();
+    } catch (error) {
+      app.log.warn({ err: error }, "[app] Neo4j graph store init failed - continuing without it (Impact/Context panels will degrade, the rest of the app is unaffected)");
+    }
     startProjectStateMonitor({
       appRootPath,
       fallbackProviderBaseUrl: defaultProviderBaseUrl,
@@ -251,14 +265,16 @@ export function createApp() {
     stopAllObservers();
     await closeNeo4jDriver();
     await closePostgresPool();
+    await closeRedisClient();
   });
 
   app.get("/api/health", async () => {
-    const [neo4jConnected, postgresConnected] = await Promise.all([
+    const [neo4jConnected, postgresConnected, redisConnected] = await Promise.all([
       verifyNeo4jConnectivity(),
       verifyPostgresConnectivity(),
+      verifyRedisConnectivity(),
     ]);
-    return { status: "ok", now: new Date().toISOString(), neo4jConnected, postgresConnected };
+    return { status: "ok", now: new Date().toISOString(), neo4jConnected, postgresConnected, redisConnected };
   });
 
   app.get("/api/providers", async () => {

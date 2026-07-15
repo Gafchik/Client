@@ -185,6 +185,21 @@ export async function initializePostgresSchema(): Promise<void> {
       updated_at timestamptz not null
     )
   `);
+
+  // knowledge_artifacts — полное тело каждого завершённого run'а (весь
+  // research/impact/context/answer), раньше жило файлами в
+  // .client/knowledge/projects/<hash>/runs/<runId>.json (2026-07-15: явное
+  // требование пользователя - ничего не должно лежать в файлах, всё в
+  // Postgres). run_id уже глобально уникален (см. knowledge_catalog) -
+  // project_root_path здесь не дублируется, при необходимости join через
+  // knowledge_catalog.
+  await runSql(`
+    create table if not exists knowledge_artifacts (
+      run_id text primary key,
+      body jsonb not null,
+      saved_at timestamptz not null
+    )
+  `);
 }
 
 /**

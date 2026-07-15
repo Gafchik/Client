@@ -164,6 +164,12 @@ function groupModelsByVendor(models: ProviderModelRecord[]): Array<{ vendor: str
     .map(([vendor, vendorModels]) => ({ vendor, models: vendorModels }));
 }
 
+/** Cost multiplier for a model id (e.g. "0.7x", "1.5x"), as reported by the provider's own /models endpoint - not hardcoded. */
+function findModelMultiplierLabel(models: ProviderModelRecord[], modelId: string): string | null {
+  const match = models.find((model) => model.id === modelId);
+  return typeof match?.tokenMultiplier === "number" ? `${match.tokenMultiplier}x` : null;
+}
+
 // Человекочитаемые лейблы для сырых module key из INTENT_PROFILES
 // (packages/research/src/index.ts) — общий, не привязанный к проекту
 // словарь. Value, которое реально уходит в task при уточнении — сырой key,
@@ -3596,17 +3602,32 @@ export function App() {
                     <div className="team-role-cards">
                       <div className="team-role-card">
                         <strong>Researcher</strong>
-                        <span>{team.researcherModel || "—"}</span>
+                        <span>
+                          {team.researcherModel || "—"}
+                          {findModelMultiplierLabel(providerModels, team.researcherModel) ? (
+                            <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.researcherModel)}</span>
+                          ) : null}
+                        </span>
                         <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.researcher}</span>
                       </div>
                       <div className="team-role-card">
                         <strong>Critic</strong>
-                        <span>{team.criticModel || "—"}</span>
+                        <span>
+                          {team.criticModel || "—"}
+                          {findModelMultiplierLabel(providerModels, team.criticModel) ? (
+                            <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.criticModel)}</span>
+                          ) : null}
+                        </span>
                         <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.critic}</span>
                       </div>
                       <div className="team-role-card">
                         <strong>Observer</strong>
-                        <span>{team.observerModel || "—"}</span>
+                        <span>
+                          {team.observerModel || "—"}
+                          {findModelMultiplierLabel(providerModels, team.observerModel) ? (
+                            <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.observerModel)}</span>
+                          ) : null}
+                        </span>
                         <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.observer}</span>
                       </div>
                     </div>

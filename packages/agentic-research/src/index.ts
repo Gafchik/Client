@@ -97,6 +97,8 @@ export interface RunAgenticResearchInput {
   maxTurns?: number;
   /** See AgenticRunOptions.priorTurnFiles - files already found in the previous turn of this conversation. */
   priorTurnFiles?: string[];
+  /** See AgenticRunOptions.graphHintTerms - symbol names from the persisted code graph matching the task. */
+  graphHintTerms?: string[];
 }
 
 export interface RunAgenticResearchResult {
@@ -116,6 +118,7 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     providerApiKey: input.providerApiKey,
     ...(input.maxTurns ? { maxTurns: input.maxTurns } : {}),
     ...(input.priorTurnFiles?.length ? { priorTurnFiles: input.priorTurnFiles } : {}),
+    ...(input.graphHintTerms?.length ? { graphHintTerms: input.graphHintTerms } : {}),
   };
 
   const raw = await runAgenticLoop(options);

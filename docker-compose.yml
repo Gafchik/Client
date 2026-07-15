@@ -1,5 +1,8 @@
-# В Docker поднимаются Neo4j (persistent knowledge graph storage) и Postgres
-# (метаданные: Project/Provider/история чатов — см. docs/architecture/002-storage.md).
+# В Docker поднимаются Neo4j (persistent knowledge graph storage), Postgres
+# (метаданные: Project/Provider/история чатов — см. docs/architecture/002-storage.md)
+# и Redis (ephemeral pipeline-status - живёт только пока выполняется вопрос,
+# TTL вместо ручной очистки; 2026-07-15: .client/pipeline-status/ на файлах
+# выросла до 2.8GB и уронила API процесс OOM'ом на старте).
 # Backend (apps/api) и frontend (apps/web) запускаются локально без Docker.
 services:
   neo4j:
@@ -36,6 +39,19 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-client} -d ${POSTGRES_DB:-client}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      # 6380, not 6379 - host already has an unrelated project's Redis bound
+      # to 6379 (magendamd_backend-cache-1); this one is exclusively ours.
+      - "${REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 30

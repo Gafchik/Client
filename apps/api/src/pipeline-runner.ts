@@ -43,6 +43,7 @@ import {
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { runAgenticResearch } from "@client/agentic-research";
 import { saveGraphSnapshot } from "./graph-store.js";
+import { getRedisClient } from "./redis-client.js";
 import { getSelectedTeam } from "./team-store.js";
 
 export interface PipelineExecutionRequest {
@@ -67,7 +68,6 @@ type QuestionRuntimeMode = "chat-fast-path" | "deep-research-path" | "team-mode"
 
 const runStore = new Map<string, PipelineRunStatus>();
 const runAppRootStore = new Map<string, string>();
-const PIPELINE_STATUS_RETENTION_MS = 1000 * 60 * 60 * 24 * 3;
 const MAX_VALIDATION_REFINEMENT_ITERATIONS = 2;
 
 function yieldToEventLoop(): Promise<void> {
@@ -99,7 +99,7 @@ export function enqueuePipelineRun(request: PipelineExecutionRequest): PipelineR
 
   runStore.set(request.runId, initialStatus);
   runAppRootStore.set(request.runId, request.appRootPath);
-  void persistRunStatus(request.appRootPath, initialStatus);
+  void persistRunStatus(initialStatus);
   setTimeout(() => {
     void executePipelineRun(request);
   }, 0);
@@ -176,6 +176,27 @@ export function findPipelineRunByRepositoryHead(input: {
   return candidates[0] ?? null;
 }
 
+// Live incident (2026-07-15): .client/pipeline-status/ (this was file-based)
+// grew to 2.8GB and OOM-crashed the API on startup - bootstrap unconditionally
+// JSON.parses every status file, and result.runtimeCache (the full project
+// index+graph, re-embedded on every single status update) had bloated some
+// files to 140MB. Moved to Redis: TTL means expiry is automatic instead of a
+// manual mtime-scan at bootstrap, and this data was always ephemeral (pure
+// live-progress-polling cache - the real reuse-optimization this cache was
+// FOR reads from the separate, Postgres-backed knowledge-artifacts store, not
+// from here) so losing it on a Redis restart costs nothing but a "resume from
+// start" on whatever was mid-flight, same as the old interrupted-run handling.
+const PIPELINE_STATUS_TTL_SECONDS = 60 * 60 * 24 * 3;
+// Defense-in-depth: toPersistableRunStatus already stops the bloat at the
+// source, but a value this large stored in Redis is never a status a human
+// is going to read anyway - skip it rather than let a future regression
+// repeat the same failure shape against a different backing store.
+const MAX_STATUS_VALUE_BYTES = 10 * 1024 * 1024;
+
+function pipelineStatusRedisKey(runId: string): string {
+  return `pipeline-status:${runId}`;
+}
+
 export async function loadPipelineRunStatus(appRootPath: string, runId: string): Promise<PipelineRunStatus | null> {
   const inMemory = runStore.get(runId);
 
@@ -183,10 +204,18 @@ export async function loadPipelineRunStatus(appRootPath: string, runId: string):
     return inMemory;
   }
 
-  const filePath = getPipelineStatusPath(appRootPath, runId);
-
   try {
-    const raw = await fs.readFile(filePath, "utf8");
+    const raw = await getRedisClient().get(pipelineStatusRedisKey(runId));
+
+    if (!raw) {
+      return null;
+    }
+
+    if (raw.length > MAX_STATUS_VALUE_BYTES) {
+      console.warn(`[pipeline-runner] skipping oversized status value (${Math.round(raw.length / 1024 / 1024)}MB) for run ${runId}`);
+      return null;
+    }
+
     const parsed = JSON.parse(raw) as PipelineRunStatus;
     runStore.set(runId, parsed);
     runAppRootStore.set(runId, appRootPath);
@@ -258,33 +287,30 @@ function markStatusInterrupted(status: PipelineRunStatus, reason: string, stageD
 }
 
 export async function bootstrapPipelineRunStatuses(appRootPath: string): Promise<void> {
-  await cleanupExpiredPipelineStatuses(appRootPath);
-  const directory = getPipelineStatusDirectory(appRootPath);
-
   try {
-    const entries = await fs.readdir(directory, { withFileTypes: true });
+    // SCAN, not KEYS - non-blocking even if the keyspace is large, unlike
+    // KEYS which would freeze Redis while it walks the whole keyspace.
+    const stream = getRedisClient().scanStream({ match: "pipeline-status:*", count: 100 });
 
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) {
-        continue;
-      }
+    for await (const keys of stream as AsyncIterable<string[]>) {
+      for (const key of keys) {
+        const runId = key.replace(/^pipeline-status:/, "");
+        const status = await loadPipelineRunStatus(appRootPath, runId);
 
-      const runId = entry.name.replace(/\.json$/i, "");
-      const status = await loadPipelineRunStatus(appRootPath, runId);
-
-      if (status && (status.status === "queued" || status.status === "running")) {
-        updateRunStatus(
-          runId,
-          markStatusInterrupted(
-            status,
-            "API был перезапущен во время выполнения. Run можно безопасно перезапустить с начала.",
-            "Run был прерван перезапуском API. Доступен resume-from-start.",
-          ),
-        );
+        if (status && (status.status === "queued" || status.status === "running")) {
+          updateRunStatus(
+            runId,
+            markStatusInterrupted(
+              status,
+              "API был перезапущен во время выполнения. Run можно безопасно перезапустить с начала.",
+              "Run был прерван перезапуском API. Доступен resume-from-start.",
+            ),
+          );
+        }
       }
     }
-  } catch {
-    // ignore missing status directory during bootstrap
+  } catch (error) {
+    console.warn("[pipeline-runner] bootstrap scan failed (Redis unavailable?):", error);
   }
 }
 
@@ -302,7 +328,6 @@ export async function markInFlightRunsInterrupted(): Promise<void> {
       continue;
     }
 
-    const appRootPath = runAppRootStore.get(runId);
     const interrupted = markStatusInterrupted(
       status,
       "Сервер был остановлен во время выполнения. Run можно безопасно перезапустить с начала.",
@@ -310,8 +335,8 @@ export async function markInFlightRunsInterrupted(): Promise<void> {
     );
     runStore.set(runId, interrupted);
 
-    if (appRootPath) {
-      pending.push(persistRunStatus(appRootPath, interrupted));
+    if (runAppRootStore.get(runId)) {
+      pending.push(persistRunStatus(interrupted));
     }
   }
 
@@ -548,6 +573,24 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     const priorTurnFiles = priorConversationTurn
       ? [...new Set(priorConversationTurn.research.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)))]
       : [];
+    // Graph-symbol hints: DISABLED after live testing (2026-07-15), not
+    // deleted - findGraphSymbolHints (graph-store.ts) is real and works for
+    // precise terms (resolved "relation cases" to UnlinkRelatedCasesAction
+    // cleanly, no Eloquent withRelations()/relationLoaded() noise), but a
+    // second live run on the same question showed the opposite failure: the
+    // term "relation" also substring-matches an unrelated real feature
+    // (CausalRelationshipRequest/SaveCausalRelationshipAction in
+    // AcuNotes/PainManagementNote - "Relationship" contains "relation") and
+    // steered a run to a confidently-wrong answer. Attempted a fix (require
+    // 2+ distinct seed terms to converge on the same namespace cluster
+    // before trusting a match) but the actual graph data doesn't support it:
+    // most matching labels (334/500 in a spot check) are bare identifiers
+    // with no namespace path to cluster by, and container depth in the ones
+    // that do isn't a fixed, project-generic offset. Shipping a mechanism
+    // that can make a wrong answer MORE confident is worse than the current
+    // honest-hedging behavior without it - needs real ranking (e.g. match
+    // density per cluster) before this is trustworthy enough to re-enable.
+    // const graphHintTerms = await findGraphSymbolHints(graphProjectId, computeTaskSearchTokens(task));
     const agenticResult = await runAgenticResearch({
       runId,
       task: observerHint ? `${task}\n\n${observerHint}` : task,
@@ -1401,6 +1444,27 @@ function buildQuestionWorkspacePlan(
 const OBSERVER_HINT_MIN_TOKEN_LENGTH = 4;
 const OBSERVER_HINT_MAX_ENTRIES = 2;
 
+// Live evidence (2026-07-15): "папка w9" never matched a real, relevant
+// entry because "w9" (length 2) was dropped by a length>=4 filter, while
+// generic 4+ char words let an unrelated entry through. Short alphanumeric
+// identifiers (w9, s3, oauth2) are exactly the tokens most likely to be a
+// real, distinctive match - length alone is the wrong signal, so a digit
+// anywhere in the token bypasses the length floor instead of being
+// penalized by it. Shared by the Observer-hint matcher and the graph-symbol
+// lookup below - same "what is this question actually about" signal, used
+// twice.
+function computeTaskSearchTokens(task: string): string[] {
+  const tokens = tokenize(task).filter((token) => token.length >= OBSERVER_HINT_MIN_TOKEN_LENGTH || /\d/.test(token));
+  // Bug found while verifying the graph-symbol-hint feature (2026-07-15):
+  // this returned raw Cyrillic tokens ("релейшн", "кейсов") straight from
+  // tokenize() with no transliteration, so a lookup against Latin-script
+  // code (class labels, Observer's business-graph text) could never match
+  // anything - the graph hint silently contributed nothing on the one run
+  // that looked like a success. expandRussianTechTransliteration adds the
+  // English equivalents ("relation", "case") alongside the originals.
+  return [...new Set([...tokens, ...expandRussianTechTransliteration(tokens)])];
+}
+
 // Observer's накопленные записи (packages/knowledge graph-entries) — не
 // подтверждённый факт, а подсказка ("похоже, было здесь"): живой Researcher
 // сам решает, доверять ли ей, после проверки по актуальному коду. Именно
@@ -1414,16 +1478,7 @@ async function buildObserverHintSuffix(projectRootPath: string, task: string): P
       return "";
     }
 
-    // Live evidence (2026-07-15): "папка w9" never matched a real, relevant
-    // entry because "w9" (length 2) was dropped by the length>=4 filter,
-    // while generic 4+ char words let an unrelated entry (Lambda/scripts)
-    // through. Short alphanumeric identifiers (w9, s3, oauth2) are exactly
-    // the tokens most likely to be a real, distinctive match - length alone
-    // is the wrong signal here, so a digit anywhere in the token bypasses
-    // the length floor instead of being penalized by it.
-    const taskTokens = tokenize(task).filter(
-      (token) => token.length >= OBSERVER_HINT_MIN_TOKEN_LENGTH || /\d/.test(token),
-    );
+    const taskTokens = computeTaskSearchTokens(task);
     const relevant = freshEntries
       .filter((entry) => {
         const haystack = `${entry.unitPath} ${entry.featureSummary} ${entry.keyMechanisms.join(" ")} ${entry.gotchas.join(" ")}`.toLowerCase();
@@ -2103,27 +2158,54 @@ function maskApiKey(value: string): string {
   return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }
 
-async function persistRunStatus(appRootPath: string, status: PipelineRunStatus | null): Promise<void> {
-  if (!status) {
-    return;
+// Live incident (2026-07-15): .client/pipeline-status/ grew to 2.8GB (files
+// up to 140MB each) and crashed the API with an OOM on startup, because
+// bootstrapPipelineRunStatuses JSON.parses every file in that directory.
+// Root cause: result.runtimeCache (the full project index + graph) was
+// written into this file on every single status update, for every run -
+// but this directory exists only for live progress polling
+// (/api/pipeline/status) and bootstrap's "was this interrupted" check,
+// neither of which ever reads runtimeCache. The actual reuse-optimization
+// this cache exists for (buildIncrementalIndexPlan/buildGraphInvalidationPlan
+// etc.) reads `previousRun` from loadBestBaselineRunArtifact, which loads
+// from the SEPARATE knowledge-artifacts directory - runtimeCache is already
+// persisted there too (see packages/knowledge's saveKnowledgeArtifacts), so
+// stripping it here only removes a pure duplicate, not the capability.
+function toPersistableRunStatus(status: PipelineRunStatus): PipelineRunStatus {
+  const result = status.result;
+
+  if (!result?.runtimeCache) {
+    return status;
   }
 
-  const directory = getPipelineStatusDirectory(appRootPath);
-  const filePath = getPipelineStatusPath(appRootPath, status.runId);
+  const { runtimeCache: _runtimeCache, ...resultWithoutRuntimeCache } = result;
+  return { ...status, result: resultWithoutRuntimeCache };
+}
 
-  await fs.mkdir(directory, { recursive: true });
-  await fs.writeFile(filePath, JSON.stringify(status, null, 2));
+async function persistRunStatus(status: PipelineRunStatus): Promise<void> {
+  try {
+    await getRedisClient().set(
+      pipelineStatusRedisKey(status.runId),
+      JSON.stringify(toPersistableRunStatus(status)),
+      "EX",
+      PIPELINE_STATUS_TTL_SECONDS,
+    );
+  } catch (error) {
+    console.warn(`[pipeline-runner] failed to persist status for run ${status.runId} to Redis:`, error);
+  }
 }
 
 function updateRunStatus(runId: string, status: PipelineRunStatus): void {
   runStore.set(runId, status);
-  const appRootPath = runAppRootStore.get(runId);
 
-  if (!appRootPath) {
+  // Redis key is global (runId is already unique) - the appRootPath
+  // association only still matters as "is this a run we actually manage"
+  // (a defensive gate carried over from the file-based version).
+  if (!runAppRootStore.get(runId)) {
     return;
   }
 
-  void persistRunStatus(appRootPath, status);
+  void persistRunStatus(status);
 }
 
 function updatePartialArtifacts(runId: string, patch: PipelinePartialArtifacts): void {
@@ -2141,38 +2223,6 @@ function updatePartialArtifacts(runId: string, patch: PipelinePartialArtifacts):
       ...patch,
     },
   });
-}
-
-function getPipelineStatusDirectory(appRootPath: string): string {
-  return path.join(appRootPath, ".client", "pipeline-status");
-}
-
-function getPipelineStatusPath(appRootPath: string, runId: string): string {
-  return path.join(getPipelineStatusDirectory(appRootPath), `${runId}.json`);
-}
-
-async function cleanupExpiredPipelineStatuses(appRootPath: string): Promise<void> {
-  const directory = getPipelineStatusDirectory(appRootPath);
-  const now = Date.now();
-
-  try {
-    const entries = await fs.readdir(directory, { withFileTypes: true });
-
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) {
-        continue;
-      }
-
-      const filePath = path.join(directory, entry.name);
-      const stat = await fs.stat(filePath);
-
-      if (now - stat.mtimeMs > PIPELINE_STATUS_RETENTION_MS) {
-        await fs.unlink(filePath);
-      }
-    }
-  } catch {
-    // ignore cleanup errors in bootstrap path
-  }
 }
 
 function buildGraphInvalidationPlan(

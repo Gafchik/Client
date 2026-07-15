@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@client/shared": "0.1.0",
+    "ioredis": "^5.11.1",
     "pg": "^8.22.0"
   },
   "devDependencies": {

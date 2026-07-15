@@ -121,6 +121,75 @@ export async function loadGraphSnapshot(projectId: string): Promise<GraphState |
   }
 }
 
+// Live evidence (2026-07-15): a raw grep for "relation" pulled in Eloquent's
+// own vocabulary (withRelations/relationLoaded) plus an unrelated
+// causal_relationship feature - too generic to discriminate. But the FULL
+// persisted graph (from background-sync, not the narrow per-question graph)
+// has precise, noise-free symbol names for the same task - a real match
+// (e.g. "UnlinkRelatedCasesAction") never collides with framework plumbing
+// the way free-text search does. Can't derive a file path from a label
+// generically (namespace->path conventions are project-specific, e.g. this
+// codebase's "Src\Containers\X" - would be exactly the hardcoding the user
+// has repeatedly ruled out) - so this returns trailing SYMBOL NAMES to use as
+// additional grep terms, letting the model's own tools resolve them to real
+// files instead of guessing a path convention.
+export async function findGraphSymbolHints(projectId: string, terms: string[], maxResults = 8): Promise<string[]> {
+  if (terms.length === 0) {
+    return [];
+  }
+
+  const session = openSession();
+
+  try {
+    const result = await session.run(
+      `
+        match (n:GraphNode { projectId: $projectId })
+        where any(term in $terms where toLower(n.label) contains term)
+        return distinct n.label as label
+        limit 200
+      `,
+      { projectId, terms: terms.map((term) => term.toLowerCase()) },
+    );
+
+    const seen = new Set<string>();
+    const symbols: string[] = [];
+
+    for (const record of result.records) {
+      const label = String(record.get("label") ?? "");
+      // Generic trailing-identifier extraction - namespace/path separators
+      // vary by language (\ in PHP, :: in C++/Rust, . in JS/Python, @ for a
+      // class@method reference) but "take what's after the last one" holds
+      // across all of them without assuming any specific convention.
+      const segments = label.split(/[\\/.@]|::/).filter(Boolean);
+      const symbol = segments[segments.length - 1];
+
+      if (!symbol || symbol.length < 3) {
+        continue;
+      }
+
+      const key = symbol.toLowerCase();
+
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      symbols.push(symbol);
+
+      if (symbols.length >= maxResults) {
+        break;
+      }
+    }
+
+    return symbols;
+  } catch (error) {
+    console.warn("[graph-store] findGraphSymbolHints failed, degrading to no hints:", error);
+    return [];
+  } finally {
+    await session.close();
+  }
+}
+
 export async function deleteGraphSnapshot(projectId: string): Promise<void> {
   const session = openSession();
 

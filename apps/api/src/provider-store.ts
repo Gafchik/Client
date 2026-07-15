@@ -240,8 +240,8 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
     }
 
     const payload = (await response.json()) as {
-      data?: Array<{ id?: string; name?: string }>;
-      models?: Array<{ id?: string; name?: string }>;
+      data?: Array<{ id?: string; name?: string; token_multiplier?: number }>;
+      models?: Array<{ id?: string; name?: string; token_multiplier?: number }>;
     };
     const sourceList = payload.data ?? payload.models ?? [];
     const models: ProviderModelRecord[] = [];
@@ -258,6 +258,7 @@ export async function fetchProviderModels(providerId?: string): Promise<Provider
         label: typeof item.name === "string" && item.name.trim() ? item.name : id,
         providerId: provider.id,
         ...(id === recommendedModelId ? { isDefault: true } : {}),
+        ...(typeof item.token_multiplier === "number" ? { tokenMultiplier: item.token_multiplier } : {}),
       });
     }
 

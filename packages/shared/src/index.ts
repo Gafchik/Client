@@ -901,6 +901,8 @@ export interface ProviderModelRecord {
   label: string;
   providerId: string;
   isDefault?: boolean;
+  /** Cost multiplier relative to the provider's base rate (e.g. 0.7 = cheaper, 1.5 = pricier), as reported by the upstream /models endpoint. */
+  tokenMultiplier?: number;
 }
 
 export interface ProviderCatalogResponse {

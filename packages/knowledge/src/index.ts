@@ -1,6 +1,20 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import { runSql } from "./postgres-client.js";
+import { getRedisClient } from "./redis-client.js";
+
+// Read-through cache over knowledge_artifacts (2026-07-15, user's explicit
+// request): Postgres stays the durable source of truth - Redis here has no
+// persistence enabled (docker-compose.yml, deliberately, to keep it a safe
+// disposable cache) so losing it costs nothing but a cache-repopulate, never
+// history. Note this honestly does not move the needle on perceived speed -
+// a single indexed Postgres row read is already low-single-digit
+// milliseconds; the real time in a question-run is LLM calls (60-200s+).
+// This exists for the "reads should come from RAM, not disk" principle, not
+// because DB reads were ever the bottleneck.
+const KNOWLEDGE_ARTIFACT_CACHE_TTL_SECONDS = 60 * 60 * 6;
+
+function knowledgeArtifactCacheKey(runId: string): string {
+  return `knowledge-artifact:${runId}`;
+}
 
 export { promoteFactsFromResearch, queryRelevantFacts } from "./facts.js";
 export {
@@ -111,17 +125,12 @@ interface PersistedPipelineRunArtifact {
 }
 
 export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise<KnowledgeSaveResult> {
-  const stateDirectory = getKnowledgeProjectDirectory(input.appRootPath, input.workspace.rootPath);
-  const runsDirectory = path.join(stateDirectory, "runs");
-  const storagePath = path.join(runsDirectory, `${input.runId}.json`);
   const savedAt = new Date().toISOString();
-
-  await fs.mkdir(runsDirectory, { recursive: true });
 
   const knowledge: KnowledgeSaveResult = {
     runId: input.runId,
     savedAt,
-    storagePath,
+    storagePath: "postgres:knowledge_artifacts",
     catalogPath: "postgres:knowledge_catalog",
     artifactCount: 5,
   };
@@ -199,19 +208,42 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       : {}),
     answer: input.answer,
     knowledge,
-    runtimeCache: {
-      index: input.index,
-      graph: input.graph,
-    },
+    // Live evidence (2026-07-15): runtimeCache (the full project index+graph)
+    // had bloated individual question-run artifacts to 128-150MB each -
+    // confirmed by reading loadBestBaselineRunArtifact just above: it only
+    // ever selects among mode === "background-sync" entries, so a
+    // question-run's own runtimeCache is never read back by anything. Only
+    // background-sync (the run whose whole purpose is refreshing the
+    // reusable baseline) needs to carry it.
+    ...(input.mode === "background-sync"
+      ? {
+          runtimeCache: {
+            index: input.index,
+            graph: input.graph,
+          },
+        }
+      : {}),
     ...(input.usage ? { usage: input.usage } : {}),
   };
-
-  await fs.writeFile(storagePath, JSON.stringify(artifact, null, 2));
 
   // upsert по run_id — атомарный, никакого read-modify-write и гонок между
   // параллельными run'ами (см. историю в git blame: раньше catalog.json
   // обновлялся через read-modify-write целого файла, и параллельный
   // background-sync мог затереть свежесохранённый вопрос пользователя).
+  // Тот же upsert-приём теперь и для тела артефакта (knowledge_artifacts) -
+  // было файлом на диске, требование пользователя (2026-07-15): ничего в
+  // файлах, всё в Postgres.
+  await runSql(
+    `
+      insert into knowledge_artifacts (run_id, body, saved_at)
+      values ($1, $2::jsonb, $3)
+      on conflict (run_id) do update set
+        body = $2::jsonb,
+        saved_at = $3
+    `,
+    [input.runId, JSON.stringify(artifact), savedAt],
+  );
+
   await runSql(
     `
       insert into knowledge_catalog
@@ -240,7 +272,7 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       input.workspace.rootPath,
       input.task,
       savedAt,
-      storagePath,
+      knowledge.storagePath,
       input.research.summary,
       input.mode,
       input.repository.repositoryId ?? null,
@@ -368,50 +400,75 @@ export async function loadLatestConversationTurn(
  * очищается от "битой" ссылки.
  */
 export async function deleteKnowledgeRuns(
-  appRootPath: string,
+  _appRootPath: string,
   projectRootPath: string,
   runIds: string[],
 ): Promise<{ deleted: string[]; notFound: string[] }> {
-  const idsToDelete = new Set(runIds);
-  const projectDirectory = getKnowledgeProjectDirectory(appRootPath, projectRootPath);
-  const runsDirectory = path.join(projectDirectory, "runs");
+  const idsToDelete = [...new Set(runIds)];
 
-  const deleted: string[] = [];
-  const notFound: string[] = [];
+  const existingRows = await runSql<{ run_id: string }>(
+    `select run_id from knowledge_artifacts where run_id = any($1::text[])`,
+    [idsToDelete],
+  );
+  const existingIds = new Set(existingRows.map((row) => row.run_id));
+  const deleted = idsToDelete.filter((runId) => existingIds.has(runId));
+  const notFound = idsToDelete.filter((runId) => !existingIds.has(runId));
 
-  for (const runId of idsToDelete) {
-    const storagePath = path.join(runsDirectory, `${runId}.json`);
-
-    try {
-      await fs.unlink(storagePath);
-      deleted.push(runId);
-    } catch {
-      notFound.push(runId);
-    }
-  }
-
+  await runSql(`delete from knowledge_artifacts where run_id = any($1::text[])`, [idsToDelete]);
   await runSql(
     `delete from knowledge_catalog where project_root_path = $1 and run_id = any($2::text[])`,
-    [projectRootPath, [...idsToDelete]],
+    [projectRootPath, idsToDelete],
   );
+
+  if (idsToDelete.length > 0) {
+    try {
+      await getRedisClient().del(...idsToDelete.map(knowledgeArtifactCacheKey));
+    } catch (error) {
+      console.warn("[knowledge] redis cache invalidation failed (stale entries self-heal via TTL):", error);
+    }
+  }
 
   return { deleted, notFound };
 }
 
 export async function loadPipelineRunArtifact(
-  appRootPath: string,
-  projectRootPath: string,
+  _appRootPath: string,
+  _projectRootPath: string,
   runId: string,
 ): Promise<PipelineRunResult | null> {
-  const runsDirectory = path.join(getKnowledgeProjectDirectory(appRootPath, projectRootPath), "runs");
-  const storagePath = path.join(runsDirectory, `${runId}.json`);
+  const cacheKey = knowledgeArtifactCacheKey(runId);
 
   try {
-    const content = await fs.readFile(storagePath, "utf8");
-    return normalizePipelineRunArtifact(JSON.parse(content) as PersistedPipelineRunArtifact, runId, storagePath);
-  } catch {
+    const cached = await getRedisClient().get(cacheKey);
+
+    if (cached) {
+      return JSON.parse(cached) as PipelineRunResult;
+    }
+  } catch (error) {
+    console.warn("[knowledge] redis cache read failed, falling back to Postgres:", error);
+  }
+
+  const rows = await runSql<{ body: PersistedPipelineRunArtifact }>(
+    `select body from knowledge_artifacts where run_id = $1`,
+    [runId],
+  );
+  const row = rows[0];
+
+  if (!row) {
     return null;
   }
+
+  const result = normalizePipelineRunArtifact(row.body, runId, "postgres:knowledge_artifacts");
+
+  if (result) {
+    try {
+      await getRedisClient().set(cacheKey, JSON.stringify(result), "EX", KNOWLEDGE_ARTIFACT_CACHE_TTL_SECONDS);
+    } catch (error) {
+      console.warn("[knowledge] redis cache write failed (Postgres remains source of truth):", error);
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -615,11 +672,6 @@ export function buildBackgroundProjectState(input: {
   };
 }
 
-function getKnowledgeProjectDirectory(appRootPath: string, projectRootPath: string): string {
-  const projectKey = stableId(["knowledge-project", projectRootPath]);
-  return path.join(appRootPath, ".client", "knowledge", "projects", projectKey);
-}
-
 function normalizePipelineRunArtifact(
   artifact: PersistedPipelineRunArtifact,
   runId: string,
@@ -655,7 +707,7 @@ function normalizePipelineRunArtifact(
     runId: artifact.runId,
     savedAt: artifact.savedAt ?? new Date(0).toISOString(),
     storagePath,
-    catalogPath: path.join(path.dirname(path.dirname(storagePath)), "catalog.json"),
+    catalogPath: "postgres:knowledge_catalog",
     artifactCount: 8,
   };
 

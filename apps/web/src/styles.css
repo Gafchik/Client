@@ -670,6 +670,12 @@ button {
   color: var(--text-muted);
 }
 
+.model-multiplier-badge {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
 .team-role-cards {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
