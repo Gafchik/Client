@@ -852,6 +852,8 @@ export interface KnowledgeCatalogEntry {
   conversationId?: string;
   /** Порядковый номер реплики в диалоге, начиная с 0. */
   turnIndex?: number;
+  /** index.manifest.fileCount на момент сохранения — чтобы читатели метаданных (монитор, статус-эндпоинт) не грузили 100MB+ артефакт ради одной цифры. */
+  fileCount?: number;
 }
 
 export interface KnowledgeSaveResult {

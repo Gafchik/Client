@@ -1796,24 +1796,23 @@ function buildRefreshPlan(preview: ExecutionPreview, research: ResearchReport): 
   return refreshPlan;
 }
 
-function deriveBlockedWriteZones(targetFiles: string[]): string[] {
-  const blocked = new Set<string>([
-    "node_modules",
+// Generic never-write zones only (2026-07-16): раньше здесь были захардкожены
+// "apps/web"/"apps/api" — раскладка ЭТОГО монорепо, утёкшая в shared-пакет и
+// отображавшаяся как "заблокированные зоны" для чужих анализируемых проектов
+// (Laravel-проект без apps/ вообще). Реальный write-контроль — это whitelist
+// allowedWriteFiles; blockedWriteZones — универсальные табу любого проекта:
+// VCS, зависимости, артефакты сборки, runtime-данные.
+function deriveBlockedWriteZones(_targetFiles: string[]): string[] {
+  return [
     ".git",
-    ".client/knowledge",
+    "node_modules",
+    "vendor",
     "dist",
     "build",
-  ]);
-
-  if (!targetFiles.some((file) => file.startsWith("apps/web"))) {
-    blocked.add("apps/web");
-  }
-
-  if (!targetFiles.some((file) => file.startsWith("apps/api"))) {
-    blocked.add("apps/api");
-  }
-
-  return [...blocked];
+    "coverage",
+    "storage",
+    ".client",
+  ];
 }
 
 function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
@@ -1859,70 +1858,43 @@ function buildDeterministicAnswer(input: BuildAnswerInput): AnswerPackage {
   };
 }
 
-// Section header labels below ("## Краткий ответ" etc.) stay in Russian on
-// purpose - the model copies them verbatim into the final answer the
-// Russian-speaking user reads, so translating them would produce a
-// half-English, half-Russian answer. Only the surrounding instructions
-// (English per user's 2026-07-16 request: weaker models parse English
-// instructions more reliably) got translated.
+// Rewritten 2026-07-16 (direct user feedback: "ответы очень похожи на
+// шаблонные структурированые" - answers should read like chatting with a
+// senior fullstack dev, not like a generated report). The old prompt forced
+// the same 4-5 fixed Russian section headers onto EVERY answer ("Краткий
+// ответ" then "Как это работает" then "Где искать код"...), which made a
+// two-line answer to "where is X configured" look like a form being filled
+// in. Now: free-form chat prose, file paths woven into the text, structure
+// only where the specific question genuinely calls for it. The answer itself
+// stays in Russian; the instructions are English per the standing
+// prompts-in-English rule.
 function buildAnswerSystemPrompt(contract: QuestionContract): string {
-  const sections: string[] = ["## Краткий ответ\n1-2 sentences addressing the core of the question. No introductions."];
-
-  if (contract.expectedAnswerShape !== "yes-no") {
-    sections.push(
-      "## Как это работает\nThe actual mechanism, no restating the obvious. 2-4 sentences max.",
-    );
-  }
-
-  sections.push(
-    "## Где искать код\nOnly specific files/classes/methods from the evidence, a bullet list, no per-item explanations.",
-  );
-
-  if (contract.requiresImpact) {
-    sections.push(
-      "## Риски и что затронет\nOnly if genuinely confirmed by claims/impact analysis. 2-3 bullets max.",
-    );
-  }
-
-  if (contract.requiresPlan) {
-    sections.push(
-      "## Рекомендуемый план действий\nSteps in execution order, only confirmed plan claims. No more than 6 steps.",
-    );
-  }
-
-  const sectionNames = sections.map((section) => section.split("\n")[0]).join(", ");
-  const wordBudget = contract.requiresImpact || contract.requiresPlan ? "220" : "130";
+  const lengthHint = contract.requiresImpact || contract.requiresPlan
+    ? "A question about changes/impact deserves a fuller reply - but still no more than ~200 words."
+    : "A simple lookup question ('where is X', 'is there Y') deserves 2-5 sentences TOTAL. Longer only if the mechanism genuinely needs it.";
 
   return [
-    "You are a senior software engineer who knows this project's codebase and is helping colleagues in chat.",
+    "You are a senior fullstack engineer with 20 years of experience who knows this project's codebase well, replying to a colleague in the team chat.",
     "",
-    "Your task is to give a clear answer to the user's question, relying exclusively on the validated claims and supporting materials given to you.",
+    "Facts discipline (non-negotiable):",
+    "- Use exclusively the validated claims and materials given to you. Do not invent anything beyond them.",
+    "- If the data is insufficient, say so honestly in one ordinary sentence ('тут не уверен, надо смотреть X') - do not pad.",
+    "- Never mention internal system words: Research, Impact, Context, Plan, baseline, overlay, validation, artifacts, confidence, synthesis, fallback. The colleague doesn't know or care about the machinery.",
     "",
-    "Content rules:",
-    "- Do not invent facts that are not in the artifacts.",
-    "- If the data is insufficient, say so honestly in one sentence, do not pad it out.",
-    "- Do not mention internal artifact names (Research, Impact, Context, Plan) in the answer.",
-    "- Do not restate the artifacts verbatim - synthesize the answer in your own words.",
-    "- Write in Russian, in the style of an experienced engineer replying to a colleague in chat, not writing a report.",
-    "- Start directly with the substance. Do not use bureaucratic phrasing like 'it is confirmed that', 'it can be observed that', 'one can conclude that'. Prefer: 'yes, here it's done like this' or 'no, no such mechanism is visible'.",
-    "- If the question is yes/no, the first sentence must start directly with 'Да', 'Нет', or 'Похоже, что да/нет', not with a description of the surrounding process.",
-    "- If the question is about a location, name the main place in the code in the first sentence, not a general overview of the module.",
-    "- Do not write to the human about confidence, readiness, validation, baseline, artifacts, synthesis, fallback, or other internal system words.",
-    "- Never start the answer with, or build it around, boilerplate phrases about data provenance ('the answer relies on the committed baseline', 'by fact provenance', 'baseline source exact-head', 'evidence-locked mode', and similar) - that's internal system mechanics, not what the human cares about. If uncertainty needs mentioning, say it in one ordinary sentence ('not fully sure, but it looks like...'), not in system terminology.",
-    "- Write like a human, not like a system describing itself: not 'the system limits the output', just get to the point.",
-    "",
-    "Length and format rules (critical - answers regularly come out too long and unstructured):",
-    `- Write ONLY the sections listed below: ${sectionNames}. Do not create any other sections, even if it seems like something should be added "for completeness".`,
-    "- If a section does not apply or there is no data for it - do not write the heading or a placeholder like 'insufficient data'. Just skip the whole section.",
-    `- Total answer length - no more than ${wordBudget} words across all sections combined. This is a hard limit, not a guideline.`,
-    "- No filler: no introductions, no 'thus', no repeating the question, no conclusions or summaries at the end.",
-    "- Each list item - at most one line. Do not explain each file in a separate paragraph.",
-    "- Headings strictly in Markdown format `## Title`, every list as lines starting with `- `.",
-    "",
-    "Answer structure (use exactly these sections, in this order, nothing extra):",
-    "",
-    sections.join("\n\n"),
-  ].join("\n");
+    "Style - this is a chat message, not a report:",
+    "- Write in Russian, the way a live experienced engineer types a reply: connected prose, first person allowed, natural transitions.",
+    "- NO fixed template. Do NOT use ritual section headers like 'Краткий ответ', 'Как это работает', 'Где искать код', 'Итог'. The structure must follow this specific question, not a form.",
+    "- The FIRST sentence answers the question directly: for yes/no questions start with 'Да'/'Нет'/'Похоже, да'; for 'where' questions name the file/place immediately.",
+    "- Weave specific files/classes/methods in backticks INTO the sentences where they matter ('линковка живёт в `LinkCaseDataAction`, оттуда дергается `SyncRelatedCasesTask`'), instead of dumping a bare file list at the end. A short bullet list is fine only when enumerating several genuinely parallel things (several routes, several configs with different roles).",
+    "- Markdown '##' headers only if the answer really covers several distinct topics - most answers should have none at all.",
+    `- Length matches the question. ${lengthHint}`,
+    "- No introductions, no repeating the question back, no 'итог:'/'вывод:' recap at the end, no bureaucratic phrasing ('можно сделать вывод', 'подтверждается, что').",
+    contract.requiresPlan
+      ? "- The user is asking about making a change: end with a short numbered plan (up to 6 steps, execution order, only confirmed steps) - this is the one case where a list at the end is expected."
+      : "",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
 }
 
 async function synthesizeAnswerWithProvider(
@@ -1996,9 +1968,9 @@ function parseProviderAnswer(
   nextActions: string[];
   warnings: string[];
 } {
-  const sections = parseMarkdownSections(content);
+  const trimmed = content.trim();
 
-  if (sections.size === 0) {
+  if (!trimmed) {
     return {
       summary: fallback.summary,
       explanation: fallback.explanation,
@@ -2007,12 +1979,27 @@ function parseProviderAnswer(
     };
   }
 
-  const shortAnswer = extractSectionText(sections, "Краткий ответ");
+  // Free-form chat answers (2026-07-16): the prompt no longer demands a
+  // "## Краткий ответ" section - a proper conversational reply usually has
+  // NO markdown headers at all, and the old `sections.size === 0 → discard
+  // the whole answer as malformed` gate would have silently replaced every
+  // such answer with the deterministic template. summary = the first
+  // substantive line (the prompt requires the first sentence to BE the
+  // direct answer); the legacy section names are still read as a fallback
+  // for models that keep producing the old structure.
+  const sections = parseMarkdownSections(trimmed);
+  const legacyShortAnswer = extractSectionText(sections, "Краткий ответ");
+  const firstSubstantiveLine = trimmed
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0 && !line.startsWith("#"))
+    ?.replace(/^[-*]\s+/, "")
+    ?? "";
   const planSteps = extractSectionBullets(sections, "Рекомендуемый план действий");
 
   return {
-    summary: shortAnswer || fallback.summary,
-    explanation: content.trim() || fallback.explanation,
+    summary: legacyShortAnswer || firstSubstantiveLine.slice(0, 240) || fallback.summary,
+    explanation: trimmed,
     nextActions: planSteps.length > 0 ? planSteps : fallback.nextActions,
     warnings: fallback.warnings,
   };
@@ -2755,7 +2742,7 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
     "",
     "=== INSTRUCTION ===",
     `Answer mode: ${fallback.answerMode}`,
-    "Produce the answer in Russian, strictly following the structure from the system prompt.",
+    "Produce the answer in Russian, following the style rules from the system prompt (live chat reply, no ritual section headers).",
     "Use only claims and facts directly confirmed in the sections above.",
     "If a fact comes only from overlay findings - explicitly mark it: \"this was found in uncommitted changes\".",
     "Do not add typical guesses about Laravel, middleware order, session, cookie, query params, kernel registration - unless confirmed above.",
@@ -2825,7 +2812,13 @@ function validateProviderAnswer(
     && !directClaimFilePaths.some((filePath) => {
       const lowerPath = filePath.toLowerCase();
       const basename = lowerPath.split("/").pop() ?? lowerPath;
-      return combined.includes(lowerPath) || combined.includes(basename);
+      // Имя класса без расширения (2026-07-16): разговорный стиль ответа
+      // (по прямому запросу пользователя) пишет `LinkCaseDataAction`, а не
+      // `LinkCaseDataAction.php` - строгая проверка на basename с
+      // расширением отбрасывала корректные, заякоренные на реальные файлы
+      // ответы и подменяла их деterministic-шаблоном (живой репродукт).
+      const stem = basename.replace(/\.[a-z0-9]+$/i, "");
+      return combined.includes(lowerPath) || combined.includes(basename) || (stem.length >= 4 && combined.includes(stem));
     });
 
   if (hallucinationSignals.length > 0 || directClaimMissing) {

@@ -7,7 +7,7 @@ import {
   getOutgoingNeighbors,
   getStructuralNeighbors,
 } from "@client/graph";
-import { clamp, deriveStructuralModuleLabel, isConfigPath, isLocalizationPath, type GraphState, type ImpactReport, type ResearchReport } from "@client/shared";
+import { clamp, deriveStructuralModuleLabel, isConfigPath, isLocalizationPath, normalizePath, type GraphState, type ImpactReport, type ResearchReport } from "@client/shared";
 
 interface ImpactInput {
   runId: string;
@@ -16,13 +16,37 @@ interface ImpactInput {
 }
 
 export function analyzeImpact(input: ImpactInput): ImpactReport {
-  const evidenceIds = input.research.evidence.map((item) => item.id);
+  const nodeById = new Map(input.graph.nodes.map((node) => [node.id, node]));
+  // Evidence-to-graph seam fix (2026-07-16): historically evidence.id was
+  // assumed to BE a graph node id - true for the deterministic researcher
+  // (its evidence items are born from graph nodes), never true for the
+  // agentic researcher (stableId(["agentic-evidence", ...])), which made
+  // impact silently start from nothing in team mode ("0 затронутых файлов"
+  // on every team-mode run). Two-part fix: (1) drop evidence ids that don't
+  // resolve to a real node BEFORE they occupy the startingPoints cap;
+  // (2) resolve evidence to graph file-nodes by filePath as well - the
+  // mode-independent link every researcher provides.
+  const liveEvidenceNodeIds = input.research.evidence
+    .map((item) => item.id)
+    .filter((id) => nodeById.has(id));
+  const fileNodeIdByPath = new Map(
+    input.graph.nodes
+      .filter((node) => node.kind === "file" && node.filePath)
+      .map((node) => [normalizePath(node.filePath as string), node.id]),
+  );
+  const evidenceFileNodeIds = input.research.evidence
+    .map((item) => (item.filePath ? fileNodeIdByPath.get(normalizePath(item.filePath)) : undefined))
+    .filter((id): id is string => Boolean(id));
   const profileSeedNodes = getNodesForQueryProfile(
     input.graph,
     input.research.queryProfileKey,
     input.research.dominantModule !== "не определён" ? { moduleLabel: input.research.dominantModule } : undefined,
   );
-  const startingPoints = uniqueStrings([...evidenceIds.slice(0, 6), ...profileSeedNodes.slice(0, 8).map((node) => node.id)]).slice(0, 10);
+  const startingPoints = uniqueStrings([
+    ...liveEvidenceNodeIds.slice(0, 6),
+    ...evidenceFileNodeIds.slice(0, 8),
+    ...profileSeedNodes.slice(0, 8).map((node) => node.id),
+  ]).slice(0, 10);
   const affectedFiles = new Set<string>();
   const affectedSymbols = new Set<string>();
   const affectedModules = new Set<string>();
@@ -30,7 +54,7 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
     input.research.queryProfileKey === "storage-topology" || isInfrastructureQuestion(input.research.task);
 
   for (const nodeId of startingPoints) {
-    const node = input.graph.nodes.find((candidate) => candidate.id === nodeId);
+    const node = nodeById.get(nodeId);
 
     if (!node) {
       continue;
@@ -83,10 +107,10 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
 
   for (const moduleLabel of input.research.affectedModules) {
     for (const relation of getModuleRelations(input.graph, moduleLabel)) {
-      const targetNode = input.graph.nodes.find((node) => node.id === relation.sourceId || node.id === relation.targetId);
-
-      if (targetNode?.kind === "module") {
-        affectedModules.add(targetNode.label);
+      for (const candidate of [nodeById.get(relation.sourceId), nodeById.get(relation.targetId)]) {
+        if (candidate?.kind === "module") {
+          affectedModules.add(candidate.label);
+        }
       }
     }
   }

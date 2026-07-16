@@ -872,7 +872,34 @@ function UserTaskMessage({ task, projectName, projectPath }: { task: string; pro
  * обычного AI-чата. Детальный прогресс по стадиям остаётся доступен через
  * Inspector ("Подробнее"), здесь только текущий шаг.
  */
-function ThinkingIndicator({ currentStageLabel }: { currentStageLabel?: string }) {
+function formatRunDuration(totalSeconds: number): string {
+  if (totalSeconds < 60) {
+    return `${totalSeconds} с`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds > 0 ? `${minutes} мин ${seconds} с` : `${minutes} мин`;
+}
+
+function ThinkingIndicator({ currentStageLabel, startedAt }: { currentStageLabel?: string; startedAt?: string }) {
+  // Живой счётчик времени (2026-07-16): пользователю важно видеть, сколько
+  // уже идёт ответ (обычный диапазон 40с-3мин в зависимости от сложности),
+  // иначе долгий research неотличим от зависшего запроса.
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  useEffect(() => {
+    if (!startedAt) {
+      return;
+    }
+
+    const startedMs = new Date(startedAt).getTime();
+    const tick = () => setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedMs) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+
   return (
     <div className="thinking-indicator">
       <span className="thinking-dots">
@@ -881,6 +908,7 @@ function ThinkingIndicator({ currentStageLabel }: { currentStageLabel?: string }
         <span />
       </span>
       <span className="thinking-label">{safeText(currentStageLabel, "Изучаю проект")}</span>
+      {startedAt ? <span className="thinking-elapsed">{formatRunDuration(elapsedSeconds)}</span> : null}
     </div>
   );
 }
@@ -959,7 +987,10 @@ function AssistantRunMessage({
       <div className="message-card">
         {running ? (
           <>
-            <ThinkingIndicator {...(runStatus?.currentStageLabel ? { currentStageLabel: runStatus.currentStageLabel } : {})} />
+            <ThinkingIndicator
+              {...(runStatus?.currentStageLabel ? { currentStageLabel: runStatus.currentStageLabel } : {})}
+              {...(runStatus?.createdAt ? { startedAt: runStatus.createdAt } : {})}
+            />
             <div className="action-row">
               <button type="button" className="ghost-button" onClick={() => onOpenInspector("overview")}>
                 Подробнее
@@ -1002,8 +1033,15 @@ function AssistantRunMessage({
 
         {completed && !needsClarification ? (
           <>
-            <p className="message-label">Ответ подготовлен · {safeText(result.project.name, "Проект неизвестен")}</p>
-            <h3>{renderInlineMarkdown(safeText(result.answer?.summary, result.research.summary))}</h3>
+            <p className="message-label">
+              Ответ подготовлен · {safeText(result.project.name, "Проект неизвестен")}
+              {runStatus && runStatus.runId === result.runId && runStatus.status === "completed"
+                ? ` · за ${formatRunDuration(Math.max(1, Math.round((new Date(runStatus.updatedAt).getTime() - new Date(runStatus.createdAt).getTime()) / 1000)))}`
+                : ""}
+            </p>
+            {/* h3-сводка убрана (2026-07-16): первая фраза ответа и есть прямой
+                ответ (так требует промпт синтеза), а жирный дубль сверху делал
+                сообщение похожим на сгенерированный отчёт, а не живой чат. */}
             <AnswerMarkdown
               text={safeText(
                 result.answer?.explanation,
@@ -3430,7 +3468,7 @@ export function App() {
               <div className="section-head">
                 <div>
                   <p className="section-kicker">Провайдеры</p>
-                  <h2>CRUD провайдеров</h2>
+                  <h2>Создание и настройка</h2>
                 </div>
                 <button type="button" className="ghost-button" onClick={() => setProviderDraft({ id: "", name: "", baseUrl: "", apiKey: "" })}>
                   Новый
@@ -3506,7 +3544,7 @@ export function App() {
               <div className="section-head">
                 <div>
                   <p className="section-kicker">Команды</p>
-                  <h2>CRUD команд</h2>
+                  <h2>Создание и настройка</h2>
                 </div>
                 <button
                   type="button"
@@ -3530,6 +3568,12 @@ export function App() {
                     onChange={(event) => setTeamDraft((current) => ({ ...current, researcherModel: event.target.value }))}
                   >
                     <option value="">Модель не выбрана</option>
+                    {/* Модель вне каталога (например ":flex"-вариант) — без этой
+                        опции select показывал "Модель не выбрана", и сохранение
+                        формы МОЛЧА затирало реальную модель команды пустой строкой. */}
+                    {teamDraft.researcherModel && !safeList(providerModels).some((model) => model.id === teamDraft.researcherModel) ? (
+                      <option value={teamDraft.researcherModel}>{teamDraft.researcherModel} (вне каталога)</option>
+                    ) : null}
                     {groupModelsByVendor(safeList(providerModels)).map((group) => (
                       <optgroup key={group.vendor} label={group.vendor}>
                         {group.models.map((model) => (
@@ -3549,6 +3593,9 @@ export function App() {
                     onChange={(event) => setTeamDraft((current) => ({ ...current, criticModel: event.target.value }))}
                   >
                     <option value="">Модель не выбрана</option>
+                    {teamDraft.criticModel && !safeList(providerModels).some((model) => model.id === teamDraft.criticModel) ? (
+                      <option value={teamDraft.criticModel}>{teamDraft.criticModel} (вне каталога)</option>
+                    ) : null}
                     {groupModelsByVendor(safeList(providerModels)).map((group) => (
                       <optgroup key={group.vendor} label={group.vendor}>
                         {group.models.map((model) => (
@@ -3568,6 +3615,9 @@ export function App() {
                     onChange={(event) => setTeamDraft((current) => ({ ...current, observerModel: event.target.value }))}
                   >
                     <option value="">Модель не выбрана</option>
+                    {teamDraft.observerModel && !safeList(providerModels).some((model) => model.id === teamDraft.observerModel) ? (
+                      <option value={teamDraft.observerModel}>{teamDraft.observerModel} (вне каталога)</option>
+                    ) : null}
                     {groupModelsByVendor(safeList(providerModels)).map((group) => (
                       <optgroup key={group.vendor} label={group.vendor}>
                         {group.models.map((model) => (

@@ -2,28 +2,83 @@ import { stableId, type ModuleIntentMatch, type ResearchReport, type ValidationR
 import path from "node:path";
 import type { AgenticRunResult } from "./loop.js";
 
-const ROOT_SEGMENTS_TO_SKIP = new Set(["app", "src", "apps", "packages", "lib", "source"]);
+// Generic LAYOUT folder names (framework conventions, not feature names):
+// "app/src" roots plus common grouping folders like Apiato's "Containers"
+// or DDD-style "Modules"/"Domains". Skipping these is framework-generic,
+// not project-specific - the point is that a folder shared by EVERY feature
+// in a codebase can never be the answer to "which module is this about".
+const ROOT_SEGMENTS_TO_SKIP = new Set([
+  "app", "src", "apps", "packages", "lib", "source",
+  "containers", "modules", "domains", "features", "components",
+]);
 
 // Heuristic module label from files actually touched during exploration -
 // not a hardcoded domain-profile lookup (deliberately: that's the exact
-// pattern this whole feature exists to escape). Picks the most common
-// meaningful path segment across touched files.
+// pattern this whole feature exists to escape).
+//
+// Rewritten 2026-07-16 (live bug): the old "most common non-skipped segment"
+// picked "Containers" on an Apiato project (app/src/Containers/CaseData/...),
+// because a layout folder shared by ALL files always out-counts the actual
+// feature folder. Downstream this poisoned focus zones in packages/context:
+// the zone "Containers" matched every file in the project, its per-zone cap
+// filled up with generic functional chips, and the researcher's actual
+// evidence files got evicted from the context package. Now: take the deepest
+// directory prefix shared by the majority (>=60%) of touched files, then the
+// deepest segment of that prefix that isn't a generic layout name.
 function deriveDominantModule(touchedFiles: string[]): string {
-  const counts = new Map<string, number>();
+  if (touchedFiles.length === 0) {
+    return "не определён";
+  }
+
+  const prefixCounts = new Map<string, number>();
 
   for (const filePath of touchedFiles) {
-    const segments = filePath.split("/").filter(Boolean);
-    const candidate = segments.find((segment) => !ROOT_SEGMENTS_TO_SKIP.has(segment.toLowerCase()));
+    const segments = filePath.split("/").filter(Boolean).slice(0, -1);
 
-    if (candidate) {
-      counts.set(candidate, (counts.get(candidate) ?? 0) + 1);
+    for (let depth = 1; depth <= segments.length; depth += 1) {
+      const prefix = segments.slice(0, depth).join("/");
+      prefixCounts.set(prefix, (prefixCounts.get(prefix) ?? 0) + 1);
+    }
+  }
+
+  const majorityThreshold = Math.ceil(touchedFiles.length * 0.6);
+  let bestPrefix = "";
+
+  for (const [prefix, count] of prefixCounts) {
+    if (count >= majorityThreshold && prefix.split("/").length > bestPrefix.split("/").filter(Boolean).length) {
+      bestPrefix = prefix;
+    }
+  }
+
+  const prefixSegments = bestPrefix.split("/").filter(Boolean);
+
+  for (let i = prefixSegments.length - 1; i >= 0; i -= 1) {
+    const segment = prefixSegments[i] as string;
+
+    if (!ROOT_SEGMENTS_TO_SKIP.has(segment.toLowerCase())) {
+      return segment;
+    }
+  }
+
+  // Majority prefix is all layout folders (touched files span several
+  // features) - fall back to the most common non-layout segment anywhere in
+  // the paths, the old behavior's spirit without its layout-folder blind spot.
+  const segmentCounts = new Map<string, number>();
+
+  for (const filePath of touchedFiles) {
+    const meaningful = new Set(
+      filePath.split("/").filter(Boolean).slice(0, -1).filter((segment) => !ROOT_SEGMENTS_TO_SKIP.has(segment.toLowerCase())),
+    );
+
+    for (const segment of meaningful) {
+      segmentCounts.set(segment, (segmentCounts.get(segment) ?? 0) + 1);
     }
   }
 
   let bestLabel = "";
   let bestCount = 0;
 
-  for (const [label, count] of counts) {
+  for (const [label, count] of segmentCounts) {
     if (count > bestCount) {
       bestLabel = label;
       bestCount = count;

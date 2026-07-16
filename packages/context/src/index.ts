@@ -346,7 +346,24 @@ function getCandidateRejectionReason(
   const candidateZone = deriveCandidateZone(candidate, focusZones);
 
   if (candidateZone) {
-    const zoneCount = selectedChunks.filter((item) => deriveCandidateZone(item, focusZones) === candidateZone).length;
+    // Прямые структурные опоры (evidence/references — файлы, которые
+    // исследование РЕАЛЬНО подтвердило, а не предположило) зонному кэпу не
+    // подчиняются: кэп существует ради разнообразия среди догадок, а не для
+    // выталкивания подтверждённых файлов; бюджет токенов ниже всё равно
+    // ограничивает общий размер. Живой баг (2026-07-16, team-mode): все
+    // evidence-файлы agentic-исследователя лежали в одной фокус-зоне
+    // (dominantModule), и кэп выкидывал их из контекста целиком.
+    if (isDirectStructuralAnchor(candidate, input)) {
+      return null;
+    }
+
+    // Только структурные фрагменты считаются занимающими зону: functional
+    // 20-токенные ярлыки ("Точка входа: ...", "Ключевая сущность: ...")
+    // сами содержат имя зоны в тексте и до этого фикса съедали весь зонный
+    // лимит раньше, чем очередь доходила до первого реального файла.
+    const zoneCount = selectedChunks.filter(
+      (item) => item.type !== "functional" && deriveCandidateZone(item, focusZones) === candidateZone,
+    ).length;
 
     if (zoneCount >= MAX_CANDIDATES_PER_ZONE) {
       return `Для зоны ${candidateZone} уже набрано достаточно сильных фрагментов.`;

@@ -255,8 +255,8 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
   await runSql(
     `
       insert into knowledge_catalog
-        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index, prompt_tokens, completion_tokens, total_tokens, provider_call_count)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index, prompt_tokens, completion_tokens, total_tokens, provider_call_count, file_count)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       on conflict (run_id) do update set
         project_root_path = $2,
         task = $3,
@@ -273,7 +273,8 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
         prompt_tokens = $14,
         completion_tokens = $15,
         total_tokens = $16,
-        provider_call_count = $17
+        provider_call_count = $17,
+        file_count = $18
     `,
     [
       input.runId,
@@ -293,6 +294,7 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
       input.usage?.completionTokens ?? 0,
       input.usage?.totalTokens ?? 0,
       input.usage?.callCount ?? 0,
+      input.index.manifest.fileCount,
     ],
   );
 
@@ -312,6 +314,7 @@ interface KnowledgeCatalogRow {
   head_fingerprint: string | null;
   conversation_id: string | null;
   turn_index: number | null;
+  file_count: number | null;
 }
 
 function mapKnowledgeCatalogRow(row: KnowledgeCatalogRow): KnowledgeCatalogEntry {
@@ -332,6 +335,7 @@ function mapKnowledgeCatalogRow(row: KnowledgeCatalogRow): KnowledgeCatalogEntry
     // делает для полного артефакта).
     conversationId: row.conversation_id ?? row.run_id,
     turnIndex: row.turn_index ?? 0,
+    ...(row.file_count ? { fileCount: row.file_count } : {}),
   };
 }
 
@@ -535,19 +539,29 @@ export async function loadAllPipelineRunArtifacts(
   return results.filter((item): item is PipelineRunResult => Boolean(item));
 }
 
-export async function loadBestBaselineRunArtifact(
+/**
+ * Выбор лучшей baseline-записи ПО КАТАЛОГУ, без загрузки самого артефакта.
+ * Выделено из loadBestBaselineRunArtifact (2026-07-16): живой замер показал,
+ * что background-sync артефакт реального проекта — ~120MB сырого JSON
+ * (44MB сжатого в TOAST), а project-state-monitor и GET-статус проекта
+ * загружали и парсили его целиком каждые 15 секунд на каждый project path
+ * ради runId/headCommit/headFingerprint/fileCount — всё это уже есть в
+ * лёгких строках knowledge_catalog. Полный артефакт остался нужен только
+ * самому pipeline-runner'у (runtimeCache для reuse графа/индекса).
+ */
+export async function loadBestBaselineCatalogEntry(
   appRootPath: string,
   projectRootPath: string,
   repository: RepositorySnapshot,
 ): Promise<{
-  run: PipelineRunResult | null;
+  entry: KnowledgeCatalogEntry | null;
   source: BackgroundProjectState["baselineSource"];
 }> {
   const catalog = (await loadKnowledgeCatalog(appRootPath, projectRootPath))
     .filter((entry) => entry.mode === "background-sync");
 
   if (catalog.length === 0) {
-    return { run: null, source: "none" };
+    return { entry: null, source: "none" };
   }
 
   const exactHead = catalog.find((entry) =>
@@ -556,10 +570,7 @@ export async function loadBestBaselineRunArtifact(
   );
 
   if (exactHead) {
-    return {
-      run: await loadPipelineRunArtifact(appRootPath, projectRootPath, exactHead.runId),
-      source: "exact-head",
-    };
+    return { entry: exactHead, source: "exact-head" };
   }
 
   const mergeBase = catalog.find((entry) =>
@@ -568,10 +579,7 @@ export async function loadBestBaselineRunArtifact(
   );
 
   if (mergeBase) {
-    return {
-      run: await loadPipelineRunArtifact(appRootPath, projectRootPath, mergeBase.runId),
-      source: "merge-base",
-    };
+    return { entry: mergeBase, source: "merge-base" };
   }
 
   const recentBranch = catalog.find((entry) =>
@@ -580,21 +588,49 @@ export async function loadBestBaselineRunArtifact(
   );
 
   if (recentBranch) {
-    return {
-      run: await loadPipelineRunArtifact(appRootPath, projectRootPath, recentBranch.runId),
-      source: "recent-branch",
-    };
+    return { entry: recentBranch, source: "recent-branch" };
   }
 
-  const latestBackground = catalog[0] ?? null;
+  return { entry: catalog[0] ?? null, source: catalog[0] ? "recent-branch" : "none" };
+}
 
-  if (!latestBackground) {
+/** Метаданные baseline, достаточные для buildBackgroundProjectState — структурное подмножество PipelineRunResult (полный run подходит без преобразований). */
+export interface BaselineRunMetadata {
+  runId: string;
+  repository: { headCommit: string; headFingerprint: string };
+  index: { manifest: { reusedFileCount?: number; fileCount?: number } };
+}
+
+/** Каталожная запись → метаданные baseline (без загрузки артефакта). null, если запись без fingerprint'ов (артефакт до их появления). */
+export function catalogEntryToBaselineMetadata(entry: KnowledgeCatalogEntry | null): BaselineRunMetadata | null {
+  if (!entry?.headCommit || !entry.headFingerprint) {
+    return null;
+  }
+
+  return {
+    runId: entry.runId,
+    repository: { headCommit: entry.headCommit, headFingerprint: entry.headFingerprint },
+    index: { manifest: entry.fileCount ? { fileCount: entry.fileCount } : {} },
+  };
+}
+
+export async function loadBestBaselineRunArtifact(
+  appRootPath: string,
+  projectRootPath: string,
+  repository: RepositorySnapshot,
+): Promise<{
+  run: PipelineRunResult | null;
+  source: BackgroundProjectState["baselineSource"];
+}> {
+  const selection = await loadBestBaselineCatalogEntry(appRootPath, projectRootPath, repository);
+
+  if (!selection.entry) {
     return { run: null, source: "none" };
   }
 
   return {
-    run: await loadPipelineRunArtifact(appRootPath, projectRootPath, latestBackground.runId),
-    source: "recent-branch",
+    run: await loadPipelineRunArtifact(appRootPath, projectRootPath, selection.entry.runId),
+    source: selection.source,
   };
 }
 
@@ -603,7 +639,12 @@ export function buildBackgroundProjectState(input: {
   projectRootPath: string;
   repository: RepositorySnapshot;
   latestRunId?: string | null;
-  baselineRun: PipelineRunResult | null;
+  // BaselineRunMetadata, а не PipelineRunResult (2026-07-16): функция всегда
+  // читала из baseline только runId/headCommit/headFingerprint/manifest-счётчики.
+  // Полный PipelineRunResult подходит структурно — pipeline-runner передаёт
+  // его как раньше; монитор и статус-эндпоинт передают лёгкие метаданные
+  // из каталога (catalogEntryToBaselineMetadata) вместо 120MB артефакта.
+  baselineRun: BaselineRunMetadata | null;
   baselineSource: BackgroundProjectState["baselineSource"];
 }): BackgroundProjectState {
   const latestRunId = input.latestRunId ?? undefined;

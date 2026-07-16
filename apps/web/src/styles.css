@@ -615,6 +615,14 @@ button {
   color: var(--text-muted);
 }
 
+.thinking-elapsed {
+  margin-left: auto;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
 .execution-preview-card {
   margin-top: 10px;
   display: grid;

@@ -188,7 +188,7 @@ function buildSystemPrompt(hasSemanticSearch: boolean): string {
         "semantic_search finds files by MEANING, not literal text - use it when the business term from the question (e.g. \"relation cases\", \"profile access\") does not obviously match any file/directory name or grep hit, instead of guessing blindly.",
       ]
       : []),
-    "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not)",
+    "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic)",
     `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Write several ACTION lines in a row in one response (up to ${MAX_ACTIONS_PER_TURN} per turn), they execute in order and the results come back together in one batch. One ACTION per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: if you call it, call ONLY it, with no other ACTION in the same response (look at the results first, then answer).`,
     "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
     "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
@@ -201,7 +201,7 @@ function buildSystemPrompt(hasSemanticSearch: boolean): string {
 const CRITIC_SYSTEM_PROMPT = [
   "You are an independent critic-validator (a different model from the one that researched the code).",
   "You are given: an engineering question, a full transcript of another model's actions (which files it looked at and what it saw), and its proposed final answer.",
-  "Check strictly: (1) every claim in the answer must be directly confirmed by what is actually in the transcript - not invented, not guessed; (2) if the answer itself mentions that something 'needs checking' or 'was not checked', but the transcript shows this was NOT checked before the final answer - that is grounds for rejection; (3) if the answer confidently asserts something for which the transcript has insufficient grounds (e.g. only one file out of a chain), that is also grounds for rejection.",
+  "Check strictly: (1) every claim in the answer must be directly confirmed by what is actually in the transcript - not invented, not guessed; (2) if the answer itself mentions that something 'needs checking' or 'was not checked', but the transcript shows this was NOT checked before the final answer - that is grounds for rejection; (3) if the answer confidently asserts something for which the transcript has insufficient grounds (e.g. only one file out of a chain), that is also grounds for rejection; (4) if the answer is essentially 'I cannot answer without reading files X, Y' while the transcript shows those files were never read - REJECT and tell it to actually read them: giving up without reading the files it itself names is not an acceptable final answer.",
   "Reply STRICTLY in one line: either \"APPROVED\", or \"REJECTED: <a short, specific note IN RUSSIAN on exactly what needs to be checked before answering again>\".",
 ].join("\n");
 
@@ -540,14 +540,41 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     { role: "user", content: `Project: ${options.projectRootPath}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}` },
   ];
 
-  const seedGrepObservation = await buildSeedGrepObservation(
-    options.projectRootPath,
-    options.task,
-    options.graphHintTerms ?? [],
-  );
+  // Seed semantic search runs in parallel with the seed grep (2026-07-16) -
+  // stage timing on live runs showed research is ~100s of a ~106s question
+  // run, so the only real speed lever is fewer exploration turns; handing the
+  // model meaning-ranked file candidates BEFORE its first turn attacks that
+  // directly (the same rationale as the seed grep, for the complementary
+  // failure mode: question words that never literally appear in the code).
+  // Verified live that the raw Russian task text works cross-lingually
+  // against English code (qwen3-embedding ranked the right CaseData files
+  // top-8 for the raw "релейшн кейсы" question). Failure/empty results
+  // (index not built yet, provider hiccup) come back as "(...)"-wrapped
+  // status strings from the injected tool - those are dropped silently
+  // rather than shown as a confusing empty seed block.
+  const [seedGrepObservation, seedSemanticObservation] = await Promise.all([
+    buildSeedGrepObservation(
+      options.projectRootPath,
+      options.task,
+      options.graphHintTerms ?? [],
+    ),
+    options.semanticSearch
+      ? options.semanticSearch(options.task).then((result) => (result.trim().startsWith("(") ? "" : result)).catch(() => "")
+      : Promise.resolve(""),
+  ]);
 
   if (seedGrepObservation) {
     messages.push({ role: "user", content: seedGrepObservation });
+  }
+
+  if (seedSemanticObservation) {
+    messages.push({
+      role: "user",
+      content: [
+        "Automatic semantic (by-meaning) search for the question itself (before your first turn). Files ranked by semantic similarity to the question - these are leads to verify with read_file, not established facts:",
+        seedSemanticObservation,
+      ].join("\n"),
+    });
   }
 
   let totalPromptTokens = 0;
@@ -586,7 +613,26 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ...overrides,
   });
 
+  // Deterministic guard, no LLM involved (2026-07-16, live incident): a run
+  // gave up on turn 2 with "cannot answer without reading files X, Y" having
+  // read ZERO files (it only saw the seed grep/semantic listings), and the
+  // critic APPROVED it - an honest non-answer contains no unconfirmed claims,
+  // so it slips through the critic's honesty-focused rules. One bounce max:
+  // if the model insists a second time, the critic (whose prompt now also
+  // covers this case) makes the call.
+  let zeroReadBounceSent = false;
+
   async function evaluateProposedAnswer(candidate: string, turn: number): Promise<AgenticRunResult | "continue-loop"> {
+    if (touchedFiles.size === 0 && !zeroReadBounceSent && turn < maxTurns - 5) {
+      zeroReadBounceSent = true;
+      actionsLog.push(`[turn ${turn}] final_answer bounced: zero files read - directory/grep listings alone are not evidence.`);
+      messages.push({
+        role: "user",
+        content: "You are proposing a final answer without having read a single file (read_file) - directory listings and grep matches are leads, not evidence. Read the key files you yourself consider relevant, then answer based on their actual content.",
+      });
+      return "continue-loop";
+    }
+
     const criticResult = await callCritic({
       criticModel: options.criticModel,
       providerBaseUrl: options.providerBaseUrl,

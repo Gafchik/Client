@@ -1,4 +1,4 @@
-import { buildBackgroundProjectState, loadBestBaselineRunArtifact, loadLatestBackgroundRunCatalogEntry } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, loadBestBaselineCatalogEntry, loadLatestBackgroundRunCatalogEntry } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type BackgroundProjectState } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
@@ -132,14 +132,18 @@ async function observeProjectPath(
       maxFiles: 0,
     });
     const repository = await inspectRepository(workspace);
-    const baselineSelection = await loadBestBaselineRunArtifact(config.appRootPath, overview.rootPath, repository);
+    // Каталожные метаданные вместо полного артефакта (2026-07-16): этот tick
+    // выполняется каждые 15 секунд на каждый project path, а background-sync
+    // артефакт реального проекта — ~120MB JSON; парсить его ради 5 полей
+    // означало постоянную фоновую загрузку CPU/GC всего API-процесса.
+    const baselineSelection = await loadBestBaselineCatalogEntry(config.appRootPath, overview.rootPath, repository);
     const latestBackgroundRun = await loadLatestBackgroundRunCatalogEntry(config.appRootPath, overview.rootPath);
     const backgroundState = buildBackgroundProjectState({
       projectId: overview.projectId,
       projectRootPath: overview.rootPath,
       repository,
       latestRunId: latestBackgroundRun?.runId ?? null,
-      baselineRun: baselineSelection.run,
+      baselineRun: catalogEntryToBaselineMetadata(baselineSelection.entry),
       baselineSource: baselineSelection.source,
     });
     const normalizedPath = normalizePath(overview.rootPath);

@@ -456,7 +456,10 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     !isHardResync
     && (shouldPreferSelectiveWorkspace(repository, baselineWorkspace ?? repositoryWorkspace) || shouldPreferSelectiveQuestionWorkspace)
     && selectiveCandidatePaths.length > 0;
-  const workspace = shouldUseSelectiveWorkspace
+  // let, не const (2026-07-16): team-mode перестраивает workspace/index/graph
+  // ПОСЛЕ agentic-исследования, добавляя файлы, которые исследователь реально
+  // прочитал — см. блок "evidence-to-impact seam" ниже.
+  let workspace = shouldUseSelectiveWorkspace
     ? await openWorkspaceSelective(projectPath, {
         includePaths: selectiveCandidatePaths,
         maxFiles: isQuestionRun
@@ -505,17 +508,14 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     && Boolean(previousRun?.runtimeCache?.graph)
     && backgroundState.freshness !== "missing";
   const indexStartedAt = startStage(runId, "index");
-  const index = canUseLightweightQuestionFlow
-    ? await runFullIndex(workspace, {
-        previousRun,
-        changedPaths: incrementalIndex.changedPaths,
-        deletedPaths: incrementalIndex.deletedPaths,
-      })
-    : await runFullIndex(workspace, {
-        previousRun,
-        changedPaths: incrementalIndex.changedPaths,
-        deletedPaths: incrementalIndex.deletedPaths,
-      });
+  // canUseLightweightQuestionFlow влияет только на текст completeStage ниже -
+  // сам вызов индексатора одинаковый (был дословно продублированный ternary
+  // с идентичными ветками, схлопнут 2026-07-16).
+  let index = await runFullIndex(workspace, {
+    previousRun,
+    changedPaths: incrementalIndex.changedPaths,
+    deletedPaths: incrementalIndex.deletedPaths,
+  });
   completeStage(
     runId,
     "index",
@@ -538,7 +538,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   await yieldToEventLoop();
 
   const graphStartedAt = startStage(runId, "graph");
-  const graph = buildGraph(workspace, index, {
+  let graph = buildGraph(workspace, index, {
     previousRun,
     invalidatedPaths: graphInvalidation.invalidatedFiles,
   });
@@ -629,6 +629,45 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       researchStartedAt,
       `Команда «${selectedTeam.name}»: изучено ${agenticResult.raw.touchedFiles.length} файлов за ${agenticResult.raw.turnsUsed} ход(а/ов), критик: ${agenticResult.raw.criticVerdict}.`,
     );
+
+    // Evidence-to-impact seam (2026-07-16): agentic-исследователь читает файлы
+    // напрямую с диска и не ограничен selective workspace (~120 файлов),
+    // собранным ДО исследования — поэтому реально прочитанные файлы часто
+    // отсутствовали в workspace/index/graph, и impact давал "0 затронутых
+    // файлов", а context терял содержимое evidence-файлов (сопоставление там —
+    // точное строковое равенство путей). Пересобираем все три артефакта с
+    // touchedFiles в срезе; по замерам стадий index+graph на таком срезе — доли
+    // секунды, так что это дешевле одного лишнего хода модели.
+    const workspaceFilePathSet = new Set(workspace.files.map((file) => file.relativePath));
+    const touchedOutsideWorkspace = agenticResult.raw.touchedFiles.filter(
+      (filePath) => !workspaceFilePathSet.has(filePath),
+    );
+
+    if (touchedOutsideWorkspace.length > 0) {
+      workspace = await openWorkspaceSelective(projectPath, {
+        includePaths: [...new Set([...agenticResult.raw.touchedFiles, ...workspace.files.map((file) => file.relativePath)])],
+        maxFiles: workspace.files.length + touchedOutsideWorkspace.length,
+      });
+      index = await runFullIndex(workspace, {
+        previousRun,
+        changedPaths: incrementalIndex.changedPaths,
+        deletedPaths: incrementalIndex.deletedPaths,
+      });
+      graph = buildGraph(workspace, index, {
+        previousRun,
+        invalidatedPaths: graphInvalidation.invalidatedFiles,
+      });
+      updatePartialArtifacts(runId, {
+        index: {
+          manifest: index.manifest,
+          stats: index.stats,
+          diagnostics: index.diagnostics,
+        },
+        graph: {
+          summary: graph.summary,
+        },
+      });
+    }
   } else {
     const researchInputForRun = {
       runId,
@@ -1330,16 +1369,24 @@ function buildQuestionWorkspacePlan(
       ...previousIndexPaths,
     ]),
   );
-  const graphNeighborPaths = previousGraph
+  // Map/Set вместо nodes.find/paths.includes на каждое ребро (2026-07-16):
+  // на реальном background-sync графе (проект ~8000 файлов, сотни тысяч
+  // рёбер) старый вариант был O(edges × nodes) и стабильно съедал ~85 СЕКУНД
+  // чистого CPU на каждый question-run — это была самая долгая часть всей
+  // workspace-стадии, дороже загрузки самого 120MB артефакта в 30+ раз.
+  // Замерено стадийными таймингами двух живых прогонов подряд.
+  const directMatchPathSet = new Set(directMatchPaths);
+  const graphNodePathById = previousGraph
+    ? new Map(previousGraph.nodes.map((node) => [node.id, normalizePath(node.filePath ?? "")]))
+    : null;
+  const graphNeighborPaths = previousGraph && graphNodePathById
     ? Array.from(
         new Set(
           previousGraph.edges.flatMap((edge) => {
-            const source = previousGraph.nodes.find((node) => node.id === edge.sourceId);
-            const target = previousGraph.nodes.find((node) => node.id === edge.targetId);
-            const sourcePath = normalizePath(source?.filePath ?? "");
-            const targetPath = normalizePath(target?.filePath ?? "");
-            const sourceMatched = sourcePath && directMatchPaths.includes(sourcePath);
-            const targetMatched = targetPath && directMatchPaths.includes(targetPath);
+            const sourcePath = graphNodePathById.get(edge.sourceId) ?? "";
+            const targetPath = graphNodePathById.get(edge.targetId) ?? "";
+            const sourceMatched = sourcePath && directMatchPathSet.has(sourcePath);
+            const targetMatched = targetPath && directMatchPathSet.has(targetPath);
 
             if (!sourceMatched && !targetMatched) {
               return [];
@@ -1360,7 +1407,6 @@ function buildQuestionWorkspacePlan(
   const fallbackStructuralPaths = shouldUseStructuralFallback
     ? distributeAcrossDirectories(availableRelativePaths.filter(isStructuralHeuristicPath), 120)
     : [];
-  const directMatchPathSet = new Set(directMatchPaths);
   const graphNeighborOnlyPaths = graphNeighborPaths.filter((relativePath) => !directMatchPathSet.has(relativePath));
   const primaryPaths: string[] = [];
   const pushPathsWithBudget = (paths: string[], budget: number): void => {

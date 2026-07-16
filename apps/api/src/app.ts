@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, deleteKnowledgeRuns, loadBestBaselineRunArtifact, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
@@ -562,13 +562,16 @@ export function createApp() {
       maxFiles: 0,
     });
     const repository = await inspectRepository(repositoryWorkspace);
-    const baselineSelection = await loadBestBaselineRunArtifact(appRootPath, overview.rootPath, repository);
+    // Каталожные метаданные вместо полного артефакта (2026-07-16) — этот
+    // GET-статус дёргается UI регулярно, а background-sync артефакт ~120MB;
+    // см. loadBestBaselineCatalogEntry в packages/knowledge.
+    const baselineSelection = await loadBestBaselineCatalogEntry(appRootPath, overview.rootPath, repository);
     const backgroundState = buildBackgroundProjectState({
       projectId: overview.projectId,
       projectRootPath: overview.rootPath,
       repository,
       latestRunId: latestBackgroundRun?.runId ?? null,
-      baselineRun: baselineSelection.run,
+      baselineRun: catalogEntryToBaselineMetadata(baselineSelection.entry),
       baselineSource: baselineSelection.source,
     });
     const activeBackgroundRun = findActivePipelineRun(projectPath, "background-sync");

@@ -120,6 +120,13 @@ export async function initializePostgresSchema(): Promise<void> {
   await runSql(`alter table knowledge_catalog add column if not exists completion_tokens integer not null default 0`);
   await runSql(`alter table knowledge_catalog add column if not exists total_tokens integer not null default 0`);
   await runSql(`alter table knowledge_catalog add column if not exists provider_call_count integer not null default 0`);
+  // file_count (2026-07-16): метаданные baseline для монитора/статус-эндпоинта.
+  // Раньше единственным местом, где лежал index.manifest.fileCount, был сам
+  // 100MB+ background-sync артефакт — и project-state-monitor каждые 15 секунд
+  // на каждый project path парсил его целиком ради этой цифры и пары
+  // fingerprint'ов (уже имевшихся в каталоге). Существующие строки backfill'ятся
+  // разовым SQL (см. project-state.md), новые пишутся при сохранении.
+  await runSql(`alter table knowledge_catalog add column if not exists file_count integer not null default 0`);
 
   await runSql(`
     create table if not exists project_facts (
