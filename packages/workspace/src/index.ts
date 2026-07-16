@@ -53,6 +53,12 @@ const SUPPORTED_EXTENSIONS = new Set([
   ".sql",
   ".php",
   ".vue",
+  ".html",
+  ".htm",
+  ".css",
+  ".scss",
+  ".sass",
+  ".less",
 ]);
 
 export async function openWorkspace(rootPath: string): Promise<WorkspaceSnapshot> {
@@ -402,6 +408,14 @@ function detectLanguage(fileName: string): LanguageId {
       return "php";
     case ".vue":
       return "vue";
+    case ".html":
+    case ".htm":
+      return "html";
+    case ".css":
+    case ".scss":
+    case ".sass":
+    case ".less":
+      return "css";
     default:
       return "unknown";
   }

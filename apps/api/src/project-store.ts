@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { forgetProjectPath } from "@client/knowledge";
 import type { PathRole, ProjectPathRecord, ProjectRecord } from "@client/shared";
 import { runSql, withTransaction } from "./postgres-client.js";
 import { inferProjectPathRole } from "./path-role.js";
+import { stopObserver } from "./observer-monitor.js";
 
 export interface SaveProjectPathInput {
   id?: string;
@@ -166,6 +168,19 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
   const name = input.name.trim();
   const description = input.description?.trim() || "";
 
+  // Cleanup for paths removed from an EXISTING project (2026-07-16, live bug
+  // found during multi-path verification): saveProject always deletes and
+  // re-inserts every project_paths row, but a path the user removed from the
+  // form (e.g. dropped "gui" from slay) previously left every other table
+  // (knowledge_catalog/facts/business_graph_entries/code_embeddings) keyed by
+  // that rootPath orphaned forever - see forgetProjectPath. Computed BEFORE
+  // the transaction below deletes the old project_paths rows.
+  const previousRootPaths = input.id?.trim()
+    ? new Set((await getProjectById(input.id.trim()))?.paths.map((path) => path.rootPath) ?? [])
+    : new Set<string>();
+  const nextRootPaths = new Set(normalizedPaths.map((path) => path.rootPath));
+  const removedRootPaths = [...previousRootPaths].filter((rootPath) => !nextRootPaths.has(rootPath));
+
   await withTransaction(async (client) => {
     await client.query(
       `
@@ -189,6 +204,11 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
     }
   });
 
+  for (const removedRootPath of removedRootPaths) {
+    stopObserver(removedRootPath);
+    void forgetProjectPath(removedRootPath);
+  }
+
   const saved = await getProjectById(nextId);
 
   if (!saved) {
@@ -199,8 +219,24 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
 }
 
 export async function deleteProject(id: string): Promise<boolean> {
+  // Fetched BEFORE the delete - project_paths cascades away with the
+  // project row (FK ON DELETE CASCADE), but that only clears project_paths
+  // itself; every other table (knowledge_catalog/facts/business_graph_entries/
+  // code_embeddings) is keyed by a plain project_root_path STRING with no FK
+  // at all, so it needs its own explicit cleanup per removed path (live bug
+  // found during multi-path verification - see forgetProjectPath).
+  const existing = await getProjectById(id);
   const result = await runSql<{ id: string }>(`delete from projects where id = $1 returning id`, [id]);
-  return result.length > 0;
+  const deleted = result.length > 0;
+
+  if (deleted && existing) {
+    for (const path of existing.paths) {
+      stopObserver(path.rootPath);
+      void forgetProjectPath(path.rootPath);
+    }
+  }
+
+  return deleted;
 }
 
 function mapProjectRow(project: ProjectRow, paths: ProjectPathRow[]): ProjectRecord {

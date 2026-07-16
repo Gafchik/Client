@@ -223,6 +223,7 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean): st
       ? [
         "IMPORTANT: this project has MULTIPLE physical repos (parts), listed in \"Project parts\" above with their role (e.g. backend, frontend-web, frontend-desktop, cli) and shown by list_dir(\".\"). Every path you write starts with the part's name, e.g. \"web/src/boot/axios.js\" or \"api/routes/api.php\" - the part name is not a regular directory, it is which repo you are in.",
         "A question about UI/screens/buttons is usually answered inside a frontend part; a question about data storage/API endpoints/business rules is usually in the backend part. Many questions genuinely span both (e.g. \"what does this button call, and what does the backend do\") - in that case grep_content across all parts in one call and read files from whichever parts actually matter, do not restrict yourself to one part out of habit.",
+        "USE THE FRONTEND AS A BUSINESS GLOSSARY: a frontend part's i18n/locale files and UI component labels are written in the user's own business language, not engineering names - e.g. an i18n file may map an English key like `cancelSubscription` to the exact literal phrase the user typed. If a business term from the question has no obvious match by its literal wording, grep for the exact phrase itself (do not only translate/rephrase it) - a hit in an i18n/locale file often reveals the real technical name to then search for, and the UI component that uses that translation key leads you to which backend endpoint it calls.",
       ]
       : []),
     `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Write several ACTION lines in a row in one response (up to ${MAX_ACTIONS_PER_TURN} per turn), they execute in order and the results come back together in one batch. One ACTION per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: if you call it, call ONLY it, with no other ACTION in the same response (look at the results first, then answer).`,
@@ -254,7 +255,10 @@ const CRITIC_SYSTEM_PROMPT = [
 const DISTINCTIVE_TOKEN_PATTERN = /[A-Za-z][A-Za-z0-9_-]*/g;
 // Raised from 5 - graph-derived symbol names (findGraphSymbolHints) are now
 // a third term source alongside Latin/transliterated tokens.
-const MAX_SEED_GREP_TERMS = 7;
+// Raised from 7 (2026-07-16) to make room for raw Cyrillic phrase terms
+// (extractCyrillicPhraseTokens) without crowding out graph-hint/distinctive
+// terms that were already filling the old budget on hard questions.
+const MAX_SEED_GREP_TERMS = 9;
 
 function extractDistinctiveTokens(task: string): string[] {
   const candidates = task.match(DISTINCTIVE_TOKEN_PATTERN) ?? [];
@@ -298,12 +302,42 @@ function extractTransliteratedTokens(task: string): string[] {
   return expanded.filter((token) => !cyrillicTokens.includes(token));
 }
 
+// Multi-path unification made this a real, generic win (2026-07-16, user's
+// request to use the frontend for better business-semantics understanding):
+// a project WITH a frontend has i18n/locale files and UI component labels
+// containing the exact literal Cyrillic business phrase from the question
+// ("Отменить подписку", "Личный кабинет") as a plain string value - something
+// pure backend code (English identifiers) never had a reason to contain.
+// Grepping the raw phrase (not just its tech-jargon transliteration) can hit
+// that locale entry directly, and from there the connected component/store/
+// endpoint. Harmless on backend-only projects too - a raw Cyrillic phrase
+// that matches nothing just costs one empty seed slot, never a wrong lead.
+const CYRILLIC_STOP_WORDS = new Set([
+  "как", "что", "где", "почему", "кто", "когда", "это", "эта", "этот",
+  "для", "или", "если", "при", "его", "или", "чем", "тем", "все", "всех",
+  "нет", "или", "уже", "ещё", "еще", "мы", "вы", "они", "мне", "нам",
+]);
+
+function extractCyrillicPhraseTokens(task: string): string[] {
+  return tokenize(task)
+    .filter((token) => /[а-яё]/i.test(token) && token.length >= 4 && !CYRILLIC_STOP_WORDS.has(token.toLowerCase()))
+    .slice(0, 4);
+}
+
 async function buildSeedGrepObservation(projectRoots: WorkspaceRoot[], task: string, graphHintTerms: string[]): Promise<string> {
   // Graph-derived symbol names go first - precise (real class/function names
   // from the persisted code graph), so if the term budget is tight they
   // should win over generic transliterated words like "case"/"relation".
+  // Raw Cyrillic phrases come right after (also literal, not a guessed
+  // translation) - transliterated tech-jargon guesses go last since they are
+  // the least directly grounded of the three sources.
   const terms = [
-    ...new Set([...graphHintTerms, ...extractDistinctiveTokens(task), ...extractTransliteratedTokens(task)]),
+    ...new Set([
+      ...graphHintTerms,
+      ...extractDistinctiveTokens(task),
+      ...extractCyrillicPhraseTokens(task),
+      ...extractTransliteratedTokens(task),
+    ]),
   ].slice(0, MAX_SEED_GREP_TERMS);
 
   if (terms.length === 0) {

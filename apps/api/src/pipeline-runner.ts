@@ -5,6 +5,7 @@ import {
   buildControlledExecutionRuntime,
   buildValidatedAnswerPacket,
   buildValidationPacket,
+  classifyProjectScopeDirective,
   createUsageAccumulator,
   embedTexts,
   expandTaskSearchKeywords,
@@ -592,9 +593,33 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
           role: pathRecord.role,
         }))
       : [{ label: "root", absolutePath: projectRootPath, role: "unknown" }];
-    const observerHint = await buildObserverHintSuffix(projectRoots, task);
-    const teamKnownFacts = await queryFactsAcrossPaths(projectRoots.map((root) => root.absolutePath));
-    const knownFactsHintText = buildKnownFactsHint(projectRoots, teamKnownFacts);
+    // Path-scoped chat directives (2026-07-16, user's explicit request): lets
+    // the user steer the Researcher in plain language ("не трогай бэкенд",
+    // "ищи только в gui", "разрабатываем только фронт") without any special
+    // UI - the whole rest of the pipeline below just sees a smaller
+    // projectRoots list, no other code path needs to know scoping happened.
+    const scopeDirective = await classifyProjectScopeDirective({
+      task,
+      providerBaseUrl,
+      providerModel: selectedTeam.criticModel,
+      providerApiKey,
+      roots: projectRoots.map((root) => ({ label: root.label, role: root.role })),
+    });
+    const effectiveProjectRoots = scopeDirective.restricted
+      ? projectRoots.filter((root) => scopeDirective.allowedLabels.includes(root.label))
+      : projectRoots;
+
+    if (scopeDirective.restricted) {
+      updateStageLabel(
+        runId,
+        "research",
+        `Команда «${selectedTeam.name}»: область поиска ограничена пользователем до: ${effectiveProjectRoots.map((root) => root.label).join(", ")}...`,
+      );
+    }
+
+    const observerHint = await buildObserverHintSuffix(effectiveProjectRoots, task);
+    const teamKnownFacts = await queryFactsAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
+    const knownFactsHintText = buildKnownFactsHint(effectiveProjectRoots, teamKnownFacts);
     // Тот же conversationTurns, что уже питает приоритетную evidence для
     // детерминированного пути (см. priorTurn чуть ниже) - agentic-путь
     // раньше вообще не участвовал в этом механизме, из-за чего каждая
@@ -631,19 +656,19 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       // (AgenticRunOptions.observerHint) - still reaches the model, just
       // appended to the LLM-facing message only, not the visible task.
       task,
-      projectRoots,
+      projectRoots: effectiveProjectRoots,
       researcherModel: selectedTeam.researcherModel,
       criticModel: selectedTeam.criticModel,
       providerBaseUrl,
       providerApiKey,
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
       ...(observerHint ? { observerHint } : {}),
-      semanticSearch: buildSemanticSearchTool(projectRoots, providerBaseUrl, providerApiKey),
+      semanticSearch: buildSemanticSearchTool(effectiveProjectRoots, providerBaseUrl, providerApiKey),
       // Speed pass (2026-07-16, по одобренному плану): контент топ-файлов
       // семантического индекса кладётся в контекст ДО первого хода (см.
       // AgenticRunOptions.semanticSeedFiles) - главный рычаг задержки на
       // лёгких вопросах (2-3 хода экономии по замерам).
-      semanticSeedFiles: buildSemanticSeedLookup(projectRoots, providerBaseUrl, providerApiKey),
+      semanticSeedFiles: buildSemanticSeedLookup(effectiveProjectRoots, providerBaseUrl, providerApiKey),
       // Факт-стор теперь питает и agentic-путь (раньше только легаси
       // детерминированный) - подтверждённые прошлыми прогонами факты как
       // "проверь и опирайся"-затравка.

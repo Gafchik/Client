@@ -16,6 +16,10 @@ const EMBEDDING_MODEL = "qwen/qwen3-embedding-8b";
 // standing rule - see docs/state/project-state.md's INTENT_PROFILES note).
 const CODE_EXTENSIONS = new Set([
   ".php", ".ts", ".tsx", ".js", ".jsx", ".vue", ".py", ".go", ".java", ".rb", ".cs",
+  // Markup/styles (2026-07-16, user's explicit request: frontend work needs
+  // to account for HTML/CSS too) - semantic_search can now surface a
+  // template/stylesheet directly instead of only the script logic around it.
+  ".html", ".htm", ".css", ".scss", ".sass", ".less",
 ]);
 const MAX_FILE_CHARS_FOR_EMBEDDING = 8000;
 const MAX_FILE_BYTES = 300_000;

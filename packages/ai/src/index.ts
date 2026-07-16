@@ -383,6 +383,104 @@ export async function expandTaskSearchKeywords(input: ExpandTaskSearchKeywordsIn
   }
 }
 
+export interface ProjectScopeDirective {
+  restricted: boolean;
+  /** Labels to actually search - empty when restricted is false. */
+  allowedLabels: string[];
+}
+
+// Cheap keyword pre-filter (2026-07-16, multi-path unification: user's
+// explicit request to be able to say "don't touch backend"/"only in gui" in
+// plain language) - most questions on a multi-repo project do NOT restrict
+// scope, so this avoids the classifier LLM call entirely in the common case.
+// Deliberately broad/generic (role-family words, not any one project's
+// naming) - a literal match against the project's OWN registered path
+// labels is checked separately by the caller before even reaching here.
+const SCOPE_TRIGGER_PATTERN = /тольк|не трог|не мен|не пиш|не смотри|исключ|кроме|без\s|backend|frontend|бэкенд|бекенд|\bбэк\b|\bбек\b|фронт|десктоп|desktop|только/i;
+
+function taskMentionsScopeTrigger(task: string, roots: Array<{ label: string }>): boolean {
+  if (SCOPE_TRIGGER_PATTERN.test(task)) {
+    return true;
+  }
+
+  const lowerTask = task.toLowerCase();
+  return roots.some((root) => lowerTask.includes(root.label.toLowerCase()));
+}
+
+/**
+ * Detects whether the user's own question restricts which physical repo(s)
+ * of a multi-repo project should be searched ("не трогай бэкенд", "только в
+ * gui", "разрабатываем только фронт") and resolves it to the actual root
+ * labels to keep. A natural-language classifier call, not regex parsing -
+ * negation scope and mixed include/exclude phrasing in one sentence
+ * ("работаем только над фронтом, бэк не трогаем") are exactly the kind of
+ * thing regex handles badly and an LLM handles for the cost of a few hundred
+ * tokens. Only called at all when a cheap keyword pre-filter finds a
+ * plausible trigger - most questions don't restrict scope, and single-repo
+ * projects never need this (checked by the caller).
+ */
+export async function classifyProjectScopeDirective(input: {
+  task: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+  roots: Array<{ label: string; role: string }>;
+}): Promise<ProjectScopeDirective> {
+  const noRestriction: ProjectScopeDirective = { restricted: false, allowedLabels: [] };
+
+  if (input.roots.length <= 1 || !taskMentionsScopeTrigger(input.task, input.roots)) {
+    return noRestriction;
+  }
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const rootsDescription = input.roots.map((root) => `"${root.label}" (role: ${root.role})`).join(", ");
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            `This project has several physical repos, each with a short label and a role: ${rootsDescription}.`,
+            "Decide whether the user's question explicitly restricts which of these repos should be searched/worked on - either by naming which one(s) to use exclusively (\"only in gui\", \"only work on the frontend\"), or by naming which one(s) to leave alone (\"don't touch the backend\").",
+            "Reply with ONLY one line of JSON: {\"restricted\": boolean, \"allowedLabels\": string[]}.",
+            "allowedLabels must always be the labels that SHOULD be searched - if the user says 'do not touch backend', allowedLabels is every OTHER label, not backend.",
+            "If the question does not restrict scope at all (most questions don't, even ones that happen to mention a role in passing), reply {\"restricted\": false, \"allowedLabels\": []}.",
+          ].join("\n"),
+        },
+        { role: "user", content: input.task },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return noRestriction;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { restricted?: boolean; allowedLabels?: unknown };
+
+    if (!parsed.restricted || !Array.isArray(parsed.allowedLabels)) {
+      return noRestriction;
+    }
+
+    const validLabels = new Set(input.roots.map((root) => root.label));
+    const allowedLabels = parsed.allowedLabels.filter((label): label is string => typeof label === "string" && validLabels.has(label));
+
+    // Empty (misfired) or "everything" (no real restriction) both collapse
+    // to "no restriction" - only a genuine, resolvable SUBSET counts.
+    if (allowedLabels.length === 0 || allowedLabels.length === input.roots.length) {
+      return noRestriction;
+    }
+
+    return { restricted: true, allowedLabels };
+  } catch {
+    return noRestriction;
+  }
+}
+
 export interface EmbedTextsInput {
   providerBaseUrl: string;
   providerApiKey: string;

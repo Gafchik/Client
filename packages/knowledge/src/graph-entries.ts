@@ -117,6 +117,15 @@ export async function queryBusinessGraphEntriesAcrossPaths(projectRootPaths: str
   }
 }
 
+/** Removes every Observer-crawled entry for one physical path (2026-07-16) - see facts.ts's deleteFactsForPath for why. */
+export async function deleteBusinessGraphEntriesForPath(projectRootPath: string): Promise<void> {
+  try {
+    await runSql(`delete from business_graph_entries where project_root_path = $1`, [projectRootPath]);
+  } catch (error) {
+    console.warn("[graph-entries] deleteBusinessGraphEntriesForPath failed:", error);
+  }
+}
+
 /** Hashes a small, known set of files (e.g. what one crawl touched) - not a full project scan. */
 export async function hashFiles(projectRootPath: string, filePaths: string[]): Promise<Record<string, string>> {
   const entries = await Promise.all(

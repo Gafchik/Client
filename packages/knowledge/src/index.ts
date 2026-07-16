@@ -1,5 +1,8 @@
 import { runSql } from "./postgres-client.js";
 import { getRedisClient } from "./redis-client.js";
+import { deleteFactsForPath } from "./facts.js";
+import { deleteBusinessGraphEntriesForPath } from "./graph-entries.js";
+import { pruneCodeEmbeddings } from "./code-embeddings.js";
 
 // Read-through cache over knowledge_artifacts (2026-07-15, user's explicit
 // request): Postgres stays the durable source of truth - Redis here has no
@@ -16,8 +19,9 @@ function knowledgeArtifactCacheKey(runId: string): string {
   return `knowledge-artifact:${runId}`;
 }
 
-export { promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
+export { deleteFactsForPath, promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
 export {
+  deleteBusinessGraphEntriesForPath,
   hashFiles,
   queryBusinessGraphEntries,
   queryBusinessGraphEntriesAcrossPaths,
@@ -444,6 +448,34 @@ export async function deleteKnowledgeRuns(
   }
 
   return { deleted, notFound };
+}
+
+/**
+ * Forgets EVERYTHING ever learned about one physical repository (2026-07-16,
+ * live bug found during verification: deleting a project or removing one
+ * path from it left knowledge_catalog/knowledge_artifacts/project_facts/
+ * business_graph_entries/code_embeddings rows behind forever - none of them
+ * has a foreign key to projects/project_paths, only a plain project_root_path
+ * string match, so ON DELETE CASCADE never reached them). Called from
+ * apps/api's deleteProject (for every path of the deleted project) and from
+ * saveProject (for any path removed from an existing project's path list).
+ * Never throws - a project delete/edit must succeed even if cleanup of one
+ * table degrades.
+ */
+export async function forgetProjectPath(projectRootPath: string): Promise<void> {
+  try {
+    const runRows = await runSql<{ run_id: string }>(
+      `select run_id from knowledge_catalog where project_root_path = $1`,
+      [projectRootPath],
+    );
+    await deleteKnowledgeRuns("", projectRootPath, runRows.map((row) => row.run_id));
+  } catch (error) {
+    console.warn("[knowledge] forgetProjectPath: run/artifact cleanup failed:", error);
+  }
+
+  await deleteFactsForPath(projectRootPath);
+  await deleteBusinessGraphEntriesForPath(projectRootPath);
+  await pruneCodeEmbeddings(projectRootPath, []);
 }
 
 export async function loadPipelineRunArtifact(

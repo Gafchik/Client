@@ -163,6 +163,21 @@ async function isFactStillValid(projectRootPath: string, fact: ProjectFact): Pro
  * Вызывается fire-and-forget из pipeline-runner — никогда не бросает
  * исключение и не должен блокировать ответ пользователю.
  */
+/**
+ * Removes every fact for one physical path (2026-07-16) - called when a
+ * project or a single path within it is deleted, so the fact store does not
+ * keep serving "verify, then rely" hints about a repo that no longer exists
+ * (or, worse, silently reattaches to a different project that later reuses
+ * the same filesystem path).
+ */
+export async function deleteFactsForPath(projectRootPath: string): Promise<void> {
+  try {
+    await runSql(`delete from project_facts where project_root_path = $1`, [projectRootPath]);
+  } catch (error) {
+    console.warn("[facts] deleteFactsForPath failed:", error);
+  }
+}
+
 export async function promoteFactsFromResearch(
   projectRootPath: string,
   report: ResearchReport,

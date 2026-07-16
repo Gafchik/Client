@@ -10,6 +10,8 @@ export type LanguageId =
   | "dockerfile"
   | "php"
   | "vue"
+  | "html"
+  | "css"
   | "unknown";
 
 export type SymbolKind =
