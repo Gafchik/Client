@@ -114,6 +114,15 @@ export interface AgenticRunOptions {
    */
   observerHint?: string;
   /**
+   * Short guidance derived from classifying the question's shape (packages/ai's
+   * classifyQuestionShape/buildQuestionShapeHint - 2026-07-16, architecture
+   * review finding: intent classification existed but never reached the
+   * Researcher's own investigation strategy, only the final answer's tone).
+   * Empty for a plain "locate" question - only diagnostic/change/compare
+   * shapes get an actual hint.
+   */
+  questionShapeHint?: string;
+  /**
    * Symbol names (class/function names, not paths) found by matching task
    * keywords against the FULL persisted code graph (packages/graph, built by
    * background-sync - see apps/api/src/graph-store.ts's
@@ -152,6 +161,21 @@ export interface AgenticRunOptions {
    * round-trips; the model remains free to read anything else.
    */
   semanticSeedFiles?: (query: string) => Promise<string[]>;
+  /**
+   * Graph-backed structural navigation (2026-07-16, architecture review
+   * finding: the graph already exists in the system - built early for
+   * Impact analysis - but was never exposed to the Researcher itself, which
+   * had only lexical grep to answer "who calls this"). Given a symbol or
+   * file name, returns real callers/dependents from the persisted structural
+   * graph - catches renamed-variable/interface-indirection call sites that a
+   * text grep for the literal name would miss. Injected the same way as
+   * semanticSearch (this package stays free of the graph-building
+   * dependency); degrades to an honest "not available" string rather than
+   * blocking when the graph has no matching node (e.g. a dynamic-dispatch
+   * call the graph never resolved statically) - a real limitation, not
+   * hidden from the model.
+   */
+  findReferences?: (symbolOrFileName: string) => Promise<string>;
   /**
    * Pre-formatted block of previously CONFIRMED project facts (fact store,
    * packages/knowledge) relevant to this task - "verify, then rely" seeds.
@@ -192,7 +216,7 @@ interface ChatMessage {
 }
 
 interface ParsedAction {
-  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "final_answer";
+  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "find_references" | "final_answer";
   arg: string;
 }
 
@@ -205,7 +229,7 @@ interface ParsedAction {
 // hypothetical) - the downstream answer-synthesis prompt (packages/ai) also
 // demands Russian, but this is a deliberate second safety net, not
 // redundant.
-function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean): string {
+function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean): string {
   return [
     "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
     "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
@@ -216,6 +240,12 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean): st
       ? [
         "ACTION: semantic_search(a plain-language description of what you are looking for)",
         "semantic_search finds files by MEANING, not literal text - use it when the business term from the question (e.g. \"relation cases\", \"profile access\") does not obviously match any file/directory name or grep hit, instead of guessing blindly.",
+      ]
+      : []),
+    ...(hasFindReferences
+      ? [
+        "ACTION: find_references(ClassOrFunctionOrFileName)",
+        "find_references looks up REAL structural callers/dependents of a class, function, or file from the persisted code graph - use it instead of grep_content when you need \"who actually calls/uses this\", because grep only matches the literal name as text and misses calls through a renamed variable, an interface, or other indirection. It may come back empty for a name the graph does not have a resolved node for (e.g. purely dynamic dispatch) - that is an honest limit of static analysis, not a sign nothing calls it; fall back to grep_content in that case.",
       ]
       : []),
     "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic)",
@@ -478,7 +508,7 @@ async function callModel(
 // parens, e.g. grep regex groups), stopping once MAX_ACTIONS_PER_TURN is
 // reached or no further match/close-paren is found.
 function parseActions(content: string): ParsedAction[] {
-  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|final_answer)\s*\(/g;
+  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|find_references|final_answer)\s*\(/g;
   const actions: ParsedAction[] = [];
   let searchFrom = 0;
 
@@ -605,6 +635,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ? `\n\nIn the previous turn of this conversation you already found and read these files: ${priorTurnFiles.join(", ")}. If the new question continues the same topic - start by reading these files (read_file) instead of researching from scratch. If the question is clearly about something else - check whether they are still relevant or search anew, do not rely on them blindly.`
     : "";
   const observerHintBlock = options.observerHint ? `\n\n${options.observerHint}` : "";
+  const questionShapeBlock = options.questionShapeHint ? `\n\n${options.questionShapeHint}` : "";
   const isMultiRoot = options.projectRoots.length > 1;
   // Single-repo projects keep the exact original "Project: <path>" line -
   // zero behavior change for the still-overwhelmingly-common case of one
@@ -614,8 +645,8 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
   const messages: ChatMessage[] = [
-    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot) },
-    { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}` },
+    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences)) },
+    { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}${questionShapeBlock}` },
   ];
 
   // Seed semantic search runs in parallel with the seed grep (2026-07-16) -
@@ -921,6 +952,10 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
         observation = options.semanticSearch
           ? await options.semanticSearch(action.arg)
           : "(semantic search is not available for this project)";
+      } else if (action.tool === "find_references") {
+        observation = options.findReferences
+          ? await options.findReferences(action.arg)
+          : "(find_references is not available for this project)";
       } else {
         const parentDir = dirnameOf(action.arg);
 

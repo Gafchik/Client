@@ -423,7 +423,15 @@ function scoreByPath(filePath: string, taskTokens: string[], focusZones: string[
   const normalized = filePath.toLowerCase();
   let score = 0;
 
-  if (normalized.startsWith("apps/") || normalized.startsWith("packages/")) {
+  // Architecture review finding (2026-07-16): this used to reward
+  // "apps/"/"packages/" specifically - THIS tool's own monorepo layout, not
+  // a generic signal. A real target project (a Laravel app rooted at
+  // "app/", a plain frontend rooted at "src/") almost never has either
+  // prefix, so the bonus silently never applied to real analyzed projects.
+  // Generic root-level source conventions instead - covers the common cases
+  // (Laravel/most PHP frameworks: app/; most JS/TS projects: src/; Go/Python
+  // and some monorepos: lib/, packages/) without assuming any one of them.
+  if (normalized.startsWith("app/") || normalized.startsWith("src/") || normalized.startsWith("lib/") || normalized.startsWith("packages/")) {
     score += 10;
   }
 

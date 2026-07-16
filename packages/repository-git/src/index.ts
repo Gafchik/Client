@@ -370,6 +370,69 @@ export function deriveRepositoryLabel(rootPath: string): string {
   return path.basename(rootPath) || "repository";
 }
 
+export interface FileChurnSignal {
+  /** How many commits touched this file within the lookback window. */
+  commitCount: number;
+  /** Of those, how many commit subjects look like a fix/bug/revert. */
+  fixCommitCount: number;
+}
+
+const CHURN_LOOKBACK = "6 months ago";
+// Generic commit-message keywords, not project-specific - the same
+// principle already established elsewhere in this codebase.
+const FIX_COMMIT_PATTERN = /\bfix|bug|hotfix|patch|revert|regression\b|исправ|баг\b|ошибк/i;
+// \x01 as a line-prefix separator for commit subjects - distinguishes them
+// from the file-path lines --name-only also prints, without needing a
+// second git invocation per commit.
+const CHURN_LOG_FORMAT = "%x01%s";
+
+/**
+ * Real risk signal from git history (2026-07-16, architecture review
+ * finding: Impact's "risk" was previously just a proxy for blast-radius
+ * size - file/symbol count thresholds - with no actual historical signal,
+ * even though the repository is already being inspected for other reasons).
+ * One `git log` call for the whole repo's recent history, not one per file -
+ * a file's bug-fix-commit frequency is a genuine, historically-grounded risk
+ * indicator that costs nothing extra to compute this way. Degrades to an
+ * empty map (no risk signal, not a crash) on any git failure - matches this
+ * package's existing fallback-snapshot philosophy for a non-git or
+ * git-command-timeout case.
+ */
+export async function computeFileChurnSignals(rootPath: string): Promise<Map<string, FileChurnSignal>> {
+  const signals = new Map<string, FileChurnSignal>();
+  const result = await runGit(rootPath, ["log", `--since=${CHURN_LOOKBACK}`, "--name-only", `--format=${CHURN_LOG_FORMAT}`]);
+
+  if (!result.ok) {
+    return signals;
+  }
+
+  let currentIsFixCommit = false;
+
+  for (const rawLine of result.stdout.split("\n")) {
+    if (rawLine.startsWith("\x01")) {
+      currentIsFixCommit = FIX_COMMIT_PATTERN.test(rawLine.slice(1));
+      continue;
+    }
+
+    const filePath = rawLine.trim();
+
+    if (!filePath) {
+      continue;
+    }
+
+    const existing = signals.get(filePath) ?? { commitCount: 0, fixCommitCount: 0 };
+    existing.commitCount += 1;
+
+    if (currentIsFixCommit) {
+      existing.fixCommitCount += 1;
+    }
+
+    signals.set(filePath, existing);
+  }
+
+  return signals;
+}
+
 export function shouldPreferSelectiveWorkspace(repository: RepositorySnapshot, workspace: WorkspaceSnapshot): boolean {
   if (workspace.summary.profile !== "large-repository") {
     return false;

@@ -114,8 +114,12 @@ export interface RunAgenticResearchInput {
   graphHintTerms?: string[];
   /** See AgenticRunOptions.observerHint - kept separate from `task` so it never leaks into ResearchReport.task (the chat UI's "Задача" display). */
   observerHint?: string;
+  /** See AgenticRunOptions.questionShapeHint. */
+  questionShapeHint?: string;
   /** See AgenticRunOptions.semanticSearch. */
   semanticSearch?: (query: string) => Promise<string>;
+  /** See AgenticRunOptions.findReferences. */
+  findReferences?: (symbolOrFileName: string) => Promise<string>;
   /** See AgenticRunOptions.semanticSeedFiles. */
   semanticSeedFiles?: (query: string) => Promise<string[]>;
   /** See AgenticRunOptions.knownFactsHint. */
@@ -143,7 +147,9 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     ...(input.priorTurnFiles?.length ? { priorTurnFiles: input.priorTurnFiles } : {}),
     ...(input.graphHintTerms?.length ? { graphHintTerms: input.graphHintTerms } : {}),
     ...(input.observerHint ? { observerHint: input.observerHint } : {}),
+    ...(input.questionShapeHint ? { questionShapeHint: input.questionShapeHint } : {}),
     ...(input.semanticSearch ? { semanticSearch: input.semanticSearch } : {}),
+    ...(input.findReferences ? { findReferences: input.findReferences } : {}),
     ...(input.semanticSeedFiles ? { semanticSeedFiles: input.semanticSeedFiles } : {}),
     ...(input.knownFactsHint ? { knownFactsHint: input.knownFactsHint } : {}),
     ...(input.onProgress ? { onProgress: input.onProgress } : {}),

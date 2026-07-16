@@ -9,10 +9,21 @@ import {
 } from "@client/graph";
 import { clamp, deriveStructuralModuleLabel, isConfigPath, isLocalizationPath, normalizePath, type GraphState, type ImpactReport, type ResearchReport } from "@client/shared";
 
+// Structurally matches packages/repository-git's FileChurnSignal - defined
+// locally rather than adding a new cross-package dependency for one small
+// shape (TypeScript's structural typing makes this safe: the caller in
+// pipeline-runner.ts passes the real computeFileChurnSignals() result).
+interface FileChurnSignal {
+  commitCount: number;
+  fixCommitCount: number;
+}
+
 interface ImpactInput {
   runId: string;
   graph: GraphState;
   research: ResearchReport;
+  /** Git-history risk signal (2026-07-16) - see repository-git's computeFileChurnSignals. Optional: absent for non-git or git-command-timeout cases, buildRisks degrades to file/symbol-count heuristics only. */
+  fileChurn?: Map<string, FileChurnSignal>;
 }
 
 export function analyzeImpact(input: ImpactInput): ImpactReport {
@@ -50,6 +61,21 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
   const affectedFiles = new Set<string>();
   const affectedSymbols = new Set<string>();
   const affectedModules = new Set<string>();
+  // Architecture review finding (2026-07-16): a cross-repo evidence file
+  // (multi-path projects) has no graph node at all - the graph is only
+  // built from the primary repo's workspace (a documented, still-open
+  // limitation - see pipeline-runner.ts's loadCrossRepoFileEntries comment).
+  // Without this, such a file silently never appeared in affectedFiles even
+  // though the Researcher's own answer was built on it directly. Evidence is
+  // ALWAYS a real, actually-read file - always seeded here regardless of
+  // whether the graph could resolve it to a node; the graph-driven
+  // expansion below still only adds STRUCTURAL neighbors for whichever of
+  // these do have a node.
+  for (const item of input.research.evidence) {
+    if (item.filePath) {
+      affectedFiles.add(item.filePath);
+    }
+  }
   const infrastructureFocus =
     input.research.queryProfileKey === "storage-topology" || isInfrastructureQuestion(input.research.task);
 
@@ -140,7 +166,7 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
 
   const fileList = [...affectedFiles].sort();
   const symbolList = [...affectedSymbols, ...affectedModules].sort();
-  const risks = buildRisks(fileList, symbolList, input.research);
+  const risks = buildRisks(fileList, symbolList, input.research, input.fileChurn);
   const validationScope = buildValidationScope(fileList);
   const confidence = computeConfidence(input.research.confidence, fileList.length, risks.length);
 
@@ -313,19 +339,50 @@ function expandBroadImpact(
   }
 }
 
-function buildRisks(files: string[], symbols: string[], research: ResearchReport): string[] {
+// Threshold picked to mean "this file has been a recurring source of bugs
+// recently", not just "it changes often" - a frequently-changed file with
+// zero fix-shaped commits is normal active development, not a risk signal.
+const CHURN_RISK_MIN_FIX_COMMITS = 2;
+
+function buildRisks(files: string[], symbols: string[], research: ResearchReport, fileChurn?: Map<string, FileChurnSignal>): string[] {
   const risks: string[] = [];
 
-  if (files.some((file) => file.startsWith("packages/shared"))) {
-    risks.push("Изменения в shared-пакете могут каскадно затронуть и API, и web-часть.");
-  }
+  // Architecture review finding (2026-07-16): the three rules this replaced
+  // hardcoded THIS codebase's own layout (apps/api, apps/web,
+  // packages/shared) - paths that never exist in any actually-analyzed
+  // target project (magendamd, slay, ...), so they silently never fired for
+  // real usage. Real, historically-grounded risk signal in their place: a
+  // file this pipeline is about to touch that has genuinely been a
+  // recurring source of bug-fix commits recently.
+  if (fileChurn) {
+    // git log's churn keys are always plain repo-relative paths (git has no
+    // concept of the multi-root label prefix - see pipeline-runner.ts's
+    // computeFileChurnSignals call site, which only covers the PRIMARY
+    // repo). A multi-root evidence path ("web/src/foo.js") never matches
+    // directly - falling back to "the part after the first slash" recovers
+    // the match for evidence that happens to belong to the primary repo,
+    // without buildRisks needing to know the actual root labels at all.
+    const lookupChurn = (file: string): FileChurnSignal | undefined => {
+      const direct = fileChurn.get(file);
 
-  if (files.some((file) => file.startsWith("apps/api"))) {
-    risks.push("Изменения в orchestration-слое API могут повлиять на детерминированный контракт пайплайна, который видит операторская консоль.");
-  }
+      if (direct) {
+        return direct;
+      }
 
-  if (files.some((file) => file.startsWith("apps/web"))) {
-    risks.push("Изменения в операторской консоли требуют проверки, что нерелевантные артефакты не попадают в видимый контекст.");
+      const slashIndex = file.indexOf("/");
+      return slashIndex === -1 ? undefined : fileChurn.get(file.slice(slashIndex + 1));
+    };
+
+    const riskyFiles = files
+      .map((file) => ({ file, signal: lookupChurn(file) }))
+      .filter((entry): entry is { file: string; signal: FileChurnSignal } => Boolean(entry.signal) && entry.signal!.fixCommitCount >= CHURN_RISK_MIN_FIX_COMMITS)
+      .sort((left, right) => right.signal.fixCommitCount - left.signal.fixCommitCount)
+      .slice(0, 3);
+
+    if (riskyFiles.length > 0) {
+      const description = riskyFiles.map((entry) => `${entry.file} (${entry.signal.fixCommitCount} багфикс-коммитов за полгода)`).join(", ");
+      risks.push(`Затронутые файлы имеют историю повторяющихся багфиксов - требуют особенно внимательного ревью: ${description}.`);
+    }
   }
 
   if (files.length >= 8 || symbols.length >= 12) {

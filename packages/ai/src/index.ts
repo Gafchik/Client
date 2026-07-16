@@ -2950,6 +2950,50 @@ function looksLikeChangeTask(task: string): boolean {
   );
 }
 
+// Architecture review finding (2026-07-16): intent classification was
+// fragmented across 3 independent, non-communicating places (this
+// diagnostic/change regex pair, used only at answer-synthesis time;
+// packages/research's QuestionTypeRegistry, used only by the legacy
+// deterministic path; the new path-scope classifier). None of it ever
+// reached the agentic Researcher's OWN investigation strategy - it just got
+// tools and a generic prompt regardless of whether the question was "where
+// is X" or "why does X sometimes fail". This reuses the existing,
+// already-proven regex classification (cheap, no new LLM call) as a single
+// exported entry point, so the SAME classification that shapes the final
+// answer's tone can also shape how deep/what-focused the investigation is.
+export type QuestionShape = "diagnostic" | "change" | "compare" | "locate";
+
+export function classifyQuestionShape(task: string): QuestionShape {
+  if (looksLikeDiagnosticTask(task)) {
+    return "diagnostic";
+  }
+
+  if (looksLikeChangeTask(task)) {
+    return "change";
+  }
+
+  if (/чем отличается|в чём разница|в чем разница|difference between|compared to|versus\b/i.test(task)) {
+    return "compare";
+  }
+
+  return "locate";
+}
+
+// English per the project's standing prompt-language rule - this text is
+// appended to the agentic loop's LLM-facing message, never shown to the user.
+export function buildQuestionShapeHint(shape: QuestionShape): string {
+  switch (shape) {
+    case "diagnostic":
+      return "This looks like a DIAGNOSTIC question (why something happens, or why it is broken/inconsistent) - prioritize finding the actual failing condition/branch/edge case, not just describing the feature in general. A confident-sounding general description that never actually locates the specific condition is not a real answer to a diagnostic question.";
+    case "change":
+      return "This looks like a CHANGE-REQUEST question (add/fix/modify something) - prioritize identifying the full blast radius (what calls/depends on the code in question, ideally via find_references if available) and whether tests exist for this area, since that is what actually determines how risky the change is.";
+    case "compare":
+      return "This looks like a COMPARISON question (how do two things differ) - make sure you investigate BOTH sides with comparable depth before answering; do not let whichever one you found first dominate the answer.";
+    case "locate":
+      return "";
+  }
+}
+
 async function performProviderRequest(endpoint: string, apiKey: string, body: Record<string, unknown>): Promise<Response> {
   let lastError: unknown = null;
 

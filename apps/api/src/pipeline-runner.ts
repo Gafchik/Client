@@ -5,7 +5,9 @@ import {
   buildControlledExecutionRuntime,
   buildValidatedAnswerPacket,
   buildValidationPacket,
+  buildQuestionShapeHint,
   classifyProjectScopeDirective,
+  classifyQuestionShape,
   createUsageAccumulator,
   embedTexts,
   expandTaskSearchKeywords,
@@ -14,12 +16,12 @@ import {
   type ProviderUsageAccumulator,
 } from "@client/ai";
 import { buildContextPackage } from "@client/context";
-import { buildGraph } from "@client/graph";
+import { buildGraph, getFileDependencies, getFileDependents, getSymbolDependencies, getSymbolDependents } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
 import { buildBackgroundProjectState, findSemanticMatchesAcrossPaths, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
-import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
+import { computeFileChurnSignals, deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
 import {
   type IncrementalIndexPlan,
@@ -27,6 +29,7 @@ import {
   type FocusedResearchRequest,
   type FocusedResearchResult,
   type GraphState,
+  contentHash,
   detectResearchAmbiguity,
   normalizePath,
   stableId,
@@ -38,6 +41,7 @@ import {
   type PipelineRunResult,
   type PipelineRunStatus,
   type PipelineStage,
+  type ProjectFile,
   type ProjectPathRecord,
   type ValidationRecommendedAction,
   type ValidationRecommendedResearchProfile,
@@ -620,6 +624,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     const observerHint = await buildObserverHintSuffix(effectiveProjectRoots, task);
     const teamKnownFacts = await queryFactsAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
     const knownFactsHintText = buildKnownFactsHint(effectiveProjectRoots, teamKnownFacts);
+    // Architecture review finding (2026-07-16): intent classification never
+    // reached the Researcher's own investigation strategy before, only the
+    // final answer's tone (packages/ai's resolveAnswerMode, called much
+    // later). Reuses the same cheap, no-LLM-call regex classification -
+    // just surfaced earlier, to the loop itself.
+    const questionShapeHintText = buildQuestionShapeHint(classifyQuestionShape(task));
     // Тот же conversationTurns, что уже питает приоритетную evidence для
     // детерминированного пути (см. priorTurn чуть ниже) - agentic-путь
     // раньше вообще не участвовал в этом механизме, из-за чего каждая
@@ -664,6 +674,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
       ...(observerHint ? { observerHint } : {}),
       semanticSearch: buildSemanticSearchTool(effectiveProjectRoots, providerBaseUrl, providerApiKey),
+      // Architecture review finding (2026-07-16): the graph existed but was
+      // never queryable by the Researcher itself - see buildGraphNavigationTool.
+      findReferences: buildGraphNavigationTool(graph),
       // Speed pass (2026-07-16, по одобренному плану): контент топ-файлов
       // семантического индекса кладётся в контекст ДО первого хода (см.
       // AgenticRunOptions.semanticSeedFiles) - главный рычаг задержки на
@@ -673,6 +686,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       // детерминированный) - подтверждённые прошлыми прогонами факты как
       // "проверь и опирайся"-затравка.
       ...(knownFactsHintText ? { knownFactsHint: knownFactsHintText } : {}),
+      ...(questionShapeHintText ? { questionShapeHint: questionShapeHintText } : {}),
       onProgress: ({ turn, filesRead }) => {
         updateStageLabel(
           runId,
@@ -727,6 +741,25 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
         previousRun,
         invalidatedPaths: graphInvalidation.invalidatedFiles,
       });
+
+      // Cross-repo touched files (2026-07-16, architecture review finding):
+      // the rebuild above still only resolves paths inside the PRIMARY
+      // repo - a label-prefixed virtual path from another repo
+      // ("web/src/foo.js") never matched anything there. Read those
+      // directly and add them as plain file entries so Context can still
+      // attach their real content, even though they get no graph/symbol
+      // coverage (see loadCrossRepoFileEntries's comment for the honest
+      // limitation this leaves).
+      const crossRepoEntries = await loadCrossRepoFileEntries(
+        agenticResult.raw.touchedFiles,
+        effectiveProjectRoots,
+        new Set(workspace.files.map((file) => file.relativePath)),
+      );
+
+      if (crossRepoEntries.length > 0) {
+        workspace = { ...workspace, files: [...workspace.files, ...crossRepoEntries] };
+      }
+
       updatePartialArtifacts(runId, {
         index: {
           manifest: index.manifest,
@@ -793,10 +826,16 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   await yieldToEventLoop();
 
   const impactStartedAt = startStage(runId, "impact");
+  // Real risk signal from git history (2026-07-16, architecture review
+  // finding) - one git log call for the whole repo's recent history, not
+  // per-file; degrades to an empty map (no risk signal, not a crash) for a
+  // non-git project or a slow/failing git command.
+  const fileChurn = repository.isGitRepository ? await computeFileChurnSignals(projectRootPath) : undefined;
   const initialImpact = analyzeImpact({
     runId,
     graph,
     research: initialResearch,
+    ...(fileChurn ? { fileChurn } : {}),
   });
   completeStage(runId, "impact", impactStartedAt, `Определено ${initialImpact.affectedFiles.length} затронутых файлов и ${initialImpact.risks.length} рисков.`);
   updatePartialArtifacts(runId, {
@@ -1610,6 +1649,136 @@ function toVirtualPath(roots: WorkspaceRoot[], ownerRootPath: string, relativePa
 
   const owningRoot = roots.find((root) => root.absolutePath === ownerRootPath);
   return owningRoot ? `${owningRoot.label}/${relativePath}` : relativePath;
+}
+
+// Injected into AgenticRunOptions.semanticSearch (2026-07-16) - kept here,
+// Architecture review finding (2026-07-16): the structural graph already
+// exists (built early for Impact analysis) but was never exposed to the
+// Researcher, which had only lexical grep to answer "who calls this" -
+// misses renamed-variable/interface-indirection call sites a text match
+// can't see. Honest, known limitation carried over from the graph's own
+// scope: this graph is built from the PRIMARY path's workspace only (see
+// the multi-path plan doc's documented boundary), so a symbol that lives
+// only in a non-primary repo will not resolve here even though it may be
+// perfectly findable by grep_content/read_file - the tool says so plainly
+// rather than silently returning nothing with no explanation.
+function buildGraphNavigationTool(graph: GraphState): (query: string) => Promise<string> {
+  return async (query: string): Promise<string> => {
+    const normalizedQuery = query.trim().toLowerCase();
+
+    if (!normalizedQuery) {
+      return "(find_references needs a class/function/file name to look up)";
+    }
+
+    const matchingNodes = graph.nodes.filter((node) => {
+      const label = node.label.toLowerCase();
+      const baseName = node.filePath?.split("/").pop()?.toLowerCase() ?? "";
+      return label === normalizedQuery || baseName === normalizedQuery || baseName === `${normalizedQuery}.php` || baseName.startsWith(`${normalizedQuery}.`);
+    });
+
+    if (matchingNodes.length === 0) {
+      return `(no graph node found for "${query}" - this can mean it genuinely has no resolved static callers, OR it lives in a part of the project the graph does not cover, OR the name does not match exactly. Try grep_content instead.)`;
+    }
+
+    const lines: string[] = [];
+
+    for (const node of matchingNodes.slice(0, 3)) {
+      const isFileNode = node.kind === "file";
+      const dependents = isFileNode ? getFileDependents(graph, node.id) : getSymbolDependents(graph, node.id);
+      const dependencies = isFileNode ? getFileDependencies(graph, node.id) : getSymbolDependencies(graph, node.id);
+
+      lines.push(`"${node.label}" (${node.kind}${node.filePath ? `, ${node.filePath}` : ""}):`);
+      lines.push(
+        dependents.length > 0
+          ? `  Called/used by: ${[...new Set(dependents.map((n) => n.filePath ?? n.label))].slice(0, 10).join(", ")}`
+          : "  Called/used by: (no statically-resolved callers found in the graph)",
+      );
+      lines.push(
+        dependencies.length > 0
+          ? `  Depends on: ${[...new Set(dependencies.map((n) => n.filePath ?? n.label))].slice(0, 10).join(", ")}`
+          : "  Depends on: (none resolved)",
+      );
+    }
+
+    return lines.join("\n");
+  };
+}
+
+// Architecture review finding (2026-07-16): the evidence-to-impact seam fix
+// (rebuilding workspace/index/graph from agenticResult.raw.touchedFiles)
+// only ever resolved paths against the PRIMARY path's root - for a
+// multi-root project, touchedFiles from a NON-primary repo are label-prefixed
+// virtual paths ("web/src/foo.js"), which openWorkspaceSelective(primaryRoot,
+// {includePaths: [...]}) cannot resolve at all (it looks for a literal "web"
+// subdirectory INSIDE the primary repo). Content Impact analysis's own
+// structural graph traversal stays a KNOWN, documented, primary-path-only
+// limitation for now (rebuilding/merging a structural graph across repos
+// safely, without symbol-id collisions between repos that happen to share a
+// relative path, is real, non-trivial work - deliberately out of scope for
+// this pass). What this DOES fix: Context's ability to attach real file
+// CONTENT for cross-repo evidence, which is what actually reaches the
+// answer-synthesis prompt - reads each cross-repo touched file directly off
+// disk (via the same root list the agentic loop itself used) and adds it as
+// a plain workspace file entry under its virtual path, so
+// buildContextPackage's exact-string match (evidence.filePath === file.relativePath)
+// succeeds for it too.
+async function loadCrossRepoFileEntries(
+  touchedFiles: string[],
+  roots: WorkspaceRoot[],
+  alreadyResolvedRelativePaths: Set<string>,
+): Promise<ProjectFile[]> {
+  if (roots.length <= 1) {
+    return [];
+  }
+
+  const entries: ProjectFile[] = [];
+
+  for (const virtualPath of touchedFiles) {
+    if (alreadyResolvedRelativePaths.has(virtualPath)) {
+      continue;
+    }
+
+    const slashIndex = virtualPath.indexOf("/");
+
+    if (slashIndex === -1) {
+      continue;
+    }
+
+    const label = virtualPath.slice(0, slashIndex);
+    const rest = virtualPath.slice(slashIndex + 1);
+    const root = roots.find((candidate) => candidate.label === label);
+
+    if (!root) {
+      continue;
+    }
+
+    try {
+      const absolutePath = path.resolve(root.absolutePath, rest);
+      const content = await fs.readFile(absolutePath, "utf8");
+      const stat = await fs.stat(absolutePath);
+
+      entries.push({
+        id: stableId(["cross-repo-file", root.absolutePath, rest]),
+        absolutePath,
+        relativePath: virtualPath,
+        extension: path.extname(rest),
+        // Not indexed for symbols (out of scope here - see comment above),
+        // so its real language does not matter for this entry's only job:
+        // being findable by exact relativePath for context attachment.
+        language: "unknown",
+        size: content.length,
+        modifiedAt: stat.mtime.toISOString(),
+        contentHash: contentHash(content),
+        content,
+      });
+    } catch {
+      // File genuinely gone/unreadable - evidence referencing it just won't
+      // get content attached, same as any other missing-file case already.
+      continue;
+    }
+  }
+
+  return entries;
 }
 
 // Injected into AgenticRunOptions.semanticSearch (2026-07-16) - kept here,

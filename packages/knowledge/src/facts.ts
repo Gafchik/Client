@@ -189,8 +189,28 @@ export async function promoteFactsFromResearch(
     const category = report.dominantModule || "general";
     const now = new Date().toISOString();
 
+    // Architecture review finding (2026-07-16): this filter only ever
+    // matched origin === "baseline", which the deterministic (legacy,
+    // now rarely used) research path assigns - agentic team-mode evidence
+    // is always origin === "structural" (packages/agentic-research's
+    // adapter.ts), so the fact store had a silently one-way-broken write
+    // path: every question answered through team-mode (the actual daily
+    // usage) never contributed a single fact back, despite the whole
+    // point of the fact store being "verify, then rely" knowledge that
+    // compounds across questions. "baseline" was never really a trust
+    // signal to begin with (it meant "from the committed baseline, not an
+    // uncommitted overlay" - a git-dirtiness axis, unrelated to answer
+    // quality). The real trust signal for agentic evidence is the
+    // research's own confidence, which already encodes the critic's
+    // verdict (adapter.ts's deriveConfidence: approved=85,
+    // rejected-once-then-accepted=65, rejected-budget-exhausted=45) - only
+    // promoting at >=65 means the critic genuinely approved the answer
+    // this evidence backs, not just that the loop happened to touch a file.
+    const isTrustworthyOrigin = (item: ResearchReport["evidence"][number]) =>
+      item.origin === "baseline" || (item.origin === "structural" && report.confidence >= 65);
+
     const candidates = report.evidence
-      .filter((item) => item.origin === "baseline" && item.filePath && currentHashByPath.has(item.filePath))
+      .filter((item) => isTrustworthyOrigin(item) && item.filePath && currentHashByPath.has(item.filePath))
       .sort((left, right) => right.score - left.score)
       .slice(0, 3);
 
