@@ -135,6 +135,30 @@ export interface AgenticRunOptions {
    * to the model at all.
    */
   semanticSearch?: (query: string) => Promise<string>;
+  /**
+   * Top file paths by semantic similarity to the task (same index as
+   * semanticSearch, but structured). When present, the loop AUTO-READS these
+   * files before turn 1 and puts their content into the seed context - the
+   * single biggest latency lever measured (2026-07-16): easy questions spent
+   * 2-3 of their 5-8 turns just requesting reads of exactly these files, at
+   * a full LLM round-trip each. Quality-neutral by construction: it is the
+   * same read_file output the model would have requested, minus the
+   * round-trips; the model remains free to read anything else.
+   */
+  semanticSeedFiles?: (query: string) => Promise<string[]>;
+  /**
+   * Pre-formatted block of previously CONFIRMED project facts (fact store,
+   * packages/knowledge) relevant to this task - "verify, then rely" seeds.
+   * Team-mode never saw the fact store before 2026-07-16 (only the legacy
+   * deterministic path did), which wasted the accumulating knowledge base.
+   */
+  knownFactsHint?: string;
+  /**
+   * Called at the start of every turn - lets the caller surface live
+   * progress (turn number, files read so far) to the user while the
+   * research phase (~95% of a question's wall time) is running.
+   */
+  onProgress?: (info: { turn: number; filesRead: number }) => void;
 }
 
 export interface AgenticRunResult {
@@ -577,11 +601,59 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     });
   }
 
+  // Auto-read seed (2026-07-16, speed pass): content of the top semantic
+  // matches goes straight into the pre-turn context. Tracked separately from
+  // touchedFiles - a seed file only becomes evidence if the final answer
+  // actually mentions it (see finalize), otherwise 3 speculative pre-reads
+  // would pollute evidence/impact/context on every question they turned out
+  // irrelevant for.
+  const seedReadFiles = new Set<string>();
+
+  if (options.semanticSeedFiles) {
+    try {
+      const seedPaths = (await options.semanticSeedFiles(options.task)).slice(0, 3);
+      const seedBlocks: string[] = [];
+
+      for (const seedPath of seedPaths) {
+        const content = await readFile(options.projectRootPath, seedPath);
+
+        if (!content.startsWith("Error")) {
+          const normalized = toWorkspaceRelativePath(options.projectRootPath, seedPath);
+          seedReadFiles.add(normalized);
+          const bounded = content.length > MAX_OBSERVATION_CHARS
+            ? `${content.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`
+            : content;
+          seedBlocks.push(`FILE ${normalized}:\n${bounded}`);
+        }
+      }
+
+      if (seedBlocks.length > 0) {
+        messages.push({
+          role: "user",
+          content: [
+            "The most semantically relevant files have been read for you in advance (same as read_file output). If they already answer the question - answer right away instead of re-requesting them; if not - research as usual:",
+            ...seedBlocks,
+          ].join("\n\n---\n\n"),
+        });
+      }
+    } catch {
+      // Seed pre-reads are an optimization, never a dependency.
+    }
+  }
+
+  if (options.knownFactsHint) {
+    messages.push({ role: "user", content: options.knownFactsHint });
+  }
+
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
-  const actionsLog: string[] = [];
+  const actionsLog: string[] = [...[...seedReadFiles].map((filePath) => `[seed] auto-read ${filePath}`)];
   const touchedFiles = new Set<string>();
-  const seenDirs = new Set<string>([normalizeDirKey("."), ...priorTurnFiles.map((filePath) => dirnameOf(filePath))]);
+  const seenDirs = new Set<string>([
+    normalizeDirKey("."),
+    ...priorTurnFiles.map((filePath) => dirnameOf(filePath)),
+    ...[...seedReadFiles].map((filePath) => dirnameOf(filePath)),
+  ]);
   const grepTermsSeen = new Set<string>();
   let criticRounds = 0;
   let criticVerdict: AgenticRunResult["criticVerdict"] = "not-run";
@@ -602,16 +674,32 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
   const finalize = (
     overrides: Partial<AgenticRunResult> & Pick<AgenticRunResult, "turnsUsed" | "stopped">,
-  ): AgenticRunResult => ({
-    finalAnswer: null,
-    touchedFiles: [...touchedFiles],
-    actionsLog,
-    criticVerdict,
-    criticRounds,
-    totalPromptTokens,
-    totalCompletionTokens,
-    ...overrides,
-  });
+  ): AgenticRunResult => {
+    // Seed pre-reads become evidence only when the answer actually leans on
+    // them (mentions the path or the class/file stem) - see seedReadFiles.
+    const answerText = (overrides.finalAnswer ?? "").toLowerCase();
+
+    if (answerText) {
+      for (const seedPath of seedReadFiles) {
+        const stem = (seedPath.split("/").pop() ?? seedPath).replace(/\.[a-z0-9]+$/i, "").toLowerCase();
+
+        if (answerText.includes(seedPath.toLowerCase()) || (stem.length >= 4 && answerText.includes(stem))) {
+          touchedFiles.add(seedPath);
+        }
+      }
+    }
+
+    return {
+      finalAnswer: null,
+      touchedFiles: [...touchedFiles],
+      actionsLog,
+      criticVerdict,
+      criticRounds,
+      totalPromptTokens,
+      totalCompletionTokens,
+      ...overrides,
+    };
+  };
 
   // Deterministic guard, no LLM involved (2026-07-16, live incident): a run
   // gave up on turn 2 with "cannot answer without reading files X, Y" having
@@ -623,7 +711,8 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   let zeroReadBounceSent = false;
 
   async function evaluateProposedAnswer(candidate: string, turn: number): Promise<AgenticRunResult | "continue-loop"> {
-    if (touchedFiles.size === 0 && !zeroReadBounceSent && turn < maxTurns - 5) {
+    // seedReadFiles count as real reads (their full content was in context).
+    if (touchedFiles.size === 0 && seedReadFiles.size === 0 && !zeroReadBounceSent && turn < maxTurns - 5) {
       zeroReadBounceSent = true;
       actionsLog.push(`[turn ${turn}] final_answer bounced: zero files read - directory/grep listings alone are not evidence.`);
       messages.push({
@@ -671,6 +760,8 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       actionsLog.push(`[turn ${turn}] ABORTED: yielding to a live interactive request.`);
       return finalize({ turnsUsed: turn, stopped: "aborted" });
     }
+
+    options.onProgress?.({ turn, filesRead: touchedFiles.size + seedReadFiles.size });
 
     let content: string;
     let usage: ProviderUsage | null;

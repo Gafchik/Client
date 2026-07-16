@@ -566,6 +566,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   if (selectedTeam) {
     updateStageLabel(runId, "research", `Команда «${selectedTeam.name}»: Researcher исследует проект инструментами...`);
     const observerHint = await buildObserverHintSuffix(projectRootPath, task);
+    const knownFactsHintText = buildKnownFactsHint(knownFacts);
     // Тот же conversationTurns, что уже питает приоритетную evidence для
     // детерминированного пути (см. priorTurn чуть ниже) - agentic-путь
     // раньше вообще не участвовал в этом механизме, из-за чего каждая
@@ -610,6 +611,22 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
       ...(observerHint ? { observerHint } : {}),
       semanticSearch: buildSemanticSearchTool(projectRootPath, providerBaseUrl, providerApiKey),
+      // Speed pass (2026-07-16, по одобренному плану): контент топ-файлов
+      // семантического индекса кладётся в контекст ДО первого хода (см.
+      // AgenticRunOptions.semanticSeedFiles) - главный рычаг задержки на
+      // лёгких вопросах (2-3 хода экономии по замерам).
+      semanticSeedFiles: buildSemanticSeedLookup(projectRootPath, providerBaseUrl, providerApiKey),
+      // Факт-стор теперь питает и agentic-путь (раньше только легаси
+      // детерминированный) - подтверждённые прошлыми прогонами факты как
+      // "проверь и опирайся"-затравка.
+      ...(knownFactsHintText ? { knownFactsHint: knownFactsHintText } : {}),
+      onProgress: ({ turn, filesRead }) => {
+        updateStageLabel(
+          runId,
+          "research",
+          `Команда «${selectedTeam.name}»: ход ${turn}, прочитано файлов: ${filesRead}...`,
+        );
+      },
     });
     initialResearch = agenticResult.research;
     teamValidation = agenticResult.validation;
@@ -1563,6 +1580,56 @@ function buildSemanticSearchTool(
       return `(semantic search error: ${error instanceof Error ? error.message : String(error)})`;
     }
   };
+}
+
+// Порог 0.45 эмпирический: живые замеры этой сессии - правильные файлы для
+// точного вопроса скорили 0.62-0.72 (англ. запрос) и 0.40-0.49 (сырой
+// русский), нерелевантные - ниже ~0.42. Ниже порога сид просто пуст - это
+// оптимизация, а не зависимость.
+const SEMANTIC_SEED_MIN_SCORE = 0.45;
+
+function buildSemanticSeedLookup(
+  projectRootPath: string,
+  providerBaseUrl: string,
+  providerApiKey: string,
+): (query: string) => Promise<string[]> {
+  return async (query: string): Promise<string[]> => {
+    try {
+      const [queryEmbedding] = await embedTexts({
+        providerBaseUrl,
+        providerApiKey,
+        embeddingModel: SEMANTIC_SEARCH_EMBEDDING_MODEL,
+        texts: [query],
+      });
+
+      if (!queryEmbedding) {
+        return [];
+      }
+
+      const matches = await findSemanticMatches(projectRootPath, queryEmbedding, 3);
+      return matches.filter((match) => match.score >= SEMANTIC_SEED_MIN_SCORE).map((match) => match.filePath);
+    } catch {
+      return [];
+    }
+  };
+}
+
+// Формирует "verify, then rely"-блок из подтверждённых фактов прошлых
+// прогонов (fact store) для agentic-цикла. Только свежие (не stale) факты с
+// файлами - у протухших content hash уже разошёлся с кодом.
+function buildKnownFactsHint(knownFacts: Awaited<ReturnType<typeof queryRelevantFacts>>): string {
+  const usable = knownFacts
+    .filter((fact) => fact.status === "fresh" && fact.filePaths.length > 0)
+    .slice(0, 5);
+
+  if (usable.length === 0) {
+    return "";
+  }
+
+  return [
+    "Facts confirmed by PREVIOUS answered questions about this project (verify against current code before relying - the code may have changed):",
+    ...usable.map((fact) => `- ${fact.statement} (files: ${fact.filePaths.slice(0, 3).join(", ")})`),
+  ].join("\n");
 }
 
 async function buildObserverHintSuffix(projectRootPath: string, task: string): Promise<string> {

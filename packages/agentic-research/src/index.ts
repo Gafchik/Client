@@ -109,6 +109,12 @@ export interface RunAgenticResearchInput {
   observerHint?: string;
   /** See AgenticRunOptions.semanticSearch. */
   semanticSearch?: (query: string) => Promise<string>;
+  /** See AgenticRunOptions.semanticSeedFiles. */
+  semanticSeedFiles?: (query: string) => Promise<string[]>;
+  /** See AgenticRunOptions.knownFactsHint. */
+  knownFactsHint?: string;
+  /** See AgenticRunOptions.onProgress. */
+  onProgress?: (info: { turn: number; filesRead: number }) => void;
 }
 
 export interface RunAgenticResearchResult {
@@ -131,6 +137,9 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     ...(input.graphHintTerms?.length ? { graphHintTerms: input.graphHintTerms } : {}),
     ...(input.observerHint ? { observerHint: input.observerHint } : {}),
     ...(input.semanticSearch ? { semanticSearch: input.semanticSearch } : {}),
+    ...(input.semanticSeedFiles ? { semanticSeedFiles: input.semanticSeedFiles } : {}),
+    ...(input.knownFactsHint ? { knownFactsHint: input.knownFactsHint } : {}),
+    ...(input.onProgress ? { onProgress: input.onProgress } : {}),
   };
 
   const raw = await runAgenticLoop(options);
