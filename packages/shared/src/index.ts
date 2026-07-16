@@ -21,6 +21,7 @@ export type SymbolKind =
   | "function"
   | "method"
   | "route"
+  | "http-call"
   | "middleware"
   | "variable"
   | "type"
@@ -40,6 +41,7 @@ export type GraphNodeKind =
   | "function"
   | "method"
   | "route"
+  | "http-call"
   | "middleware"
   | "dependency";
 
@@ -483,7 +485,7 @@ export function detectResearchAmbiguity(research: ResearchReport): ResearchAmbig
  * атомарный, переиспользуемый вывод, привязанный к конкретным файлам через
  * их content hash на момент подтверждения.
  */
-export type FactStatus = "fresh" | "potentially_stale" | "deprecated";
+export type FactStatus = "fresh" | "potentially_stale" | "deprecated" | "contradicted";
 export type FactSource = "research" | "user-confirmed" | "execution";
 
 export interface ProjectFact {

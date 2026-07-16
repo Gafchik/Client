@@ -1,5 +1,6 @@
 import path from "node:path";
 import ts from "typescript";
+import { Engine as PhpEngine } from "php-parser";
 import {
   normalizePath,
   stableId,
@@ -375,6 +376,16 @@ function extractScriptFile(
 
   visit(sourceFile);
 
+  // Convention-based FE->BE dependency detection (2026-07-17, architecture
+  // review Tier 3): extracted as plain symbols with no relation of their own
+  // here - matching them to the backend's Route:: symbols (extractPhpRoutes)
+  // needs the full merged graph (frontend + backend, often different repos),
+  // which doesn't exist yet at single-file index time. See
+  // packages/graph's linkHttpCallsToRoutes for the matching pass.
+  const httpCalls = extractFrontendHttpCalls(file);
+  symbols.push(...httpCalls.symbols);
+  relations.push(...httpCalls.relations);
+
   return {
     file: {
       fileId: file.id,
@@ -390,6 +401,129 @@ function extractScriptFile(
     symbols,
     relations,
   };
+}
+
+// Matches axios/$http/api-style client calls: axios.post('/login', ...),
+// this.$axios.get(`/users/${id}`), apiClient.delete("/users/1"). Restricted
+// to identifiers that plausibly name an HTTP client (axios/api/http/client,
+// case-insensitively) rather than matching ANY ".get("/post(" call - those
+// words are common enough on plain objects/Maps that an unrestricted match
+// would produce mostly noise.
+const HTTP_CLIENT_CALL_PATTERN =
+  /\b(?:\$?axios|\$?http|\w*[Aa]pi\w*|\w*[Cc]lient\w*)\s*\.\s*(get|post|put|patch|delete)\s*\(\s*(['"`])((?:(?!\2)[^\\]|\\.)*?)\2/g;
+// Bare fetch('/path', { method: 'POST' }) - method defaults to GET per the
+// Fetch API spec when the init object is absent or has no method field.
+const FETCH_CALL_PATTERN = /\bfetch\s*\(\s*(['"`])((?:(?!\1)[^\\]|\\.)*?)\1(\s*,\s*\{[\s\S]{0,300}?\})?/g;
+const FETCH_METHOD_PATTERN = /method\s*:\s*['"](\w+)['"]/;
+// axios({ method: 'post', url: '/login' }) object-call form - key order is
+// not guaranteed, so url/method are extracted independently from the same
+// bounded window rather than assumed adjacent.
+const AXIOS_OBJECT_CALL_PATTERN = /\baxios\s*\(\s*\{([\s\S]{0,300}?)\}\s*\)/g;
+const AXIOS_OBJECT_URL_PATTERN = /\burl\s*:\s*(['"`])((?:(?!\1)[^\\]|\\.)*?)\1/;
+const AXIOS_OBJECT_METHOD_PATTERN = /\bmethod\s*:\s*['"](\w+)['"]/;
+
+function normalizeHttpCallPath(rawPath: string): string {
+  const withoutQuery = rawPath.split("?")[0] ?? rawPath;
+  const withParams = withoutQuery
+    // JS template literal interpolation: `/users/${id}` -> /users/:param
+    .replace(/\$\{[^}]*\}/g, ":param")
+    // Laravel-style route placeholders, in case a shared helper mirrors backend paths: {id}/{id?} -> :param
+    .replace(/\{[^}]*\}/g, ":param")
+    // Vue-router style dynamic segments: :id -> :param (normalizes naming, not just braces)
+    .replace(/:[A-Za-z_][A-Za-z0-9_]*/g, ":param");
+  const collapsedSlashes = withParams.replace(/\/+/g, "/");
+  const withLeadingSlash = collapsedSlashes.startsWith("/") ? collapsedSlashes : `/${collapsedSlashes}`;
+  return withLeadingSlash.length > 1 && withLeadingSlash.endsWith("/") ? withLeadingSlash.slice(0, -1) : withLeadingSlash;
+}
+
+function getLineNumberAt(content: string, charIndex: number): number {
+  let line = 1;
+
+  for (let index = 0; index < charIndex && index < content.length; index += 1) {
+    if (content[index] === "\n") {
+      line += 1;
+    }
+  }
+
+  return line;
+}
+
+function extractFrontendHttpCalls(file: ProjectFile): { symbols: IndexSymbol[]; relations: IndexRelation[] } {
+  const symbols: IndexSymbol[] = [];
+  const relations: IndexRelation[] = [];
+  const content = file.content;
+  const seen = new Set<string>();
+
+  const addCall = (method: string, rawPath: string, charIndex: number): void => {
+    // A literal string with no interpolation and no leading slash almost
+    // never denotes an endpoint path in these call shapes (more often a
+    // named event, a relative import, or unrelated string argument) - skip
+    // rather than risk a false match.
+    if (!rawPath || (!rawPath.startsWith("/") && !rawPath.includes("${"))) {
+      return;
+    }
+
+    const normalizedPath = normalizeHttpCallPath(rawPath);
+    const name = `${method.toUpperCase()} ${normalizedPath}`;
+    const dedupeKey = `${name}@${charIndex}`;
+
+    if (seen.has(dedupeKey)) {
+      return;
+    }
+
+    seen.add(dedupeKey);
+
+    const symbol: IndexSymbol = {
+      id: stableId(["symbol", file.relativePath, "http-call", "", name, String(charIndex)]),
+      stableSymbolId: stableId(["stable-symbol", "http-call", "", name]),
+      name,
+      kind: "http-call",
+      language: file.language,
+      fileId: file.id,
+      filePath: file.relativePath,
+      line: getLineNumberAt(content, charIndex),
+      signature: rawPath,
+    };
+
+    symbols.push(symbol);
+    relations.push({
+      id: stableId(["declares", file.id, symbol.id]),
+      type: "DECLARES",
+      sourceId: file.id,
+      targetId: symbol.id,
+    });
+  };
+
+  for (const match of content.matchAll(HTTP_CLIENT_CALL_PATTERN)) {
+    const method = match[1];
+    const rawPath = match[3];
+
+    if (method && rawPath !== undefined && match.index !== undefined) {
+      addCall(method, rawPath, match.index);
+    }
+  }
+
+  for (const match of content.matchAll(FETCH_CALL_PATTERN)) {
+    const rawPath = match[2];
+    const optionsBlock = match[3] ?? "";
+    const method = FETCH_METHOD_PATTERN.exec(optionsBlock)?.[1] ?? "GET";
+
+    if (rawPath !== undefined && match.index !== undefined) {
+      addCall(method, rawPath, match.index);
+    }
+  }
+
+  for (const match of content.matchAll(AXIOS_OBJECT_CALL_PATTERN)) {
+    const block = match[1] ?? "";
+    const url = AXIOS_OBJECT_URL_PATTERN.exec(block)?.[2];
+    const method = AXIOS_OBJECT_METHOD_PATTERN.exec(block)?.[1] ?? "GET";
+
+    if (url !== undefined && match.index !== undefined) {
+      addCall(method, url, match.index);
+    }
+  }
+
+  return { symbols, relations };
 }
 
 function extractMarkdownFile(file: ProjectFile): {
@@ -517,7 +651,377 @@ function extractJsonFile(file: ProjectFile): {
   };
 }
 
+// PHP AST-based indexing (2026-07-17, architecture review Tier 3 - the
+// highest-risk item on the list, since nearly every PHP-derived feature
+// shipped this session (routes, http-call linking, hot-path risk, impact
+// analysis) reads the symbols/relations this produces). Tries a real parser
+// (php-parser, pure JS, no PHP runtime needed) first - it is strictly more
+// correct than the regex approach below for exactly the cases regex cannot
+// see at all: class-like text inside comments/strings, methods with no
+// explicit visibility keyword (implicit public - valid PHP, silently
+// invisible to the old `(public|protected|private)\s+function` pattern),
+// and multi-class files (the old code attributed EVERY method in a file to
+// the FIRST class found, via `defaultContainerName`). Falls back to the
+// proven regex extractor on ANY parse or extraction failure - never
+// silently drops a file to zero symbols just because php-parser choked on
+// one construct it doesn't support.
 function extractPhpFile(
+  file: ProjectFile,
+  fileByRelativePath: Map<string, ProjectFile>,
+): {
+  file: IndexedFile;
+  symbols: IndexSymbol[];
+  relations: IndexRelation[];
+} {
+  try {
+    return extractPhpFileViaAst(file, fileByRelativePath);
+  } catch (error) {
+    console.warn(`[indexer] PHP AST parse failed for ${file.relativePath}, falling back to regex extraction:`, error instanceof Error ? error.message : error);
+    return extractPhpFileViaRegex(file, fileByRelativePath);
+  }
+}
+
+interface PhpAstNode {
+  kind: string;
+  name?: { name: string } | string;
+  loc?: { start: { offset: number; line: number }; end: { offset: number; line: number } };
+  children?: PhpAstNode[];
+  body?: PhpAstNode[] | PhpAstNode | null;
+  items?: PhpAstNode[];
+  extends?: PhpAstNode | PhpAstNode[] | null;
+  implements?: PhpAstNode[] | null;
+  arguments?: PhpAstNode[];
+  alias?: { name: string } | null;
+  visibility?: string;
+}
+
+function phpNodeName(node: PhpAstNode | null | undefined): string | undefined {
+  if (!node) {
+    return undefined;
+  }
+
+  return typeof node.name === "string" ? node.name : node.name?.name;
+}
+
+function extractPhpFileViaAst(
+  file: ProjectFile,
+  fileByRelativePath: Map<string, ProjectFile>,
+): {
+  file: IndexedFile;
+  symbols: IndexSymbol[];
+  relations: IndexRelation[];
+} {
+  const content = file.content;
+  const lineStarts = buildLineStarts(content);
+  const symbols: IndexSymbol[] = [];
+  const relations: IndexRelation[] = [];
+  const imports: string[] = [];
+  const useMap = new Map<string, string>();
+  const symbolByContainerAndName = new Map<string, IndexSymbol>();
+  const phpDeclaredNames = new Set<string>();
+  // Regex-based, but scans raw content directly rather than parsing
+  // declarations - unrelated to the declaration-parsing this replaces, kept
+  // exactly as-is (see extractPhpMethodParameterRelations/extractPhpServiceCalls,
+  // which depend on its output and are themselves unchanged).
+  const propertyTypeByName = collectPhpPropertyTypes(content);
+  const methodScopes: PhpMethodScope[] = [];
+  const classSymbols = new Map<string, IndexSymbol>();
+
+  // Takes a LINE number (not an offset) as its 3rd argument - this exact
+  // signature is shared with extractPhpRoutes (called at the bottom of this
+  // function, unchanged), which already calls it that way.
+  const addSymbol = (
+    name: string,
+    symbolKind: IndexSymbol["kind"],
+    line: number,
+    containerName?: string,
+    signature?: string,
+  ): IndexSymbol => {
+    const symbol: IndexSymbol = {
+      id: stableId(["symbol", file.relativePath, symbolKind, containerName ?? "", name]),
+      stableSymbolId: stableId(["stable-symbol", symbolKind, containerName ?? "", name]),
+      name,
+      kind: symbolKind,
+      language: file.language,
+      fileId: file.id,
+      filePath: file.relativePath,
+      line,
+    };
+
+    if (containerName) {
+      symbol.containerName = containerName;
+    }
+
+    if (signature) {
+      symbol.signature = signature;
+    }
+
+    symbols.push(symbol);
+    phpDeclaredNames.add(name);
+    symbolByContainerAndName.set(buildSymbolLookupKey(containerName, name), symbol);
+    relations.push({
+      id: stableId(["declares", file.id, symbol.id]),
+      type: "DECLARES",
+      sourceId: file.id,
+      targetId: symbol.id,
+    });
+
+    return symbol;
+  };
+
+  const engine = new PhpEngine({
+    parser: { extractDoc: false, php7: true },
+    ast: { withPositions: true },
+  });
+  const ast = engine.parseCode(content, file.relativePath) as PhpAstNode;
+
+  // namespace/group-use wrap top-level declarations one level deep (and a
+  // file can have several namespace blocks) - flattened here so the rest of
+  // this function can walk one flat list, same as the regex version
+  // effectively did by scanning the whole file at once.
+  const topLevelNodes: PhpAstNode[] = [];
+
+  const collectTopLevel = (node: PhpAstNode | null | undefined): void => {
+    if (!node) {
+      return;
+    }
+
+    if (node.kind === "namespace") {
+      for (const child of node.children ?? []) {
+        collectTopLevel(child);
+      }
+    } else {
+      topLevelNodes.push(node);
+    }
+  };
+
+  for (const child of ast.children ?? []) {
+    collectTopLevel(child);
+  }
+
+  // Pass 1: use-imports.
+  for (const node of topLevelNodes) {
+    if (node.kind !== "usegroup") {
+      continue;
+    }
+
+    for (const item of node.items ?? []) {
+      const imported = phpNodeName(item);
+
+      if (!imported) {
+        continue;
+      }
+
+      const aliasName = phpNodeName(item.alias as PhpAstNode | undefined);
+      const shortName = aliasName ?? imported.split("\\").pop();
+
+      if (!shortName) {
+        continue;
+      }
+
+      useMap.set(shortName, imported);
+      imports.push(imported);
+
+      const resolvedTarget = resolvePhpClassTarget(imported, fileByRelativePath);
+      const targetId = resolvedTarget?.id ?? stableId(["dependency", imported]);
+
+      relations.push({
+        id: stableId(["imports", file.id, targetId, imported]),
+        type: "IMPORTS",
+        sourceId: file.id,
+        targetId,
+        metadata: {
+          specifier: imported,
+          targetLabel: resolvedTarget?.relativePath ?? imported,
+          external: resolvedTarget ? "false" : "true",
+        },
+      });
+    }
+  }
+
+  // Pass 2: class/interface/enum/trait declarations - traits are indexed
+  // too (kind "class", the closest existing fit - SymbolKind has no
+  // separate "trait" value) unlike the old regex version, which silently
+  // skipped them entirely; a project's real business logic frequently lives
+  // in a project-own trait, not just in library traits.
+  const containerNodes = topLevelNodes.filter((node) => ["class", "interface", "enum", "trait"].includes(node.kind));
+
+  for (const node of containerNodes) {
+    const name = phpNodeName(node);
+
+    if (!name) {
+      continue;
+    }
+
+    const symbolKind: IndexSymbol["kind"] = node.kind === "interface" ? "interface" : node.kind === "enum" ? "enum" : "class";
+    const classSymbol = addSymbol(name, symbolKind, getLineNumber(lineStarts, node.loc?.start.offset ?? 0));
+    classSymbols.set(name, classSymbol);
+  }
+
+  // Pass 3: inheritance - class.extends is a single name node, interface.extends is an array (interfaces can extend several).
+  for (const node of containerNodes) {
+    const name = phpNodeName(node);
+    const classSymbol = name ? classSymbols.get(name) : undefined;
+
+    if (!classSymbol) {
+      continue;
+    }
+
+    const extendsNodes = Array.isArray(node.extends) ? node.extends : node.extends ? [node.extends] : [];
+
+    for (const extendsNode of extendsNodes) {
+      const parentName = phpNodeName(extendsNode);
+
+      if (!parentName) {
+        continue;
+      }
+
+      const targetId = resolvePhpSymbolOrDependencyId(parentName, useMap, symbolByContainerAndName);
+      relations.push({
+        id: stableId(["extends", classSymbol.id, targetId, parentName]),
+        type: "EXTENDS",
+        sourceId: classSymbol.id,
+        targetId,
+        metadata: {
+          targetLabel: parentName,
+          external: String(!isLocalPhpSymbol(parentName, useMap, symbolByContainerAndName)),
+        },
+      });
+    }
+
+    for (const implementsNode of node.implements ?? []) {
+      const contractName = phpNodeName(implementsNode);
+
+      if (!contractName) {
+        continue;
+      }
+
+      const targetId = resolvePhpSymbolOrDependencyId(contractName, useMap, symbolByContainerAndName);
+      relations.push({
+        id: stableId(["implements", classSymbol.id, targetId, contractName]),
+        type: "IMPLEMENTS",
+        sourceId: classSymbol.id,
+        targetId,
+        metadata: {
+          targetLabel: contractName,
+          external: String(!isLocalPhpSymbol(contractName, useMap, symbolByContainerAndName)),
+        },
+      });
+    }
+  }
+
+  // Pass 4: methods, correctly scoped to their ACTUAL containing
+  // class/interface/enum/trait - unlike the old regex version, which
+  // attributed every method in the file to whichever class was found FIRST.
+  for (const node of containerNodes) {
+    const containerName = phpNodeName(node);
+    const classSymbol = containerName ? classSymbols.get(containerName) : undefined;
+    const body = Array.isArray(node.body) ? node.body : [];
+
+    for (const member of body) {
+      if (member.kind !== "method" || member.loc === undefined) {
+        continue;
+      }
+
+      const methodName = phpNodeName(member);
+
+      if (!methodName) {
+        continue;
+      }
+
+      const methodSymbol = addSymbol(methodName, "method", getLineNumber(lineStarts, member.loc.start.offset), containerName);
+      const bodyNode = !Array.isArray(member.body) ? member.body : null;
+      const bodyEndOffset = bodyNode?.loc?.end.offset ?? member.loc.end.offset;
+
+      methodScopes.push({
+        symbolId: methodSymbol.id,
+        containerName,
+        methodName,
+        startOffset: member.loc.start.offset,
+        endOffset: bodyEndOffset,
+      });
+
+      if (classSymbol) {
+        relations.push({
+          id: stableId(["contains", classSymbol.id, methodSymbol.id]),
+          type: "CONTAINS",
+          sourceId: classSymbol.id,
+          targetId: methodSymbol.id,
+        });
+      }
+
+      const methodArguments = member.arguments ?? [];
+
+      if (methodArguments.length > 0) {
+        const first = methodArguments[0]?.loc;
+        const last = methodArguments[methodArguments.length - 1]?.loc;
+        const paramsText = first && last ? content.slice(first.start.offset, last.end.offset) : "";
+
+        extractPhpMethodParameterRelations(
+          paramsText,
+          methodSymbol.id,
+          useMap,
+          symbolByContainerAndName,
+          relations,
+          propertyTypeByName,
+          methodName,
+        );
+      }
+    }
+  }
+
+  // Pass 5: top-level functions (not inside any class/interface/enum/trait).
+  for (const node of topLevelNodes) {
+    if (node.kind !== "function" || node.loc === undefined) {
+      continue;
+    }
+
+    const functionName = phpNodeName(node);
+
+    if (!functionName) {
+      continue;
+    }
+
+    addSymbol(functionName, "function", getLineNumber(lineStarts, node.loc.start.offset));
+  }
+
+  // Same shared, content-scanning sub-extractors the regex path uses -
+  // unaffected by how declarations above were found, since they read
+  // useMap/symbolByContainerAndName/methodScopes/propertyTypeByName, not the
+  // AST itself.
+  extractPhpServiceCalls(
+    file,
+    content,
+    useMap,
+    fileByRelativePath,
+    symbolByContainerAndName,
+    relations,
+    phpDeclaredNames,
+    propertyTypeByName,
+    methodScopes,
+  );
+  extractPhpStaticCalls(content, useMap, symbolByContainerAndName, relations, methodScopes);
+  extractPhpRuntimeSignals(file, content, relations, methodScopes);
+  extractPhpRoutes(file, content, useMap, fileByRelativePath, symbols, relations, symbolByContainerAndName, addSymbol);
+
+  return {
+    file: {
+      fileId: file.id,
+      filePath: file.relativePath,
+      language: file.language,
+      contentHash: file.contentHash,
+      modifiedAt: file.modifiedAt,
+      parseCacheKey: buildParseCacheKey(file),
+      astFingerprint: buildAstFingerprint(file),
+      symbolIds: symbols.map((symbol) => symbol.id),
+      imports,
+    },
+    symbols,
+    relations,
+  };
+}
+
+function extractPhpFileViaRegex(
   file: ProjectFile,
   fileByRelativePath: Map<string, ProjectFile>,
 ): {

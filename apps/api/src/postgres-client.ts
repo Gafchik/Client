@@ -190,6 +190,32 @@ export async function initializePostgresSchema(): Promise<void> {
     `create index if not exists idx_business_graph_entries_project on business_graph_entries(project_root_path, unit_path)`,
   );
 
+  // domain_glossary_entries (2026-07-17, architecture review Tier 3) — a
+  // structured counterpart to project_facts: facts are one-off statements
+  // ("X does Y"), this is a persistent business-term dictionary ("what does
+  // <term> actually MEAN in this codebase") extracted from research answers
+  // by extractDomainGlossaryTerms (packages/ai) and kept as ONE row per
+  // (project, term) - unlike facts, a re-discovery of the same term UPDATES
+  // the definition in place (keeping whichever is higher-confidence) rather
+  // than accumulating duplicate rows, since a glossary entry is meant to
+  // read as a single authoritative definition, not a log of observations.
+  await runSql(`
+    create table if not exists domain_glossary_entries (
+      id text primary key,
+      project_root_path text not null,
+      term text not null,
+      definition text not null,
+      related_files text[] not null default '{}',
+      confidence integer not null default 50,
+      source_run_id text,
+      created_at timestamptz not null,
+      updated_at timestamptz not null
+    )
+  `);
+  await runSql(
+    `create unique index if not exists idx_domain_glossary_entries_term on domain_glossary_entries(project_root_path, lower(term))`,
+  );
+
   // teams — Researcher/Critic/Observer роли, каждая закреплена за моделью
   // (свободная строка, отправляется как есть в /chat/completions текущего
   // выбранного Provider — здесь нет отдельных credentials, см. team-store.ts).

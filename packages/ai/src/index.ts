@@ -481,6 +481,133 @@ export async function classifyProjectScopeDirective(input: {
   }
 }
 
+export interface DomainGlossaryTermCandidate {
+  term: string;
+  definition: string;
+  relatedFiles: string[];
+}
+
+// Domain Glossary (2026-07-17, architecture review Tier 3): promoteFactsFromResearch
+// (packages/knowledge/facts.ts) already writes to a persistent store, but its
+// statement is built from evidence.reason - for agentic evidence that reason
+// is always the SAME boilerplate line ("file was actually opened by the
+// researcher"), never an actual business-meaning definition. This is a
+// separate, purpose-built extraction over the research's own final answer
+// text (already written in the conversational, business-facing style the
+// answer synthesizer produces - see buildAnswerSystemPrompt) - it is the only
+// good source of real domain meaning this pipeline currently produces.
+export async function extractDomainGlossaryTerms(input: {
+  answerText: string;
+  evidenceFilePaths: string[];
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<DomainGlossaryTermCandidate[]> {
+  // Too short to plausibly contain a real definition (e.g. "не найдено" /
+  // "нет доступа к файлу") - skip the call rather than risk the model
+  // inventing a term to fill the response.
+  if (input.answerText.trim().length < 80) {
+    return [];
+  }
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You extract domain-glossary entries from a developer's answer about a specific codebase.",
+            "A domain-glossary entry is a business/domain TERM (an entity, status, role, or concept actually named in this codebase - e.g. a model name, a field, a state value) paired with what it concretely MEANS in THIS project, based only on what the answer actually says.",
+            "Do NOT invent terms the answer doesn't support. Do NOT write generic descriptions of what a file or class does structurally (\"this class handles X\") - write what the TERM means from a business standpoint (\"an X is a Y that can only ...\").",
+            "Skip this entirely if the answer contains no real domain term worth remembering (e.g. it's about tooling, config, or a pure bug/typo) - return an empty array rather than force one.",
+            "Reply with ONLY one line of JSON: {\"terms\": [{\"term\": string, \"definition\": string}]}. Up to 3 entries. definition is one sentence, in Russian, standalone (understandable without re-reading the question).",
+          ].join("\n"),
+        },
+        { role: "user", content: input.answerText.slice(0, 4000) },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return [];
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { terms?: unknown };
+
+    if (!Array.isArray(parsed.terms)) {
+      return [];
+    }
+
+    return parsed.terms
+      .filter((entry): entry is { term: unknown; definition: unknown } => typeof entry === "object" && entry !== null)
+      .map((entry) => ({
+        term: typeof entry.term === "string" ? entry.term.trim() : "",
+        definition: typeof entry.definition === "string" ? entry.definition.trim() : "",
+        relatedFiles: input.evidenceFilePaths.slice(0, 5),
+      }))
+      .filter((entry) => entry.term.length >= 2 && entry.term.length <= 60 && entry.definition.length >= 10)
+      .slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
+// Belief reconciliation (2026-07-17, architecture review Tier 3): the Fact
+// Store dedupes by exact statement text (stableId hash of the normalized
+// string) - two DIFFERENTLY-WORDED facts about the same file(s) that
+// actually contradict each other (e.g. "email validation happens inline in
+// the controller" vs "email validation is delegated to a FormRequest") were
+// previously just two unrelated "fresh" rows, both handed to the Researcher
+// with no signal they might be in tension. This is the classification half
+// of that fix - facts.ts's promoteFactsFromResearch calls it (via an
+// injected callback, to keep packages/knowledge free of any LLM-calling
+// code) only when a new candidate fact shares a file with an existing one
+// and the two statements aren't near-identical text to begin with.
+export async function classifyFactConflict(input: {
+  existingStatement: string;
+  candidateStatement: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<boolean> {
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You compare two short factual statements about the same source file(s) in a codebase.",
+            "Reply {\"conflict\": true} only if they make genuinely INCOMPATIBLE claims about the same behavior (one says X happens, the other says X does not happen / something contradictory happens instead).",
+            "Reply {\"conflict\": false} if they are simply about different aspects of the file, or one is more specific/detailed than the other without contradicting it - most pairs are this case.",
+            "Reply with ONLY one line of JSON: {\"conflict\": boolean}.",
+          ].join("\n"),
+        },
+        { role: "user", content: `Statement A (existing): ${input.existingStatement}\nStatement B (new): ${input.candidateStatement}` },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return false;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { conflict?: unknown };
+    return parsed.conflict === true;
+  } catch {
+    return false;
+  }
+}
+
 export interface EmbedTextsInput {
   providerBaseUrl: string;
   providerApiKey: string;

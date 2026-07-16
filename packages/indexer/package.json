@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@client/shared": "0.1.0",
+    "php-parser": "^3.7.0",
     "typescript": "^5.8.3"
   }
 }

@@ -1,4 +1,5 @@
 import {
+  computeEntrypointReachability,
   getFileDependencies,
   getFileDependents,
   getIncomingNeighbors,
@@ -164,9 +165,10 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
       break;
   }
 
-  const fileList = [...affectedFiles].sort();
+  const fileList = dedupeLabelPrefixedDuplicates([...affectedFiles]);
   const symbolList = [...affectedSymbols, ...affectedModules].sort();
-  const risks = buildRisks(fileList, symbolList, input.research, input.fileChurn);
+  const entrypointReachability = computeEntrypointReachability(input.graph);
+  const risks = buildRisks(fileList, symbolList, input.research, input.fileChurn, entrypointReachability);
   const validationScope = buildValidationScope(fileList);
   const confidence = computeConfidence(input.research.confidence, fileList.length, risks.length);
 
@@ -343,8 +345,18 @@ function expandBroadImpact(
 // recently", not just "it changes often" - a frequently-changed file with
 // zero fix-shaped commits is normal active development, not a risk signal.
 const CHURN_RISK_MIN_FIX_COMMITS = 2;
+// Reachable from 1-2 routes is normal (most files serve a handful of related
+// endpoints) - 3+ distinct entrypoints is where "this is genuinely shared
+// infrastructure" starts, not just "this file has more than one caller".
+const ENTRYPOINT_FANIN_MIN = 3;
 
-function buildRisks(files: string[], symbols: string[], research: ResearchReport, fileChurn?: Map<string, FileChurnSignal>): string[] {
+function buildRisks(
+  files: string[],
+  symbols: string[],
+  research: ResearchReport,
+  fileChurn?: Map<string, FileChurnSignal>,
+  entrypointReachability?: Map<string, Set<string>>,
+): string[] {
   const risks: string[] = [];
 
   // Architecture review finding (2026-07-16): the three rules this replaced
@@ -362,19 +374,8 @@ function buildRisks(files: string[], symbols: string[], research: ResearchReport
     // directly - falling back to "the part after the first slash" recovers
     // the match for evidence that happens to belong to the primary repo,
     // without buildRisks needing to know the actual root labels at all.
-    const lookupChurn = (file: string): FileChurnSignal | undefined => {
-      const direct = fileChurn.get(file);
-
-      if (direct) {
-        return direct;
-      }
-
-      const slashIndex = file.indexOf("/");
-      return slashIndex === -1 ? undefined : fileChurn.get(file.slice(slashIndex + 1));
-    };
-
     const riskyFiles = files
-      .map((file) => ({ file, signal: lookupChurn(file) }))
+      .map((file) => ({ file, signal: lookupWithLabelFallback(fileChurn, file) }))
       .filter((entry): entry is { file: string; signal: FileChurnSignal } => Boolean(entry.signal) && entry.signal!.fixCommitCount >= CHURN_RISK_MIN_FIX_COMMITS)
       .sort((left, right) => right.signal.fixCommitCount - left.signal.fixCommitCount)
       .slice(0, 3);
@@ -382,6 +383,26 @@ function buildRisks(files: string[], symbols: string[], research: ResearchReport
     if (riskyFiles.length > 0) {
       const description = riskyFiles.map((entry) => `${entry.file} (${entry.signal.fixCommitCount} багфикс-коммитов за полгода)`).join(", ");
       risks.push(`Затронутые файлы имеют историю повторяющихся багфиксов - требуют особенно внимательного ревью: ${description}.`);
+    }
+  }
+
+  // Hot-path/entrypoint-reachability risk signal (2026-07-17, architecture
+  // review Tier 3) - a file reachable from several distinct public routes is
+  // shared infrastructure in practice even if the graph never labels it a
+  // "module"; a bug there ships broken to every one of those endpoints at
+  // once, not just to whatever feature the current question is about.
+  if (entrypointReachability) {
+    const hotFiles = files
+      .map((file) => ({ file, routes: lookupWithLabelFallback(entrypointReachability, file) }))
+      .filter((entry): entry is { file: string; routes: Set<string> } => Boolean(entry.routes) && entry.routes!.size >= ENTRYPOINT_FANIN_MIN)
+      .sort((left, right) => right.routes.size - left.routes.size)
+      .slice(0, 3);
+
+    if (hotFiles.length > 0) {
+      const description = hotFiles
+        .map((entry) => `${entry.file} (${entry.routes.size} эндпоинтов, напр. ${[...entry.routes].slice(0, 2).join(", ")})`)
+        .join(", ");
+      risks.push(`Затронутые файлы лежат на пути выполнения сразу нескольких публичных эндпоинтов - ошибка здесь затронет все из них одновременно: ${description}.`);
     }
   }
 
@@ -410,6 +431,23 @@ function buildRisks(files: string[], symbols: string[], research: ResearchReport
   // genuinely empty array correctly omits the section instead of inventing
   // a platitude to fill it.
   return risks;
+}
+
+// Shared by the churn and entrypoint-reachability risk signals: both keyed
+// maps are built from single-repo sources (git log, the primary graph) that
+// have no concept of the multi-root label prefix ("web/src/foo.js"), so a
+// direct lookup misses for anything but the primary repo's own files -
+// stripping the first path segment and retrying recovers the match without
+// buildRisks needing to know the actual root labels at all.
+function lookupWithLabelFallback<T>(map: Map<string, T>, file: string): T | undefined {
+  const direct = map.get(file);
+
+  if (direct) {
+    return direct;
+  }
+
+  const slashIndex = file.indexOf("/");
+  return slashIndex === -1 ? undefined : map.get(file.slice(slashIndex + 1));
 }
 
 function buildValidationScope(files: string[]): string[] {
@@ -499,4 +537,34 @@ function extractInfrastructureTerms(research: ResearchReport): string[] {
 
 function uniqueStrings(values: string[]): string[] {
   return values.filter((value, index) => Boolean(value) && values.indexOf(value) === index);
+}
+
+// Multi-root evidence paths are always label-prefixed ("api/app/..."), but
+// the primary root's own graph nodes are not (see pipeline-runner.ts - only
+// buildCrossRepoStructuralData relabels SECONDARY roots, relabeling the
+// primary one too would ripple into the deterministic legacy path which
+// reads the same workspace/graph unprefixed). That mismatch made the same
+// primary-repo file show up twice in affectedFiles: once via direct evidence
+// seeding (prefixed) and once via graph-node traversal like
+// getNodesForQueryProfile (unprefixed). Collapses "label/x" + "x" pairs into
+// the prefixed form, which is the convention the rest of the pipeline
+// (buildKnownFactsHint, context scoring, tools.ts) already expects.
+function dedupeLabelPrefixedDuplicates(files: string[]): string[] {
+  const set = new Set(files);
+
+  for (const file of files) {
+    const slashIndex = file.indexOf("/");
+
+    if (slashIndex === -1) {
+      continue;
+    }
+
+    const stripped = file.slice(slashIndex + 1);
+
+    if (stripped !== file && set.has(stripped)) {
+      set.delete(stripped);
+    }
+  }
+
+  return [...set].sort();
 }

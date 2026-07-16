@@ -542,6 +542,142 @@ export function getSymbolDependents(graph: GraphState, symbolId: string): GraphN
   );
 }
 
+// Convention-based FE->BE dependency detection (2026-07-17, architecture
+// review Tier 3): route symbols ("GET /users/{id}", from extractPhpRoutes)
+// and frontend http-call symbols ("GET /users/:param", from
+// extractFrontendHttpCalls) are indexed independently - often in different
+// repos entirely - so they can only be linked once both sides exist in the
+// same merged graph. Call this once, after any cross-repo graph merge, and
+// fold the result into graph.edges; a CALLS edge here is what lets
+// getFileDependents/getSymbolDependents (both already CALLS-aware) trace
+// impact from a backend route change out to every frontend call site, and
+// vice versa, with no new traversal code of their own.
+export function linkHttpCallsToRoutes(graph: GraphState): GraphEdge[] {
+  const routeNodes = graph.nodes.filter((node) => node.kind === "route");
+  const httpCallNodes = graph.nodes.filter((node) => node.kind === "http-call");
+
+  if (routeNodes.length === 0 || httpCallNodes.length === 0) {
+    return [];
+  }
+
+  const existingEdgeIds = new Set(graph.edges.map((edge) => edge.id));
+  const routeIdByNormalizedLabel = new Map<string, string>();
+
+  for (const route of routeNodes) {
+    routeIdByNormalizedLabel.set(normalizeRouteLikeLabel(route.label), route.id);
+  }
+
+  const newEdges: GraphEdge[] = [];
+
+  for (const httpCall of httpCallNodes) {
+    const routeId = routeIdByNormalizedLabel.get(normalizeRouteLikeLabel(httpCall.label));
+
+    if (!routeId) {
+      continue;
+    }
+
+    const edgeId = stableId(["calls-route", httpCall.id, routeId]);
+
+    if (existingEdgeIds.has(edgeId)) {
+      continue;
+    }
+
+    newEdges.push({
+      id: edgeId,
+      type: "CALLS",
+      sourceId: httpCall.id,
+      targetId: routeId,
+    });
+  }
+
+  return newEdges;
+}
+
+// Hot-path/entrypoint-reachability risk signal (2026-07-17, architecture
+// review Tier 3): a bug in a file that sits on the request path of a dozen
+// public endpoints is a fundamentally different kind of risk than the same
+// bug in a file only one obscure admin route ever reaches - structural
+// "N files affected" counts alone don't distinguish these. BFS outward from
+// every route node over plain structural edges (not CALLS-only, since a
+// route usually reaches its real logic via REFERENCES/BELONGS_TO/CONTAINS
+// hops through a controller before any CALLS edge appears), capped at
+// maxDepth so cost stays bounded regardless of graph size.
+export function computeEntrypointReachability(graph: GraphState, maxDepth = 4): Map<string, Set<string>> {
+  const routeNodes = graph.nodes.filter((node) => node.kind === "route");
+
+  if (routeNodes.length === 0) {
+    return new Map();
+  }
+
+  const outgoingByNode = new Map<string, string[]>();
+
+  for (const edge of graph.edges) {
+    const existing = outgoingByNode.get(edge.sourceId);
+
+    if (existing) {
+      existing.push(edge.targetId);
+    } else {
+      outgoingByNode.set(edge.sourceId, [edge.targetId]);
+    }
+  }
+
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+  const reachability = new Map<string, Set<string>>();
+
+  for (const route of routeNodes) {
+    const visited = new Set<string>([route.id]);
+    let frontier = [route.id];
+
+    for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+      const next: string[] = [];
+
+      for (const nodeId of frontier) {
+        for (const targetId of outgoingByNode.get(nodeId) ?? []) {
+          if (visited.has(targetId)) {
+            continue;
+          }
+
+          visited.add(targetId);
+          next.push(targetId);
+
+          const targetNode = nodeById.get(targetId);
+
+          if (targetNode?.kind === "file" && targetNode.filePath) {
+            const existing = reachability.get(targetNode.filePath);
+
+            if (existing) {
+              existing.add(route.label);
+            } else {
+              reachability.set(targetNode.filePath, new Set([route.label]));
+            }
+          }
+        }
+      }
+
+      frontier = next;
+    }
+  }
+
+  return reachability;
+}
+
+// Shared normalization so a route label built at PHP-extraction time
+// ("GET /users/{id}") and a call-site label built at JS-extraction time
+// ("GET /users/:param") converge on the same key, regardless of which
+// framework's placeholder syntax each side happened to use.
+function normalizeRouteLikeLabel(label: string): string {
+  const spaceIndex = label.indexOf(" ");
+  const method = (spaceIndex === -1 ? label : label.slice(0, spaceIndex)).toUpperCase();
+  const rawPath = spaceIndex === -1 ? "" : label.slice(spaceIndex + 1);
+  const normalizedPath = rawPath
+    .replace(/\{[^}]*\}/g, ":param")
+    .replace(/:[A-Za-z_][A-Za-z0-9_]*/g, ":param")
+    .replace(/\/+/g, "/");
+  const withLeadingSlash = normalizedPath.startsWith("/") ? normalizedPath : `/${normalizedPath}`;
+  const trimmed = withLeadingSlash.length > 1 && withLeadingSlash.endsWith("/") ? withLeadingSlash.slice(0, -1) : withLeadingSlash;
+  return `${method} ${trimmed}`;
+}
+
 export function getFunctionalEntryPointSet(graph: GraphState, moduleLabel?: string): GraphNode[] {
   const routes = moduleLabel ? getRoutesForModule(graph, moduleLabel) : getRouteNodes(graph);
   const nodeIds = new Set<string>(routes.map((node) => node.id));
@@ -845,6 +981,8 @@ function mapSymbolKindToGraphKind(symbolKind: IndexResult["symbols"][number]["ki
       return "method";
     case "route":
       return "route";
+    case "http-call":
+      return "http-call";
     case "middleware":
       return "middleware";
     default:
@@ -857,7 +995,7 @@ function buildSymbolLookupKey(filePath: string, name: string): string {
 }
 
 function isCodeNode(kind: GraphNodeKind): boolean {
-  return ["class", "interface", "enum", "function", "method", "route", "middleware"].includes(kind);
+  return ["class", "interface", "enum", "function", "method", "route", "http-call", "middleware"].includes(kind);
 }
 
 function normalizeRelationType(

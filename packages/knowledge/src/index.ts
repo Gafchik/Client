@@ -3,6 +3,7 @@ import { getRedisClient } from "./redis-client.js";
 import { deleteFactsForPath } from "./facts.js";
 import { deleteBusinessGraphEntriesForPath } from "./graph-entries.js";
 import { pruneCodeEmbeddings } from "./code-embeddings.js";
+import { deleteGlossaryEntriesForPath } from "./glossary.js";
 
 // Read-through cache over knowledge_artifacts (2026-07-15, user's explicit
 // request): Postgres stays the durable source of truth - Redis here has no
@@ -29,6 +30,13 @@ export {
   type BusinessGraphEntry,
   type UpsertBusinessGraphEntryInput,
 } from "./graph-entries.js";
+export {
+  deleteGlossaryEntriesForPath,
+  queryGlossaryAcrossPaths,
+  upsertGlossaryEntry,
+  type DomainGlossaryEntry,
+  type UpsertGlossaryEntryInput,
+} from "./glossary.js";
 export {
   findSemanticMatches,
   findSemanticMatchesAcrossPaths,
@@ -475,6 +483,7 @@ export async function forgetProjectPath(projectRootPath: string): Promise<void> 
 
   await deleteFactsForPath(projectRootPath);
   await deleteBusinessGraphEntriesForPath(projectRootPath);
+  await deleteGlossaryEntriesForPath(projectRootPath);
   await pruneCodeEmbeddings(projectRootPath, []);
 }
 

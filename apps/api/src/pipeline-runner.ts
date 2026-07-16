@@ -6,28 +6,35 @@ import {
   buildValidatedAnswerPacket,
   buildValidationPacket,
   buildQuestionShapeHint,
+  classifyFactConflict,
   classifyProjectScopeDirective,
   classifyQuestionShape,
   createUsageAccumulator,
   embedTexts,
   expandTaskSearchKeywords,
+  extractDomainGlossaryTerms,
   summarizeProviderUsage,
   validateEvidence,
   type ProviderUsageAccumulator,
 } from "@client/ai";
 import { buildContextPackage } from "@client/context";
-import { buildGraph, getFileDependencies, getFileDependents, getSymbolDependencies, getSymbolDependents } from "@client/graph";
+import { buildGraph, getFileDependencies, getFileDependents, getSymbolDependencies, getSymbolDependents, linkHttpCallsToRoutes } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, findSemanticMatchesAcrossPaths, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, findSemanticMatchesAcrossPaths, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryGlossaryAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts, upsertGlossaryEntry } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { computeFileChurnSignals, deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
 import {
   type IncrementalIndexPlan,
   type IndexResult,
+  type IndexedFile,
+  type IndexSymbol,
+  type IndexRelation,
   type FocusedResearchRequest,
   type FocusedResearchResult,
+  type GraphEdge,
+  type GraphNode,
   type GraphState,
   contentHash,
   detectResearchAmbiguity,
@@ -48,7 +55,7 @@ import {
   type ValidationResult,
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
-import { runAgenticResearch, type WorkspaceRoot } from "@client/agentic-research";
+import { grepContent, runAgenticResearch, type WorkspaceRoot } from "@client/agentic-research";
 import { saveGraphSnapshot } from "./graph-store.js";
 import { getRedisClient } from "./redis-client.js";
 import { getSelectedTeam } from "./team-store.js";
@@ -623,7 +630,10 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
     const observerHint = await buildObserverHintSuffix(effectiveProjectRoots, task);
     const teamKnownFacts = await queryFactsAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
-    const knownFactsHintText = buildKnownFactsHint(effectiveProjectRoots, teamKnownFacts);
+    const teamGlossary = await queryGlossaryAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
+    const knownFactsHintText = [buildKnownFactsHint(effectiveProjectRoots, teamKnownFacts), buildGlossaryHint(teamGlossary)]
+      .filter(Boolean)
+      .join("\n\n");
     // Architecture review finding (2026-07-16): intent classification never
     // reached the Researcher's own investigation strategy before, only the
     // final answer's tone (packages/ai's resolveAnswerMode, called much
@@ -742,22 +752,31 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
         invalidatedPaths: graphInvalidation.invalidatedFiles,
       });
 
-      // Cross-repo touched files (2026-07-16, architecture review finding):
-      // the rebuild above still only resolves paths inside the PRIMARY
-      // repo - a label-prefixed virtual path from another repo
-      // ("web/src/foo.js") never matched anything there. Read those
-      // directly and add them as plain file entries so Context can still
-      // attach their real content, even though they get no graph/symbol
-      // coverage (see loadCrossRepoFileEntries's comment for the honest
-      // limitation this leaves).
-      const crossRepoEntries = await loadCrossRepoFileEntries(
+      // Cross-repo touched files (2026-07-16): the rebuild above still only
+      // resolves paths inside the PRIMARY repo - a label-prefixed virtual
+      // path from another repo ("web/src/foo.js") never matched anything
+      // there. buildCrossRepoStructuralData now gives these real graph/
+      // symbol coverage too, not just raw content - see its comment for how
+      // the id-collision risk that used to block this is avoided.
+      const crossRepoData = await buildCrossRepoStructuralData(
         agenticResult.raw.touchedFiles,
         effectiveProjectRoots,
         new Set(workspace.files.map((file) => file.relativePath)),
       );
 
-      if (crossRepoEntries.length > 0) {
-        workspace = { ...workspace, files: [...workspace.files, ...crossRepoEntries] };
+      if (crossRepoData.files.length > 0) {
+        workspace = { ...workspace, files: [...workspace.files, ...crossRepoData.files] };
+        index = {
+          ...index,
+          files: [...index.files, ...crossRepoData.indexedFiles],
+          symbols: [...index.symbols, ...crossRepoData.symbols],
+          relations: [...index.relations, ...crossRepoData.relations],
+        };
+        graph = {
+          ...graph,
+          nodes: [...graph.nodes, ...crossRepoData.nodes],
+          edges: [...graph.edges, ...crossRepoData.edges],
+        };
       }
 
       updatePartialArtifacts(runId, {
@@ -822,8 +841,33 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   });
   // fire-and-forget: Fact Store — вспомогательная память, не должна ни
   // блокировать ответ пользователю, ни ронять run при сбое Postgres.
-  void promoteFactsFromResearch(projectRootPath, initialResearch, repository, index);
+  // Belief reconciliation (2026-07-17, architecture review Tier 3): the
+  // conflict checker is injected here (not imported into packages/knowledge)
+  // so that package stays free of any LLM-calling code - see
+  // classifyFactConflict's comment for why this only fires on real file
+  // overlaps, not on every fact.
+  void promoteFactsFromResearch(projectRootPath, initialResearch, repository, index, (existingStatement, candidateStatement) =>
+    classifyFactConflict({
+      existingStatement,
+      candidateStatement,
+      providerBaseUrl,
+      providerModel: selectedTeam?.criticModel || providerModel,
+      providerApiKey,
+    }),
+  );
   await yieldToEventLoop();
+
+  // Convention-based FE->BE dependency detection (2026-07-17, architecture
+  // review Tier 3): route symbols and frontend http-call symbols are indexed
+  // independently (extractPhpRoutes / extractFrontendHttpCalls run per-file,
+  // often in different repos) - this is the one point after ANY cross-repo
+  // graph merge where both sides are guaranteed to already be in `graph`,
+  // for both team-mode and the legacy deterministic path.
+  const httpCallEdges = linkHttpCallsToRoutes(graph);
+
+  if (httpCallEdges.length > 0) {
+    graph = { ...graph, edges: [...graph.edges, ...httpCallEdges] };
+  }
 
   const impactStartedAt = startStage(runId, "impact");
   // Real risk signal from git history (2026-07-16, architecture review
@@ -1010,6 +1054,35 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     answer,
   });
   await yieldToEventLoop();
+
+  // Domain Glossary (2026-07-17, architecture review Tier 3): fire-and-forget,
+  // same reasoning as promoteFactsFromResearch - never blocks the response,
+  // never throws. Runs over the ANSWER's prose (already conversational,
+  // business-facing text), not evidence metadata - see extractDomainGlossaryTerms's
+  // comment for why that distinction matters.
+  if (isQuestionRun && answer.synthesis === "llm") {
+    void (async () => {
+      const relatedFiles = [...new Set(research.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)))];
+      const terms = await extractDomainGlossaryTerms({
+        answerText: `${answer.summary}\n${answer.explanation}`,
+        evidenceFilePaths: relatedFiles,
+        providerBaseUrl,
+        providerModel: selectedTeam?.criticModel || providerModel,
+        providerApiKey,
+      });
+
+      for (const candidate of terms) {
+        await upsertGlossaryEntry({
+          projectRootPath,
+          term: candidate.term,
+          definition: candidate.definition,
+          relatedFiles: candidate.relatedFiles,
+          confidence: research.confidence,
+          sourceRunId: runId,
+        });
+      }
+    })().catch((error) => console.warn("[pipeline-runner] domain glossary extraction failed:", error));
+  }
 
   const knowledgeStartedAt = startStage(runId, "knowledge");
   const knowledge = await saveKnowledgeArtifacts({
@@ -1704,34 +1777,34 @@ function buildGraphNavigationTool(graph: GraphState): (query: string) => Promise
   };
 }
 
-// Architecture review finding (2026-07-16): the evidence-to-impact seam fix
-// (rebuilding workspace/index/graph from agenticResult.raw.touchedFiles)
-// only ever resolved paths against the PRIMARY path's root - for a
-// multi-root project, touchedFiles from a NON-primary repo are label-prefixed
-// virtual paths ("web/src/foo.js"), which openWorkspaceSelective(primaryRoot,
-// {includePaths: [...]}) cannot resolve at all (it looks for a literal "web"
-// subdirectory INSIDE the primary repo). Content Impact analysis's own
-// structural graph traversal stays a KNOWN, documented, primary-path-only
-// limitation for now (rebuilding/merging a structural graph across repos
-// safely, without symbol-id collisions between repos that happen to share a
-// relative path, is real, non-trivial work - deliberately out of scope for
-// this pass). What this DOES fix: Context's ability to attach real file
-// CONTENT for cross-repo evidence, which is what actually reaches the
-// answer-synthesis prompt - reads each cross-repo touched file directly off
-// disk (via the same root list the agentic loop itself used) and adds it as
-// a plain workspace file entry under its virtual path, so
-// buildContextPackage's exact-string match (evidence.filePath === file.relativePath)
-// succeeds for it too.
-async function loadCrossRepoFileEntries(
+// Architecture review follow-up (2026-07-16): this used to only load raw
+// file CONTENT for cross-repo touched files (so Context could attach them),
+// explicitly leaving structural graph coverage for non-primary repos as a
+// documented, unfixed limitation - rebuilding/merging a structural graph
+// across repos safely, without symbol-id collisions between repos that
+// happen to share a relative path (e.g. two frontends both having
+// "src/stores/auth-store"), was called "real, non-trivial work" and
+// deferred. Closing it now: packages/workspace/indexer/graph all derive
+// their ids purely from `file.relativePath` (stableId(["file",
+// relativePath]), stableId(["symbol", file.relativePath, ...]) etc - NOT
+// from the root's absolute path), so two repos with the same relative
+// structure WOULD collide if indexed as-is. Fix: build a small selective
+// workspace scoped to just this root's touched files (cheap - same bound as
+// the primary-path rebuild), then relabel every file's relativePath with
+// the root's label BEFORE indexing - every downstream id naturally becomes
+// namespaced by repo, with no separate id-rewriting pass needed.
+async function buildCrossRepoStructuralData(
   touchedFiles: string[],
   roots: WorkspaceRoot[],
   alreadyResolvedRelativePaths: Set<string>,
-): Promise<ProjectFile[]> {
+): Promise<{ files: ProjectFile[]; indexedFiles: IndexedFile[]; symbols: IndexSymbol[]; relations: IndexRelation[]; nodes: GraphNode[]; edges: GraphEdge[] }> {
+  const empty = { files: [], indexedFiles: [], symbols: [], relations: [], nodes: [], edges: [] };
+
   if (roots.length <= 1) {
-    return [];
+    return empty;
   }
 
-  const entries: ProjectFile[] = [];
+  const restPathsByLabel = new Map<string, string[]>();
 
   for (const virtualPath of touchedFiles) {
     if (alreadyResolvedRelativePaths.has(virtualPath)) {
@@ -1745,7 +1818,25 @@ async function loadCrossRepoFileEntries(
     }
 
     const label = virtualPath.slice(0, slashIndex);
+
+    if (!roots.some((candidate) => candidate.label === label)) {
+      continue;
+    }
+
     const rest = virtualPath.slice(slashIndex + 1);
+    const bucket = restPathsByLabel.get(label) ?? [];
+    bucket.push(rest);
+    restPathsByLabel.set(label, bucket);
+  }
+
+  const files: ProjectFile[] = [];
+  const indexedFiles: IndexedFile[] = [];
+  const symbols: IndexSymbol[] = [];
+  const relations: IndexRelation[] = [];
+  const nodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+
+  for (const [label, restPaths] of restPathsByLabel) {
     const root = roots.find((candidate) => candidate.label === label);
 
     if (!root) {
@@ -1753,32 +1844,32 @@ async function loadCrossRepoFileEntries(
     }
 
     try {
-      const absolutePath = path.resolve(root.absolutePath, rest);
-      const content = await fs.readFile(absolutePath, "utf8");
-      const stat = await fs.stat(absolutePath);
-
-      entries.push({
-        id: stableId(["cross-repo-file", root.absolutePath, rest]),
-        absolutePath,
-        relativePath: virtualPath,
-        extension: path.extname(rest),
-        // Not indexed for symbols (out of scope here - see comment above),
-        // so its real language does not matter for this entry's only job:
-        // being findable by exact relativePath for context attachment.
-        language: "unknown",
-        size: content.length,
-        modifiedAt: stat.mtime.toISOString(),
-        contentHash: contentHash(content),
-        content,
+      const subWorkspace = await openWorkspaceSelective(root.absolutePath, {
+        includePaths: restPaths,
+        maxFiles: restPaths.length + 10,
       });
+      const relabeledFiles = subWorkspace.files.map((file) => ({ ...file, relativePath: `${label}/${file.relativePath}` }));
+      const relabeledWorkspace = { ...subWorkspace, files: relabeledFiles };
+      const subIndex = await runFullIndex(relabeledWorkspace, {});
+      const subGraph = buildGraph(relabeledWorkspace, subIndex, {});
+
+      files.push(...relabeledFiles);
+      // subIndex.files already carries real imports/symbolIds computed
+      // against the relabeled (namespaced) paths - reused as-is rather than
+      // reconstructed, so cross-repo import edges are not silently dropped.
+      indexedFiles.push(...subIndex.files);
+      symbols.push(...subIndex.symbols);
+      relations.push(...subIndex.relations);
+      nodes.push(...subGraph.nodes);
+      edges.push(...subGraph.edges);
     } catch {
-      // File genuinely gone/unreadable - evidence referencing it just won't
-      // get content attached, same as any other missing-file case already.
+      // A missing/unreadable root for this pass just means no structural
+      // coverage for it this time - never fail the whole run over it.
       continue;
     }
   }
 
-  return entries;
+  return { files, indexedFiles, symbols, relations, nodes, edges };
 }
 
 // Injected into AgenticRunOptions.semanticSearch (2026-07-16) - kept here,
@@ -1792,12 +1883,39 @@ async function loadCrossRepoFileEntries(
 // cross-repo question ("what does the frontend call, and what does the
 // backend do about it") is that ONE semantic query can surface hits on both
 // sides at once.
+// Retrieval fusion (2026-07-17, architecture review Tier 3): semantic_search
+// and grep_content used to be two fully separate ACTIONS the Researcher had
+// to reconcile itself, with no shared ranking - a file that scored just
+// under the semantic threshold but matched every keyword in the question
+// literally had no way to surface unless the model happened to also grep for
+// it. Reciprocal Rank Fusion (RRF, k=60 - the standard choice from the
+// original Cormack/Clarke/Buettcher paper, not tuned here) merges both
+// signals into ONE ranked list from a single semantic_search call: a file
+// that ranks well on EITHER signal, and especially one that ranks well on
+// BOTH, surfaces above one that only ever scored on one axis.
+const RRF_K = 60;
+
+function buildRrfRankMap(orderedKeys: string[]): Map<string, number> {
+  const ranks = new Map<string, number>();
+
+  orderedKeys.forEach((key, index) => {
+    if (!ranks.has(key)) {
+      ranks.set(key, index + 1);
+    }
+  });
+
+  return ranks;
+}
+
 function buildSemanticSearchTool(
   roots: WorkspaceRoot[],
   providerBaseUrl: string,
   providerApiKey: string,
 ): (query: string) => Promise<string> {
   return async (query: string): Promise<string> => {
+    let semanticMatches: Awaited<ReturnType<typeof findSemanticMatchesAcrossPaths>> = [];
+    let semanticError: string | null = null;
+
     try {
       const [queryEmbedding] = await embedTexts({
         providerBaseUrl,
@@ -1806,22 +1924,81 @@ function buildSemanticSearchTool(
         texts: [query],
       });
 
-      if (!queryEmbedding) {
-        return "(semantic search failed: no embedding returned)";
-      }
-
-      const matches = await findSemanticMatchesAcrossPaths(roots.map((root) => root.absolutePath), queryEmbedding, 8);
-
-      if (matches.length === 0) {
-        return "(no semantic index built yet for this project, or no match found - try list_dir/grep_content instead)";
-      }
-
-      return matches
-        .map((match) => `${toVirtualPath(roots, match.projectRootPath, match.filePath)} (similarity ${match.score.toFixed(2)})`)
-        .join("\n");
+      semanticMatches = queryEmbedding
+        ? await findSemanticMatchesAcrossPaths(roots.map((root) => root.absolutePath), queryEmbedding, 8)
+        : [];
     } catch (error) {
-      return `(semantic search error: ${error instanceof Error ? error.message : String(error)})`;
+      semanticError = error instanceof Error ? error.message : String(error);
     }
+
+    const semanticPathByVirtual = new Map(
+      semanticMatches.map((match) => [toVirtualPath(roots, match.projectRootPath, match.filePath), match]),
+    );
+    const semanticOrder = [...semanticPathByVirtual.keys()];
+
+    // Lexical side: the same tokenization already used for Observer-hint
+    // relevance filtering (computeTaskSearchTokens), reused here rather than
+    // inventing a second query-parsing path - up to 6 longest tokens keep the
+    // alternation regex (and rg's cost) bounded.
+    const lexicalTokens = computeTaskSearchTokens(query)
+      .filter((token) => token.length >= 3)
+      .sort((left, right) => right.length - left.length)
+      .slice(0, 6)
+      .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+    let lexicalOrder: string[] = [];
+
+    if (lexicalTokens.length > 0) {
+      try {
+        const grepOutput = await grepContent(roots, lexicalTokens.join("|"));
+        const hitCountByPath = new Map<string, number>();
+
+        for (const line of grepOutput.split("\n")) {
+          const colonIndex = line.indexOf(":");
+          const filePath = colonIndex === -1 ? "" : line.slice(0, colonIndex);
+
+          if (filePath) {
+            hitCountByPath.set(filePath, (hitCountByPath.get(filePath) ?? 0) + 1);
+          }
+        }
+
+        // Ranked by how many distinct lines matched per file - a rough but
+        // free relevance proxy (grepContent itself caps at 2 matches/file via
+        // --max-count, so this mostly just orders "hit in 2 spots" above
+        // "hit in 1 spot", not a precise density score).
+        lexicalOrder = [...hitCountByPath.entries()].sort((left, right) => right[1] - left[1]).map(([filePath]) => filePath);
+      } catch {
+        lexicalOrder = [];
+      }
+    }
+
+    if (semanticOrder.length === 0 && lexicalOrder.length === 0) {
+      return semanticError
+        ? `(semantic search error: ${semanticError}; lexical fallback found nothing either)`
+        : "(no semantic index built yet for this project, and no lexical match found - try list_dir/grep_content instead)";
+    }
+
+    const semanticRanks = buildRrfRankMap(semanticOrder);
+    const lexicalRanks = buildRrfRankMap(lexicalOrder);
+    const allPaths = new Set([...semanticOrder, ...lexicalOrder]);
+
+    const fused = [...allPaths]
+      .map((filePath) => {
+        const semanticRank = semanticRanks.get(filePath);
+        const lexicalRank = lexicalRanks.get(filePath);
+        const score = (semanticRank ? 1 / (RRF_K + semanticRank) : 0) + (lexicalRank ? 1 / (RRF_K + lexicalRank) : 0);
+        const match = semanticPathByVirtual.get(filePath);
+        const signals = [
+          match ? `similarity ${match.score.toFixed(2)}` : null,
+          lexicalRank ? "keyword match" : null,
+        ].filter(Boolean).join(", ");
+
+        return { filePath, score, signals };
+      })
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 8);
+
+    return fused.map((entry) => `${entry.filePath} (${entry.signals})`).join("\n");
   };
 }
 
@@ -1876,6 +2053,22 @@ function buildKnownFactsHint(roots: WorkspaceRoot[], knownFacts: Awaited<ReturnT
     ...usable.map((fact) =>
       `- ${fact.statement} (files: ${fact.filePaths.slice(0, 3).map((filePath) => toVirtualPath(roots, fact.projectRootPath, filePath)).join(", ")})`,
     ),
+  ].join("\n");
+}
+
+// Domain Glossary hint (2026-07-17, architecture review Tier 3) - unlike
+// buildKnownFactsHint's evidence-tied statements, these are standing
+// business-term definitions built once and reused across every future
+// question, closest this pipeline gets to a persistent "what things mean
+// here" reference for the Researcher.
+function buildGlossaryHint(entries: Awaited<ReturnType<typeof queryGlossaryAcrossPaths>>): string {
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return [
+    "Domain glossary - business terms already defined from prior questions about this project (verify against current code, terms can drift as the code evolves):",
+    ...entries.slice(0, 8).map((entry) => `- ${entry.term}: ${entry.definition}`),
   ].join("\n");
 }
 

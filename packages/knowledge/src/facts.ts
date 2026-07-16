@@ -178,11 +178,38 @@ export async function deleteFactsForPath(projectRootPath: string): Promise<void>
   }
 }
 
+interface ExistingFactRow {
+  id: string;
+  statement: string;
+}
+
+// Belief reconciliation (2026-07-17): injected rather than imported, so
+// packages/knowledge stays free of any LLM-calling code - pipeline-runner
+// supplies the real implementation (packages/ai's classifyFactConflict).
+type ConflictChecker = (existingStatement: string, candidateStatement: string) => Promise<boolean>;
+
+// A quick, free guard before spending an LLM call: if the two statements
+// already share most of their significant words, they're almost certainly
+// the same finding reworded, not a contradiction - not worth checking.
+function looksLikeNearDuplicate(left: string, right: string): boolean {
+  const wordsOf = (text: string) => new Set(text.toLowerCase().split(/\W+/).filter((word) => word.length >= 4));
+  const leftWords = wordsOf(left);
+  const rightWords = wordsOf(right);
+
+  if (leftWords.size === 0 || rightWords.size === 0) {
+    return false;
+  }
+
+  const shared = [...leftWords].filter((word) => rightWords.has(word)).length;
+  return shared / Math.min(leftWords.size, rightWords.size) >= 0.7;
+}
+
 export async function promoteFactsFromResearch(
   projectRootPath: string,
   report: ResearchReport,
   repository: RepositorySnapshot,
   index: IndexResult,
+  checkConflict?: ConflictChecker,
 ): Promise<void> {
   try {
     const currentHashByPath = new Map(index.files.map((file) => [file.filePath, file.contentHash]));
@@ -222,6 +249,23 @@ export async function promoteFactsFromResearch(
       const id = stableId(["fact", projectRootPath, category, normalizedStatement]);
       const contentHashesJson = JSON.stringify({ [filePath]: contentHash });
 
+      // Existing facts to reconcile against are looked up BEFORE the insert
+      // below (which the on-conflict clause could otherwise turn into a
+      // reconfirmation of a fact identical to `id`, throwing off "is this
+      // really a different existing fact" further down).
+      let candidateConflictRows: ExistingFactRow[] = [];
+
+      if (checkConflict) {
+        try {
+          candidateConflictRows = await runSql<ExistingFactRow>(
+            `select id, statement from project_facts where project_root_path = $1 and status = 'fresh' and $2 = any(file_paths) and id != $3 limit 3`,
+            [projectRootPath, filePath, id],
+          );
+        } catch (error) {
+          console.warn("[facts] belief reconciliation lookup failed, skipping:", error);
+        }
+      }
+
       await runSql(
         `
           insert into project_facts
@@ -249,6 +293,28 @@ export async function promoteFactsFromResearch(
           repository.headCommit,
         ],
       );
+
+      // Run AFTER the insert above - superseded_by_fact_id references
+      // project_facts(id), so the new fact's row must already exist before
+      // an existing row can point its FK at it.
+      for (const existing of candidateConflictRows) {
+        if (looksLikeNearDuplicate(existing.statement, statement)) {
+          continue;
+        }
+
+        try {
+          const isConflict = await checkConflict!(existing.statement, statement);
+
+          if (isConflict) {
+            await runSql(
+              `update project_facts set status = 'contradicted', superseded_by_fact_id = $1 where id = $2`,
+              [id, existing.id],
+            );
+          }
+        } catch (error) {
+          console.warn("[facts] belief reconciliation check failed, skipping:", error);
+        }
+      }
     }
   } catch (error) {
     console.warn("[facts] promoteFactsFromResearch failed:", error);
