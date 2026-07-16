@@ -876,6 +876,7 @@ export function createApp() {
       conversationId,
       task: normalizedTask,
       projectPath,
+      ...(projectRecord?.paths.length ? { projectPaths: projectRecord.paths } : {}),
       providerBaseUrl,
       providerModel,
       providerApiKey,

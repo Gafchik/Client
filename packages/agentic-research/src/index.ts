@@ -1,6 +1,7 @@
 import { extractSectionBullets, extractSectionText, parseMarkdownSections, stableId, type ResearchReport, type ValidationResult } from "@client/shared";
 import { toResearchReport, toValidationResult } from "./adapter.js";
 import { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult } from "./loop.js";
+import type { WorkspaceRoot } from "./tools.js";
 
 export { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult } from "./loop.js";
 export { toResearchReport, toValidationResult } from "./adapter.js";
@@ -54,7 +55,12 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
 
   const raw = await runAgenticLoop({
     task,
-    projectRootPath: input.projectRootPath,
+    // Observer always crawls one unit inside one repo - a one-element
+    // roots array reproduces the pre-multi-root behavior exactly (see
+    // tools.ts's resolvePath fast path). role is irrelevant here (Observer
+    // doesn't reason about frontend/backend), label is unused since there's
+    // nothing to disambiguate against.
+    projectRoots: [{ label: "root", absolutePath: input.projectRootPath, role: "unknown" }],
     researcherModel: input.observerModel,
     criticModel: input.criticModel,
     providerBaseUrl: input.providerBaseUrl,
@@ -95,7 +101,8 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
 export interface RunAgenticResearchInput {
   runId?: string;
   task: string;
-  projectRootPath: string;
+  /** See AgenticRunOptions.projectRoots - one or more physical repos making up this project. */
+  projectRoots: WorkspaceRoot[];
   researcherModel: string;
   criticModel: string;
   providerBaseUrl: string;
@@ -124,10 +131,10 @@ export interface RunAgenticResearchResult {
 }
 
 export async function runAgenticResearch(input: RunAgenticResearchInput): Promise<RunAgenticResearchResult> {
-  const runId = input.runId ?? stableId(["agentic-research-run", input.task, input.projectRootPath, Date.now()]);
+  const runId = input.runId ?? stableId(["agentic-research-run", input.task, input.projectRoots[0]?.absolutePath ?? "", Date.now()]);
   const options: AgenticRunOptions = {
     task: input.task,
-    projectRootPath: input.projectRootPath,
+    projectRoots: input.projectRoots,
     researcherModel: input.researcherModel,
     criticModel: input.criticModel,
     providerBaseUrl: input.providerBaseUrl,

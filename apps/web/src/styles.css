@@ -394,6 +394,13 @@ button {
   color: var(--text);
 }
 
+.environment-paths-badge {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  cursor: default;
+}
+
 .environment-status-pill {
   margin-left: auto;
   display: grid;

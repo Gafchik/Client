@@ -62,6 +62,21 @@ export async function initializePostgresSchema(): Promise<void> {
     )
   `);
   await runSql(`create index if not exists idx_project_paths_project_id on project_paths(project_id)`);
+  // sort_order (2026-07-16, live bug found during multi-path verification):
+  // all paths of one project are inserted in the same saveProject() call with
+  // an IDENTICAL created_at (JS Date.toISOString() truncated to the
+  // millisecond) - "order by created_at asc" had no real tiebreaker, so
+  // Postgres returned an effectively arbitrary order per query (confirmed
+  // live: /api/projects and a direct psql query returned two DIFFERENT
+  // orderings for the same 4 rows). paths[0] is used everywhere as "the
+  // primary path" (deterministic pipeline root, UI default selection) - a
+  // random order there is a real bug, not a cosmetic one.
+  await runSql(`alter table project_paths add column if not exists sort_order integer not null default 0`);
+  // via inferProjectPathRole (path-role.ts) - lets the agentic Researcher
+  // reason about which physical repo is frontend/backend/cli within one
+  // logical multi-repo project. Default 'unknown' for pre-existing rows
+  // until the next saveProject re-tags them.
+  await runSql(`alter table project_paths add column if not exists role text not null default 'unknown'`);
 
   await runSql(`
     create table if not exists providers (
@@ -225,6 +240,10 @@ export async function initializePostgresSchema(): Promise<void> {
     )
   `);
   await runSql(`create index if not exists code_embeddings_project_idx on code_embeddings (project_root_path)`);
+  // role (2026-07-16, multi-path unification): filled in by embedding-indexer
+  // at embed time from the path's inferred role - avoids a join against
+  // project_paths on every semantic-search query.
+  await runSql(`alter table code_embeddings add column if not exists role text not null default 'unknown'`);
 }
 
 /**

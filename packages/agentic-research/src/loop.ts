@@ -1,5 +1,5 @@
 import { expandRussianTechTransliteration, tokenize } from "@client/shared";
-import { dirnameOf, grepContent, listDir, normalizeDirKey, readFile, toWorkspaceRelativePath } from "./tools.js";
+import { dirnameOf, grepContent, listDir, normalizeDirKey, readFile, toWorkspaceRelativePath, type WorkspaceRoot } from "./tools.js";
 
 // Matches packages/ai's documented provider-call convention (timeout,
 // attempts, backoff) rather than inventing new constants - see
@@ -69,7 +69,13 @@ const RESEARCHER_REASONING_EFFORT: string | undefined = undefined;
 
 export interface AgenticRunOptions {
   task: string;
-  projectRootPath: string;
+  /**
+   * The physical repo(s) making up this project (2026-07-16, multi-path
+   * unification). A single-repo project is just a one-element array - every
+   * caller (interactive Researcher, Observer's crawlUnit) goes through this
+   * same shape, no branching on repo count anywhere in the loop.
+   */
+  projectRoots: WorkspaceRoot[];
   researcherModel: string;
   criticModel: string;
   providerBaseUrl: string;
@@ -199,7 +205,7 @@ interface ParsedAction {
 // hypothetical) - the downstream answer-synthesis prompt (packages/ai) also
 // demands Russian, but this is a deliberate second safety net, not
 // redundant.
-function buildSystemPrompt(hasSemanticSearch: boolean): string {
+function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean): string {
   return [
     "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
     "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
@@ -213,6 +219,12 @@ function buildSystemPrompt(hasSemanticSearch: boolean): string {
       ]
       : []),
     "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic)",
+    ...(isMultiRoot
+      ? [
+        "IMPORTANT: this project has MULTIPLE physical repos (parts), listed in \"Project parts\" above with their role (e.g. backend, frontend-web, frontend-desktop, cli) and shown by list_dir(\".\"). Every path you write starts with the part's name, e.g. \"web/src/boot/axios.js\" or \"api/routes/api.php\" - the part name is not a regular directory, it is which repo you are in.",
+        "A question about UI/screens/buttons is usually answered inside a frontend part; a question about data storage/API endpoints/business rules is usually in the backend part. Many questions genuinely span both (e.g. \"what does this button call, and what does the backend do\") - in that case grep_content across all parts in one call and read files from whichever parts actually matter, do not restrict yourself to one part out of habit.",
+      ]
+      : []),
     `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Write several ACTION lines in a row in one response (up to ${MAX_ACTIONS_PER_TURN} per turn), they execute in order and the results come back together in one batch. One ACTION per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: if you call it, call ONLY it, with no other ACTION in the same response (look at the results first, then answer).`,
     "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
     "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
@@ -286,7 +298,7 @@ function extractTransliteratedTokens(task: string): string[] {
   return expanded.filter((token) => !cyrillicTokens.includes(token));
 }
 
-async function buildSeedGrepObservation(projectRootPath: string, task: string, graphHintTerms: string[]): Promise<string> {
+async function buildSeedGrepObservation(projectRoots: WorkspaceRoot[], task: string, graphHintTerms: string[]): Promise<string> {
   // Graph-derived symbol names go first - precise (real class/function names
   // from the persisted code graph), so if the term budget is tight they
   // should win over generic transliterated words like "case"/"relation".
@@ -304,7 +316,7 @@ async function buildSeedGrepObservation(projectRootPath: string, task: string, g
   const perTermCap = Math.floor(MAX_OBSERVATION_CHARS / terms.length);
   const results = await Promise.all(
     terms.map(async (term) => {
-      const raw = await grepContent(projectRootPath, term);
+      const raw = await grepContent(projectRoots, term);
       const bounded = raw.length > perTermCap ? `${raw.slice(0, perTermCap)}\n... (truncated)` : raw;
       return `grep_content("${term}"):\n${bounded}`;
     }),
@@ -559,9 +571,17 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ? `\n\nIn the previous turn of this conversation you already found and read these files: ${priorTurnFiles.join(", ")}. If the new question continues the same topic - start by reading these files (read_file) instead of researching from scratch. If the question is clearly about something else - check whether they are still relevant or search anew, do not rely on them blindly.`
     : "";
   const observerHintBlock = options.observerHint ? `\n\n${options.observerHint}` : "";
+  const isMultiRoot = options.projectRoots.length > 1;
+  // Single-repo projects keep the exact original "Project: <path>" line -
+  // zero behavior change for the still-overwhelmingly-common case of one
+  // physical repo (see tools.ts's resolvePath fast path for the same
+  // principle applied to path resolution).
+  const projectLine = isMultiRoot
+    ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
+    : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
   const messages: ChatMessage[] = [
-    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch)) },
-    { role: "user", content: `Project: ${options.projectRootPath}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}` },
+    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot) },
+    { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}` },
   ];
 
   // Seed semantic search runs in parallel with the seed grep (2026-07-16) -
@@ -578,7 +598,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   // rather than shown as a confusing empty seed block.
   const [seedGrepObservation, seedSemanticObservation] = await Promise.all([
     buildSeedGrepObservation(
-      options.projectRootPath,
+      options.projectRoots,
       options.task,
       options.graphHintTerms ?? [],
     ),
@@ -615,10 +635,10 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       const seedBlocks: string[] = [];
 
       for (const seedPath of seedPaths) {
-        const content = await readFile(options.projectRootPath, seedPath);
+        const content = await readFile(options.projectRoots, seedPath);
 
         if (!content.startsWith("Error")) {
-          const normalized = toWorkspaceRelativePath(options.projectRootPath, seedPath);
+          const normalized = toWorkspaceRelativePath(options.projectRoots, seedPath);
           seedReadFiles.add(normalized);
           const bounded = content.length > MAX_OBSERVATION_CHARS
             ? `${content.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`
@@ -858,10 +878,10 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       let observation: string;
 
       if (action.tool === "list_dir") {
-        observation = await listDir(options.projectRootPath, action.arg);
+        observation = await listDir(options.projectRoots, action.arg);
         seenDirs.add(normalizeDirKey(action.arg));
       } else if (action.tool === "grep_content") {
-        observation = await grepContent(options.projectRootPath, action.arg);
+        observation = await grepContent(options.projectRoots, action.arg);
         grepTermsSeen.add(action.arg.toLowerCase());
       } else if (action.tool === "semantic_search") {
         observation = options.semanticSearch
@@ -875,14 +895,14 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
           // to do it next turn (2026-07-15 speed pass) - we already know
           // exactly which directory needs listing, so doing it now saves a
           // full round-trip instead of bouncing the model back empty-handed.
-          const dirListing = await listDir(options.projectRootPath, parentDir);
+          const dirListing = await listDir(options.projectRoots, parentDir);
           seenDirs.add(normalizeDirKey(parentDir));
           observation = `You asked to read a file in the "${parentDir}" directory, which you have not listed yet - here is its content (a neighboring file with a similar name might answer more precisely); read the file you need as your next action:\n${dirListing}`;
         } else {
-          observation = await readFile(options.projectRootPath, action.arg);
+          observation = await readFile(options.projectRoots, action.arg);
 
           if (!observation.startsWith("Error")) {
-            touchedFiles.add(toWorkspaceRelativePath(options.projectRootPath, action.arg));
+            touchedFiles.add(toWorkspaceRelativePath(options.projectRoots, action.arg));
           }
         }
       }

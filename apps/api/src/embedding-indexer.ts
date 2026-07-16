@@ -3,7 +3,7 @@ import path from "node:path";
 import { embedTexts } from "@client/ai";
 import { IGNORED_DIRS } from "@client/agentic-research";
 import { getCodeEmbeddingContentHashes, pruneCodeEmbeddings, upsertCodeEmbedding } from "@client/knowledge";
-import { contentHash, normalizePath } from "@client/shared";
+import { contentHash, normalizePath, type PathRole } from "@client/shared";
 import { getCurrentProvider } from "./provider-store.js";
 import { listProjects } from "./project-store.js";
 
@@ -99,13 +99,15 @@ async function tick(config: EmbeddingIndexerConfig): Promise<void> {
     }
 
     const projects = await listProjects();
-    const allPaths = projects.flatMap((project) => project.paths.map((projectPath) => normalizePath(projectPath.rootPath)));
+    const allPaths = projects.flatMap((project) =>
+      project.paths.map((projectPath) => ({ rootPath: normalizePath(projectPath.rootPath), role: projectPath.role })),
+    );
 
     // Parallel across project paths (each is an independent tree + its own
     // embedding-model calls) - sequential awaiting here would make a
     // multi-sub-project monorepo (e.g. magendamd's 3 paths) index one at a
     // time for no reason, tripling the time to a usable first pass.
-    await Promise.all(allPaths.map((rootPath) => indexOneProject(rootPath, provider)));
+    await Promise.all(allPaths.map(({ rootPath, role }) => indexOneProject(rootPath, role, provider)));
   } catch (error) {
     // setInterval + void: an uncaught rejection here would be an unhandled
     // promise rejection that kills the whole process (same failure mode
@@ -141,7 +143,7 @@ async function walkCodeFiles(rootPath: string): Promise<string[]> {
   return results;
 }
 
-async function indexOneProject(rootPath: string, provider: ResolvedProvider): Promise<void> {
+async function indexOneProject(rootPath: string, role: PathRole, provider: ResolvedProvider): Promise<void> {
   const absoluteFiles = await walkCodeFiles(rootPath);
   const relativeFiles = absoluteFiles.map((absolute) => normalizePath(path.relative(rootPath, absolute)));
   const indexState = await getCodeEmbeddingContentHashes(rootPath);
@@ -210,7 +212,7 @@ async function indexOneProject(rootPath: string, provider: ResolvedProvider): Pr
           batch.map((item, index) => {
             const embedding = vectors[index];
             return embedding
-              ? upsertCodeEmbedding({ projectRootPath: rootPath, filePath: item.relPath, contentHash: item.hash, embedding })
+              ? upsertCodeEmbedding({ projectRootPath: rootPath, filePath: item.relPath, contentHash: item.hash, embedding, role })
               : Promise.resolve();
           }),
         );

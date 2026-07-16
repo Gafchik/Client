@@ -1,4 +1,4 @@
-import { stableId } from "@client/shared";
+import { stableId, type PathRole } from "@client/shared";
 import { runSql } from "./postgres-client.js";
 
 interface CodeEmbeddingRow {
@@ -10,6 +10,12 @@ interface CodeEmbeddingRow {
 export interface CodeEmbeddingMatch {
   filePath: string;
   score: number;
+}
+
+/** Cross-path match (2026-07-16, multi-path unification) - additionally identifies WHICH physical repo the file belongs to, so the caller can build a label-prefixed virtual path (see packages/agentic-research/tools.ts's WorkspaceRoot convention). */
+export interface CrossPathCodeEmbeddingMatch extends CodeEmbeddingMatch {
+  projectRootPath: string;
+  role: PathRole;
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -66,6 +72,8 @@ export interface UpsertCodeEmbeddingInput {
   filePath: string;
   contentHash: string;
   embedding: number[];
+  /** Auto-detected path role (2026-07-16, multi-path unification) - stored at embed time so cross-path queries don't need a join against project_paths. */
+  role: PathRole;
 }
 
 export async function upsertCodeEmbedding(input: UpsertCodeEmbeddingInput): Promise<void> {
@@ -73,14 +81,15 @@ export async function upsertCodeEmbedding(input: UpsertCodeEmbeddingInput): Prom
     const id = stableId(["code-embedding", input.projectRootPath, input.filePath]);
     await runSql(
       `
-        insert into code_embeddings (id, project_root_path, file_path, content_hash, embedding, updated_at)
-        values ($1, $2, $3, $4, $5::jsonb, $6)
+        insert into code_embeddings (id, project_root_path, file_path, content_hash, embedding, role, updated_at)
+        values ($1, $2, $3, $4, $5::jsonb, $6, $7)
         on conflict (id) do update set
           content_hash = excluded.content_hash,
           embedding = excluded.embedding,
+          role = excluded.role,
           updated_at = excluded.updated_at
       `,
-      [id, input.projectRootPath, input.filePath, input.contentHash, JSON.stringify(input.embedding), new Date().toISOString()],
+      [id, input.projectRootPath, input.filePath, input.contentHash, JSON.stringify(input.embedding), input.role, new Date().toISOString()],
     );
   } catch (error) {
     console.warn("[code-embeddings] upsertCodeEmbedding failed:", error);
@@ -122,6 +131,45 @@ export async function findSemanticMatches(
       .slice(0, topK);
   } catch (error) {
     console.warn("[code-embeddings] findSemanticMatches failed, degrading to no matches:", error);
+    return [];
+  }
+}
+
+/**
+ * Cross-path variant (2026-07-16, multi-path unification) - ranks matches
+ * across EVERY physical repo of a project at once (a single semantic query
+ * can and should surface both a frontend page and the backend endpoint it
+ * calls). Returns which repo + role each match belongs to so the caller can
+ * build a label-prefixed virtual path (packages/agentic-research's
+ * WorkspaceRoot convention) instead of a bare relative path that would be
+ * ambiguous once two repos share directory names like "src".
+ */
+export async function findSemanticMatchesAcrossPaths(
+  projectRootPaths: string[],
+  queryEmbedding: number[],
+  topK = 8,
+): Promise<CrossPathCodeEmbeddingMatch[]> {
+  if (projectRootPaths.length === 0) {
+    return [];
+  }
+
+  try {
+    const rows = await runSql<CodeEmbeddingRow & { project_root_path: string; role: PathRole }>(
+      `select project_root_path, file_path, content_hash, embedding, role from code_embeddings where project_root_path = any($1::text[])`,
+      [projectRootPaths],
+    );
+
+    return rows
+      .map((row) => ({
+        filePath: row.file_path,
+        score: cosineSimilarity(queryEmbedding, row.embedding),
+        projectRootPath: row.project_root_path,
+        role: row.role,
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topK);
+  } catch (error) {
+    console.warn("[code-embeddings] findSemanticMatchesAcrossPaths failed, degrading to no matches:", error);
     return [];
   }
 }

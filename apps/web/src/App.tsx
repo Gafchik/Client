@@ -668,40 +668,80 @@ function describeObserverStatus(
   };
 }
 
+// Project-level aggregate (2026-07-16, multi-path unification) - a project
+// can have several physical repos, each with its own Observer runner; this
+// rolls them up into one status so a single button can start/stop all of
+// them. "Running" if ANY path is running (matches the "one click covers the
+// whole project" intent); the description shows how many of the paths are
+// actually active so a partial start/stop is still visible, not hidden.
+function describeProjectObserverStatus(
+  status: ObserverStatusResponse | null,
+  projectRootPaths: string[],
+): { title: string; description: string; running: boolean } | null {
+  if (projectRootPaths.length === 0) {
+    return null;
+  }
+
+  const perPathStates = projectRootPaths.map((rootPath) => describeObserverStatus(status, rootPath));
+  const runningCount = perPathStates.filter((state) => state?.running).length;
+
+  if (runningCount === 0) {
+    return { title: "Observer остановлен", description: `0/${projectRootPaths.length} путей`, running: false };
+  }
+
+  return {
+    title: runningCount === projectRootPaths.length ? "Observer изучает проект" : "Observer изучает частично",
+    description: `${runningCount}/${projectRootPaths.length} путей запущено`,
+    running: true,
+  };
+}
+
+// Path-role labels are short and generic (no project-specific naming) - a
+// direct display of PathRole values, not a marketing name.
+const PATH_ROLE_LABELS: Record<string, string> = {
+  backend: "backend",
+  "frontend-web": "frontend",
+  "frontend-desktop": "desktop",
+  cli: "cli",
+  unknown: "?",
+};
+
 function EnvironmentStrip({
   projects,
   selectedProjectId,
-  selectedProjectPathId,
   selectedProviderId,
   providers,
   teams,
   selectedTeamId,
-  projectPath,
   observerStatus,
   disabled,
   onProjectChange,
-  onProjectPathChange,
   onProviderChange,
   onTeamChange,
   onObserverToggle,
 }: {
   projects: ProjectRecord[];
   selectedProjectId: string;
-  selectedProjectPathId: string;
   selectedProviderId: string;
   providers: ProviderRecord[];
   teams: TeamRecord[];
   selectedTeamId: string;
-  projectPath: string;
   observerStatus: ObserverStatusResponse | null;
   disabled: boolean;
   onProjectChange: (projectId: string) => void;
-  onProjectPathChange: (pathId: string) => void;
   onProviderChange: (providerId: string) => void;
   onTeamChange: (teamId: string) => void;
-  onObserverToggle: (projectPath: string, nextRunning: boolean) => void;
+  onObserverToggle: (projectPaths: string[], nextRunning: boolean) => void;
 }) {
-  const observerState = describeObserverStatus(observerStatus, projectPath);
+  // Multi-path unification (2026-07-16): selecting a project is now enough -
+  // no more manually picking "which path" first. Every path of the project
+  // is shown as a read-only badge (so the user still sees what's included)
+  // and Observer starts/stops on all of them with one click.
+  const selectedProject = projects.find((item) => item.id === selectedProjectId) ?? null;
+  const projectPaths = selectedProject?.paths ?? [];
+  const projectRootPaths = projectPaths.map((pathItem) => pathItem.rootPath);
+  const observerState = describeProjectObserverStatus(observerStatus, projectRootPaths);
+
   return (
     <section className="environment-strip">
       <select className="environment-pill" value={selectedProjectId} onChange={(event) => onProjectChange(event.target.value)} disabled={disabled}>
@@ -713,14 +753,11 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      <select className="environment-pill" value={selectedProjectPathId} onChange={(event) => onProjectPathChange(event.target.value)} disabled={disabled}>
-        <option value="">Путь</option>
-        {safeList(projects.find((item) => item.id === selectedProjectId)?.paths).map((pathItem) => (
-          <option key={pathItem.id} value={pathItem.id}>
-            {pathItem.name}
-          </option>
-        ))}
-      </select>
+      {projectPaths.length > 0 ? (
+        <span className="environment-pill environment-paths-badge" title="Все эти пути изучаются и видны Researcher'у как один проект">
+          {projectPaths.map((pathItem) => `${pathItem.name} (${PATH_ROLE_LABELS[pathItem.role] ?? pathItem.role})`).join(" · ")}
+        </span>
+      ) : null}
 
       <select className="environment-pill" value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)} disabled={disabled}>
         <option value="">Провайдер</option>
@@ -740,12 +777,12 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      {projectPath ? (
+      {projectRootPaths.length > 0 ? (
         <button
           type="button"
           className="environment-status-pill environment-status-pill-button"
           title={observerState?.description ?? "Ещё не запускался для этого проекта"}
-          onClick={() => onObserverToggle(projectPath, !(observerState?.running ?? false))}
+          onClick={() => onObserverToggle(projectRootPaths, !(observerState?.running ?? false))}
         >
           <strong>{observerState?.title ?? "Observer остановлен"}</strong>
           <span>{observerState?.running ? "Остановить" : "Запустить"} · {observerState?.description ?? "нет данных"}</span>
@@ -2902,6 +2939,29 @@ export function App() {
     }
   }
 
+  // Project-level toggle (2026-07-16, multi-path unification): one click
+  // starts/stops Observer on every physical repo of the selected project -
+  // the user no longer has to know or care that a project can have several
+  // paths. Reuses the existing per-path start/stop endpoint (each path's
+  // Observer runner is still independent - it has its own git history), just
+  // loops it client-side, same pattern as resumeObservers already does.
+  async function toggleProjectObserver(observerProjectPaths: string[], nextRunning: boolean) {
+    try {
+      await Promise.all(
+        observerProjectPaths.map((observerProjectPath) =>
+          fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/observer/${nextRunning ? "start" : "stop"}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ projectPath: observerProjectPath }),
+          }),
+        ),
+      );
+      await loadObserverStatus();
+    } catch (toggleError) {
+      setError(toggleError instanceof Error ? toggleError.message : "Не удалось переключить Observer.");
+    }
+  }
+
   async function stopAllObserversNow() {
     try {
       const result = await fetchJsonWithTimeout<{ ok: true; stopped: string[] }>(`${API_BASE_URL}/api/observer/stop-all`, {
@@ -3312,32 +3372,27 @@ export function App() {
             <EnvironmentStrip
               projects={projects}
               selectedProjectId={selectedProjectId}
-              selectedProjectPathId={selectedProjectPathId}
               selectedProviderId={selectedProviderId}
               providers={providers}
               teams={teams}
               selectedTeamId={selectedTeamId}
-              projectPath={projectPath}
               observerStatus={observerStatus}
               disabled={running}
               onProjectChange={(nextProjectId) => {
                 setSelectedProjectId(nextProjectId);
                 const selectedProject = projects.find((item) => item.id === nextProjectId);
+                // Multi-path unification (2026-07-16): the primary path is
+                // always paths[0] - no more manual "Путь" selection. The
+                // backend independently expands to every path of the
+                // project for research/Observer purposes.
                 const activePath = selectedProject?.paths[0] ?? null;
                 setSelectedProjectPathId(activePath?.id ?? "");
                 setProjectPath(activePath?.rootPath ?? "");
                 void loadProject(activePath?.rootPath, nextProjectId);
               }}
-              onProjectPathChange={(nextPathId) => {
-                setSelectedProjectPathId(nextPathId);
-                const selectedProject = projects.find((item) => item.id === selectedProjectId) ?? null;
-                const selectedPath = selectedProject?.paths.find((pathItem) => pathItem.id === nextPathId) ?? null;
-                setProjectPath(selectedPath?.rootPath ?? "");
-                void loadProject(selectedPath?.rootPath, selectedProjectId || undefined);
-              }}
               onProviderChange={(providerId) => void selectProvider(providerId)}
               onTeamChange={(teamId) => void selectTeam(teamId)}
-              onObserverToggle={(observerProjectPath, nextRunning) => void toggleObserver(observerProjectPath, nextRunning)}
+              onObserverToggle={(observerProjectPaths, nextRunning) => void toggleProjectObserver(observerProjectPaths, nextRunning)}
             />
 
             <ObserverGlobalBar
@@ -3779,7 +3834,11 @@ export function App() {
                   <div key={projectItem.id} className="list-item">
                     <strong>{projectItem.name}</strong>
                     <span>{projectItem.description || "Без описания"}</span>
-                    <span>{projectItem.paths.map((pathItem: ProjectPathRecord) => `${pathItem.name}: ${pathItem.rootPath}`).join(" · ")}</span>
+                    <span>
+                      {projectItem.paths
+                        .map((pathItem: ProjectPathRecord) => `${pathItem.name} [${PATH_ROLE_LABELS[pathItem.role] ?? pathItem.role}]: ${pathItem.rootPath}`)
+                        .join(" · ")}
+                    </span>
                     <div className="action-row">
                       <button type="button" className="ghost-button" onClick={() => startEditProject(projectItem)}>
                         Редактировать

@@ -1,4 +1,7 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import {
+  contentHash,
   stableId,
   type FactSource,
   type FactStatus,
@@ -87,6 +90,57 @@ export async function queryRelevantFacts(
     console.warn("[facts] queryRelevantFacts failed, degrading to no facts:", error);
     return [];
   }
+}
+
+/**
+ * Cross-path variant (2026-07-16, multi-path unification) for the agentic
+ * Researcher's "verify, then rely" seed hint - queries confirmed facts
+ * across EVERY physical repo of a project at once, not just the one
+ * `IndexResult` `queryRelevantFacts` is normally tied to. Staleness is
+ * recomputed the same way business_graph_entries does (graph-entries.ts's
+ * currentHashOf) - reads each fact's own small file set on demand, no full
+ * index needed, cheap since a fact typically references 1-3 files. No
+ * rename-tracking here (that needs a git diff per repo, more than this
+ * lightweight hint warrants) - a renamed file's fact just goes stale, same
+ * as any other content change.
+ */
+export async function queryFactsAcrossPaths(projectRootPaths: string[]): Promise<ProjectFact[]> {
+  if (projectRootPaths.length === 0) {
+    return [];
+  }
+
+  try {
+    const rows = await runSql<ProjectFactRow>(
+      `select * from project_facts where project_root_path = any($1::text[]) and status != 'deprecated' order by last_confirmed_at desc limit 100`,
+      [projectRootPaths],
+    );
+
+    return await Promise.all(
+      rows.map(async (row) => {
+        const fact = mapFactRow(row);
+        const stillValid = await isFactStillValid(row.project_root_path, fact);
+        return { ...fact, status: stillValid ? fact.status : ("potentially_stale" as FactStatus) };
+      }),
+    );
+  } catch (error) {
+    console.warn("[facts] queryFactsAcrossPaths failed, degrading to no facts:", error);
+    return [];
+  }
+}
+
+async function isFactStillValid(projectRootPath: string, fact: ProjectFact): Promise<boolean> {
+  for (const filePath of fact.filePaths) {
+    try {
+      const content = await fs.readFile(path.resolve(projectRootPath, filePath), "utf8");
+      if (contentHash(content) === fact.contentHashes[filePath]) {
+        return true;
+      }
+    } catch {
+      // File missing/unreadable - not valid via this path, keep checking others.
+    }
+  }
+
+  return false;
 }
 
 /**

@@ -968,11 +968,20 @@ export interface ProviderUsageSummary {
   callCount: number;
 }
 
+// Auto-detected (2026-07-16, multi-path unification) from generic manifest
+// signatures (package.json/composer.json/go.mod/etc) - never hardcoded to a
+// specific project's naming. Lets the agentic Researcher reason about which
+// part of a multi-repo project ("this project has a backend AND a frontend
+// AND a cli") a question likely belongs to, without the user manually
+// tagging every path.
+export type PathRole = "backend" | "frontend-web" | "frontend-desktop" | "cli" | "unknown";
+
 export interface ProjectPathRecord {
   id: string;
   projectId: string;
   name: string;
   rootPath: string;
+  role: PathRole;
   createdAt: string;
   updatedAt: string;
 }

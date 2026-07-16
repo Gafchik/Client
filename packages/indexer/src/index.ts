@@ -160,6 +160,8 @@ function indexFile(
     case "typescript":
     case "javascript":
       return extractScriptFile(file, fileByRelativePath);
+    case "vue":
+      return extractVueFile(file, fileByRelativePath);
     case "php":
       return extractPhpFile(file, fileByRelativePath);
     case "markdown":
@@ -183,6 +185,64 @@ function indexFile(
         relations: [],
       };
   }
+}
+
+// Vue SFC symbol extraction (2026-07-16, multi-path unification - onboarding
+// Vue/Quasar frontend repos). Narrow scope on purpose: only pulls out the
+// <script>/<script setup> block and reuses the existing generic TS/JS AST
+// extractor on it - no <template>/directive analysis. Before this, .vue
+// files got zero symbols (fell through indexFile's default case), which is
+// harmless for the agentic Researcher (it reads files directly) but left the
+// structural graph blind for an entire language. Only the FIRST <script>
+// block is read - a Vue 3 file combining a plain <script> (e.g. for
+// `defineOptions`) with a separate <script setup> is rare enough that
+// handling just one is a reasonable simplification for this MVP.
+function extractVueFile(
+  file: ProjectFile,
+  fileByRelativePath: Map<string, ProjectFile>,
+): {
+  file: IndexedFile;
+  symbols: IndexSymbol[];
+  relations: IndexRelation[];
+} {
+  const openTagMatch = /<script([^>]*)>/i.exec(file.content);
+
+  if (!openTagMatch) {
+    return {
+      file: {
+        fileId: file.id,
+        filePath: file.relativePath,
+        language: file.language,
+        contentHash: file.contentHash,
+        modifiedAt: file.modifiedAt,
+        parseCacheKey: buildParseCacheKey(file),
+        astFingerprint: buildAstFingerprint(file),
+        symbolIds: [],
+        imports: [],
+      },
+      symbols: [],
+      relations: [],
+    };
+  }
+
+  const scriptStart = openTagMatch.index + openTagMatch[0].length;
+  const closeTagIndex = file.content.indexOf("</script>", scriptStart);
+  const scriptContent = closeTagIndex === -1 ? file.content.slice(scriptStart) : file.content.slice(scriptStart, closeTagIndex);
+  const langAttrMatch = /lang\s*=\s*["'](\w+)["']/i.exec(openTagMatch[1] ?? "");
+  const scriptLanguage: LanguageId = langAttrMatch?.[1]?.toLowerCase() === "ts" || langAttrMatch?.[1]?.toLowerCase() === "typescript"
+    ? "typescript"
+    : "javascript";
+  // Lines before the script content, so symbol line numbers stay accurate
+  // against the REAL .vue file, not the extracted script substring.
+  const lineOffset = (file.content.slice(0, scriptStart).match(/\n/g) ?? []).length;
+
+  const result = extractScriptFile({ ...file, content: scriptContent, language: scriptLanguage }, fileByRelativePath);
+
+  return {
+    ...result,
+    file: { ...result.file, filePath: file.relativePath, language: file.language, contentHash: file.contentHash, modifiedAt: file.modifiedAt },
+    symbols: result.symbols.map((symbol) => ({ ...symbol, filePath: file.relativePath, language: file.language, line: symbol.line + lineOffset })),
+  };
 }
 
 function extractScriptFile(

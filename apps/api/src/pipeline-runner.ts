@@ -16,7 +16,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, findSemanticMatches, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntries, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
+import { buildBackgroundProjectState, findSemanticMatchesAcrossPaths, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -37,12 +37,13 @@ import {
   type PipelineRunResult,
   type PipelineRunStatus,
   type PipelineStage,
+  type ProjectPathRecord,
   type ValidationRecommendedAction,
   type ValidationRecommendedResearchProfile,
   type ValidationResult,
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
-import { runAgenticResearch } from "@client/agentic-research";
+import { runAgenticResearch, type WorkspaceRoot } from "@client/agentic-research";
 import { saveGraphSnapshot } from "./graph-store.js";
 import { getRedisClient } from "./redis-client.js";
 import { getSelectedTeam } from "./team-store.js";
@@ -53,6 +54,18 @@ export interface PipelineExecutionRequest {
   conversationId: string;
   task: string;
   projectPath: string;
+  /**
+   * All physical repos of the resolved project (2026-07-16, multi-path
+   * unification) - `projectPath` above stays the single "primary path"
+   * identity used for run-tracking/conversation-threading (unchanged), but
+   * team-mode builds its WorkspaceRoot[] from this full list so the agentic
+   * Researcher can see every repo, not just the primary one. Absent for
+   * callers that never resolved a ProjectRecord (background-sync/hard-resync
+   * triggered without one, eval scenarios) - team-mode then falls back to a
+   * single root built from `projectPath` alone, identical to pre-multi-path
+   * behavior.
+   */
+  projectPaths?: ProjectPathRecord[];
   providerBaseUrl: string;
   providerModel: string;
   providerApiKey: string;
@@ -392,7 +405,7 @@ async function executePipelineRun(request: PipelineExecutionRequest): Promise<vo
 }
 
 async function buildPipelineRunResult(request: PipelineExecutionRequest): Promise<PipelineRunResult> {
-  const { runId, mode, conversationId, task, projectPath, providerBaseUrl, providerModel, providerApiKey, appRootPath } = request;
+  const { runId, mode, conversationId, task, projectPath, projectPaths, providerBaseUrl, providerModel, providerApiKey, appRootPath } = request;
   const overview = await scanWorkspaceOverview(projectPath);
   const largeRepositoryProfile = overview.summary.profile === "large-repository";
   const isQuestionRun = mode === "question-run";
@@ -565,8 +578,23 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
   if (selectedTeam) {
     updateStageLabel(runId, "research", `Команда «${selectedTeam.name}»: Researcher исследует проект инструментами...`);
-    const observerHint = await buildObserverHintSuffix(projectRootPath, task);
-    const knownFactsHintText = buildKnownFactsHint(knownFacts);
+    // Multi-path unification (2026-07-16): team-mode sees EVERY physical
+    // repo of the resolved project, not just the primary one the
+    // deterministic legacy pipeline above is keyed to (workspace/index/graph/
+    // impact/plan stay single-path for now - see the plan doc's known
+    // limitation). Falls back to a single root built from projectRootPath
+    // when the request never resolved a ProjectRecord (background-sync/
+    // hard-resync/eval callers) - identical to pre-multi-path behavior.
+    const projectRoots: WorkspaceRoot[] = projectPaths?.length
+      ? projectPaths.map((pathRecord) => ({
+          label: pathRecord.name,
+          absolutePath: normalizePath(path.resolve(pathRecord.rootPath)),
+          role: pathRecord.role,
+        }))
+      : [{ label: "root", absolutePath: projectRootPath, role: "unknown" }];
+    const observerHint = await buildObserverHintSuffix(projectRoots, task);
+    const teamKnownFacts = await queryFactsAcrossPaths(projectRoots.map((root) => root.absolutePath));
+    const knownFactsHintText = buildKnownFactsHint(projectRoots, teamKnownFacts);
     // Тот же conversationTurns, что уже питает приоритетную evidence для
     // детерминированного пути (см. priorTurn чуть ниже) - agentic-путь
     // раньше вообще не участвовал в этом механизме, из-за чего каждая
@@ -603,19 +631,19 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       // (AgenticRunOptions.observerHint) - still reaches the model, just
       // appended to the LLM-facing message only, not the visible task.
       task,
-      projectRootPath,
+      projectRoots,
       researcherModel: selectedTeam.researcherModel,
       criticModel: selectedTeam.criticModel,
       providerBaseUrl,
       providerApiKey,
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
       ...(observerHint ? { observerHint } : {}),
-      semanticSearch: buildSemanticSearchTool(projectRootPath, providerBaseUrl, providerApiKey),
+      semanticSearch: buildSemanticSearchTool(projectRoots, providerBaseUrl, providerApiKey),
       // Speed pass (2026-07-16, по одобренному плану): контент топ-файлов
       // семантического индекса кладётся в контекст ДО первого хода (см.
       // AgenticRunOptions.semanticSeedFiles) - главный рычаг задержки на
       // лёгких вопросах (2-3 хода экономии по замерам).
-      semanticSeedFiles: buildSemanticSeedLookup(projectRootPath, providerBaseUrl, providerApiKey),
+      semanticSeedFiles: buildSemanticSeedLookup(projectRoots, providerBaseUrl, providerApiKey),
       // Факт-стор теперь питает и agentic-путь (раньше только легаси
       // детерминированный) - подтверждённые прошлыми прогонами факты как
       // "проверь и опирайся"-затравка.
@@ -1544,15 +1572,34 @@ function computeTaskSearchTokens(task: string): string[] {
 // поэтому формулировка ниже явно говорит "проверь", а не "вот факт".
 const SEMANTIC_SEARCH_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b";
 
+// Shared by all four builders below (2026-07-16, multi-path unification) -
+// a bare relative path is ambiguous once a project has 2+ physical repos
+// (both could have "src/index.js"), so every hint/tool that surfaces a file
+// path to the agentic loop must resolve it to the same label-prefixed
+// virtual-path convention packages/agentic-research's tools.ts uses. For a
+// single-repo project (the common case) this is a no-op passthrough.
+function toVirtualPath(roots: WorkspaceRoot[], ownerRootPath: string, relativePath: string): string {
+  if (roots.length === 1) {
+    return relativePath;
+  }
+
+  const owningRoot = roots.find((root) => root.absolutePath === ownerRootPath);
+  return owningRoot ? `${owningRoot.label}/${relativePath}` : relativePath;
+}
+
 // Injected into AgenticRunOptions.semanticSearch (2026-07-16) - kept here,
 // not in packages/agentic-research, so that package stays free of any
 // DB/provider-embeddings dependency (mirrors how shouldAbort is injected).
 // Queries whatever apps/api/src/embedding-indexer.ts has built so far in the
 // background; never builds/blocks on an index itself, so a project with no
 // embeddings yet just degrades to an honest "nothing indexed yet" message
-// rather than stalling a live question.
+// rather than stalling a live question. Multi-root (2026-07-16): searches
+// across every repo of the project in one call - the whole point of a
+// cross-repo question ("what does the frontend call, and what does the
+// backend do about it") is that ONE semantic query can surface hits on both
+// sides at once.
 function buildSemanticSearchTool(
-  projectRootPath: string,
+  roots: WorkspaceRoot[],
   providerBaseUrl: string,
   providerApiKey: string,
 ): (query: string) => Promise<string> {
@@ -1569,13 +1616,15 @@ function buildSemanticSearchTool(
         return "(semantic search failed: no embedding returned)";
       }
 
-      const matches = await findSemanticMatches(projectRootPath, queryEmbedding, 8);
+      const matches = await findSemanticMatchesAcrossPaths(roots.map((root) => root.absolutePath), queryEmbedding, 8);
 
       if (matches.length === 0) {
         return "(no semantic index built yet for this project, or no match found - try list_dir/grep_content instead)";
       }
 
-      return matches.map((match) => `${match.filePath} (similarity ${match.score.toFixed(2)})`).join("\n");
+      return matches
+        .map((match) => `${toVirtualPath(roots, match.projectRootPath, match.filePath)} (similarity ${match.score.toFixed(2)})`)
+        .join("\n");
     } catch (error) {
       return `(semantic search error: ${error instanceof Error ? error.message : String(error)})`;
     }
@@ -1589,7 +1638,7 @@ function buildSemanticSearchTool(
 const SEMANTIC_SEED_MIN_SCORE = 0.45;
 
 function buildSemanticSeedLookup(
-  projectRootPath: string,
+  roots: WorkspaceRoot[],
   providerBaseUrl: string,
   providerApiKey: string,
 ): (query: string) => Promise<string[]> {
@@ -1606,8 +1655,10 @@ function buildSemanticSeedLookup(
         return [];
       }
 
-      const matches = await findSemanticMatches(projectRootPath, queryEmbedding, 3);
-      return matches.filter((match) => match.score >= SEMANTIC_SEED_MIN_SCORE).map((match) => match.filePath);
+      const matches = await findSemanticMatchesAcrossPaths(roots.map((root) => root.absolutePath), queryEmbedding, 3);
+      return matches
+        .filter((match) => match.score >= SEMANTIC_SEED_MIN_SCORE)
+        .map((match) => toVirtualPath(roots, match.projectRootPath, match.filePath));
     } catch {
       return [];
     }
@@ -1617,7 +1668,7 @@ function buildSemanticSeedLookup(
 // Формирует "verify, then rely"-блок из подтверждённых фактов прошлых
 // прогонов (fact store) для agentic-цикла. Только свежие (не stale) факты с
 // файлами - у протухших content hash уже разошёлся с кодом.
-function buildKnownFactsHint(knownFacts: Awaited<ReturnType<typeof queryRelevantFacts>>): string {
+function buildKnownFactsHint(roots: WorkspaceRoot[], knownFacts: Awaited<ReturnType<typeof queryFactsAcrossPaths>>): string {
   const usable = knownFacts
     .filter((fact) => fact.status === "fresh" && fact.filePaths.length > 0)
     .slice(0, 5);
@@ -1628,13 +1679,15 @@ function buildKnownFactsHint(knownFacts: Awaited<ReturnType<typeof queryRelevant
 
   return [
     "Facts confirmed by PREVIOUS answered questions about this project (verify against current code before relying - the code may have changed):",
-    ...usable.map((fact) => `- ${fact.statement} (files: ${fact.filePaths.slice(0, 3).join(", ")})`),
+    ...usable.map((fact) =>
+      `- ${fact.statement} (files: ${fact.filePaths.slice(0, 3).map((filePath) => toVirtualPath(roots, fact.projectRootPath, filePath)).join(", ")})`,
+    ),
   ].join("\n");
 }
 
-async function buildObserverHintSuffix(projectRootPath: string, task: string): Promise<string> {
+async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: string): Promise<string> {
   try {
-    const entries = await queryBusinessGraphEntries(projectRootPath);
+    const entries = await queryBusinessGraphEntriesAcrossPaths(roots.map((root) => root.absolutePath));
     const freshEntries = entries.filter((entry) => !entry.isStale && entry.featureSummary.trim());
 
     if (freshEntries.length === 0) {
@@ -1664,7 +1717,7 @@ async function buildObserverHintSuffix(projectRootPath: string, task: string): P
     // user directly (see the 2026-07-15 fix that stopped it from leaking
     // into ResearchReport.task/"Задача").
     const hintLines = relevant.flatMap((entry) => [
-      `- "${entry.unitPath}": ${entry.featureSummary}`,
+      `- "${toVirtualPath(roots, entry.projectRootPath, entry.unitPath)}": ${entry.featureSummary}`,
       ...(entry.keyMechanisms.length ? [`  Mechanisms: ${entry.keyMechanisms.join("; ")}`] : []),
       ...(entry.gotchas.length ? [`  Gotchas: ${entry.gotchas.join("; ")}`] : []),
     ]);

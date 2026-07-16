@@ -16,20 +16,23 @@ function knowledgeArtifactCacheKey(runId: string): string {
   return `knowledge-artifact:${runId}`;
 }
 
-export { promoteFactsFromResearch, queryRelevantFacts } from "./facts.js";
+export { promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
 export {
   hashFiles,
   queryBusinessGraphEntries,
+  queryBusinessGraphEntriesAcrossPaths,
   upsertBusinessGraphEntry,
   type BusinessGraphEntry,
   type UpsertBusinessGraphEntryInput,
 } from "./graph-entries.js";
 export {
   findSemanticMatches,
+  findSemanticMatchesAcrossPaths,
   getCodeEmbeddingContentHashes,
   pruneCodeEmbeddings,
   upsertCodeEmbedding,
   type CodeEmbeddingMatch,
+  type CrossPathCodeEmbeddingMatch,
   type UpsertCodeEmbeddingInput,
 } from "./code-embeddings.js";
 import type { PipelineRunMode } from "@client/shared";

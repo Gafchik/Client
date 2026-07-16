@@ -98,6 +98,25 @@ export async function queryBusinessGraphEntries(projectRootPath: string): Promis
   }
 }
 
+/** Cross-path variant (2026-07-16, multi-path unification) - Observer crawls each physical repo of a project independently, this reads hints from ALL of them at once for the agentic Researcher's observerHint. */
+export async function queryBusinessGraphEntriesAcrossPaths(projectRootPaths: string[]): Promise<BusinessGraphEntry[]> {
+  if (projectRootPaths.length === 0) {
+    return [];
+  }
+
+  try {
+    const rows = await runSql<BusinessGraphEntryRow>(
+      `select * from business_graph_entries where project_root_path = any($1::text[]) order by last_crawled_at desc`,
+      [projectRootPaths],
+    );
+
+    return await Promise.all(rows.map((row) => mapRow(row)));
+  } catch (error) {
+    console.warn("[graph-entries] queryBusinessGraphEntriesAcrossPaths failed, degrading to no hints:", error);
+    return [];
+  }
+}
+
 /** Hashes a small, known set of files (e.g. what one crawl touched) - not a full project scan. */
 export async function hashFiles(projectRootPath: string, filePaths: string[]): Promise<Record<string, string>> {
   const entries = await Promise.all(
