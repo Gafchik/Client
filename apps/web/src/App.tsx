@@ -47,6 +47,14 @@ interface ProjectInfo {
   } | null;
 }
 
+interface HealthStatusResponse {
+  status: string;
+  now: string;
+  neo4jConnected: boolean;
+  postgresConnected: boolean;
+  redisConnected: boolean;
+}
+
 type ProviderDraft = {
   id: string;
   name: string;
@@ -412,6 +420,74 @@ function backgroundSyncState(project: ProjectInfo | null): {
     tone: "idle",
     title: "Можно спрашивать сейчас",
     description: "Фоновый sync сейчас не нужен: текущий baseline уже пригоден для question-run, а локальные изменения будут учтены через worktree overlay при необходимости.",
+  };
+}
+
+function buildChatPreflight(input: {
+  health: HealthStatusResponse | null;
+  providers: ProviderRecord[];
+  selectedProviderId: string;
+  teams: TeamRecord[];
+  selectedTeamId: string;
+  projects: ProjectRecord[];
+  selectedProjectId: string;
+}) {
+  const selectedProvider = input.providers.find((provider) => provider.id === input.selectedProviderId) ?? null;
+  const selectedTeam = input.teams.find((team) => team.id === input.selectedTeamId) ?? null;
+  const selectedProject = input.projects.find((project) => project.id === input.selectedProjectId) ?? null;
+  const hasWorkingProvider = Boolean(selectedProvider?.baseUrl?.trim());
+  const hasApiKeyHint = input.providers.some((provider) => provider.baseUrl.trim() && provider.name.trim() && !provider.isCurrent)
+    || Boolean(selectedProvider);
+
+  const items = [
+    {
+      key: "infra",
+      ready: Boolean(input.health?.postgresConnected && input.health?.redisConnected),
+      label: "Инфраструктура",
+      detail: input.health
+        ? `Postgres ${input.health.postgresConnected ? "ok" : "off"} · Redis ${input.health.redisConnected ? "ok" : "off"} · Neo4j ${input.health.neo4jConnected ? "ok" : "degraded"}`
+        : "Статус инфраструктуры ещё не загружен.",
+      action: "Проверь docker compose и /api/health.",
+    },
+    {
+      key: "provider",
+      ready: hasWorkingProvider && hasApiKeyHint,
+      label: "Провайдер",
+      detail: selectedProvider
+        ? `${selectedProvider.name} выбран.`
+        : "Текущий provider ещё не выбран.",
+      action: "Создай или выбери provider на странице «Провайдеры».",
+    },
+    {
+      key: "team",
+      ready: Boolean(selectedTeam && selectedTeam.researcherModel && selectedTeam.criticModel && selectedTeam.observerModel),
+      label: "Команда",
+      detail: selectedTeam
+        ? `${selectedTeam.name} выбрана.`
+        : "Команда с ролями Researcher/Critic/Observer ещё не выбрана.",
+      action: "Выбери team на странице «Команды».",
+    },
+    {
+      key: "project",
+      ready: Boolean(selectedProject?.paths.length),
+      label: "Проект",
+      detail: selectedProject
+        ? `${selectedProject.name} · ${selectedProject.paths.length} path`
+        : "Проект ещё не добавлен или не выбран.",
+      action: "Добавь project и хотя бы один реальный root path на странице «Проекты».",
+    },
+  ] as const;
+
+  const missing = items.filter((item) => !item.ready);
+
+  return {
+    items,
+    ready: missing.length === 0,
+    title: missing.length === 0 ? "Всё готово к первому вопросу" : "Перед первым вопросом осталось проверить несколько вещей",
+    description:
+      missing.length === 0
+        ? "Инфраструктура поднята, provider/team/project выбраны. Можно сразу спрашивать."
+        : missing[0]?.action ?? "Заверши базовую настройку окружения.",
   };
 }
 
@@ -1965,6 +2041,7 @@ export function App() {
   const [teams, setTeams] = useState<TeamRecord[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState<string>("");
   const [observerStatus, setObserverStatus] = useState<ObserverStatusResponse | null>(null);
+  const [health, setHealth] = useState<HealthStatusResponse | null>(null);
   // Запоминает, какие проекты были активны на момент "Остановить все", чтобы
   // "Запустить снова" перезапускала именно их, а не все проекты подряд.
   const [pausedObserverProjects, setPausedObserverProjects] = useState<string[]>([]);
@@ -1999,6 +2076,15 @@ export function App() {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const readiness = projectReadinessState(project);
   const backgroundSyncStatus = backgroundSyncState(project);
+  const preflight = buildChatPreflight({
+    health,
+    providers,
+    selectedProviderId,
+    teams,
+    selectedTeamId,
+    projects,
+    selectedProjectId,
+  });
 
   useEffect(() => {
     void initializeApp();
@@ -2180,7 +2266,7 @@ export function App() {
       // независимых запроса (ни один не зависит от результата другого), но
       // общее время ожидания было суммой обоих вместо максимума. На старте
       // приложения это и ощущалось как "долго не прилетают проекты/провайдеры".
-      const [loadedProjects] = await Promise.all([loadProjects(), loadProviders(), loadTeams()]);
+      const [loadedProjects] = await Promise.all([loadProjects(), loadProviders(), loadTeams(), loadHealth()]);
       const preferredProjectId =
         selectedProjectIdRef.current && loadedProjects.some((projectItem) => projectItem.id === selectedProjectIdRef.current)
           ? selectedProjectIdRef.current
@@ -2210,6 +2296,16 @@ export function App() {
     });
 
     return projectCatalog.projects;
+  }
+
+  async function loadHealth() {
+    const healthData = await fetchJsonWithTimeout<HealthStatusResponse>(`${API_BASE_URL}/api/health`);
+
+    startTransition(() => {
+      setHealth(healthData);
+    });
+
+    return healthData;
   }
 
   function resolveSelectedProjectPath(projectItem: ProjectRecord | null | undefined, preferredRootPath?: string): ProjectPathRecord | null {
@@ -3403,6 +3499,23 @@ export function App() {
             />
 
             <div className="chat-body">
+              {!preflight.ready && !loading ? (
+                <div className="chat-hero chat-hero-empty">
+                  <p className="section-kicker">Preflight</p>
+                  <h2>{preflight.title}</h2>
+                  <p>{preflight.description}</p>
+                  <div className="preflight-list">
+                    {preflight.items.map((item) => (
+                      <div key={item.key} className={`preflight-item ${item.ready ? "preflight-item-ready" : "preflight-item-warning"}`}>
+                        <strong>{item.ready ? "Готово" : "Нужно действие"} · {item.label}</strong>
+                        <span>{item.detail}</span>
+                        {!item.ready ? <span>{item.action}</span> : null}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
               {!safeList(projects).length && !loading ? (
                 <div className="chat-hero chat-hero-empty">
                   <p className="section-kicker">Начало работы</p>
@@ -3790,6 +3903,9 @@ export function App() {
                 </label>
 
                 <div className="stack">
+                  <p className="form-help-text">
+                    Добавь один или несколько абсолютных путей к папкам репозиториев на этой машине. Имя пути необязательно: если оставить пустым, backend подставит название папки сам.
+                  </p>
                   {projectDraft.paths.map((pathItem, index) => (
                     <div key={`${pathItem.id || "draft"}-${index}`} className="path-editor">
                       <label className="field">

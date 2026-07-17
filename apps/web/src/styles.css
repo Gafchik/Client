@@ -334,6 +334,40 @@ button {
   background: var(--bg-elevated-2);
 }
 
+.preflight-list {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+}
+
+.preflight-item {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.preflight-item-ready {
+  border-color: rgba(53, 196, 127, 0.22);
+  background: rgba(53, 196, 127, 0.08);
+}
+
+.preflight-item-warning {
+  border-color: rgba(242, 163, 79, 0.22);
+  background: rgba(242, 163, 79, 0.08);
+}
+
+.preflight-item strong {
+  color: var(--text);
+}
+
+.preflight-item span {
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
 .chat-header {
   padding: 2px 2px 0;
 }
@@ -682,6 +716,13 @@ button {
 
 .field-hint {
   font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.form-help-text {
+  margin: 0;
+  font-size: 0.83rem;
+  line-height: 1.5;
   color: var(--text-muted);
 }
 

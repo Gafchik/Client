@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { forgetProjectPath } from "@client/knowledge";
 import type { PathRole, ProjectPathRecord, ProjectRecord } from "@client/shared";
 import { runSql, withTransaction } from "./postgres-client.js";
@@ -35,6 +37,13 @@ interface ProjectPathRow {
   sort_order: number;
   created_at: Date;
   updated_at: Date;
+}
+
+interface NormalizedProjectPathInput {
+  id: string;
+  name: string;
+  rootPath: string;
+  role: PathRole;
 }
 
 export async function initializeProjectStore(): Promise<void> {
@@ -142,19 +151,7 @@ export async function getProjectById(id: string): Promise<ProjectRecord | null> 
 
 export async function saveProject(input: SaveProjectInput): Promise<ProjectRecord> {
   const nextId = input.id?.trim() || `project-${randomUUID()}`;
-  const normalizedPathsRaw = input.paths
-    .map((item) => ({
-      id: item.id?.trim() || `project-path-${randomUUID()}`,
-      name: item.name.trim(),
-      rootPath: item.rootPath.trim(),
-    }))
-    .filter((item) => item.name && item.rootPath);
-  // Auto-detected per path on every save (2026-07-16, multi-path
-  // unification) - cheap (a handful of file reads), re-run on every save so
-  // an edited path (e.g. rootPath changed) gets re-classified too.
-  const normalizedPaths = await Promise.all(
-    normalizedPathsRaw.map(async (item) => ({ ...item, role: await inferProjectPathRole(item.rootPath) })),
-  );
+  const normalizedPaths = await normalizeProjectPaths(input.paths);
 
   if (!input.name.trim()) {
     throw new Error("Нужно указать имя проекта.");
@@ -260,4 +257,50 @@ function mapProjectPathRow(path: ProjectPathRow): ProjectPathRecord {
     createdAt: new Date(path.created_at).toISOString(),
     updatedAt: new Date(path.updated_at).toISOString(),
   };
+}
+
+async function normalizeProjectPaths(paths: SaveProjectPathInput[]): Promise<NormalizedProjectPathInput[]> {
+  const normalized: NormalizedProjectPathInput[] = [];
+  const seenRootPaths = new Set<string>();
+
+  for (const item of paths) {
+    const rawRootPath = item.rootPath.trim();
+
+    if (!rawRootPath) {
+      continue;
+    }
+
+    const resolvedRootPath = path.resolve(rawRootPath);
+    let stats;
+
+    try {
+      stats = await fs.stat(resolvedRootPath);
+    } catch {
+      throw new Error(`Путь проекта не найден: ${resolvedRootPath}`);
+    }
+
+    if (!stats.isDirectory()) {
+      throw new Error(`Путь проекта должен указывать на директорию: ${resolvedRootPath}`);
+    }
+
+    if (seenRootPaths.has(resolvedRootPath)) {
+      continue;
+    }
+
+    seenRootPaths.add(resolvedRootPath);
+
+    normalized.push({
+      id: item.id?.trim() || `project-path-${randomUUID()}`,
+      name: item.name.trim() || inferPathDisplayName(resolvedRootPath),
+      rootPath: resolvedRootPath,
+      role: await inferProjectPathRole(resolvedRootPath),
+    });
+  }
+
+  return normalized;
+}
+
+function inferPathDisplayName(rootPath: string): string {
+  const baseName = path.basename(rootPath).trim();
+  return baseName || rootPath;
 }
