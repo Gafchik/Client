@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { rgPath } from "@vscode/ripgrep";
 import { normalizePath, type PathRole } from "@client/shared";
 
 const execFileAsync = promisify(execFile);
@@ -164,7 +165,15 @@ export async function grepContent(roots: WorkspaceRoot[], pattern: string): Prom
     // arguments natively) - a cross-repo question ("where does the frontend
     // call this endpoint") needs exactly this: a single ACTION that searches
     // both sides, not one grep per repo.
-    const { stdout } = await execFileAsync("rg", [
+    // Bootstrap fix (2026-07-17): was a bare "rg" command string, which
+    // silently depended on ripgrep being separately installed as a system
+    // binary (present on this machine via Homebrew, invisible in package.json
+    // and undocumented anywhere) - a fresh clone on a machine without it
+    // would have every grep_content ACTION fail, which is most of what the
+    // agentic loop actually does. @vscode/ripgrep bundles a prebuilt binary
+    // per platform as a real npm dependency, downloaded on `npm install` -
+    // zero manual system-level setup step for whoever else runs this.
+    const { stdout } = await execFileAsync(rgPath, [
       "-n",
       "-i",
       "--max-count", "2",

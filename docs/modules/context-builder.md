@@ -2,8 +2,8 @@
 
 **Статус:** Draft  
 **Автор:** Principal Engineering Specification  
-**Дата:** 2026-07-08  
-**Версия:** 1.0.0  
+**Дата:** 2026-07-17  
+**Версия:** 1.1.0  
 **Зависимости:** [000-overview.md](/Users/evgenii/Desktop/client/docs/architecture/000-overview.md), [001-domain-model.md](/Users/evgenii/Desktop/client/docs/architecture/001-domain-model.md), [002-storage.md](/Users/evgenii/Desktop/client/docs/architecture/002-storage.md), [003-event-system.md](/Users/evgenii/Desktop/client/docs/architecture/003-event-system.md), [indexer.md](/Users/evgenii/Desktop/client/docs/modules/indexer.md), [graph.md](/Users/evgenii/Desktop/client/docs/modules/graph.md), [research.md](/Users/evgenii/Desktop/client/docs/modules/research.md)
 
 ---
@@ -613,6 +613,14 @@ Ranking должен зависеть от типа downstream consumer:
 - review-oriented consumer нуждается в risk and constraint context;
 - architecture discussion требует большего веса ADR и structural rationale.
 
+### 8.5 Path-based эвристики ranking: без project-specific hardcoding
+
+Часть ranking-сигналов основана на path-конвенциях расположения файлов. Такие эвристики обязаны опираться на общие, широко распространённые конвенции структуры проектов, а не на layout какого-то одного конкретного целевого проекта и уж тем более не на layout самого Context Builder — модуль работает над множеством разных анализируемых репозиториев, а не только над собственным монорепозиторием.
+
+Практически это означает бонус к релевантности для распространённых root-level source-директорий: `app/` (Laravel и большинство PHP-фреймворков), `src/` (большинство JS/TS-проектов), `lib/` (Go, Python, часть монорепозиториев), `packages/` (монорепозитории). Ни один из этих префиксов не привязан к конкретному стеку — эвристика должна одинаково срабатывать и на Laravel-приложении, и на plain frontend-проекте, и на монорепозитории.
+
+Это частный случай более общего принципа: path-based ranking-логика не должна содержать сигналов, которые совпадают только с layout самого инструмента и никогда не совпадают с layout реально анализируемых целевых проектов, — иначе бонус существует "на бумаге", но фактически никогда не срабатывает. Ранее path-scoring давал бонус путям с префиксом `apps/`/`packages/` — это была собственная монорепо-структура Context Builder, а не сигнал, применимый к анализируемым проектам, поэтому бонус там молча не срабатывал. Тот же класс ошибки был независимо найден и исправлен в Impact Analysis (`buildRisks`), где risk-ranking ранее опирался на три захардкоженных пути этого же монорепозитория.
+
 ---
 
 ## 9. Token Budget Strategy
@@ -811,6 +819,12 @@ Chunk должен иметь:
 - semantic completeness;
 - token cost;
 - local relevance.
+
+### 11.6 Независимость от конкретного языка файла
+
+Chunk Selection и ranking внутри Context Builder не содержат отдельной логики, привязанной к конкретному языку или расширению файла: кандидат оценивается по пути, релевантности задаче, focus zone и query profile — одинаково для TypeScript, PHP, HTML или CSS.
+
+Поэтому расширение набора языков, распознаваемых на уровне Workspace (HTML, CSS, SCSS, SASS и LESS теперь определяются как конкретный язык, а не как `unknown`), не потребовало изменений в самом Context Builder. Как только Workspace включает такие файлы в снапшот, они становятся обычными кандидатами наравне со всеми остальными и проходят через тот же pipeline отбора и ranking. До этого изменения такие файлы просто не попадали в workspace snapshot и физически не могли стать кандидатами — независимо от того, насколько релевантным было бы их содержимое для задачи.
 
 ---
 

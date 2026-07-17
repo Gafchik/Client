@@ -1,5 +1,12 @@
 # Roadmap
 
+Актуализация на 2026-07-17: ближайший практический фокус проекта сместился не в сторону codegen, а в сторону качества research-chat как "карманного senior full-stack". Это означает такой реальный порядок работ:
+
+1. ускорять fast-path для обычных вопрос-ответ сценариев;
+2. делать long-running agent flow понятным и устойчивым на больших репозиториях;
+3. улучшать качество human-style ответа без потери доказательности;
+4. только после этого расширять execution/code-writing слой.
+
 ## Текущий трек
 
 ### MVP Slice 1 — Structural Intelligence Loop
@@ -38,20 +45,17 @@
   - direct entity/symbol/path matches больше не тонут в широком `graph-neighbor` expansion;
   - selective workspace slice теперь резервирует budget под точное сущностное ядро и только затем дозированно расширяется через graph neighbors;
   - устранён перекос `ChiroNotes` vs `AcuNotes`, найденный на живом stress-тесте magendamd.
+- **Team-режим (Researcher/Critic/Observer, 2026-07-14…17)** — agentic-исследование (`packages/agentic-research`) стало основным путём research: модель сама ходит по проекту инструментами (`list_dir`/`grep_content`/`read_file`/`semantic_search`/`find_references`), независимый Critic валидирует ответ перед показом пользователю; детерминированный `packages/research` остался kill-switch fallback'ом (без выбранной команды — старое поведение без изменений).
+- **Multi-path unification (2026-07-16)** — проект с несколькими физическими репозиториями (backend/frontend-web/frontend-desktop/cli) виден системе как единое целое: роль пути автоопределяется по манифестам, agentic-инструменты работают по всем корням через виртуальный путь `label/relative/path`, выпадающий список "Путь" в чате убран.
+- **Convention-based FE→BE связь (2026-07-17)** — граф понимает, что `axios.post('/login')` на фронте и `Route::post('/login', ...)` на бэке — одно ребро (`packages/graph`'s `linkHttpCallsToRoutes`), без хардкода под конкретный проект.
+- **PHP AST-based indexing (2026-07-17)** — извлечение классов/интерфейсов/enum/trait/методов перешло с regex на настоящий парсер (`php-parser`), с fallback на regex при ошибке разбора; попутно исправлены 3 структурных бага (implicit-public методы, методы в мультикласс-файлах, trait'ы вообще не индексировались).
+- **Domain Glossary + belief reconciliation (2026-07-17)** — персистентный словарь бизнес-терминов, обновляемый от вопроса к вопросу (`domain_glossary_entries`), и сверка противоречащих друг другу фактов между запусками (`classifyFactConflict` → статус `contradicted`).
+- **Hot-path/entrypoint-reachability риск и git-churn риск** — Impact Analysis больше не мерит риск только объёмом затронутых файлов: учитывает, сколько публичных эндпоинтов реально проходит через файл, и историю багфикс-коммитов.
+- **Диалоговая связность (2026-07-17)** — agentic-цикл получает тему предыдущей реплики (не только список файлов), чтобы эллиптический follow-up ("дай список роутов для него") не терял тему разговора; исправлена излишняя сдача без глубокого поиска буквального термина вопроса.
 
 ### Сейчас в фокусе
 
-- Углубление functional understanding в Research
-- Дальнейшее выравнивание Graph с утверждённой архитектурой
-- Углубление Planner
-- Подготовка controlled execution runtime
-- Усиление контрактов данных между API, артефактами и UI
-- Продолжение Slice 4 (`008-next-generation-architecture.md`): переход от единого перезаписываемого graph snapshot к snapshot+overlay модели по коммитам; content-addressing индексатора по git blob hash
-- Agent-like runtime/UX для длинных прогонов на больших репозиториях:
-  - чат не должен падать по client timeout во время long-running research;
-  - пользователь должен видеть живой статус работы и не терять активный run;
-  - composer и конфликтующие действия должны блокироваться, пока текущий project-thinking цикл не завершён.
-  - первый UX-hardening pass уже сделан: transient polling timeouts больше не считаются фатальным падением run, а chat surface блокируется на время активного thinking-цикла.
+Structural/knowledge-фундамент (Research, Graph, Impact, Knowledge, agentic Team-режим) закрыт и проверен на двух реальных многопутевых проектах (multi-repo `slay`, крупный монолит `magendamd` — 7955 PHP-файлов). Следующий реальный шаг продукта — **Developer + Reviewer роли** (см. `docs/architecture/010-senior-developer-capability-roadmap.md`, п. 4.3): первая реализация написания кода поверх уже накопленного контекста, вместо дальнейшего углубления research-стороны. Planner/Execution Engine остаются preview-only до этого шага.
 
 ## Следующие этапы
 

@@ -1,10 +1,27 @@
 # Provider System — Унифицированный Слой Абстракции Внешних AI-Сервисов
 
-**Статус:** Спецификация
+**Статус:** Частично реализовано; документ совмещает текущую реализацию и целевую спецификацию
 **Автор:** Principal Architecture Specification
-**Дата:** 2026-07-15
-**Версия:** 1.1.0
+**Дата:** 2026-07-17
+**Версия:** 1.2.0
 **Зависимости:** [000-overview.md](../architecture/000-overview.md), [001-domain-model.md](../architecture/001-domain-model.md), [002-storage.md](../architecture/002-storage.md), [003-event-system.md](../architecture/003-event-system.md), [004-dependency-map.md](../architecture/004-dependency-map.md), [005-contract-gaps.md](../architecture/005-contract-gaps.md)
+
+## Статус реализации на 2026-07-17
+
+Уже реализовано в коде:
+
+- CRUD провайдеров через Postgres-backed API/UI
+- хранение API-ключей в зашифрованном виде (`CLIENT_SECRET_KEY` или локальный `.client/secret.key`)
+- выбор текущего провайдера и default model
+- TTL-кэш списка моделей провайдера
+- graceful fallback на локальный каталог моделей, если внешний `/models` недоступен
+
+Пока не реализовано в полном виде из этой спеки:
+
+- полноценный capability router
+- централизованный budget manager
+- policy engine уровня allowlist/denylist/compliance
+- многоступенчатые fallback chains между несколькими провайдерами
 
 ---
 

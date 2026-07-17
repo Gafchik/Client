@@ -2,8 +2,8 @@
 
 **Статус:** Спецификация
 **Автор:** Архитектурный Комитет
-**Дата:** 2026-07-08
-**Версия:** 1.0
+**Дата:** 2026-07-17
+**Версия:** 1.1 (актуализировано по фактической реализации `packages/knowledge/src/*.ts` на 2026-07-17: Domain Glossary, belief reconciliation между Fact'ами, fix trusted-origin фильтра promotion, `forgetProjectPath`)
 
 ---
 
@@ -50,6 +50,27 @@ Knowledge не является простым хранилищем докуме
 - **Связывает** знания с графом кода (Graph), артефактами, задачами и решениями.
 - **Отслеживает актуальность** знаний по мере эволюции кодовой базы.
 - **Предоставляет retrieval API** для downstream-модулей (Research, Impact Analysis, Context Builder, Planner).
+
+### Важное уточнение (2026-07-17): чем текущая реализация проще утверждённой архитектуры
+
+Разделы 2-25 этого документа описывают целевую архитектуру Knowledge (Coordinator, Ingestion Manager, Vectorization Manager, Conflict Resolver и т.д.) — она остаётся ориентиром и не отменяется. Но фактический код в `packages/knowledge/src/*.ts` на сегодня реализует не универсальный Knowledge Entry с версионированием и графом конфликтов, а четыре узких, прагматичных Postgres-хранилища, каждое под свою конкретную задачу:
+
+| Хранилище | Файл | Таблица | Роль |
+|-----------|------|---------|------|
+| **Fact Store** | `facts.ts` | `project_facts` | Одноразовые проверяемые утверждения ("verify, then rely"), привязанные к content hash файлов-evidence |
+| **Domain Glossary** | `glossary.ts` | `domain_glossary_entries` | Один термин — одно текущее бизнес-определение (новое, 2026-07-17) |
+| **Business Graph Entries** | `graph-entries.ts` | `business_graph_entries` | Память Observer'а о бизнес-графе проекта |
+| **Code Embeddings** | `code-embeddings.ts` | — | Индекс для семантического поиска по коду |
+
+Плюс общий артефакт-каталог run'ов (`index.ts`, `knowledge_artifacts`/`knowledge_catalog`). Ниже — только то, что реально добавилось/изменилось 2026-07-17; остальные разделы описывают целевую модель и должны читаться как таковая, а не как отчёт о текущем коде.
+
+**Изменения 2026-07-17:**
+1. **Domain Glossary** — новая подсистема (см. 6.15, 7.12).
+2. **Belief reconciliation между Fact'ами** — `promoteFactsFromResearch` теперь умеет помечать факт как `contradicted` при обнаруженном противоречии (см. 17.9).
+3. **Fix trusted-origin фильтра promotion** — agentic/Team-режим исследования (основной в проде с 2026-07-15/16, см. `docs/modules/research.md`) наконец пишет в Fact Store (см. 18.2).
+4. **`forgetProjectPath`** — полный каскад удаления знаний о репозитории (см. 18.8).
+
+Подробнее по коду: `packages/knowledge/src/facts.ts`, `packages/knowledge/src/glossary.ts`, `packages/knowledge/src/index.ts`, `packages/ai/src/index.ts` (`classifyFactConflict`, `extractDomainGlossaryTerms`), `apps/api/src/pipeline-runner.ts`.
 
 ### 1.2 Почему Knowledge существует
 

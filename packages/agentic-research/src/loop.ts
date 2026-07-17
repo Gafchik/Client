@@ -104,6 +104,19 @@ export interface AgenticRunOptions {
    */
   priorTurnFiles?: string[];
   /**
+   * The PREVIOUS turn's own question text and short answer summary (2026-07-17,
+   * bug fix - live evidence: a follow-up like "дай список роутов" [give me a
+   * list of routes], with no explicit subject, implicitly meant "routes for
+   * Bill Items" [the previous turn's topic] but the model had no textual
+   * signal for that - priorTurnFiles only carries bare file paths, never what
+   * they were ABOUT - and answered a completely generic, unscoped question
+   * instead. This is the missing semantic bridge: unlike priorTurnFiles (a
+   * lead to jump to), this tells the model outright what the ongoing topic
+   * is, so it can recognize an elliptical follow-up and stay scoped instead
+   * of treating every message as a fresh, standalone question.
+   */
+  priorTurnTopic?: { task: string; summary: string };
+  /**
    * Observer's business-graph hint text (pipeline-runner.ts's
    * buildObserverHintSuffix) - kept OUT of `task` on purpose (2026-07-15 bug
    * fix): task flows straight into ResearchReport.task, which the chat UI
@@ -261,6 +274,7 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
     "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
     "IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet in this conversation, list_dir that directory first. A neighboring file with a similar name might be the one that actually answers the question - blindly guessing a filename skips that discovery.",
     "You have time to think it through properly. Do not rush to final_answer before checking all realistic places, including neighboring files with related meaning (e.g. there may be more than one Service nearby - check the whole directory).",
+    "IMPORTANT before giving up: if the question names a specific field/column/variable/parameter (e.g. `personal_claim_number`, `is_active`) and you have not yet grepped that EXACT literal name across the whole project, do that before writing a final_answer that admits you could not find enough. Which file assigns/reads it, and under what condition, is usually only visible by searching for the literal name itself - reading a handful of plausible-looking files that happen to reference it is not the same as tracing where it is actually written to and why. An honest 'insufficient facts' answer is only honest if grep_content for the literal term was actually tried and still came up empty.",
     "When ready, call final_answer exactly once. Do not invent facts you have not seen in the observations. If you did not check something, say so plainly instead of asserting it with confidence.",
   ].join("\n");
 }
@@ -268,7 +282,7 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
 const CRITIC_SYSTEM_PROMPT = [
   "You are an independent critic-validator (a different model from the one that researched the code).",
   "You are given: an engineering question, a full transcript of another model's actions (which files it looked at and what it saw), and its proposed final answer.",
-  "Check strictly: (1) every claim in the answer must be directly confirmed by what is actually in the transcript - not invented, not guessed; (2) if the answer itself mentions that something 'needs checking' or 'was not checked', but the transcript shows this was NOT checked before the final answer - that is grounds for rejection; (3) if the answer confidently asserts something for which the transcript has insufficient grounds (e.g. only one file out of a chain), that is also grounds for rejection; (4) if the answer is essentially 'I cannot answer without reading files X, Y' while the transcript shows those files were never read - REJECT and tell it to actually read them: giving up without reading the files it itself names is not an acceptable final answer.",
+  "Check strictly: (1) every claim in the answer must be directly confirmed by what is actually in the transcript - not invented, not guessed; (2) if the answer itself mentions that something 'needs checking' or 'was not checked', but the transcript shows this was NOT checked before the final answer - that is grounds for rejection; (3) if the answer confidently asserts something for which the transcript has insufficient grounds (e.g. only one file out of a chain), that is also grounds for rejection; (4) if the answer is essentially 'I cannot answer without reading files X, Y' while the transcript shows those files were never read - REJECT and tell it to actually read them: giving up without reading the files it itself names is not an acceptable final answer; (5) if the question names a specific field/column/variable/parameter and the answer gives up ('not enough facts', 'needs manual debugging') without the transcript showing a grep_content call for that EXACT literal name anywhere - REJECT and tell it to grep that literal term first. A give-up answer is not automatically honest just because it makes no false claims - it must show the obvious literal search was actually tried.",
   "Reply STRICTLY in one line: either \"APPROVED\", or \"REJECTED: <a short, specific note IN RUSSIAN on exactly what needs to be checked before answering again>\".",
 ].join("\n");
 
@@ -299,8 +313,16 @@ function extractDistinctiveTokens(task: string): string[] {
     const hasDigit = /\d/.test(token);
     const isAcronym = /^[A-Z]{2,6}$/.test(token);
     const isMixedCase = /[a-z]/.test(token) && /[A-Z]/.test(token) && token.length >= 3;
+    // Bug fix (2026-07-17): a lowercase snake_case identifier like
+    // "personal_claim_number" - the single most common naming convention for
+    // PHP/Laravel model fields and DB columns - matched none of the above and
+    // was silently NEVER auto-grepped, even when it was the exact literal
+    // term the user's question was about. Live evidence: two consecutive
+    // questions about this exact field both gave up with "not enough facts"
+    // without the loop ever having grepped it automatically.
+    const isSnakeCaseIdentifier = token.includes("_") && token.length >= 5;
 
-    if (!hasDigit && !isAcronym && !isMixedCase) {
+    if (!hasDigit && !isAcronym && !isMixedCase && !isSnakeCaseIdentifier) {
       continue;
     }
 
@@ -631,6 +653,12 @@ async function callCritic(input: {
 export async function runAgenticLoop(options: AgenticRunOptions): Promise<AgenticRunResult> {
   const maxTurns = options.maxTurns ?? DEFAULT_SAFETY_CEILING_TURNS;
   const priorTurnFiles = [...new Set(options.priorTurnFiles ?? [])];
+  // Topic bridge comes FIRST, files second - the topic is what tells the
+  // model an elliptical question ("give me a list of routes", no subject) is
+  // a continuation at all; the file list is only useful once that's established.
+  const priorTurnTopicHint = options.priorTurnTopic
+    ? `\n\nThe PREVIOUS question in this same conversation was: "${options.priorTurnTopic.task}" - and it was answered with: "${options.priorTurnTopic.summary}". If the new question is elliptical (no explicit subject - e.g. "give me a list of routes for it", "and how do I call it", "what about on mobile") it almost always means "continue about the SAME topic as the previous question", not a fresh unscoped question about the whole project - resolve the missing subject against the previous topic before researching. Only ignore this if the new question clearly names something unrelated.`
+    : "";
   const priorTurnHint = priorTurnFiles.length > 0
     ? `\n\nIn the previous turn of this conversation you already found and read these files: ${priorTurnFiles.join(", ")}. If the new question continues the same topic - start by reading these files (read_file) instead of researching from scratch. If the question is clearly about something else - check whether they are still relevant or search anew, do not rely on them blindly.`
     : "";
@@ -646,7 +674,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
   const messages: ChatMessage[] = [
     { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences)) },
-    { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnHint}${observerHintBlock}${questionShapeBlock}` },
+    { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnTopicHint}${priorTurnHint}${observerHintBlock}${questionShapeBlock}` },
   ];
 
   // Seed semantic search runs in parallel with the seed grep (2026-07-16) -

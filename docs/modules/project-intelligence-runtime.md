@@ -1,8 +1,24 @@
 # Project Intelligence Runtime
 
-**Статус:** Архитектурная спецификация  
-**Версия:** 1.0.0  
+**Статус:** Частично реализовано; документ описывает и текущий runtime, и целевую модель  
+**Версия:** 1.1.0  
 **Зависимости:** Workspace, Repository Git Intelligence, Indexer, Graph, Research, Knowledge, Context Builder, Planner, Storage, Event System
+
+## Статус реализации на 2026-07-17
+
+Уже есть в продукте:
+
+- background state monitor
+- baseline/background-sync артефакты в Postgres
+- branch/worktree-aware project state сигналы
+- observer background crawl
+- question-time reuse baseline вместо полного старта "с нуля" в каждом случае
+
+Ещё не доведено до целевой архитектуры:
+
+- полноценные branch overlays как отдельные first-class persisted сущности
+- строгая стратегия invalidation/refresh для всех слоёв
+- завершённый execution/runtime слой для code-writing задач
 
 ---
 

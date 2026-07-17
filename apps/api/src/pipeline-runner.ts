@@ -648,6 +648,17 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     const priorTurnFiles = priorConversationTurn
       ? [...new Set(priorConversationTurn.research.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)))]
       : [];
+    // Bug fix (2026-07-17): priorTurnFiles alone is bare paths, no topic text -
+    // an elliptical follow-up ("give me a list of routes for it") had no
+    // signal that it continues the previous turn's topic, so the Researcher
+    // treated it as a fresh, unscoped question. This carries the actual
+    // question+answer text of the previous turn into the SAME research call
+    // that decides investigation strategy, not just into the later answer-
+    // synthesis prompt (conversationTranscript, below) which was too late to
+    // help - research scope was already fixed by then.
+    const priorTurnTopic = priorConversationTurn
+      ? { task: priorConversationTurn.research.task, summary: priorConversationTurn.research.summary }
+      : undefined;
     // Graph-symbol hints: DISABLED after live testing (2026-07-15), not
     // deleted - findGraphSymbolHints (graph-store.ts) is real and works for
     // precise terms (resolved "relation cases" to UnlinkRelatedCasesAction
@@ -682,6 +693,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       providerBaseUrl,
       providerApiKey,
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
+      ...(priorTurnTopic ? { priorTurnTopic } : {}),
       ...(observerHint ? { observerHint } : {}),
       semanticSearch: buildSemanticSearchTool(effectiveProjectRoots, providerBaseUrl, providerApiKey),
       // Architecture review finding (2026-07-16): the graph existed but was

@@ -110,6 +110,8 @@ export interface RunAgenticResearchInput {
   maxTurns?: number;
   /** See AgenticRunOptions.priorTurnFiles - files already found in the previous turn of this conversation. */
   priorTurnFiles?: string[];
+  /** See AgenticRunOptions.priorTurnTopic - the previous turn's own question text and answer summary. */
+  priorTurnTopic?: { task: string; summary: string };
   /** See AgenticRunOptions.graphHintTerms - symbol names from the persisted code graph matching the task. */
   graphHintTerms?: string[];
   /** See AgenticRunOptions.observerHint - kept separate from `task` so it never leaks into ResearchReport.task (the chat UI's "Задача" display). */
@@ -145,6 +147,7 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     providerApiKey: input.providerApiKey,
     ...(input.maxTurns ? { maxTurns: input.maxTurns } : {}),
     ...(input.priorTurnFiles?.length ? { priorTurnFiles: input.priorTurnFiles } : {}),
+    ...(input.priorTurnTopic ? { priorTurnTopic: input.priorTurnTopic } : {}),
     ...(input.graphHintTerms?.length ? { graphHintTerms: input.graphHintTerms } : {}),
     ...(input.observerHint ? { observerHint: input.observerHint } : {}),
     ...(input.questionShapeHint ? { questionShapeHint: input.questionShapeHint } : {}),

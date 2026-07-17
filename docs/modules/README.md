@@ -1,5 +1,7 @@
 # Modules
 
+Ниже список модулей и их архитектурных документов. Важный контекст на 2026-07-17: часть документов описывает целевую архитектуру шире, чем текущая реализация MVP. Актуальное фактическое состояние всегда нужно сверять с `docs/state/project-state.md` и `README.md`.
+
 - [Workspace](/Users/evgenii/Desktop/client/docs/modules/workspace.md)
 - [Indexer](/Users/evgenii/Desktop/client/docs/modules/indexer.md)
 - [Graph](/Users/evgenii/Desktop/client/docs/modules/graph.md)
