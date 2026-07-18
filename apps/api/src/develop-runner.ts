@@ -764,6 +764,28 @@ export async function cleanupTelemetryDevelopRunWorktrees(runId: string, label?:
 }
 
 /**
+ * Telemetry-fallback counterpart of mergeDevelopRunToRealCheckout
+ * (2026-07-19 bug fix): cleanup-worktree already had this fallback
+ * (cleanupTelemetryDevelopRunWorktrees above), merge did not - the Worktree
+ * Manager sidebar surfaces BOTH live and telemetry-sourced entries (see
+ * listDevelopWorktreeEntriesFromTelemetry), so a worktree from before a
+ * server restart showed a working "Удалить" button next to a "Занести в
+ * текущий чекаут" button that only ever 404'd. Returns null (not an empty
+ * array) when the run isn't in telemetry either, so the caller can tell
+ * "genuinely not found" apart from "found, nothing to merge".
+ */
+export async function mergeTelemetryDevelopRunWorktrees(runId: string, label?: string): Promise<MergeToBranchOutcome[] | null> {
+  const worktrees = await loadDevelopRunWorktreesFromTelemetry(runId);
+
+  if (!worktrees) {
+    return null;
+  }
+
+  const targets = label ? worktrees.filter((worktree) => worktree.label === label) : worktrees;
+  return mergeDevelopRunToRealCheckout(targets);
+}
+
+/**
  * Impact analysis (2026-07-18, docs/architecture/011 §4.13): deterministic
  * "who depends on the files I just edited" lookup against the SAME
  * persisted graph find_references already uses (buildGraphNavigationTool,

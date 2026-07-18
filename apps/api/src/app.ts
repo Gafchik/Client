@@ -18,7 +18,7 @@ import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProv
 import { initializeSecretCrypto } from "./secret-crypto.js";
 import { classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
-import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
+import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -1391,7 +1391,22 @@ export function createApp() {
     const record = getDevelopRunStatus(runId);
 
     if (!record) {
-      return reply.code(404).send({ message: "Run не найден (после перезапуска сервера статусы не сохраняются)." });
+      // Bug fix (2026-07-19): cleanup-worktree already fell back to
+      // telemetry after a server restart, merge didn't - the Worktree
+      // Manager shows both live and telemetry-sourced entries side by
+      // side, so a restart-surfaced worktree had a working delete button
+      // next to a merge button that only ever 404'd.
+      const telemetryOutcomes = await mergeTelemetryDevelopRunWorktrees(runId, label);
+
+      if (telemetryOutcomes === null) {
+        return reply.code(404).send({ message: "Run не найден ни в памяти, ни в telemetry developer_runs." });
+      }
+
+      if (telemetryOutcomes.length === 0) {
+        return reply.code(409).send({ message: "У этого run'а больше нет worktree — уже занесено и очищено, либо ничего не менялось." });
+      }
+
+      return reply.send({ outcomes: telemetryOutcomes });
     }
 
     const targets = label ? record.worktrees.filter((worktree) => worktree.label === label) : record.worktrees;

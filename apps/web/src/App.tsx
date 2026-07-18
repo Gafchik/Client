@@ -662,7 +662,7 @@ function formatHistoryTime(value: string | undefined): string {
 
 function buildHistoryTitle(task: string | undefined): string {
   const normalized = safeText(task, "Новый вопрос");
-  return normalized.length > 72 ? `${normalized.slice(0, 69)}...` : normalized;
+  return normalized.length > 72 ? `${normalized.slice(0, 69)}…` : normalized;
 }
 
 // Раньше строка истории показывала только время (formatHistoryTime) без
@@ -782,7 +782,7 @@ function RunHistorySidebar({
 
         {selectedIds.size > 0 ? (
           <button type="button" className="history-delete-selected" onClick={onDeleteSelected} disabled={deleting}>
-            {deleting ? "Удаляю..." : `Удалить (${selectedIds.size})`}
+            {deleting ? "Удаляю…" : `Удалить (${selectedIds.size})`}
           </button>
         ) : null}
 
@@ -870,7 +870,7 @@ function describeObserverStatus(
   }
 
   if (entry.status === "running") {
-    return { title: "Observer запущен", description: `ищет, что ещё не изучено... · ${progressText}`, running: true };
+    return { title: "Observer запущен", description: `ищет, что ещё не изучено… · ${progressText}`, running: true };
   }
 
   if (entry.progress.percent >= 100) {
@@ -964,7 +964,7 @@ function EnvironmentStrip({
 
   return (
     <section className="environment-strip">
-      <select className="environment-pill" value={selectedProjectId} onChange={(event) => onProjectChange(event.target.value)} disabled={disabled}>
+      <select className="environment-pill" aria-label="Проект" value={selectedProjectId} onChange={(event) => onProjectChange(event.target.value)} disabled={disabled}>
         <option value="">Проект</option>
         {safeList(projects).map((projectItem) => (
           <option key={projectItem.id} value={projectItem.id}>
@@ -979,7 +979,7 @@ function EnvironmentStrip({
         </span>
       ) : null}
 
-      <select className="environment-pill" value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)} disabled={disabled}>
+      <select className="environment-pill" aria-label="Провайдер" value={selectedProviderId} onChange={(event) => onProviderChange(event.target.value)} disabled={disabled}>
         <option value="">Провайдер</option>
         {safeList(providers).map((provider) => (
           <option key={provider.id} value={provider.id}>
@@ -988,7 +988,7 @@ function EnvironmentStrip({
         ))}
       </select>
 
-      <select className="environment-pill" value={selectedTeamId} onChange={(event) => onTeamChange(event.target.value)} disabled={disabled}>
+      <select className="environment-pill" aria-label="Команда" value={selectedTeamId} onChange={(event) => onTeamChange(event.target.value)} disabled={disabled}>
         <option value="">Команда</option>
         {safeList(teams).map((team) => (
           <option key={team.id} value={team.id}>
@@ -1076,7 +1076,12 @@ function ObserversPanel({
   const runningCount = observerStatus?.observers.filter((observer) => observer.status === "running").length ?? 0;
 
   return (
-    <section className="settings-layout">
+    // settings-layout-single (2026-07-19 bug fix): .settings-layout is a
+    // hard 2-column grid built for Projects/Providers/Teams, which always
+    // render two cards side by side. This panel only ever has ONE card -
+    // used unchanged, the second grid column sat empty, wasting half the
+    // screen width on anything wider than a phone.
+    <section className="settings-layout settings-layout-single">
       <article className="settings-card">
         <div className="section-head">
           <div>
@@ -1218,12 +1223,12 @@ function UserTaskMessage({ task, projectName, projectPath }: { task: string; pro
  */
 function formatRunDuration(totalSeconds: number): string {
   if (totalSeconds < 60) {
-    return `${totalSeconds} с`;
+    return `${totalSeconds} с`;
   }
 
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
-  return seconds > 0 ? `${minutes} мин ${seconds} с` : `${minutes} мин`;
+  return seconds > 0 ? `${minutes} мин ${seconds} с` : `${minutes} мин`;
 }
 
 function ThinkingIndicator({ currentStageLabel, startedAt }: { currentStageLabel?: string; startedAt?: string }) {
@@ -1251,7 +1256,13 @@ function ThinkingIndicator({ currentStageLabel, startedAt }: { currentStageLabel
         <span />
         <span />
       </span>
-      <span className="thinking-label">{safeText(currentStageLabel, "Изучаю проект")}</span>
+      {/* aria-live только на лейбле стадии (2026-07-19, web-interface-guidelines
+          "async updates need aria-live=polite") - НЕ на всём индикаторе:
+          elapsed-счётчик тикает раз в секунду, повесь live-регион на него -
+          скринридер зачитывал бы время каждую секунду, что бесполезно и
+          невыносимо. Лейбл стадии меняется редко (раз в несколько ходов) -
+          там live-объявление реально полезно. */}
+      <span className="thinking-label" aria-live="polite">{safeText(currentStageLabel, "Изучаю проект")}</span>
       {startedAt ? <span className="thinking-elapsed">{formatRunDuration(elapsedSeconds)}</span> : null}
     </div>
   );
@@ -1377,6 +1388,25 @@ function groupWorktreeEntries(entries: DevelopWorktreeRegistryEntryView[]): Arra
             { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
           );
 
+          // Dedupe by worktreePath (2026-07-19 bug fix): a correction/chain
+          // continuation reuses the SAME physical worktree under a NEW
+          // runId (see startDevelopRun's continueFrom) - the prior run's
+          // own record still has it too (nothing clears it), so without
+          // this the same on-disk worktree showed up as two separate rows.
+          // sortedEntries is newest-first, so keeping the first occurrence
+          // per path naturally picks the run whose id current actions
+          // (merge/delete) should actually address.
+          const seenWorktreePaths = new Set<string>();
+          const dedupedWorktrees = sortedEntries
+            .flatMap((entry) => entry.worktrees.map((worktree) => ({ ...worktree, runId: entry.runId })))
+            .filter((worktree) => {
+              if (seenWorktreePaths.has(worktree.worktreePath)) {
+                return false;
+              }
+              seenWorktreePaths.add(worktree.worktreePath);
+              return true;
+            });
+
           return {
             projectPath,
             conversationId,
@@ -1384,7 +1414,7 @@ function groupWorktreeEntries(entries: DevelopWorktreeRegistryEntryView[]): Arra
             task: latestEntry.task,
             startedAt: latestEntry.startedAt,
             status: latestEntry.status,
-            worktrees: sortedEntries.flatMap((entry) => entry.worktrees.map((worktree) => ({ ...worktree, runId: entry.runId }))),
+            worktrees: dedupedWorktrees,
             autoMergeOutcome: sortedEntries.flatMap((entry) => safeList(entry.autoMergeOutcome)),
             usage: usage.totalTokens > 0 ? usage : null,
           };
@@ -1400,20 +1430,20 @@ function groupWorktreeEntries(entries: DevelopWorktreeRegistryEntryView[]): Arra
 
 function developPhaseLabel(progress?: { turn: number; filesChanged: number; phase: string }): string {
   if (!progress) {
-    return "Готовлю изолированную копию проекта...";
+    return "Готовлю изолированную копию проекта…";
   }
 
   if (progress.phase === "reviewing") {
-    return "Независимое ревью изменений...";
+    return "Независимое ревью изменений…";
   }
 
   if (progress.phase === "fixing") {
-    return `Правлю по замечаниям ревью (ход ${progress.turn})...`;
+    return `Правлю по замечаниям ревью (ход ${progress.turn})…`;
   }
 
   return progress.filesChanged > 0
-    ? `Пишу код (ход ${progress.turn}, изменено файлов: ${progress.filesChanged})...`
-    : `Разбираюсь в коде (ход ${progress.turn})...`;
+    ? `Пишу код (ход ${progress.turn}, изменено файлов: ${progress.filesChanged})…`
+    : `Разбираюсь в коде (ход ${progress.turn})…`;
 }
 
 function developVerdictBadge(result: DevelopRunResultView): { label: string; className: string } {
@@ -1516,6 +1546,13 @@ function DevelopWorktreeRow({
   }
 
   async function handleCleanup() {
+    // Same confirm as the sidebar's bulk delete (2026-07-19) - this is the
+    // same irreversible action (real, possibly-unmerged code discarded),
+    // just triggered from a chat message instead of the Worktree Manager.
+    if (!window.confirm("Удалить этот worktree? Если diff ещё не занесён в чекаут — он будет потерян безвозвратно.")) {
+      return;
+    }
+
     setCleaning(true);
     setActionError(null);
 
@@ -1541,10 +1578,10 @@ function DevelopWorktreeRow({
 
       <div className="action-row">
         <button type="button" className="ghost-button" onClick={() => void handleMerge()} disabled={merging || cleaning}>
-          {merging ? "Заношу..." : "Занести в текущий чекаут"}
+          {merging ? "Заношу…" : "Занести в текущий чекаут"}
         </button>
         <button type="button" className="ghost-button danger-button" onClick={() => void handleCleanup()} disabled={merging || cleaning}>
-          {cleaning ? "Удаляю..." : "Удалить этот worktree"}
+          {cleaning ? "Удаляю…" : "Удалить этот worktree"}
         </button>
       </div>
 
@@ -1775,13 +1812,32 @@ function WorktreeManagerSidebar({
     const controller = new AbortController();
     setLoading(true);
     void loadWorktrees(controller.signal).finally(() => setLoading(false));
+    // Was a flat 1500ms forever (2026-07-19 fix, vercel-react-best-practices
+    // §4 client-side fetching) - a background HTTP round trip every 1.5s
+    // regardless of whether the tab is even visible. Worktree state changes
+    // on the order of "a run finished" or "someone clicked a button" (this
+    // component's own actions already call scheduleRefresh(150) for that),
+    // not sub-second - 5s is still responsive for a background sidebar
+    // without the constant chatter, and pausing on document.hidden avoids
+    // polling a backgrounded tab entirely.
+    const POLL_INTERVAL_MS = 5000;
     const timer = window.setInterval(() => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
       void loadWorktrees();
-    }, 1500);
+    }, POLL_INTERVAL_MS);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void loadWorktrees();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
       controller.abort();
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
       if (refreshTimerRef.current !== null) {
         window.clearTimeout(refreshTimerRef.current);
       }
@@ -1839,6 +1895,20 @@ function WorktreeManagerSidebar({
 
   async function cleanupTargets(targets: Array<{ runId: string; label?: string }>) {
     if (!targets.length) {
+      return;
+    }
+
+    // Explicit confirm before ANY worktree delete (2026-07-19) - unlike
+    // other "Удалить" buttons in the app, this one can discard real,
+    // never-merged code sitting only in that worktree (lived this exact
+    // risk earlier in this same session, twice, with real uncommitted diffs).
+    const confirmed = window.confirm(
+      targets.length === 1
+        ? "Удалить этот worktree? Если diff ещё не занесён в чекаут — он будет потерян безвозвратно."
+        : `Удалить ${targets.length} worktree? Если diff'ы ещё не занесены в чекаут — они будут потеряны безвозвратно.`,
+    );
+
+    if (!confirmed) {
       return;
     }
 
@@ -1905,7 +1975,7 @@ function WorktreeManagerSidebar({
         </div>
       ) : null}
 
-      {loading && entries.length === 0 ? <p className="muted">Загружаю worktree...</p> : null}
+      {loading && entries.length === 0 ? <p className="muted">Загружаю worktree…</p> : null}
       {error ? <p className="message-footnote">{error}</p> : null}
       {!loading && entries.length === 0 ? <p className="muted">Активных worktree сейчас нет.</p> : null}
 
@@ -1940,7 +2010,7 @@ function WorktreeManagerSidebar({
                     {projectOpen ? "▾" : "▸"}
                   </button>
                   <button type="button" className="ghost-button danger-button" onClick={() => void cleanupTargets(projectTargets)} disabled={cleaning}>
-                    {cleaning ? "..." : "Удалить"}
+                    {cleaning ? "…" : "Удалить"}
                   </button>
                 </div>
               </div>
@@ -1979,7 +2049,7 @@ function WorktreeManagerSidebar({
                               {chatOpen ? "▾" : "▸"}
                             </button>
                             <button type="button" className="ghost-button danger-button" onClick={() => void cleanupTargets(chatTargets)} disabled={cleaning}>
-                              {cleaning ? "..." : "Удалить"}
+                              {cleaning ? "…" : "Удалить"}
                             </button>
                           </div>
                         </div>
@@ -1992,7 +2062,7 @@ function WorktreeManagerSidebar({
                             ) : null}
                             {chatGroup.usage ? (
                               <p className="worktree-run-usage">
-                                {chatGroup.usage.totalTokens.toLocaleString("ru-RU")} ток. · prompt {chatGroup.usage.promptTokens.toLocaleString("ru-RU")} · completion {chatGroup.usage.completionTokens.toLocaleString("ru-RU")}
+                                {chatGroup.usage.totalTokens.toLocaleString("ru-RU")}{" "}ток. · prompt {chatGroup.usage.promptTokens.toLocaleString("ru-RU")} · completion {chatGroup.usage.completionTokens.toLocaleString("ru-RU")}
                               </p>
                             ) : null}
 
@@ -2020,7 +2090,27 @@ function WorktreeManagerSidebar({
                                     runId={worktree.runId}
                                     worktree={worktree}
                                     outcome={chatGroup.autoMergeOutcome.find((outcome) => outcome.label === worktree.label) ?? null}
-                                    onMerged={() => {}}
+                                    onMerged={(mergedOutcome) => {
+                                      // Was a no-op (2026-07-19 bug fix) - a
+                                      // successful merge from this sidebar
+                                      // never showed its own outcome until
+                                      // the next 1.5s poll happened to catch
+                                      // up. Now it reflects immediately.
+                                      setEntries((current) =>
+                                        current.map((candidate) =>
+                                          candidate.runId === worktree.runId
+                                            ? {
+                                                ...candidate,
+                                                autoMergeOutcome: [
+                                                  ...safeList(candidate.autoMergeOutcome).filter((existing) => existing.label !== mergedOutcome.label),
+                                                  mergedOutcome,
+                                                ],
+                                              }
+                                            : candidate,
+                                        ),
+                                      );
+                                      scheduleRefresh(150);
+                                    }}
                                     onRemoved={() => {
                                       setEntries((current) =>
                                         current
@@ -2064,7 +2154,7 @@ function WorktreeManagerSidebar({
               void cleanupTargets(collectSelectedTargets());
             }}
           >
-            {cleaning ? "Удаляю..." : `Удалить выбранное (${selectedCount})`}
+            {cleaning ? "Удаляю…" : `Удалить выбранное (${selectedCount})`}
           </button>
         </div>
       ) : null}
@@ -2104,7 +2194,7 @@ function UsageBreakdown({ usage, providerModels }: { usage: ProviderUsageSummary
               {row.model ? <em> · {row.model}</em> : null}
             </span>
             <span className="usage-breakdown-value">
-              {row.totalTokens.toLocaleString("ru-RU")} ток.
+              {row.totalTokens.toLocaleString("ru-RU")}{" "}ток.
               {multiplier !== null && adjusted !== null
                 ? ` × ${multiplier}x = ${adjusted.toLocaleString("ru-RU")}`
                 : " (множитель не найден)"}
@@ -2116,7 +2206,7 @@ function UsageBreakdown({ usage, providerModels }: { usage: ProviderUsageSummary
       <div className="usage-breakdown-row usage-breakdown-total">
         <span className="usage-breakdown-role">Итого</span>
         <span className="usage-breakdown-value">
-          {usage.totalTokens.toLocaleString("ru-RU")} ток. · {usage.callCount} вызов(ов)
+          {usage.totalTokens.toLocaleString("ru-RU")}{" "}ток. · {usage.callCount} вызов(ов)
         </span>
       </div>
     </div>
@@ -4090,6 +4180,14 @@ export function App() {
   }
 
   async function removeProvider(providerId: string) {
+    // Consistent confirmation across every destructive action (2026-07-19,
+    // penpot-uiux-design golden rule "consistency builds trust") - this was
+    // the one delete button in Providers/Teams/Projects with no confirm,
+    // unlike chat-history deletion which already had one.
+    if (!window.confirm("Удалить этого провайдера? Действие необратимо.")) {
+      return;
+    }
+
     setError(null);
 
     try {
@@ -4185,6 +4283,10 @@ export function App() {
   }
 
   async function removeTeam(teamId: string) {
+    if (!window.confirm("Удалить эту команду? Действие необратимо.")) {
+      return;
+    }
+
     setError(null);
 
     try {
@@ -4372,6 +4474,10 @@ export function App() {
   }
 
   async function removeProject(projectId: string) {
+    if (!window.confirm("Удалить этот проект? Действие необратимо (сама кодовая база на диске не тронется).")) {
+      return;
+    }
+
     setError(null);
 
     try {
@@ -4804,7 +4910,7 @@ export function App() {
                     }
                   }}
                   rows={4}
-                  placeholder="Напиши инженерную задачу или вопрос по проекту... (Enter — отправить, Shift+Enter — новая строка)"
+                  placeholder="Напиши инженерную задачу или вопрос по проекту… (Enter — отправить, Shift+Enter — новая строка)"
                   disabled={running}
                 />
 
@@ -4816,7 +4922,7 @@ export function App() {
                     {runStatus ? <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span> : null}
                   </div>
                   <button type="submit" className="primary-button" disabled={running || loading || !selectedProjectId}>
-                    {running ? "Собираю ответ..." : !selectedProjectId ? "Сначала выбери проект" : "Получить ответ по проекту"}
+                    {running ? "Собираю ответ…" : !selectedProjectId ? "Сначала выбери проект" : "Получить ответ по проекту"}
                   </button>
                 </div>
               </div>
@@ -4840,15 +4946,19 @@ export function App() {
               <div className="stack">
                 <label className="field">
                   <span>Имя</span>
-                  <input value={providerDraft.name} onChange={(event) => setProviderDraft((current) => ({ ...current, name: event.target.value }))} />
+                  <input name="providerName" autoComplete="off" value={providerDraft.name} onChange={(event) => setProviderDraft((current) => ({ ...current, name: event.target.value }))} />
                 </label>
                 <label className="field">
                   <span>Base URL</span>
-                  <input value={providerDraft.baseUrl} onChange={(event) => setProviderDraft((current) => ({ ...current, baseUrl: event.target.value }))} />
+                  <input type="url" name="providerBaseUrl" autoComplete="off" spellCheck={false} value={providerDraft.baseUrl} onChange={(event) => setProviderDraft((current) => ({ ...current, baseUrl: event.target.value }))} />
                 </label>
                 <label className="field">
                   <span>API Key</span>
-                  <input value={providerDraft.apiKey} onChange={(event) => setProviderDraft((current) => ({ ...current, apiKey: event.target.value }))} />
+                  {/* Была type="text" по умолчанию - ключ рендерился на экране
+                      обычным читаемым текстом (2026-07-19, web-interface-guidelines
+                      fix). autoComplete="off" - браузер не должен предлагать
+                      сохранить/автозаполнить секрет. */}
+                  <input type="password" name="providerApiKey" autoComplete="off" spellCheck={false} value={providerDraft.apiKey} onChange={(event) => setProviderDraft((current) => ({ ...current, apiKey: event.target.value }))} />
                 </label>
                 <div className="action-row">
                   <button type="button" className="primary-button" onClick={() => void saveProvider()}>
@@ -5174,7 +5284,7 @@ export function App() {
                       </label>
                       <label className="field">
                         <span>Путь</span>
-                        <input value={pathItem.rootPath} onChange={(event) => updateProjectDraftPath(index, { rootPath: event.target.value })} placeholder="/Users/.../project" />
+                        <input value={pathItem.rootPath} onChange={(event) => updateProjectDraftPath(index, { rootPath: event.target.value })} placeholder="/Users/…/project" />
                       </label>
                       <div className="action-row">
                         <button type="button" className="ghost-button danger-button" onClick={() => removeProjectDraftPath(index)}>
@@ -5254,7 +5364,7 @@ export function App() {
           />
         ) : null}
 
-        {error ? <p className="error">{error}</p> : null}
+        {error ? <p className="error" role="alert">{error}</p> : null}
         </section>
 
         {activeView === "chat" ? (

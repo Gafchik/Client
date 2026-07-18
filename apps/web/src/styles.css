@@ -14,8 +14,13 @@
   --text-muted: #9399a8;
   /* Было #656b7a — ~3.5:1 на --bg, ниже порога WCAG AA (4.5:1) для мелкого
      текста; используется для таймстампов в истории чатов и футера, это
-     реальный читаемый текст, а не декор. Новое значение — ~4.5:1+. */
-  --text-faint: #7d8291;
+     реальный читаемый текст, а не декор. Следующее значение (#7d8291) уже
+     проходило на --bg/--bg-alt (~4.7-5:1), но не на --bg-elevated-2 (4.09:1) -
+     переменная используется в т.ч. на элевейтед-поверхностях (worktree
+     sidebar и т.п.). Текущее значение проверено против САМОГО тёмного
+     фона в системе (--bg-elevated-2), не только основного (2026-07-19,
+     penpot-uiux-design: "Color contrast: Text 4.5:1"). */
+  --text-faint: #858a98;
   --accent: #5b8cff;
   --accent-soft: rgba(91, 140, 255, 0.14);
   --accent-2: #f2a34f;
@@ -36,6 +41,31 @@
   box-sizing: border-box;
 }
 
+/* Visible keyboard focus (2026-07-19, web-interface-guidelines) - previously
+   relied entirely on each browser's own default outline, which is
+   inconsistent and can be low-contrast against a custom dark theme with
+   pill-shaped controls. :focus-visible (not :focus) so a mouse click never
+   shows a ring, only real keyboard/AT navigation does. */
+:where(button, a, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Respect reduced-motion (2026-07-19, web-interface-guidelines) - the app
+   has real animation (thinking-dots pulse, hover transforms, accordion/
+   panel transitions) that was never gated on this before. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 html,
 body,
 #root {
@@ -46,14 +76,29 @@ body {
   margin: 0;
   min-width: 320px;
   background: var(--bg);
+  /* Intentional tap flash color (2026-07-19, web-interface-guidelines) -
+     otherwise iOS Safari shows its own default grey highlight, which reads
+     as a visual glitch against a dark theme with a themed accent color. */
+  -webkit-tap-highlight-color: transparent;
 }
 
 button,
 input,
 textarea,
-select {
+select,
+a {
   font: inherit;
   color: inherit;
+}
+
+button,
+a,
+[role="button"] {
+  /* Removes the ~300ms double-tap-to-zoom delay on touch devices for
+     controls that are never meant to be double-tapped (2026-07-19,
+     web-interface-guidelines). Not applied to inputs/textareas - those
+     legitimately want normal touch/zoom/select behavior. */
+  touch-action: manipulation;
 }
 
 button {
@@ -69,6 +114,13 @@ button {
 .app-shell-product {
   display: grid;
   gap: 14px;
+  /* Explicit (2026-07-19 fix: "хедер не привязан к верху") - .app-shell sets
+     min-height: 100vh, and on short-content pages (e.g. Observers) the
+     implicit grid rows were left to the browser's own default alignment
+     instead of being pinned to the top, floating the header down with a
+     matching gap at the bottom. Same explicit pattern .chat-body already
+     uses below. */
+  align-content: start;
 }
 
 .app-topbar {
@@ -131,6 +183,7 @@ button {
   top: 12px;
   max-height: calc(100vh - 36px);
   overflow: auto;
+  overscroll-behavior: contain;
   align-self: start;
 }
 
@@ -241,13 +294,20 @@ button {
 }
 
 .worktree-accordion-button {
-  width: 30px;
-  height: 30px;
+  /* Was 30x30 (2026-07-19 fix, penpot-uiux-design accessibility minimum:
+     touch targets >= 44x44px) - this is the primary expand/collapse control,
+     clicked repeatedly across many nested rows. */
+  width: 44px;
+  height: 44px;
   border-radius: 999px;
   background: var(--bg-elevated-2);
   border: 1px solid var(--border);
   color: var(--text);
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .worktree-accordion-button:hover {
@@ -380,6 +440,7 @@ button {
   border: 1px solid var(--border);
   max-height: calc(100vh - 28px);
   overflow: auto;
+  overscroll-behavior: contain;
   align-self: start;
 }
 
@@ -394,6 +455,7 @@ button {
   display: grid;
   gap: 4px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .chat-history-toolbar {
@@ -476,6 +538,26 @@ button {
 .settings-layout {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
+}
+
+/* One-card panels (currently only Observers) - see the JSX comment at its
+   call site. Overrides the 2-column grid above instead of duplicating
+   .settings-layout's gap/display, so the two stay in sync if either changes. */
+.settings-layout-single {
+  grid-template-columns: minmax(0, 1fr);
+  /* Was full shell width (~1800px) edge-to-edge (2026-07-19 fix: "карточки
+     сильно растянутые") - the fix for the empty-second-column bug made the
+     single card fill the whole width, but .observer-project-head is a plain
+     `justify-content: space-between` row, so at that width the label and
+     the "Запустить" button ended up with a huge dead gap between them.
+     Capped to roughly what ONE column already looks like on the two-card
+     pages (Projects/Providers/Teams), instead of inventing a new width.
+     margin: 0 auto (2026-07-19 follow-up) - max-width alone just shrinks
+     the block and leaves it flush against the left edge with the same dead
+     space now on the right instead of split both sides - needs centering
+     too, not just capping. */
+  max-width: 900px;
+  margin: 0 auto;
 }
 
 .settings-card,
@@ -1288,6 +1370,7 @@ button {
 .inspector-content {
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   padding-right: 2px;
   display: grid;
   gap: 10px;
