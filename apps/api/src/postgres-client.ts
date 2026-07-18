@@ -233,6 +233,12 @@ export async function initializePostgresSchema(): Promise<void> {
       updated_at timestamptz not null
     )
   `);
+  // Developer pipeline (011, 2026-07-17): роли Developer/Reviewer разведены с
+  // Researcher/Critic — у них противоположные требования (см. TeamRecord в
+  // packages/shared). Пустая строка = «роль не задана явно», fallback-логика
+  // живёт в team-store.mapTeamRow, не в схеме.
+  await runSql(`alter table teams add column if not exists developer_model text not null default ''`);
+  await runSql(`alter table teams add column if not exists reviewer_model text not null default ''`);
 
   // knowledge_artifacts — полное тело каждого завершённого run'а (весь
   // research/impact/context/answer), раньше жило файлами в
@@ -270,6 +276,48 @@ export async function initializePostgresSchema(): Promise<void> {
   // at embed time from the path's inferred role - avoids a join against
   // project_paths on every semantic-search query.
   await runSql(`alter table code_embeddings add column if not exists role text not null default 'unknown'`);
+
+  // developer_runs — телеметрия Developer pipeline с первого дня
+  // (docs/architecture/011-developer-pipeline.md, раздел 7): без этих данных
+  // ни один будущий вопрос тюнинга (нужен ли отдельный Reviewer-vendor, где
+  // сгорают токены, какой гейт что ловит) не имеет ответа. Строка создаётся
+  // при старте run'а (status=running) и дополняется при завершении — упавший
+  // процесс оставляет честную running-строку для post-mortem, а не пустоту.
+  await runSql(`
+    create table if not exists developer_runs (
+      run_id text primary key,
+      project_path text not null,
+      task text not null,
+      status text not null,
+      stopped text not null default '',
+      review_verdict text not null default '',
+      summary text not null default '',
+      clarification_question text not null default '',
+      diff text not null default '',
+      changed_files jsonb not null default '[]'::jsonb,
+      verification_log jsonb not null default '[]'::jsonb,
+      reviews jsonb not null default '[]'::jsonb,
+      worktrees jsonb not null default '[]'::jsonb,
+      turns_used integer not null default 0,
+      prompt_tokens bigint not null default 0,
+      completion_tokens bigint not null default 0,
+      developer_model text not null default '',
+      reviewer_model text not null default '',
+      error text not null default '',
+      started_at timestamptz not null,
+      finished_at timestamptz
+    )
+  `);
+  await runSql(`create index if not exists developer_runs_project_idx on developer_runs (project_path)`);
+  // conversation_id (2026-07-17, чат-интеграция): develop-run принадлежит
+  // треду чата — корректировки пользователя продолжают последний develop-run
+  // того же conversationId.
+  await runSql(`alter table developer_runs add column if not exists conversation_id text not null default ''`);
+  // DB safety (2026-07-18): sensitive DB-мутирующие команды (миграции/сиды/
+  // деструктивный DDL) требуют явного апрува человека — эти колонки хранят
+  // историю запросов на апрув и их разрешений для трассируемости.
+  await runSql(`alter table developer_runs add column if not exists pending_approval jsonb not null default 'null'::jsonb`);
+  await runSql(`alter table developer_runs add column if not exists sensitive_actions jsonb not null default '[]'::jsonb`);
 }
 
 /**

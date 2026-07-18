@@ -8,6 +8,8 @@ export interface SaveTeamInput {
   researcherModel: string;
   criticModel: string;
   observerModel: string;
+  developerModel?: string;
+  reviewerModel?: string;
   isSelected?: boolean;
 }
 
@@ -17,6 +19,8 @@ interface TeamRow {
   researcher_model: string;
   critic_model: string;
   observer_model: string;
+  developer_model: string;
+  reviewer_model: string;
   is_selected: boolean;
   created_at: Date;
   updated_at: Date;
@@ -32,6 +36,15 @@ const DEFAULT_TEAM_ID = "team-default-researched-trio";
 const DEFAULT_RESEARCHER_MODEL = "openai/gpt-5.4-mini";
 const DEFAULT_CRITIC_MODEL = "google/gemini-3.1-flash-lite";
 const DEFAULT_OBSERVER_MODEL = "nvidia/nemotron-3-ultra";
+// Reviewer по умолчанию — НЕ критик (2026-07-17, живое свидетельство: на
+// первом же E2E develop-ране flash-lite-критик в роли ревьюера выдал
+// фактически неверный finding — «один восклицательный знак» при двух прямо в
+// предъявленном ему журнале верификации). Kimi K2.7 Code — единственная
+// code-специализированная модель среднего ценового диапазона каталога (009,
+// принцип 5); ревью — редкий вызов change-flow, 1.6x здесь допустимо (009
+// §12.1). Это ДЕФОЛТ для команд, где роль не задана явно — сама модель
+// живёт в Postgres и меняется с фронта, как и остальные роли.
+const DEFAULT_REVIEWER_MODEL = "moonshotai/kimi-k2.7-code";
 
 export async function initializeTeamStore(): Promise<void> {
   // Таблица создаётся централизованно в initializePostgresSchema() (postgres-client.ts).
@@ -67,15 +80,17 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
 
     await client.query(
       `
-        insert into teams (id, name, researcher_model, critic_model, observer_model, is_selected, created_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $7)
+        insert into teams (id, name, researcher_model, critic_model, observer_model, developer_model, reviewer_model, is_selected, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
         on conflict (id) do update set
           name = $2,
           researcher_model = $3,
           critic_model = $4,
           observer_model = $5,
-          is_selected = $6,
-          updated_at = $7
+          developer_model = $6,
+          reviewer_model = $7,
+          is_selected = $8,
+          updated_at = $9
       `,
       [
         nextId,
@@ -83,6 +98,8 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
         input.researcherModel.trim(),
         input.criticModel.trim(),
         input.observerModel.trim(),
+        input.developerModel?.trim() ?? "",
+        input.reviewerModel?.trim() ?? "",
         shouldBeSelected,
         now,
       ],
@@ -151,6 +168,7 @@ async function ensureDefaultTeam(): Promise<void> {
     researcherModel: DEFAULT_RESEARCHER_MODEL,
     criticModel: DEFAULT_CRITIC_MODEL,
     observerModel: DEFAULT_OBSERVER_MODEL,
+    reviewerModel: DEFAULT_REVIEWER_MODEL,
     isSelected: true,
   });
 }
@@ -162,6 +180,13 @@ function mapTeamRow(row: TeamRow): TeamRecord {
     researcherModel: row.researcher_model,
     criticModel: row.critic_model,
     observerModel: row.observer_model,
+    // Fallback-политика для команд, где develop-роли не заданы явно:
+    // Developer = Researcher (тот же агентный архетип «исследует и делает»),
+    // Reviewer = code-специализированный дефолт, НЕ критик (см. константу).
+    // UI показывает эти же effective-значения, так что пользователь всегда
+    // видит, какая модель реально пойдёт в работу.
+    developerModel: row.developer_model || row.researcher_model,
+    reviewerModel: row.reviewer_model || DEFAULT_REVIEWER_MODEL,
     isSelected: Boolean(row.is_selected),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),

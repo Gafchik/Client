@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
@@ -16,7 +16,9 @@ import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-sta
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
-import { deleteTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
+import { classifyApprovalResponse, classifyChatIntent } from "@client/ai";
+import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
+import { findLatestDevelopRunForConversation, getDevelopRunStatus, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -102,6 +104,8 @@ interface SaveTeamRequest {
   researcherModel?: string;
   criticModel?: string;
   observerModel?: string;
+  developerModel?: string;
+  reviewerModel?: string;
   isSelected?: boolean;
 }
 
@@ -443,6 +447,8 @@ export function createApp() {
       researcherModel: request.body.researcherModel?.trim() || "",
       criticModel: request.body.criticModel?.trim() || "",
       observerModel: request.body.observerModel?.trim() || "",
+      developerModel: request.body.developerModel?.trim() || "",
+      reviewerModel: request.body.reviewerModel?.trim() || "",
       isSelected: request.body.isSelected ?? false,
     });
 
@@ -832,6 +838,165 @@ export function createApp() {
       ? `Принудительно пересобери branch-aware project intelligence.\n\nОригинальная задача: ${task}`
       : task;
 
+    // Chat intent routing (docs/architecture/011-developer-pipeline.md):
+    // пользователь пишет в ОДИН чат и вопросы, и задачи разработки, и
+    // корректировки уже сделанного — различает их система. Только для
+    // обычного question-run (системные resync/refresh — не разработка) и
+    // только при выбранной Team. Любой сбой роутинга безопасно откатывается
+    // в обычный Q&A-путь.
+    if (mode === "question-run") {
+      try {
+        const selectedTeam = await getSelectedTeam();
+
+        if (selectedTeam && providerBaseUrl && providerApiKey) {
+          const conversationKey = request.body.conversationId?.trim() || "";
+          const priorDevelop = conversationKey ? findLatestDevelopRunForConversation(conversationKey) : null;
+          const developInputBase = {
+            projectPath: normalizePath(path.resolve(projectPath)),
+            ...(projectRecord?.paths.length ? { projectPaths: projectRecord.paths } : {}),
+            providerBaseUrl,
+            providerApiKey,
+            developerModel: selectedTeam.developerModel,
+            reviewerModel: selectedTeam.reviewerModel,
+            ...(conversationKey ? { conversationId: conversationKey } : {}),
+          };
+
+          if (priorDevelop?.status === "running") {
+            return reply.code(409).send({
+              message: "По этому диалогу ещё выполняется задача разработки — дождись её завершения, прежде чем отправлять следующее сообщение.",
+            });
+          }
+
+          // DB safety (2026-07-18): ответ на запрос апрува чувствительной
+          // команды — та же схема, что и needs-clarification (продолжение без
+          // классификации намерения, диалог сам только что спросил), но
+          // разрешение конкретно да/нет/непонятно, fail-closed на "непонятно"
+          // (никогда не выполняем миграцию без однозначного согласия).
+          if (priorDevelop?.result?.stopped === "needs-approval" && priorDevelop.result.pendingApproval) {
+            const pendingApproval = priorDevelop.result.pendingApproval;
+            const decision = await classifyApprovalResponse({
+              message: task,
+              pendingCommand: pendingApproval.command,
+              pendingReason: pendingApproval.reason,
+              providerBaseUrl,
+              providerModel: selectedTeam.criticModel,
+              providerApiKey,
+            });
+
+            if (decision === "unclear") {
+              // Fail-closed (2026-07-18): re-emit the SAME still-pending record
+              // rather than guessing - reuses the develop-kind shape the
+              // frontend already knows how to render (pendingApproval card),
+              // instead of inventing a response shape it cannot display.
+              return reply.code(200).send({ kind: "develop", ...priorDevelop });
+            }
+
+            const resolvedAction = await resolvePendingApproval(pendingApproval, priorDevelop.worktrees, decision);
+            const composedTask = decision === "approved"
+              ? `${priorDevelop.task}\n\nПользователь ПОДТВЕРДИЛ выполнение команды "${resolvedAction.command}". Она выполнена: exit code ${resolvedAction.exitCode ?? "?"}. Продолжи задачу, учитывая результат.`
+              : `${priorDevelop.task}\n\nПользователь ОТКЛОНИЛ выполнение команды "${resolvedAction.command}". Продолжи задачу БЕЗ неё — либо предложи альтернативный путь, либо честно опиши в итоговом summary, что это заблокировано и требует ручного вмешательства.`;
+            const status = startDevelopRun({
+              ...developInputBase,
+              task: composedTask,
+              continueFrom: {
+                worktrees: priorDevelop.worktrees,
+                priorTask: priorDevelop.task,
+                priorSummary: priorDevelop.result?.summary ?? "",
+                priorSensitiveActions: [
+                  ...(priorDevelop.result.sensitiveActions ?? []).filter((entry) => !(entry.status === "pending" && entry.command === resolvedAction.command)),
+                  resolvedAction,
+                ],
+              },
+            });
+            return reply.code(202).send({ kind: "develop", ...status });
+          }
+
+          // Ответ на уточняющий вопрос Developer'а — продолжение разработки
+          // без классификации: система сама только что спросила.
+          if (priorDevelop?.result?.stopped === "needs-clarification") {
+            const composedTask = [
+              priorDevelop.task,
+              "",
+              `Ответ пользователя на уточняющий вопрос («${priorDevelop.result.clarificationQuestion ?? ""}»): ${task}`,
+            ].join("\n");
+            const status = startDevelopRun({
+              ...developInputBase,
+              task: composedTask,
+              continueFrom: {
+                worktrees: priorDevelop.worktrees,
+                priorTask: priorDevelop.task,
+                priorSummary: priorDevelop.result?.summary ?? "",
+              },
+            });
+            return reply.code(202).send({ kind: "develop", ...status });
+          }
+
+          const intent = await classifyChatIntent({
+            task,
+            providerBaseUrl,
+            providerModel: selectedTeam.criticModel,
+            providerApiKey,
+            ...(priorDevelop?.status === "completed"
+              ? { priorDevelop: { task: priorDevelop.task, summary: priorDevelop.result?.summary ?? "" } }
+              : {}),
+          });
+
+          if (intent === "develop" || intent === "develop-correction") {
+            // Bug-debug flow (2026-07-18): a bug report reads as a plain
+            // question ("не работает X", "почему Y") and gets diagnosed by
+            // the normal Q&A pipeline (looksLikeDiagnosticTask already routes
+            // it to evidence-locked diagnostic-answer mode); a follow-up
+            // "какие варианты фикса?" is ALSO just a question, answered with
+            // a numbered plan (looksLikeChangeTask extended for this). Only
+            // the explicit go-ahead ("делай пункт 2", ...) is an imperative
+            // and classifies as "develop" here - but a bare "делай пункт 2"
+            // means nothing to the Developer without the diagnosis/options
+            // that were actually shown. This carries the immediately prior
+            // Q&A turn in the SAME conversation forward as context, so the
+            // Developer sees the root cause and the option the user picked -
+            // never fires without this classifier's explicit "develop"
+            // verdict, so a plain question or a fix-options question still
+            // never touches code on its own.
+            let composedTask = task;
+
+            if (intent === "develop" && conversationKey) {
+              try {
+                const priorTurn = await loadLatestConversationTurn(appRootPath, normalizePath(path.resolve(projectPath)), conversationKey);
+
+                if (priorTurn) {
+                  composedTask = [
+                    `Предыдущее сообщение в этом диалоге: "${priorTurn.research.task}"`,
+                    `Ответ на него: "${(priorTurn.answer.explanation || priorTurn.answer.summary).slice(0, 1500)}"`,
+                    "",
+                    `Текущее сообщение пользователя: "${task}"`,
+                  ].join("\n");
+                }
+              } catch {
+                // Prior-turn context is an enrichment, never a dependency.
+              }
+            }
+
+            const status = startDevelopRun({
+              ...developInputBase,
+              task: composedTask,
+              ...(intent === "develop-correction" && priorDevelop
+                ? {
+                    continueFrom: {
+                      worktrees: priorDevelop.worktrees,
+                      priorTask: priorDevelop.task,
+                      priorSummary: priorDevelop.result?.summary ?? "",
+                    },
+                  }
+                : {}),
+            });
+            return reply.code(202).send({ kind: "develop", ...status });
+          }
+        }
+      } catch (error) {
+        request.log.warn(error, "chat intent routing failed - falling back to the question pipeline");
+      }
+    }
+
     if (mode === "background-sync") {
       const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
         includePaths: [],
@@ -884,6 +1049,99 @@ export function createApp() {
     });
 
     return reply.code(202).send(acceptedStatus);
+  });
+
+  // Developer pipeline (docs/architecture/011-developer-pipeline.md):
+  // change-задача -> изолированный worktree -> Developer-цикл -> Reviewer ->
+  // diff человеку. 202 + poll по /api/develop/status, как у pipeline/run.
+  app.post<{
+    Body: {
+      task?: string;
+      projectPath?: string;
+      projectId?: string;
+    };
+  }>("/api/develop/run", async (request, reply) => {
+    const task = request.body.task?.trim();
+
+    if (!task) {
+      return reply.code(400).send({ message: "Нужно указать задачу разработки." });
+    }
+
+    if (!request.body.projectId?.trim() && !request.body.projectPath?.trim()) {
+      return reply.code(400).send({ message: "Нужно выбрать проект: ни projectId, ни projectPath не переданы." });
+    }
+
+    let projectRecord = null;
+
+    if (request.body.projectId?.trim()) {
+      try {
+        projectRecord = await resolveProjectRecord({
+          projectId: request.body.projectId,
+          projectPath: request.body.projectPath,
+        });
+      } catch (error) {
+        request.log.error(error);
+      }
+
+      if (!projectRecord && !request.body.projectPath?.trim()) {
+        return reply.code(404).send({ message: "Проект с указанным projectId не найден и projectPath не передан." });
+      }
+    }
+
+    const projectPath = request.body.projectPath?.trim() || projectRecord?.paths[0]?.rootPath || "";
+
+    if (!projectPath) {
+      return reply.code(400).send({ message: "Не удалось определить путь проекта." });
+    }
+
+    let provider = null;
+
+    try {
+      provider = await getCurrentProvider();
+    } catch (error) {
+      request.log.error(error);
+    }
+
+    const providerBaseUrl = provider?.baseUrl || defaultProviderBaseUrl;
+    const providerApiKey = provider?.apiKey || defaultProviderApiKey;
+
+    if (!providerBaseUrl || !providerApiKey) {
+      return reply.code(409).send({ message: "AI provider не настроен — разработка требует настроенного провайдера." });
+    }
+
+    const selectedTeam = await getSelectedTeam().catch(() => null);
+
+    if (!selectedTeam) {
+      return reply.code(409).send({ message: "Не выбрана Team — Developer использует researcher-модель команды, Reviewer — critic-модель." });
+    }
+
+    const status = startDevelopRun({
+      task,
+      projectPath: normalizePath(path.resolve(projectPath)),
+      ...(projectRecord?.paths.length ? { projectPaths: projectRecord.paths } : {}),
+      providerBaseUrl,
+      providerApiKey,
+      developerModel: selectedTeam.developerModel,
+      reviewerModel: selectedTeam.reviewerModel,
+    });
+
+    return reply.code(202).send(status);
+  });
+
+  app.get<{ Querystring: { runId?: string } }>("/api/develop/status", async (request, reply) => {
+    const runId = request.query.runId?.trim();
+
+    if (!runId) {
+      return reply.code(400).send({ message: "Нужно указать runId." });
+    }
+
+    const status = getDevelopRunStatus(runId);
+
+    if (!status) {
+      return reply.code(404).send({ message: "Статус разработки не найден (после перезапуска сервера статусы живут только в телеметрии developer_runs)." });
+    }
+
+    return status;
   });
 
   app.post<{ Body: EvalRunRequest }>("/api/pipeline/eval", async (request, reply) => {

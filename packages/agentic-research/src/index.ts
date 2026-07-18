@@ -7,6 +7,16 @@ export { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult } from ".
 export { toResearchReport, toValidationResult } from "./adapter.js";
 export * from "./tools.js";
 export { listWorkUnits } from "./worklist.js";
+export {
+  parseDevelopActions,
+  runDevelopmentTask,
+  type DevelopReviewRound,
+  type DevelopRunOptions,
+  type DevelopRunResult,
+  type DevelopSensitiveAction,
+  type DevelopVerificationEntry,
+  type ParsedDevelopAction,
+} from "./develop-loop.js";
 
 export interface CrawlUnitInput {
   projectRootPath: string;

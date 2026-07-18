@@ -68,12 +68,16 @@ type TeamDraft = {
   researcherModel: string;
   criticModel: string;
   observerModel: string;
+  developerModel: string;
+  reviewerModel: string;
 };
 
 const TEAM_ROLE_DESCRIPTIONS = {
   researcher: "Исследует кодовую базу и ищет доказательства для ответа.",
-  critic: "Проверяет ответ Researcher перед тем как показать его пользователю.",
+  critic: "Проверяет ответ Researcher перед тем как показать его пользователю. Также классифицирует сообщения чата (вопрос/задача) — частые дешёвые вызовы.",
   observer: "Изучает проект в фоне между вопросами, чтобы будущие ответы были быстрее.",
+  developer: "Пишет код по задаче из чата в изолированном worktree. Пусто — используется модель Researcher.",
+  reviewer: "Независимое ревью diff перед выдачей. Должна быть не слабее Developer по коду — слабый ревьюер шумит неверными замечаниями. Пусто — code-дефолт (Kimi K2.7 Code).",
 } as const;
 
 type ProjectDraftPath = {
@@ -1022,6 +1026,174 @@ function ThinkingIndicator({ currentStageLabel, startedAt }: { currentStageLabel
       </span>
       <span className="thinking-label">{safeText(currentStageLabel, "Изучаю проект")}</span>
       {startedAt ? <span className="thinking-elapsed">{formatRunDuration(elapsedSeconds)}</span> : null}
+    </div>
+  );
+}
+
+// --- Developer pipeline (docs/architecture/011-developer-pipeline.md) ---
+// Чат понимает не только вопросы, но и задачи разработки: сервер сам
+// классифицирует сообщение (/api/pipeline/run -> kind: "develop") и ведёт
+// Developer-цикл в изолированном worktree. Эти типы зеркалят
+// apps/api/src/develop-runner.ts.
+
+interface DevelopSensitiveActionView {
+  command: string;
+  reason: string;
+  status: "pending" | "approved" | "rejected";
+  exitCode?: number;
+  output?: string;
+}
+
+interface DevelopRunResultView {
+  summary: string | null;
+  clarificationQuestion: string | null;
+  pendingApproval: DevelopSensitiveActionView | null;
+  sensitiveActions: DevelopSensitiveActionView[];
+  diff: string;
+  changedFiles: string[];
+  verificationLog: Array<{ command: string; exitCode: number; durationMs: number; output: string; turn: number }>;
+  reviews: Array<{ verdict: string; findings: string[]; raw: string }>;
+  reviewVerdict: "approved" | "needs-changes" | "not-run";
+  stopped: string;
+  error?: string;
+  turnsUsed: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+}
+
+interface DevelopRunStatusView {
+  runId: string;
+  conversationId: string;
+  status: "running" | "completed" | "failed";
+  task: string;
+  startedAt: string;
+  progress?: { turn: number; filesChanged: number; phase: string };
+  worktrees: Array<{ label: string; rootPath: string; worktreePath: string; branch: string }>;
+  result?: DevelopRunResultView;
+  errorMessage?: string;
+}
+
+function developPhaseLabel(progress?: { turn: number; filesChanged: number; phase: string }): string {
+  if (!progress) {
+    return "Готовлю изолированную копию проекта...";
+  }
+
+  if (progress.phase === "reviewing") {
+    return "Независимое ревью изменений...";
+  }
+
+  if (progress.phase === "fixing") {
+    return `Правлю по замечаниям ревью (ход ${progress.turn})...`;
+  }
+
+  return progress.filesChanged > 0
+    ? `Пишу код (ход ${progress.turn}, изменено файлов: ${progress.filesChanged})...`
+    : `Разбираюсь в коде (ход ${progress.turn})...`;
+}
+
+function developVerdictBadge(result: DevelopRunResultView): { label: string; className: string } {
+  if (result.stopped === "needs-approval") {
+    return { label: "Требуется апрув", className: "develop-verdict develop-verdict-clarify" };
+  }
+
+  if (result.stopped === "needs-clarification") {
+    return { label: "Нужно уточнение", className: "develop-verdict develop-verdict-clarify" };
+  }
+
+  if (result.reviewVerdict === "approved") {
+    return { label: "Ревью: одобрено", className: "develop-verdict develop-verdict-approved" };
+  }
+
+  if (result.reviewVerdict === "needs-changes") {
+    return { label: "Ревью: есть замечания", className: "develop-verdict develop-verdict-changes" };
+  }
+
+  return { label: result.diff.trim() ? "Без ревью" : "Без изменений кода", className: "develop-verdict" };
+}
+
+function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
+  const result = run.result ?? null;
+  const running = run.status === "running";
+  const lastReview = result?.reviews.length ? result.reviews[result.reviews.length - 1] : null;
+
+  return (
+    <div className="message assistant-message">
+      <div className="message-badge">Dev</div>
+      <div className="message-card">
+        {running ? (
+          <ThinkingIndicator currentStageLabel={developPhaseLabel(run.progress)} startedAt={run.startedAt} />
+        ) : null}
+
+        {!running && run.status === "failed" ? (
+          <>
+            <p className="message-label">Разработка завершилась ошибкой</p>
+            <p>{safeText(run.errorMessage || result?.error, "Неизвестная ошибка — детали в телеметрии developer_runs.")}</p>
+          </>
+        ) : null}
+
+        {!running && run.status === "completed" && result ? (
+          <>
+            {result.stopped === "needs-approval" && result.pendingApproval ? (
+              <>
+                <span className="develop-verdict develop-verdict-clarify">Требуется апрув: чувствительная команда БД</span>
+                <p className="message-label">Разработчик хочет выполнить:</p>
+                <pre className="develop-pending-command">$ {result.pendingApproval.command}</pre>
+                <p>{safeText(result.pendingApproval.reason)}</p>
+                <p className="message-footnote">Это изменение схемы/данных, которое git не откатит — подтверди или отклони прямо в чате (например «да» / «нет»).</p>
+              </>
+            ) : result.stopped === "needs-clarification" ? (
+              <>
+                <p className="message-label">Уточняющий вопрос перед разработкой</p>
+                <h3>{safeText(result.clarificationQuestion, "Нужно уточнение по задаче")}</h3>
+                <p className="message-footnote">Ответь прямо в чате — разработка продолжится с учётом ответа.</p>
+              </>
+            ) : (
+              <>
+                <span className={developVerdictBadge(result).className}>{developVerdictBadge(result).label}</span>
+                {result.summary ? <p className="develop-summary">{result.summary}</p> : null}
+
+                {lastReview && lastReview.findings.length > 0 ? (
+                  <div className="develop-findings">
+                    <p className="message-label">Замечания ревью (последний раунд)</p>
+                    <ul>
+                      {lastReview.findings.map((finding, index) => (
+                        <li key={index}>{finding}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {result.verificationLog.length > 0 ? (
+                  <div className="develop-verification">
+                    <p className="message-label">Верификация</p>
+                    <ul>
+                      {result.verificationLog.map((entry, index) => (
+                        <li key={index}>
+                          <code>$ {entry.command}</code> → exit {entry.exitCode}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {result.diff.trim() ? (
+                  <details className="develop-diff">
+                    <summary>Diff ({result.changedFiles.length} файл(ов): {result.changedFiles.join(", ")})</summary>
+                    <pre>{result.diff}</pre>
+                  </details>
+                ) : null}
+
+                {run.worktrees.length > 0 ? (
+                  <p className="message-footnote">
+                    Изменения лежат в ветке {run.worktrees.map((worktree) => `${worktree.branch}`).join(", ")} (изолированный worktree, твой чекаут не тронут).
+                    Проверь diff — и либо смёржи ветку, либо напиши здесь, что переделать.
+                  </p>
+                ) : null}
+              </>
+            )}
+          </>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -2037,6 +2209,8 @@ export function App() {
     researcherModel: "",
     criticModel: "",
     observerModel: "",
+    developerModel: "",
+    reviewerModel: "",
   });
   const [teams, setTeams] = useState<TeamRecord[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState<string>("");
@@ -2055,6 +2229,12 @@ export function App() {
   // транскрипта в chat-body. `result`/`selectedTask` остаются как есть (последняя
   // реплика) — вся логика Inspector-панели читает именно их и не меняется.
   const [turns, setTurns] = useState<PipelineRunResult[]>([]);
+  // Develop-реплики текущего диалога (отдельно от turns: другой тип артефакта,
+  // другой поллинг). v1: живут в памяти сессии, при перезагрузке страницы
+  // восстанавливаются только Q&A-реплики (develop-история — в developer_runs).
+  const [developTurns, setDevelopTurns] = useState<DevelopRunStatusView[]>([]);
+  const [activeDevelop, setActiveDevelop] = useState<DevelopRunStatusView | null>(null);
+  const activeDevelopRunIdRef = useRef<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [clarificationRound, setClarificationRound] = useState(0);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -2373,6 +2553,8 @@ export function App() {
           researcherModel: selectedTeam.researcherModel,
           criticModel: selectedTeam.criticModel,
           observerModel: selectedTeam.observerModel,
+          developerModel: selectedTeam.developerModel,
+          reviewerModel: selectedTeam.reviewerModel,
         });
       }
     });
@@ -2467,6 +2649,14 @@ export function App() {
           // (fetchRunArtifact).
           if (!activeRunIdRef.current) {
             setTurns(data.latestRun ? [data.latestRun] : []);
+
+            // Переключение проекта: develop-реплики принадлежали прежнему
+            // проекту/диалогу. Не сбрасываем, пока идёт живой develop-ран
+            // (его поллинг сам владеет состоянием).
+            if (!activeDevelopRunIdRef.current) {
+              setDevelopTurns([]);
+              setActiveDevelop(null);
+            }
           }
         }
       });
@@ -2516,7 +2706,7 @@ export function App() {
       : task.trim();
 
     try {
-      const accepted = await fetchJsonWithTimeout<PipelineRunStatus>(`${API_BASE_URL}/api/pipeline/run`, {
+      const accepted = await fetchJsonWithTimeout<PipelineRunStatus & { kind?: string }>(`${API_BASE_URL}/api/pipeline/run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -2540,6 +2730,24 @@ export function App() {
           conversationId: !hardResync && !forceRefresh ? conversationId ?? undefined : undefined,
         }),
       });
+
+      // Сервер распознал в сообщении задачу разработки (или корректировку
+      // предыдущей) и запустил Developer pipeline вместо Q&A — совсем другой
+      // артефакт и другой endpoint статуса.
+      if (accepted.kind === "develop") {
+        const developAccepted = accepted as unknown as DevelopRunStatusView;
+        startTransition(() => {
+          setActiveDevelop({ ...developAccepted, task: composedTask || developAccepted.task });
+          setConversationId(developAccepted.conversationId || developAccepted.runId);
+          setRunStatus(null);
+          setResult(null);
+          setSelectedTask("");
+          setTask("");
+        });
+        activeDevelopRunIdRef.current = developAccepted.runId;
+        await pollDevelopStatus(developAccepted.runId, composedTask || developAccepted.task);
+        return;
+      }
 
       startTransition(() => {
         setRunStatus(accepted);
@@ -2673,6 +2881,55 @@ export function App() {
 
   async function triggerHardResync() {
     await submitPipelineRun(false, true);
+  }
+
+  // Поллинг Developer-рана — зеркало pollPipelineStatus, с теми же двумя
+  // защитами от "утёкшего" статуса при переключении чата (проверка ref до и
+  // после fetch). displayTask сохраняется, потому что сервер для продолжений
+  // хранит СКЛЕЕННУЮ задачу (исходная + ответ на уточнение) — в чате
+  // показываем то, что пользователь реально напечатал.
+  async function pollDevelopStatus(runId: string, displayTask: string) {
+    for (;;) {
+      if (activeDevelopRunIdRef.current !== runId) {
+        return;
+      }
+
+      let status: DevelopRunStatusView;
+      try {
+        status = await fetchJsonWithTimeout<DevelopRunStatusView>(
+          `${API_BASE_URL}/api/develop/status?runId=${encodeURIComponent(runId)}`,
+          undefined,
+          8000,
+        );
+      } catch (statusError) {
+        if (!isTransientPollError(statusError)) {
+          throw statusError;
+        }
+
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        continue;
+      }
+
+      if (activeDevelopRunIdRef.current !== runId) {
+        return;
+      }
+
+      const displayStatus: DevelopRunStatusView = { ...status, task: displayTask };
+
+      if (status.status !== "running") {
+        startTransition(() => {
+          setDevelopTurns((current) => [...current.filter((turn) => turn.runId !== status.runId), displayStatus]);
+          setActiveDevelop(null);
+        });
+        activeDevelopRunIdRef.current = null;
+        return;
+      }
+
+      startTransition(() => {
+        setActiveDevelop(displayStatus);
+      });
+      await new Promise((resolve) => window.setTimeout(resolve, 3000));
+    }
   }
 
   async function pollPipelineStatus(runId: string) {
@@ -2947,6 +3204,8 @@ export function App() {
           researcherModel: teamDraft.researcherModel,
           criticModel: teamDraft.criticModel,
           observerModel: teamDraft.observerModel,
+          developerModel: teamDraft.developerModel,
+          reviewerModel: teamDraft.reviewerModel,
           isSelected: true,
         }),
       });
@@ -2988,6 +3247,8 @@ export function App() {
             researcherModel: selected.researcherModel,
             criticModel: selected.criticModel,
             observerModel: selected.observerModel,
+            developerModel: selected.developerModel,
+            reviewerModel: selected.reviewerModel,
           });
         }
       });
@@ -3015,6 +3276,8 @@ export function App() {
           researcherModel: selected?.researcherModel ?? "",
           criticModel: selected?.criticModel ?? "",
           observerModel: selected?.observerModel ?? "",
+          developerModel: selected?.developerModel ?? "",
+          reviewerModel: selected?.reviewerModel ?? "",
         });
       });
     } catch (removeError) {
@@ -3264,8 +3527,13 @@ export function App() {
         updateActiveRunId(null);
         setSelectedTask(artifact.knowledge?.runId ? safeText(artifact.research?.summary, selectedTask) : selectedTask);
         setTurns(conversationTurns);
+        // Открыт другой (Q&A) диалог из истории — develop-реплики прежней
+        // сессии к нему не относятся.
+        setDevelopTurns([]);
+        setActiveDevelop(null);
         setConversationId(artifact.conversationId);
       });
+      activeDevelopRunIdRef.current = null;
     } catch (loadError) {
       // Ссылка на run, которого больше нет (удалённый чат, протухший deep
       // link) — раньше это оставляло пользователя на мёртвом URL с голым
@@ -3303,8 +3571,11 @@ export function App() {
       setSelectedHistoryIds(new Set());
       setClarificationRound(0);
       setTurns([]);
+      setDevelopTurns([]);
+      setActiveDevelop(null);
       setConversationId(null);
     });
+    activeDevelopRunIdRef.current = null;
     navigate("/chat");
   }
 
@@ -3592,6 +3863,20 @@ export function App() {
                   />
                 </Fragment>
               ) : null}
+
+              {/* Develop-реплики диалога (после Q&A-реплик; см. developTurns) */}
+              {developTurns.map((turn) => (
+                <Fragment key={turn.runId}>
+                  <UserTaskMessage task={turn.task} projectName={safeText(project?.name, "")} projectPath={projectPath} />
+                  <DevelopRunMessage run={turn} />
+                </Fragment>
+              ))}
+              {activeDevelop ? (
+                <Fragment>
+                  <UserTaskMessage task={activeDevelop.task} projectName={safeText(project?.name, "")} projectPath={projectPath} />
+                  <DevelopRunMessage run={activeDevelop} />
+                </Fragment>
+              ) : null}
               <div ref={chatEndRef} />
             </div>
 
@@ -3717,7 +4002,7 @@ export function App() {
                 <button
                   type="button"
                   className="ghost-button"
-                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "" })}
+                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "", developerModel: "", reviewerModel: "" })}
                 >
                   Новая
                 </button>
@@ -3763,6 +4048,50 @@ export function App() {
                     <option value="">Модель не выбрана</option>
                     {teamDraft.criticModel && !safeList(providerModels).some((model) => model.id === teamDraft.criticModel) ? (
                       <option value={teamDraft.criticModel}>{teamDraft.criticModel} (вне каталога)</option>
+                    ) : null}
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Developer</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.developer}</span>
+                  <select
+                    value={teamDraft.developerModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, developerModel: event.target.value }))}
+                  >
+                    <option value="">Как у Researcher</option>
+                    {teamDraft.developerModel && !safeList(providerModels).some((model) => model.id === teamDraft.developerModel) ? (
+                      <option value={teamDraft.developerModel}>{teamDraft.developerModel} (вне каталога)</option>
+                    ) : null}
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Reviewer</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.reviewer}</span>
+                  <select
+                    value={teamDraft.reviewerModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, reviewerModel: event.target.value }))}
+                  >
+                    <option value="">Дефолт (Kimi K2.7 Code)</option>
+                    {teamDraft.reviewerModel && !safeList(providerModels).some((model) => model.id === teamDraft.reviewerModel) ? (
+                      <option value={teamDraft.reviewerModel}>{teamDraft.reviewerModel} (вне каталога)</option>
                     ) : null}
                     {groupModelsByVendor(safeList(providerModels)).map((group) => (
                       <optgroup key={group.vendor} label={group.vendor}>
@@ -3839,6 +4168,26 @@ export function App() {
                         <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.critic}</span>
                       </div>
                       <div className="team-role-card">
+                        <strong>Developer</strong>
+                        <span>
+                          {team.developerModel || "—"}
+                          {findModelMultiplierLabel(providerModels, team.developerModel) ? (
+                            <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.developerModel)}</span>
+                          ) : null}
+                        </span>
+                        <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.developer}</span>
+                      </div>
+                      <div className="team-role-card">
+                        <strong>Reviewer</strong>
+                        <span>
+                          {team.reviewerModel || "—"}
+                          {findModelMultiplierLabel(providerModels, team.reviewerModel) ? (
+                            <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.reviewerModel)}</span>
+                          ) : null}
+                        </span>
+                        <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.reviewer}</span>
+                      </div>
+                      <div className="team-role-card">
                         <strong>Observer</strong>
                         <span>
                           {team.observerModel || "—"}
@@ -3860,6 +4209,8 @@ export function App() {
                             researcherModel: team.researcherModel,
                             criticModel: team.criticModel,
                             observerModel: team.observerModel,
+                            developerModel: team.developerModel,
+                            reviewerModel: team.reviewerModel,
                           })
                         }
                       >

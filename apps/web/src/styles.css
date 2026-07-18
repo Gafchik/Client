@@ -1081,3 +1081,72 @@ button {
     width: auto;
   }
 }
+
+/* --- Developer pipeline (develop-реплики в чате) --- */
+.develop-verdict {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  margin-bottom: 8px;
+}
+
+.develop-verdict-approved {
+  color: #1a7f37;
+}
+
+.develop-verdict-changes {
+  color: #b35900;
+}
+
+.develop-verdict-clarify {
+  color: #58a6ff;
+}
+
+.develop-summary {
+  white-space: pre-wrap;
+}
+
+.develop-findings ul,
+.develop-verification ul {
+  margin: 4px 0 8px;
+  padding-left: 18px;
+}
+
+.develop-verification code {
+  font-size: 12px;
+}
+
+.develop-diff {
+  margin-top: 8px;
+}
+
+.develop-diff summary {
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.develop-diff pre {
+  margin-top: 8px;
+  max-height: 420px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  white-space: pre;
+}
+
+.develop-pending-command {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  white-space: pre-wrap;
+  word-break: break-all;
+}

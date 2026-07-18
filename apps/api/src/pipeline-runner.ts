@@ -1747,7 +1747,11 @@ function toVirtualPath(roots: WorkspaceRoot[], ownerRootPath: string, relativePa
 // only in a non-primary repo will not resolve here even though it may be
 // perfectly findable by grep_content/read_file - the tool says so plainly
 // rather than silently returning nothing with no explanation.
-function buildGraphNavigationTool(graph: GraphState): (query: string) => Promise<string> {
+// Exported (2026-07-18, Developer pipeline reuse/regression-safety fix):
+// develop-runner.ts wires the SAME tool the Researcher already uses, rather
+// than reimplementing graph lookup - see develop-runner.ts's comment on why
+// this was previously missing entirely from the Developer loop.
+export function buildGraphNavigationTool(graph: GraphState): (query: string) => Promise<string> {
   return async (query: string): Promise<string> => {
     const normalizedQuery = query.trim().toLowerCase();
 
@@ -1919,7 +1923,10 @@ function buildRrfRankMap(orderedKeys: string[]): Map<string, number> {
   return ranks;
 }
 
-function buildSemanticSearchTool(
+// Exported (2026-07-18) - same reason as buildGraphNavigationTool above.
+// Needs no pre-built index/graph (queries Postgres code_embeddings + live
+// grep directly), so develop-runner.ts can use it unconditionally.
+export function buildSemanticSearchTool(
   roots: WorkspaceRoot[],
   providerBaseUrl: string,
   providerApiKey: string,
@@ -2020,7 +2027,9 @@ function buildSemanticSearchTool(
 // оптимизация, а не зависимость.
 const SEMANTIC_SEED_MIN_SCORE = 0.45;
 
-function buildSemanticSeedLookup(
+// Exported (2026-07-18) for develop-runner.ts - the exact same "single
+// biggest latency lever measured" mechanism the Q&A path already uses.
+export function buildSemanticSeedLookup(
   roots: WorkspaceRoot[],
   providerBaseUrl: string,
   providerApiKey: string,
@@ -2051,7 +2060,10 @@ function buildSemanticSeedLookup(
 // Формирует "verify, then rely"-блок из подтверждённых фактов прошлых
 // прогонов (fact store) для agentic-цикла. Только свежие (не stale) факты с
 // файлами - у протухших content hash уже разошёлся с кодом.
-function buildKnownFactsHint(roots: WorkspaceRoot[], knownFacts: Awaited<ReturnType<typeof queryFactsAcrossPaths>>): string {
+// Exported (2026-07-17, Developer pipeline): develop-runner.ts injects the
+// exact same memory channels into the Developer loop - per 011's principle
+// "память инъецируется в цикл, а не через агента-переводчика".
+export function buildKnownFactsHint(roots: WorkspaceRoot[], knownFacts: Awaited<ReturnType<typeof queryFactsAcrossPaths>>): string {
   const usable = knownFacts
     .filter((fact) => fact.status === "fresh" && fact.filePaths.length > 0)
     .slice(0, 5);
@@ -2073,7 +2085,7 @@ function buildKnownFactsHint(roots: WorkspaceRoot[], knownFacts: Awaited<ReturnT
 // business-term definitions built once and reused across every future
 // question, closest this pipeline gets to a persistent "what things mean
 // here" reference for the Researcher.
-function buildGlossaryHint(entries: Awaited<ReturnType<typeof queryGlossaryAcrossPaths>>): string {
+export function buildGlossaryHint(entries: Awaited<ReturnType<typeof queryGlossaryAcrossPaths>>): string {
   if (entries.length === 0) {
     return "";
   }
@@ -2084,7 +2096,7 @@ function buildGlossaryHint(entries: Awaited<ReturnType<typeof queryGlossaryAcros
   ].join("\n");
 }
 
-async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: string): Promise<string> {
+export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: string): Promise<string> {
   try {
     const entries = await queryBusinessGraphEntriesAcrossPaths(roots.map((root) => root.absolutePath));
     const freshEntries = entries.filter((entry) => !entry.isStale && entry.featureSummary.trim());

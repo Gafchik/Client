@@ -1,10 +1,16 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import os from "node:os";
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import { normalizePath, stableId, type RepositoryChangedFile, type RepositorySnapshot, type WorkspaceSnapshot } from "@client/shared";
 
 const execFileAsync = promisify(execFile);
 const GIT_COMMAND_TIMEOUT_MS = 5_000;
+// Worktree creation checks out the entire tree - on a large repo that is
+// legitimately slower than the 5s budget of the read-only status commands
+// above, and a timeout here aborts a development run before it starts.
+const WORKTREE_COMMAND_TIMEOUT_MS = 120_000;
 
 export async function inspectRepository(workspace: WorkspaceSnapshot): Promise<RepositorySnapshot> {
   const scannedAt = new Date().toISOString();
@@ -96,13 +102,14 @@ async function resolveMergeBase(rootPath: string): Promise<{ ok: boolean; stdout
 async function runGit(
   cwd: string,
   args: string[],
+  timeoutMs: number = GIT_COMMAND_TIMEOUT_MS,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   try {
     const result = await execFileAsync("git", args, {
       cwd,
       encoding: "utf8",
       maxBuffer: 1024 * 1024 * 8,
-      timeout: GIT_COMMAND_TIMEOUT_MS,
+      timeout: timeoutMs,
     });
 
     return {
@@ -431,6 +438,92 @@ export async function computeFileChurnSignals(rootPath: string): Promise<Map<str
   }
 
   return signals;
+}
+
+/**
+ * Isolated checkout for one development task in one physical repo
+ * (docs/architecture/011-developer-pipeline.md, "изоляция"). The Developer
+ * agent mutates ONLY the worktree - the user's own checkout (their branch,
+ * their uncommitted changes, their IDE state) is never touched. Checkpoints
+ * and rollback are plain git in this worktree, not a bespoke engine.
+ */
+export interface TaskWorktree {
+  /** Original repo root the worktree was created from. */
+  rootPath: string;
+  /** The isolated checkout the Developer works in. */
+  worktreePath: string;
+  /** Task branch checked out in the worktree (exists in the original repo too). */
+  branch: string;
+  /** HEAD commit the worktree started from - the diff baseline. */
+  startCommit: string;
+}
+
+export async function createTaskWorktree(rootPath: string, taskId: string, label: string): Promise<TaskWorktree> {
+  const gitRoot = await resolveGitRoot(rootPath);
+
+  if (!gitRoot) {
+    throw new Error(`«${rootPath}» не является git-репозиторием — разработка без git-изоляции не запускается (нет безопасного отката).`);
+  }
+
+  const normalizedRoot = normalizePath(gitRoot);
+  const head = await runGit(normalizedRoot, ["rev-parse", "HEAD"]);
+
+  if (!head.ok) {
+    throw new Error(`Не удалось определить HEAD в «${normalizedRoot}»: ${head.stderr.trim() || "git rev-parse HEAD failed"}. Возможно, репозиторий без единого коммита.`);
+  }
+
+  const startCommit = normalizeGitValue(head.stdout, "");
+  const branch = `client/task-${taskId}`;
+  // Outside the repo on purpose: a worktree directory inside the repo would
+  // show up as an untracked dir in the user's own `git status` and get
+  // picked up by their IDE/indexer.
+  const worktreePath = normalizePath(path.join(os.tmpdir(), "client-task-worktrees", taskId, label));
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+
+  const added = await runGit(normalizedRoot, ["worktree", "add", "-b", branch, worktreePath, startCommit], WORKTREE_COMMAND_TIMEOUT_MS);
+
+  if (!added.ok) {
+    throw new Error(`Не удалось создать worktree для задачи: ${added.stderr.trim() || added.stdout.trim() || "git worktree add failed"}`);
+  }
+
+  return { rootPath: normalizedRoot, worktreePath, branch, startCommit };
+}
+
+/**
+ * Full diff of everything the task changed, including newly created files.
+ * Staging inside the throwaway worktree is safe by construction (nobody else
+ * uses its index), and `diff --cached <startCommit>` stays correct even if
+ * the Developer chose to commit intermediate checkpoints along the way.
+ */
+export async function collectWorktreeChanges(worktree: TaskWorktree): Promise<{ diff: string; changedFiles: string[] }> {
+  const staged = await runGit(worktree.worktreePath, ["add", "-A"], WORKTREE_COMMAND_TIMEOUT_MS);
+
+  if (!staged.ok) {
+    return { diff: "", changedFiles: [] };
+  }
+
+  const [diffResult, namesResult] = await Promise.all([
+    runGit(worktree.worktreePath, ["diff", "--cached", worktree.startCommit], WORKTREE_COMMAND_TIMEOUT_MS),
+    runGit(worktree.worktreePath, ["diff", "--cached", "--name-only", worktree.startCommit], WORKTREE_COMMAND_TIMEOUT_MS),
+  ]);
+
+  return {
+    diff: diffResult.ok ? diffResult.stdout : "",
+    changedFiles: namesResult.ok
+      ? namesResult.stdout.split("\n").map((line) => normalizePath(line.trim())).filter(Boolean)
+      : [],
+  };
+}
+
+export async function removeTaskWorktree(worktree: TaskWorktree, options?: { deleteBranch?: boolean }): Promise<void> {
+  // Best-effort cleanup - a leftover worktree in tmpdir is an annoyance, not
+  // a correctness problem, so failures here never mask the run's own result.
+  await runGit(worktree.rootPath, ["worktree", "remove", "--force", worktree.worktreePath], WORKTREE_COMMAND_TIMEOUT_MS);
+  await runGit(worktree.rootPath, ["worktree", "prune"], WORKTREE_COMMAND_TIMEOUT_MS);
+
+  if (options?.deleteBranch) {
+    await runGit(worktree.rootPath, ["branch", "-D", worktree.branch]);
+  }
 }
 
 export function shouldPreferSelectiveWorkspace(repository: RepositorySnapshot, workspace: WorkspaceSnapshot): boolean {

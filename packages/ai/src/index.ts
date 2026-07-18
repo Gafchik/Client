@@ -481,6 +481,137 @@ export async function classifyProjectScopeDirective(input: {
   }
 }
 
+export type ChatIntentKind = "question" | "develop" | "develop-correction";
+
+export type ApprovalResponseKind = "approved" | "rejected" | "unclear";
+
+/**
+ * Resolves the user's chat reply to a pending sensitive-DB-command approval
+ * request (2026-07-18 DB safety, docs/architecture/011). Fails closed to
+ * "unclear" (treated as NOT approved by the caller) - an irreversible
+ * command must only run on an unambiguous yes, unlike classifyChatIntent's
+ * "question" default which is just a mis-routed research question, not a
+ * real-world side effect.
+ */
+export async function classifyApprovalResponse(input: {
+  message: string;
+  pendingCommand: string;
+  pendingReason: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<ApprovalResponseKind> {
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "The assistant asked the user for approval to run a command that changes a database (migration/seed/schema change) and cannot be undone by git. Classify the user's reply to that specific request.",
+            "\"approved\" - a clear, unambiguous yes (\"да\", \"го\", \"запускай\", \"давай\", \"ok\", \"approve\", \"delать\", explicitly agreeing to run it).",
+            "\"rejected\" - a clear no or explicit cancel (\"нет\", \"не сейчас\", \"отмени\", \"стоп\", \"cancel\").",
+            "\"unclear\" - anything else: a new unrelated request, a question, a vague/non-committal reply, or anything you are not confident is a direct yes/no to THIS specific request. When genuinely unsure, choose unclear - never guess approved.",
+            "Reply with ONLY one line of JSON: {\"kind\": \"approved\" | \"rejected\" | \"unclear\"}.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: `Pending command: ${input.pendingCommand}\nReason given: ${input.pendingReason}\n\nUser's reply: ${input.message}`,
+        },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return "unclear";
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { kind?: unknown };
+    return parsed.kind === "approved" || parsed.kind === "rejected" ? parsed.kind : "unclear";
+  } catch {
+    return "unclear";
+  }
+}
+
+/**
+ * Routes a chat message between the Q&A pipeline and the Developer pipeline
+ * (docs/architecture/011-developer-pipeline.md): the user writes questions,
+ * development tasks and review feedback into the SAME chat box, and the
+ * system - not the user - must tell them apart. An LLM call, not keyword
+ * regex: "как добавить кэширование?" (a question containing an imperative
+ * verb) vs "добавь кэширование" (a task) is exactly the distinction keyword
+ * matching gets wrong. Fails closed to "question" - a misrouted question
+ * costs one research run, a misrouted develop task would mutate a worktree
+ * nobody asked for.
+ */
+export async function classifyChatIntent(input: {
+  task: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+  /** Last delivered develop iteration in this conversation, when one exists. */
+  priorDevelop?: { task: string; summary: string };
+}): Promise<ChatIntentKind> {
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "The user chats with an AI senior developer about their codebase. Classify the user's latest message into exactly one kind:",
+            "- \"question\": asks to explain, find, analyze or discuss something about the project. No code modification is being requested from the assistant. IMPORTANT: \"how do I add X?\" / \"как добавить X?\" is a question (asking HOW, not asking the assistant to DO it).",
+            "- \"develop\": asks the assistant to implement, change, fix, remove, rename or refactor code (imperative request for a code change: \"добавь\", \"сделай\", \"исправь\", \"убери\", \"реализуй\", \"напиши код\"...).",
+            "- \"develop-correction\": ONLY when a previous development result exists in this conversation (it is provided below if so) AND the message is review feedback demanding changes to THAT delivered result (\"переделай\", \"нет, не так\", \"убери то, что ты добавил\", pointing out mistakes in what was just delivered). A brand-new unrelated change request is \"develop\", not a correction.",
+            "Reply with ONLY one line of JSON: {\"kind\": \"question\" | \"develop\" | \"develop-correction\"}.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            ...(input.priorDevelop
+              ? [
+                `Previous development result in this conversation - task: "${input.priorDevelop.task}". Delivered summary: "${input.priorDevelop.summary.slice(0, 600)}".`,
+                "",
+              ]
+              : []),
+            `User's latest message: ${input.task}`,
+          ].join("\n"),
+        },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return "question";
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { kind?: unknown };
+
+    if (parsed.kind === "develop") {
+      return "develop";
+    }
+
+    if (parsed.kind === "develop-correction") {
+      // A correction without anything to correct collapses to a fresh task.
+      return input.priorDevelop ? "develop-correction" : "develop";
+    }
+
+    return "question";
+  } catch {
+    return "question";
+  }
+}
+
 export interface DomainGlossaryTermCandidate {
   term: string;
   definition: string;
@@ -551,6 +682,111 @@ export async function extractDomainGlossaryTerms(input: {
         relatedFiles: input.evidenceFilePaths.slice(0, 5),
       }))
       .filter((entry) => entry.term.length >= 2 && entry.term.length <= 60 && entry.definition.length >= 10)
+      .slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
+export interface CodePatternFactCandidate {
+  statement: string;
+  relatedFiles: string[];
+}
+
+/**
+ * Extracts REUSABLE facts worth remembering from a completed, Reviewer-
+ * approved development task (2026-07-18, "напиши как я, только лучше"
+ * follow-up to the MD-1332/1474/1498 benchmark; broadened same day per the
+ * product owner's own live observation while working the Slay color-scheme
+ * task - "I didn't realize the GUI can start before the user's data has
+ * loaded until AFTER working on the backend" - a project-specific pitfall
+ * discovered only through hands-on work, exactly the kind of thing a senior
+ * developer accumulates and a fresh session has no way to know). Two kinds
+ * of entry, one mechanism:
+ * - CONVENTIONS: "how does THIS codebase already solve problems shaped like
+ *   this one" - the thing the MD-1498 run failed to discover on its own
+ *   (the project's `cloneFromMainClinic()`-style hook for giving new
+ *   entities default records, cold-grepped for and missed twice).
+ * - GOTCHAS: a non-obvious pitfall/landmine specific to this project that
+ *   only becomes visible through actually building something here - a
+ *   timing/lifecycle assumption that silently breaks, a "looks right but
+ *   isn't" trap, something that bit the developer (or was deliberately
+ *   guarded against) during this run.
+ * This is deliberately NOT domain glossary (business meaning) and NOT "what
+ * this diff did" (ticket-specific, not reusable). Promoted via
+ * packages/knowledge's promoteFactsFromDevelopment into the SAME
+ * project_facts store the Q&A path already uses - consumption is already
+ * wired (develop-runner.ts's knownFactsHint), this only adds production.
+ * Gated to APPROVED runs only by the caller: an unreviewed or rejected diff
+ * is not a trustworthy source of "this is how it's done here" / "this is
+ * really how it behaves".
+ */
+export async function extractCodePatternFacts(input: {
+  task: string;
+  summary: string;
+  /** Files the Developer actually read this run (loop.ts's touchedFiles) - candidates are constrained to this set to prevent hallucinated paths. */
+  touchedFiles: string[];
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<CodePatternFactCandidate[]> {
+  if (input.touchedFiles.length === 0 || input.summary.trim().length < 40) {
+    return [];
+  }
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You look at a just-completed, already-reviewed development task (task + what the developer did) and identify facts worth permanently remembering about THIS specific codebase - the kind of thing a senior developer new to the team would want written down so the NEXT task doesn't have to rediscover it the hard way. Two kinds, both welcome:",
+            "1. CONVENTION - a concrete, repeatable mechanism this project already uses (e.g. \"new entities get default child records via a clone-from-template hook method, not by inserting them directly in the create action\", \"status/lookup backfills for existing rows are written as standalone raw-SQL migrations, not model-level code\").",
+            "2. GOTCHA - a non-obvious pitfall or landmine specific to this project that is easy to get wrong (e.g. \"the desktop app's UI can render before the logged-in user's server-side data has loaded, so code that assumes user/profile data is already available at startup must handle it being absent\", \"X only takes effect after Y, not immediately\").",
+            "Both must be grounded in one or more of the files listed below (which the developer actually opened this run) - either the mechanism/pitfall is directly visible there, or it is exactly what the developer's own description of what they did/verified demonstrates.",
+            "Do NOT write what THIS ticket's diff specifically did (that's ticket-specific, not reusable) and do NOT write business/domain meaning (that's a separate glossary, not your job here). Skip entirely if nothing genuinely reusable surfaced - most tickets won't have one, an empty list is the common, correct answer.",
+            "Every relatedFiles entry MUST be copied verbatim from the file list you're given below - never invent a path.",
+            "Reply with ONLY one line of JSON: {\"patterns\": [{\"statement\": string, \"relatedFiles\": string[]}]}. Up to 3 entries total. statement is one or two sentences, in Russian, phrased as a standing fact about the project (start with \"Конвенция проекта:\" or \"Особенность/риск проекта:\" depending on which kind it is), standalone.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            `Задача: ${input.task.slice(0, 800)}`,
+            `Что сделал разработчик: ${input.summary.slice(0, 1500)}`,
+            `Файлы, которые разработчик реально открыл в этом ране: ${input.touchedFiles.join(", ")}`,
+          ].join("\n\n"),
+        },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return [];
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { patterns?: unknown };
+
+    if (!Array.isArray(parsed.patterns)) {
+      return [];
+    }
+
+    const touchedSet = new Set(input.touchedFiles);
+
+    return parsed.patterns
+      .filter((entry): entry is { statement: unknown; relatedFiles: unknown } => typeof entry === "object" && entry !== null)
+      .map((entry) => ({
+        statement: typeof entry.statement === "string" ? entry.statement.trim() : "",
+        relatedFiles: Array.isArray(entry.relatedFiles)
+          ? entry.relatedFiles.filter((filePath): filePath is string => typeof filePath === "string" && touchedSet.has(filePath))
+          : [],
+      }))
+      .filter((entry) => entry.statement.length >= 15 && entry.relatedFiles.length > 0)
       .slice(0, 3);
   } catch {
     return [];
@@ -1009,7 +1245,7 @@ export async function buildAnswerPackage(input: BuildAnswerInput): Promise<Answe
   }
 
   const canUseProvider =
-    !evidenceLocked
+    !shouldForceEvidenceLockedMode(input, false)
     && input.providerBaseUrl.trim().length > 0
     && input.providerModel.trim().length > 0
     && input.providerApiKey.trim().length > 0;
@@ -2246,8 +2482,22 @@ function resolveAnswerMode(input: BuildAnswerInput): AnswerMode {
   return "direct-answer";
 }
 
-function shouldForceEvidenceLockedMode(input: BuildAnswerInput): boolean {
-  const diagnosticMode = looksLikeDiagnosticTask(input.task);
+// Debugger-flow live evidence (2026-07-18): a bug report ("не удаляется
+// старый проброс портов, почему?") got a textbook-precise root cause from
+// research - exact file, exact line, exact reasoning - and STILL got
+// rendered through the rigid deterministic template (headers, "Что это
+// заденет" boilerplate) instead of the natural senior-dev prose every other
+// answer uses (see buildAnswerSystemPrompt). Root cause: diagnosticMode was
+// one of the OR'd conditions in the single evidenceLocked flag, which gates
+// BOTH the ambiguity-clarification skip (its actual intended purpose here -
+// a bug legitimately touching several modules is evidence, not an
+// ambiguous question) AND, as an unrelated side effect, whether the LLM
+// synthesis path gets attempted at all. A clean, well-evidenced diagnosis
+// has no reason to be denied LLM polishing. includeDiagnosticSignal lets
+// the ambiguity-skip call site keep the original (correct) behavior while
+// the LLM-gate call site excludes diagnosticMode specifically.
+function shouldForceEvidenceLockedMode(input: BuildAnswerInput, includeDiagnosticSignal = true): boolean {
+  const diagnosticMode = includeDiagnosticSignal && looksLikeDiagnosticTask(input.task);
   const localeBehavior = input.research.functionalSummary.toLowerCase().includes("runtime-поведению локализации");
   // `research.unknowns` копит до 7 независимых сигналов (нет entry points,
   // нет side effects, нет data sources, indexer diagnostics и т.д.) —
@@ -3072,9 +3322,14 @@ function looksLikeDiagnosticTask(task: string): boolean {
 
 function looksLikeChangeTask(task: string): boolean {
   const normalized = task.toLowerCase();
-  return ["исправ", "fix", "добав", "implement", "измен", "change", "поддерж", "support", "поменя"].some((token) =>
-    normalized.includes(token),
-  );
+  return [
+    "исправ", "fix", "добав", "implement", "измен", "change", "поддерж", "support", "поменя",
+    // Bug-debug flow (2026-07-18): a follow-up like "какие варианты фикса?"
+    // asks ABOUT a hypothetical change, not asking a question about existing
+    // behavior - it needs the same numbered-plan answer shape (requiresPlan)
+    // as an actual change request, even though it contains no imperative verb.
+    "вариант", "почин", "как решить", "план фикс",
+  ].some((token) => normalized.includes(token));
 }
 
 // Architecture review finding (2026-07-16): intent classification was

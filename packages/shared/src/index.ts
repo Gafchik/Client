@@ -924,6 +924,19 @@ export interface TeamRecord {
   researcherModel: string;
   criticModel: string;
   observerModel: string;
+  /**
+   * Developer pipeline (011): пишет код в изолированном worktree. Пусто в
+   * старых командах — тогда используется researcherModel (тот же агентный
+   * архетип, см. team-store).
+   */
+  developerModel: string;
+  /**
+   * Независимое ревью diff. Роль РАЗВЕДЕНА с criticModel (2026-07-17):
+   * critic — частые дешёвые вызовы (Q&A-валидация, классификация интентов),
+   * reviewer — редкие вызовы с высокой ценой ошибки, требует модель не
+   * слабее developer по code-способности.
+   */
+  reviewerModel: string;
   isSelected: boolean;
   createdAt: string;
   updatedAt: string;

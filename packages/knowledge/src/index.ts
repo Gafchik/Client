@@ -20,7 +20,7 @@ function knowledgeArtifactCacheKey(runId: string): string {
   return `knowledge-artifact:${runId}`;
 }
 
-export { deleteFactsForPath, promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
+export { deleteFactsForPath, promoteFactsFromDevelopment, promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
 export {
   deleteBusinessGraphEntriesForPath,
   hashFiles,
