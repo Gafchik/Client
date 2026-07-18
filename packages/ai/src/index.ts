@@ -608,6 +608,73 @@ export async function classifyTestsOffer(input: {
   }
 }
 
+export type PostCompletionCommandAction = "merge-to-branch" | "cleanup-worktree";
+
+// Cheap keyword pre-filter (same "don't pay for an LLM call on the common
+// case" convention as taskMentionsScopeTrigger above) - most messages after
+// a completed develop run are unrelated follow-ups (a new question, a new
+// task), not one of these two commands.
+const POST_COMPLETION_COMMAND_TRIGGER_PATTERN = /занес|перенес|принес|в\s+ветк|в\s+бранч|в\s+текущ|merge|apply.*branch|почист|убери\s*ворк|удали\s*ворк|clean.*worktree|worktree/i;
+
+/**
+ * Recognizes two explicit, opt-in follow-up commands after a delivered
+ * develop run (2026-07-18, explicit product-owner request: they had never
+ * once needed a git worktree in years of commercial work and don't want
+ * to learn one - the wanted flow is "give a task, hear done, say bring it
+ * into my branch, review the ordinary uncommitted diff in my own IDE").
+ * "merge-to-branch": apply the worktree's diff onto the user's real
+ * checkout as uncommitted changes (see repository-git's
+ * applyWorktreeDiffToRoot - never commits, never pushes).
+ * "cleanup-worktree": remove the throwaway worktree/branch now, instead of
+ * waiting for it to be cleaned up implicitly.
+ * Fails closed to null (do nothing, fall through to normal chat routing)
+ * on any ambiguity - both actions mutate a real, non-isolated checkout or
+ * delete real git state, so guessing is not acceptable here.
+ */
+export async function classifyPostCompletionCommand(input: {
+  message: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<PostCompletionCommandAction | null> {
+  if (!POST_COMPLETION_COMMAND_TRIGGER_PATTERN.test(input.message)) {
+    return null;
+  }
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "The assistant just delivered a completed code change that currently lives in an isolated git worktree, not in the user's own checkout. Classify the user's message into ONE of these, or neither.",
+            "\"merge-to-branch\" - the user asks to bring/apply/merge the change into their own current branch/checkout so they can see it as a normal uncommitted diff (\"занеси в текущую ветку\", \"перенеси в мою ветку\", \"примени в рабочую копию\", \"merge it into my branch\") - this does NOT mean commit or push, just make the files appear changed in their own checkout.",
+            "\"cleanup-worktree\" - the user asks to remove/clean up the throwaway worktree now (\"почисти ворктри\", \"убери за собой\", \"удали воркtree\", \"clean up the worktree\").",
+            "If the message is neither of these (a new question, a new task, an unrelated reply) - reply with null.",
+            "Reply with ONLY one line of JSON: {\"action\": \"merge-to-branch\" | \"cleanup-worktree\" | null}.",
+          ].join("\n"),
+        },
+        { role: "user", content: input.message },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return null;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { action?: unknown };
+    return parsed.action === "merge-to-branch" || parsed.action === "cleanup-worktree" ? parsed.action : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Routes a chat message between the Q&A pipeline and the Developer pipeline
  * (docs/architecture/011-developer-pipeline.md): the user writes questions,
@@ -722,6 +789,17 @@ export async function planDevelopSubtasks(input: {
             "Only decompose when the task genuinely spans multiple architectural layers or a large number of files (e.g. a new feature needing a DB schema change AND backend logic AND an API endpoint AND frontend UI, or many clearly separable pieces of work). A task already scoped to one file, one layer, or a bug fix must come back as a SINGLE step, unchanged in substance - do not invent artificial slices for something small, that only adds overhead and review friction for no benefit.",
             "NEVER split a change from its own test/verification into separate steps - writing and verifying a piece of code is part of doing that step, not a separate layer, no matter how the task happens to phrase it (even if the task explicitly asks for a test as an add-on instruction). A step that implements something already includes proving it works.",
             "When you do decompose: 2 to 5 steps, in the order they must be built (each step can assume all EARLIER steps are already done and merged - e.g. 'add the API endpoint' can assume the DB schema and model from an earlier step already exist). Each step's description must be self-contained and concrete enough to hand to a developer who has not seen the original request - restate exactly what that step needs to do, do not write vague labels like 'backend part'.",
+            // Live evidence (2026-07-18): the SAME feature task got split
+            // into a tight 4-file "schema + model" step on one run, but a
+            // 17-file "entire backend layer" (migration + model + repository
+            // + service + controller + routes, all bundled) step on
+            // another - inconsistent because "how much is one layer" was
+            // left to judgment call. A slow/less-reliable-on-large-diffs
+            // Reviewer model (deepseek-v4-pro) timed out reviewing the
+            // 17-file step; the 4-file step reviewed fine. Splitting by a
+            // FIXED architectural boundary, not free judgment, is what
+            // makes step size predictable.
+            "Split ALONG architectural-layer boundaries, one layer per step, even within what might look like a single \"backend\" or \"frontend\" concern: (a) database schema/migrations, (b) models/entities and their direct relations, (c) repository/service/business-logic layer, (d) API endpoint/controller/routes, (e) frontend UI. Never bundle more than one of these into the same step - a step that touches both a migration AND a controller is two steps, not one, even if that feels like \"the natural backend chunk\". Each step should be small enough that a reviewer can hold the whole diff in mind at once - as a rough guide, a single step should rarely touch more than 5-6 files; if a layer genuinely needs more than that, split it further by sub-concern (e.g. two separate models) rather than accept a large step.",
             "Reply with ONLY one line of JSON: {\"subtasks\": string[]}. A single-item array means no decomposition.",
           ].join("\n"),
         },

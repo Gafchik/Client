@@ -121,6 +121,7 @@ export interface DevelopVerificationEntry extends ShellCommandResult {
 
 export interface DevelopReviewRound {
   verdict: "approved" | "needs-changes";
+  noteFindings: string[];
   findings: string[];
   raw: string;
 }
@@ -187,6 +188,21 @@ export interface DevelopRunOptions {
    * snapshot exists yet, degrading silently to today's behavior.
    */
   computeImpactPreview?: (editedFiles: string[]) => string;
+  /**
+   * Semantic repeat detection (2026-07-18, docs/architecture/011 §4.16
+   * follow-up): the round-2 repeat-suppression added in §4.15
+   * (suppressRepeatedRoundTwoBlockers) only matches findings by normalized
+   * STRING equality - live evidence showed round 1 and round 2 restating
+   * the exact same already-disputed claim in different wording ("не имеет
+   * ограничения" vs "не имеет ограничения NOT NULL") slip past it entirely,
+   * since the normalized keys differ even though the underlying claim is
+   * identical. Given (candidateFinding, comparisonTexts), returns the
+   * highest cosine similarity between the candidate's embedding and any
+   * comparison text's embedding - undefined/best-effort: on any failure
+   * (no provider, network error) the caller falls back to the existing
+   * string-only check, never blocking the review on this.
+   */
+  computeFindingSimilarity?: (candidateFinding: string, comparisonTexts: string[]) => Promise<number>;
 }
 
 /**
@@ -255,6 +271,15 @@ export interface ParsedDevelopAction {
   formatError?: string;
 }
 
+function isMicroCopyTask(task: string): boolean {
+  const normalized = task.toLowerCase();
+  const hasReplaceIntent = /замени|переименуй|исправь|переведи/.test(normalized);
+  const hasTextCue = /слово|текст|строк|placeholder|label|заголов|подпись|provider|backend|frontend|chat|локал|перевод/.test(normalized);
+  const hasTightScope = /больше ничего|ничего не меняй|только пользовательский текст|только текст|только в .*блоке|только .*строк/.test(normalized);
+  const excludesCodeyTask = !/миграц|api|endpoint|schema|таблиц|column|поле|model|service|controller|bug|ошибк|exception|refactor|рефактор|логик/.test(normalized);
+  return hasReplaceIntent && hasTextCue && hasTightScope && excludesCodeyTask;
+}
+
 function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean): string {
   return [
     "You are an experienced senior fullstack developer implementing a code change in a project you are seeing for the first time. You work in an isolated git worktree - your edits cannot damage the user's checkout, and everything you change will be reviewed as a diff.",
@@ -270,7 +295,9 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
       : []),
     "ACTION: run_command(shell command) - runs in the project root (180s timeout). Use it to run the project's OWN checks: tests, linter, build, php -l, etc. Also use it to boot local infrastructure this task needs (e.g. docker compose up -d for a database) - check for a docker-compose file / README / .env.example as part of your normal exploration if the task needs a working DB.",
     ...(isMultiRoot
-      ? ["For run_command in this multi-part project, prefix with the part label: ACTION: run_command(api: php artisan test)"]
+      ? [
+          "For run_command in this multi-part project, prefix with the part label: ACTION: run_command(api: php artisan test) - the label goes INSIDE the parentheses, as the first part of the command argument. It is NOT a separate action type: never write \"ACTION: api: php artisan test\" (missing the run_command(...) wrapper entirely) - that is not a recognized action and will be silently ignored, wasting the whole turn.",
+        ]
       : []),
     "DB SAFETY: a command that changes persisted schema or data in a way git cannot undo (running a migration, db:seed, migrate:rollback, DROP/ALTER/TRUNCATE, etc.) will NOT execute when you call run_command - it instead PAUSES this run for a human to approve, and resumes afterward WITH THE REAL OUTPUT of what you ran, so you can act on it. This is expected, not an error - if the task genuinely needs a migration, issue it via run_command like any other command and wait; do not try to work around it (no manually editing files inside a database, no alternate commands to sneak past it). A command with --pretend or --dry-run (e.g. php artisan migrate --pretend) runs immediately WITHOUT pausing - nothing actually changes, so it is a good first move to preview a migration before running it for real. If you only need to VERIFY something against the database without permanently changing data (e.g. checking a query/insert behaves correctly), wrap it in an explicit transaction that you roll back yourself using the project's own DB tooling (e.g. for Laravel: php artisan tinker --execute=\"DB::beginTransaction(); ...; DB::rollBack();\", or raw SQL: START TRANSACTION; ...; ROLLBACK;) - that is a normal run_command too, not a paused one, since nothing is actually left changed.",
     "ACTION: write_file(relative/path/to/file.ext) - creates or fully overwrites a file. The content comes in a block IMMEDIATELY after the ACTION line:",
@@ -339,6 +366,7 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
 export const REVIEWER_SYSTEM_PROMPT = [
   "You are an independent senior code reviewer (a different model from the author). You are given: the original task, the full unified diff of the change, and the verification journal (commands the author ran, with exit codes).",
   "Form your OWN opinion of how this task should be solved in this codebase, then judge the diff against it. You were deliberately NOT given the author's notes or plan - review the result, not the intention.",
+  "Review ONLY the changed files visible in the diff and their direct, explicitly-provided structural impact. Do not turn this into a broader audit of neighboring modules, hypothetical files, or unrelated architecture cleanup.",
   "Look for, in order of importance: (1) the diff not actually doing what the task asks, or doing it partially; (2) correctness bugs and behavior broken for existing callers visible from the diff context - if a \"Structural impact\" block is given below, it lists REAL, deterministically-found dependents of the changed files (not a claim, actual graph data); check whether the diff's behavior change is compatible with each one, this is your strongest source for this finding, stronger than what you can infer from the diff alone; (3) changes with no plausible relation to the task (each must be justified or flagged); (4) a verification command the author actually RAN that FAILED (non-zero exit / visible error in its output) and the diff does not address it - flag it; (5) clear inconsistency with the surrounding code's own style visible in the diff context; (6) duplication and single-responsibility drift VISIBLE IN THE DIFF CONTEXT ITSELF - only flag this if you can point at a SPECIFIC existing function/method shown in the diff's surrounding context that the new code re-implements instead of reusing or extending, or a single new function/method that does two or more clearly unrelated things. Do not lecture about SOLID/DRY/design patterns in the abstract and do not suggest introducing a new abstraction (factory/strategy/interface/base class) unless the diff's own surrounding context already uses that abstraction elsewhere for the same kind of thing - proposing patterns the codebase does not already use is over-engineering, not a real finding; (7) a NEW PERSISTED FIELD WITH NO MIGRATION - if the diff adds a field/column to something that looks like it is meant to be saved to a database (added to a model's fillable/casts array, an ORM entity/@Column decorator, a serializer, a repository insert/update call) but the diff contains NO migration/schema file creating that column anywhere, flag it explicitly as broken - this code will fail at runtime against a real database, not just be incomplete (live evidence: this exact gap shipped a 'tags' field with zero migration).",
   // Tests-as-separate-step (2026-07-18, docs/architecture/011 §4.12, explicit
   // product-owner directive): this project's own primary test target (and
@@ -359,6 +387,15 @@ export const REVIEWER_SYSTEM_PROMPT = [
   // evidence already sitting right there in the journal it was given.
   "Before writing a finding that says something MIGHT be missing/incomplete/unchecked ('there could be other files', 'this might not cover X'), check the verification journal you were given - if a command already shown there (list_dir, grep, a test run) already answers that specific question, use that answer instead of speculating, even if the answer means there is nothing to flag.",
   "Do NOT enumerate the diff line by line confirming things ARE correct/present/used properly - if something is fine, say nothing about it, do not write a finding that concludes 'this is fine/correct/not required'. A real diff rarely has more than a handful of genuine findings - if you notice yourself listing more than ~6-8, stop and re-read: you have very likely drifted into restating non-problems instead of finding real ones.",
+  "If you are reviewing a SECOND round and are shown the previous blocker list plus the author's dispute/summary, only keep blocking on a blocker that is STILL present in the updated diff or on a TRULY NEW blocker introduced by the fix. Do not repeat an already-disputed blocker unless the updated diff or verification journal gives fresh concrete evidence that it remains broken.",
+  // Live evidence (2026-07-18): round 1 blocked on a column having
+  // unique() ("the task never asked for global uniqueness"); the author
+  // removed unique() exactly as asked; round 2 then blocked on the
+  // ABSENCE of unique() on that same column, reversing the round-1
+  // position without ever acknowledging the reversal - a genuine
+  // consistency failure, not a new finding.
+  "If the author's fix did EXACTLY what your own previous round asked for (e.g. you said a constraint should not be there, and it is now gone), do NOT flag the resulting state as a NEW problem in this round unless you explicitly say why your own earlier guidance was wrong - silently reversing your own prior position without acknowledging it is not a legitimate finding, it is inconsistency. If you genuinely believe the previous round's guidance was mistaken, say so explicitly instead of pretending this is a fresh, unrelated observation.",
+  "Classify every finding explicitly as either BLOCKER or NOTE. BLOCKER means merge should stop because the task is still wrong or broken. NOTE means a minor concern, cleanup idea, or follow-up that should NOT block approval.",
   // Live evidence (2026-07-18): a confidently-worded finding claimed a class
   // import was missing and would cause a fatal error - the class was
   // actually in the SAME namespace as the caller, so no import was needed;
@@ -369,7 +406,7 @@ export const REVIEWER_SYSTEM_PROMPT = [
   // a general expectation of what code like this usually needs. If you are
   // not certain the diff you can actually see supports the finding, do not
   // write it.",
-  "Reply STRICTLY in this format: either the single word \"APPROVED\", or \"NEEDS_CHANGES:\" followed by a numbered list of findings IN RUSSIAN (one finding per number, each self-contained).",
+  "Reply STRICTLY in this format: either the single word \"APPROVED\", or \"NEEDS_CHANGES:\" followed by a numbered list of findings IN RUSSIAN, one finding per number, each starting with either \"BLOCKER:\" or \"NOTE:\".",
 ].join("\n");
 
 // Narrow, generic (not tied to one stack/ORM) detector for DB schema/
@@ -596,6 +633,192 @@ function filterSelfContradictingFindings(findings: string[]): string[] {
   return findings.filter((finding) => !SELF_CONTRADICTING_FINDING_PATTERN.test(finding)).slice(0, MAX_REVIEWER_FINDINGS);
 }
 
+function normalizeFindingKey(finding: string): string {
+  return finding
+    .toLowerCase()
+    .replace(/^(blocker|note)\s*:\s*/i, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function splitFindingsBySeverity(findings: string[]): { blockers: string[]; notes: string[] } {
+  const blockers: string[] = [];
+  const notes: string[] = [];
+
+  for (const finding of findings) {
+    const trimmed = finding.trim();
+
+    if (/^note\s*:/i.test(trimmed)) {
+      notes.push(trimmed.replace(/^note\s*:\s*/i, "").trim());
+      continue;
+    }
+
+    if (/^blocker\s*:/i.test(trimmed)) {
+      blockers.push(trimmed.replace(/^blocker\s*:\s*/i, "").trim());
+      continue;
+    }
+
+    blockers.push(trimmed);
+  }
+
+  return { blockers, notes };
+}
+
+const NON_BLOCKING_REVIEWER_FALLBACK_PATTERN = /(?:\bслово\b|\bформулировк|\bформулировка\b|\bтекст\b|\bкопирайт|\bcopy\b|\bcopywriting\b|\bстилист|\bграммат|\bопечатк|\bперевод\b|\bлокализац|\bназван(?:ие|ия)\b|\bнаименован|\bлучше\b|\bстоит\b|\bпредпочтительн|\bболее корректн|\bнеестественн|\bчитабельн|\bфраз|\bтермин\b|\bлишн(?:ее|яя|ий)\b|\bбессмысленн|\bничего не меняй\b)/i;
+const STRONG_BLOCKER_SIGNAL_PATTERN = /(?:runtime|рантайм|фатальн|упад[её]т|слом|ошибк|exception|undefined|не сработает|не работает|неверн|неправильн|missing|отсутствует|не созда[её]т|не обновля[её]т|не сохраня[её]т|не ловит|validation|валидац|migration|миграц|schema|колонк|column|database|бд|sql|данн|caller|dependen|совместим|регрес|broken|bug|дефект|не тот файл|не ту|не там|не выполняет задачу|частично|only part|не покрывает задачу|wrong place|не в том месте)/i;
+
+function downgradeSoftBlockers(blockers: string[], notes: string[]): { blockers: string[]; notes: string[] } {
+  const keptBlockers: string[] = [];
+  const extraNotes: string[] = [];
+
+  for (const finding of blockers) {
+    const looksSoft = NON_BLOCKING_REVIEWER_FALLBACK_PATTERN.test(finding);
+    const looksStrong = STRONG_BLOCKER_SIGNAL_PATTERN.test(finding);
+
+    if (looksSoft && !looksStrong) {
+      extraNotes.push(finding);
+      continue;
+    }
+
+    keptBlockers.push(finding);
+  }
+
+  return { blockers: keptBlockers, notes: [...notes, ...extraNotes] };
+}
+
+function dedupeNotes(findings: string[]): string[] {
+  return findings.filter((finding, index, list) => {
+    const key = normalizeFindingKey(finding);
+    return key && list.findIndex((item) => normalizeFindingKey(item) === key) === index;
+  });
+}
+
+// Live evidence (2026-07-18): round 1 disputed a NOT-NULL claim on a column
+// ("Laravel's $table->string() is NOT NULL by default, this is correct as
+// written"); round 2 restated the SAME claim as "поле не имеет ограничения
+// NOT NULL" (round 1 had said "не имеет ограничения") - different enough
+// wording that normalizeFindingKey produced different keys, so the exact
+// match below missed it and the disputed claim got re-blocked anyway. The
+// semantic fallback exists specifically for this: an LLM naturally
+// paraphrases, so a string-only repeat check will always miss some real
+// repeats. Checked ONLY against disputedLines (not all of priorRound's
+// findings) - a finding that matches a FIXED (non-disputed) prior finding
+// reappearing is a legitimate "the fix didn't actually work" signal and
+// must stay a blocker; only a match against something the author explicitly
+// disputed is safe to demote.
+//
+// Threshold calibrated (2026-07-18) against real embeddings before ever
+// running this through the full pipeline: the qwen3-embedding-8b cosine
+// similarity of the ACTUAL observed same-claim pair above was only 0.83 -
+// an initial 0.87 guess would have missed the exact case this exists for.
+// A different-but-related-topic pair ("missing NOT NULL" vs "missing
+// index", same table) scored 0.62, and a totally unrelated pair scored
+// 0.45 - 0.75 sits with real margin above the false-positive risk (0.62)
+// and below the genuine match (0.83).
+const SEMANTIC_REPEAT_THRESHOLD = 0.75;
+
+async function suppressRepeatedRoundTwoBlockers(
+  blockers: string[],
+  priorRound?: DevelopReviewRound,
+  authorDisputeSummary?: string,
+  computeFindingSimilarity?: (candidateFinding: string, comparisonTexts: string[]) => Promise<number>,
+): Promise<{ blockers: string[]; notes: string[] }> {
+  if (!priorRound || blockers.length === 0) {
+    return { blockers, notes: [] };
+  }
+
+  const priorKeys = new Set(priorRound.findings.map(normalizeFindingKey));
+  const disputedLines = extractSummaryChunks(authorDisputeSummary ?? "");
+  const disputedKeys = new Set(disputedLines.map(normalizeFindingKey));
+  const keptBlockers: string[] = [];
+  const demotedNotes: string[] = [];
+
+  for (const finding of blockers) {
+    const key = normalizeFindingKey(finding);
+    const isExactRepeat = key && priorKeys.has(key);
+    const wasExactlyDisputed = key && disputedKeys.has(key);
+
+    if (isExactRepeat && wasExactlyDisputed) {
+      demotedNotes.push(`Повторно заявленная находка после оспаривания: ${finding}`);
+      continue;
+    }
+
+    if (computeFindingSimilarity && disputedLines.length > 0) {
+      try {
+        const similarity = await computeFindingSimilarity(finding, disputedLines);
+
+        if (similarity >= SEMANTIC_REPEAT_THRESHOLD) {
+          demotedNotes.push(`Повторно заявленная находка после оспаривания (перефразировано): ${finding}`);
+          continue;
+        }
+      } catch {
+        // Best-effort - a similarity-check failure just falls through to
+        // keeping the finding as a blocker, same as if it were never called.
+      }
+    }
+
+    keptBlockers.push(finding);
+  }
+
+  return { blockers: keptBlockers, notes: demotedNotes };
+}
+
+// Live evidence (2026-07-18, three separate failed attempts): trying to
+// recognize a "dispute" by keyword/tag kept losing to the Developer's own
+// formatting variance - a plain numbered-list item with no "Оспорено:" tag
+// at all; a "**Оспорено:**" SECTION HEADER with the actual reasoning in
+// bullet points below it, not on that line; phrasing like "было бы
+// неконсистентным и избыточным" that no fixed keyword list anticipates.
+// Matching natural-language disagreement by regex is a losing game - an
+// LLM has effectively unlimited ways to phrase the same disagreement.
+// Gave up on trying to classify WHICH parts of the summary are "disputes"
+// at all - instead this just splits the whole summary into paragraph/
+// bullet-sized chunks (a much more reliable STRUCTURAL signal than
+// dispute-specific vocabulary) and lets the semantic-similarity threshold
+// in suppressRepeatedRoundTwoBlockers do the actual relevance judgment.
+// Known residual risk, accepted deliberately: this can no longer
+// distinguish "the author disputed this" from "the author described
+// fixing this" - a genuine "the fix didn't actually work" re-block could
+// theoretically get suppressed if its embedding happens to be close to the
+// fix-description text. Live evidence today was 3-for-3 the other way
+// (real repeats missed, zero false suppressions observed) - revisit if
+// that ever flips.
+function extractSummaryChunks(summary: string): string[] {
+  const paragraphs = summary.split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter(Boolean);
+  const chunks: string[] = [];
+
+  for (const paragraph of paragraphs) {
+    const lines = paragraph.split("\n").map((line) => line.trim()).filter(Boolean);
+    const hasListMarkers = lines.some((line) => /^[-•*]\s|^\d+\.\s/.test(line));
+
+    if (!hasListMarkers) {
+      chunks.push(paragraph);
+      continue;
+    }
+
+    let current = "";
+
+    for (const line of lines) {
+      if (/^[-•*]\s|^\d+\.\s/.test(line)) {
+        if (current) {
+          chunks.push(current.trim());
+        }
+
+        current = line;
+      } else {
+        current += ` ${line}`;
+      }
+    }
+
+    if (current) {
+      chunks.push(current.trim());
+    }
+  }
+
+  return chunks.filter((chunk) => chunk.length >= 15);
+}
+
 async function callReviewer(input: {
   reviewerModel: string;
   providerBaseUrl: string;
@@ -606,6 +829,9 @@ async function callReviewer(input: {
   verificationLog: DevelopVerificationEntry[];
   /** Deterministic structural-dependents block (see DevelopRunOptions.computeImpactPreview) - grounds finding (2) in real graph data. */
   impactPreview?: string;
+  priorRound?: DevelopReviewRound;
+  authorDisputeSummary?: string;
+  computeFindingSimilarity?: (candidateFinding: string, comparisonTexts: string[]) => Promise<number>;
 }): Promise<{ round: DevelopReviewRound | null; promptTokens: number; completionTokens: number; unavailableReason?: string }> {
   const boundedDiff = input.diff.length > MAX_REVIEW_DIFF_CHARS
     ? `${input.diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n... (diff truncated at ${MAX_REVIEW_DIFF_CHARS} chars - flag this if the visible part alone cannot justify approval)`
@@ -620,6 +846,34 @@ async function callReviewer(input: {
         "",
         "Verification journal:",
         formatVerificationJournal(input.verificationLog),
+        // Live evidence (2026-07-18): with the OLD framing ("previous
+        // blockers from the prior round"), the model would re-emit the same
+        // blockers verbatim even when the diff below (the CURRENT, updated
+        // version) clearly already contained the fix - it looks like
+        // anchoring on its own prior conclusion instead of freshly
+        // re-checking. Reframed as another reviewer's pass over an OLDER
+        // snapshot, with an explicit instruction to verify against the diff
+        // you are ACTUALLY given below, not to trust the list on faith.
+        ...(input.priorRound
+          ? [
+              "",
+              "A reviewer pass over an EARLIER, now-superseded version of this diff (before the author's latest changes) raised these points - they may or may not still apply, you must check the CURRENT diff below yourself, do not assume any of them are still true just because they were raised before:",
+              ...(input.priorRound.findings.length ? input.priorRound.findings.map((finding, index) => `${index + 1}. ${finding}`) : ["(none)"]),
+            ]
+          : []),
+        ...(input.authorDisputeSummary
+          ? [
+              "",
+              "The author's response to that earlier pass (fixes made and/or points disputed as wrong):",
+              input.authorDisputeSummary,
+            ]
+          : []),
+        ...(input.priorRound
+          ? [
+              "",
+              "Before repeating ANY point from that earlier pass, find the specific text in the CURRENT diff below that still shows the problem. If you cannot point to it, the issue is resolved - do not report it again.",
+            ]
+          : []),
         ...(input.impactPreview
           ? ["", "Structural impact (deterministic, from the project's dependency graph - not the author's claim): who actually depends on the changed files:", input.impactPreview]
           : []),
@@ -651,15 +905,36 @@ async function callReviewer(input: {
     // not the model finding real issues - deterministic filtering doesn't
     // rely on the model not doing this again. A finding whose own text
     // already says the thing IS correct/not required is not a finding.
-    const findings = filterSelfContradictingFindings(rawFindings);
+    const filteredFindings = filterSelfContradictingFindings(rawFindings);
+    const { blockers, notes } = splitFindingsBySeverity(filteredFindings);
+    const severityAdjusted = downgradeSoftBlockers(blockers, notes);
+    const priorKeys = new Set((input.priorRound?.findings ?? []).map(normalizeFindingKey));
+    const dedupedBlockers = severityAdjusted.blockers.filter((finding, index, list) => {
+      const key = normalizeFindingKey(finding);
+      return key && list.findIndex((item) => normalizeFindingKey(item) === key) === index;
+    });
+    const dedupedNotes = severityAdjusted.notes.filter((finding, index, list) => {
+      const key = normalizeFindingKey(finding);
+      return key && list.findIndex((item) => normalizeFindingKey(item) === key) === index;
+    });
+    const repeatedAdjusted = await suppressRepeatedRoundTwoBlockers(
+      dedupedBlockers,
+      input.priorRound,
+      input.authorDisputeSummary,
+      input.computeFindingSimilarity,
+    );
+    const roundTwoRepeatedNotes = dedupeNotes((input.priorRound
+      ? dedupedNotes.filter((finding) => !priorKeys.has(normalizeFindingKey(finding)))
+      : dedupedNotes).concat(repeatedAdjusted.notes));
 
     return {
       round: {
-        verdict: approved ? "approved" : findings.length > 0 ? "needs-changes" : "approved",
+        verdict: approved ? "approved" : repeatedAdjusted.blockers.length > 0 ? "needs-changes" : "approved",
+        noteFindings: roundTwoRepeatedNotes,
         // A non-APPROVED reply with no parseable numbered findings still
         // carries its message - keep the raw text as the single finding
         // rather than silently approving a rejection.
-        findings: approved ? [] : (findings.length > 0 ? findings : rawFindings.length > 0 ? [] : [trimmed]),
+        findings: approved ? [] : (repeatedAdjusted.blockers.length > 0 ? repeatedAdjusted.blockers : filteredFindings.length > 0 ? [] : [trimmed]),
         raw: trimmed,
       },
       promptTokens: usage?.prompt_tokens ?? 0,
@@ -681,6 +956,7 @@ async function callReviewer(input: {
 export async function runDevelopmentTask(options: DevelopRunOptions): Promise<DevelopRunResult> {
   const maxTurns = options.maxTurns ?? DEFAULT_DEVELOP_CEILING_TURNS;
   const isMultiRoot = options.projectRoots.length > 1;
+  const microCopyTask = isMicroCopyTask(options.task);
   const projectLine = isMultiRoot
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
@@ -715,6 +991,16 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       content: [
         projectLine,
         `Task: ${options.task}`,
+        ...(microCopyTask
+          ? [
+              "",
+              "MICRO-COPY MODE: this is a narrow text-edit task, not a feature task.",
+              "- First prove the exact target line(s): grep the literal word(s), then read only the file that contains the user-facing text you plan to change.",
+              "- Change the MINIMUM possible surface: ideally one string literal / one line. If two nearby strings contain the same English word, do NOT change both unless the task text explicitly requires both.",
+              "- If the user said \"больше ничего не меняй\" or similar, treat any extra text change as suspicious by default and keep it out unless you can point to the exact words in the task that require it.",
+              "- For verification, prefer grep/sed on the exact lines you changed and explicitly confirm that neighboring text stayed the same.",
+            ]
+          : []),
         ...priorIterationBlock,
         ...sensitiveActionsBlock,
         ...(options.observerHint ? ["", options.observerHint] : []),
@@ -905,6 +1191,9 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       changedFiles: latestChangedFiles,
       verificationLog,
       ...(options.computeImpactPreview ? { impactPreview: options.computeImpactPreview([...editedFiles]) } : {}),
+      ...(reviews.length > 0 ? { priorRound: reviews[reviews.length - 1] } : {}),
+      ...(reviews.length > 0 && summary ? { authorDisputeSummary: summary } : {}),
+      ...(options.computeFindingSimilarity ? { computeFindingSimilarity: options.computeFindingSimilarity } : {}),
     });
     totalPromptTokens += reviewResult.promptTokens;
     totalCompletionTokens += reviewResult.completionTokens;
@@ -933,6 +1222,13 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       content: [
         "An independent reviewer examined your diff and returned these findings:",
         ...reviewResult.round.findings.map((finding, index) => `${index + 1}. ${finding}`),
+        ...(reviewResult.round.noteFindings.length
+          ? [
+              "",
+              "Non-blocking notes from the reviewer (do not expand scope just to satisfy them; fix only if they are genuinely cheap and directly relevant):",
+              ...reviewResult.round.noteFindings.map((finding, index) => `${index + 1}. ${finding}`),
+            ]
+          : []),
         "",
         "Address each finding: fix the ones that are real (then re-verify with run_command where relevant) and call task_complete again. If a finding is factually wrong, do NOT change code for it - explain why in the new summary under a line starting with \"Оспорено:\". This is the final review round.",
         // Live evidence (debugger-flow test, 2026-07-18): a 1-line bug fix got

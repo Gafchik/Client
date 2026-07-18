@@ -99,7 +99,7 @@ async function resolveMergeBase(rootPath: string): Promise<{ ok: boolean; stdout
   return runGit(rootPath, ["merge-base", "HEAD", upstreamRef]);
 }
 
-async function runGit(
+export async function runGit(
   cwd: string,
   args: string[],
   timeoutMs: number = GIT_COMMAND_TIMEOUT_MS,
@@ -513,6 +513,65 @@ export async function collectWorktreeChanges(worktree: TaskWorktree): Promise<{ 
       ? namesResult.stdout.split("\n").map((line) => normalizePath(line.trim())).filter(Boolean)
       : [],
   };
+}
+
+export interface ApplyWorktreeDiffResult {
+  applied: boolean;
+  changedFiles: string[];
+  error?: string;
+}
+
+/**
+ * Applies a task worktree's diff directly onto the user's REAL checkout
+ * (worktree.rootPath) as UNCOMMITTED changes - explicit, opt-in "bring
+ * this into my current branch" action (2026-07-18, explicit product-owner
+ * request: after 5 years of commercial experience they had never once
+ * needed a git worktree and don't want to learn one now - they want to
+ * give a task, hear "done", say "bring it into my branch", and review the
+ * result as an ordinary uncommitted diff in their own IDE, same as any
+ * other local edit). NEVER commits, NEVER pushes, NEVER touches the user's
+ * branch pointer or index - purely `git apply` of the exact diff already
+ * computed from the worktree. Safe by construction regardless of whatever
+ * ELSE is uncommitted in the target checkout: `git apply --check` (a dry
+ * run) is tried first, and git's own conflict detection refuses cleanly -
+ * changing nothing - if the base has diverged too far to apply, rather
+ * than partially applying or corrupting unrelated local changes.
+ */
+export async function applyWorktreeDiffToRoot(worktree: TaskWorktree): Promise<ApplyWorktreeDiffResult> {
+  const { diff, changedFiles } = await collectWorktreeChanges(worktree);
+
+  if (!diff.trim()) {
+    return { applied: false, changedFiles: [], error: "Пустой diff - нечего заносить в ветку." };
+  }
+
+  const patchPath = path.join(os.tmpdir(), `client-apply-${Date.now()}-${Math.random().toString(36).slice(2)}.patch`);
+  await fs.writeFile(patchPath, diff, "utf8");
+
+  try {
+    const check = await runGit(worktree.rootPath, ["apply", "--check", patchPath], WORKTREE_COMMAND_TIMEOUT_MS);
+
+    if (!check.ok) {
+      return {
+        applied: false,
+        changedFiles: [],
+        error: check.stderr.trim() || "Diff не применяется без конфликтов к текущему состоянию ветки - вероятно, файлы успели измениться с момента старта задачи.",
+      };
+    }
+
+    const apply = await runGit(worktree.rootPath, ["apply", patchPath], WORKTREE_COMMAND_TIMEOUT_MS);
+
+    if (!apply.ok) {
+      return {
+        applied: false,
+        changedFiles: [],
+        error: apply.stderr.trim() || "git apply завершился с ошибкой после успешной проверки.",
+      };
+    }
+
+    return { applied: true, changedFiles };
+  } finally {
+    await fs.unlink(patchPath).catch(() => {});
+  }
 }
 
 export async function removeTaskWorktree(worktree: TaskWorktree, options?: { deleteBranch?: boolean }): Promise<void> {

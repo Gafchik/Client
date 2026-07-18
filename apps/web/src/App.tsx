@@ -1052,7 +1052,7 @@ interface DevelopRunResultView {
   diff: string;
   changedFiles: string[];
   verificationLog: Array<{ command: string; exitCode: number; durationMs: number; output: string; turn: number }>;
-  reviews: Array<{ verdict: string; findings: string[]; raw: string }>;
+  reviews: Array<{ verdict: string; findings: string[]; noteFindings?: string[]; raw: string }>;
   reviewVerdict: "approved" | "needs-changes" | "not-run";
   stopped: string;
   error?: string;
@@ -1157,6 +1157,17 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
                     <p className="message-label">Замечания ревью (последний раунд)</p>
                     <ul>
                       {lastReview.findings.map((finding, index) => (
+                        <li key={index}>{finding}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {lastReview && safeList(lastReview.noteFindings).length > 0 ? (
+                  <div className="develop-verification">
+                    <p className="message-label">Неблокирующие заметки</p>
+                    <ul>
+                      {safeList(lastReview.noteFindings).map((finding, index) => (
                         <li key={index}>{finding}</li>
                       ))}
                     </ul>

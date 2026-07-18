@@ -1,10 +1,10 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { runDevelopmentTask, runShellCommand, type DevelopRunResult, type DevelopSensitiveAction, type WorkspaceRoot } from "@client/agentic-research";
-import { classifyFactConflict, extractCodePatternFacts } from "@client/ai";
+import { classifyFactConflict, embedTexts, extractCodePatternFacts } from "@client/ai";
 import { getFileDependents } from "@client/graph";
 import { promoteFactsFromDevelopment, queryFactsAcrossPaths, queryGlossaryAcrossPaths } from "@client/knowledge";
-import { collectWorktreeChanges, createTaskWorktree, removeTaskWorktree, type TaskWorktree } from "@client/repository-git";
+import { applyWorktreeDiffToRoot, collectWorktreeChanges, createTaskWorktree, removeTaskWorktree, type TaskWorktree } from "@client/repository-git";
 import { normalizePath, stableId, type GraphState, type ProjectPathRecord } from "@client/shared";
 import { loadGraphSnapshot } from "./graph-store.js";
 import { buildGlossaryHint, buildGraphNavigationTool, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool, buildSemanticSeedLookup } from "./pipeline-runner.js";
@@ -383,6 +383,7 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     semanticSeedFiles: semanticSeedFilesTool,
     ...(findReferencesTool ? { findReferences: findReferencesTool } : {}),
     ...(impactPreviewTool ? { computeImpactPreview: impactPreviewTool } : {}),
+    computeFindingSimilarity: buildFindingSimilarityTool(input.providerBaseUrl, input.providerApiKey),
     ...(input.continueFrom
       ? {
           priorIteration: {
@@ -479,6 +480,64 @@ export async function resolvePendingApproval(
   }
 }
 
+export interface MergeToBranchOutcome {
+  label: string;
+  applied: boolean;
+  changedFiles: string[];
+  error?: string;
+}
+
+/**
+ * "Занеси в текущую ветку" (2026-07-18, explicit product-owner request):
+ * applies each worktree's diff directly onto the user's own real checkout
+ * as UNCOMMITTED changes, via repository-git's applyWorktreeDiffToRoot -
+ * never commits, never pushes. The worktree itself is left in place
+ * afterward (not auto-cleaned) - a merge attempt that partially fails
+ * across a multi-root project should not destroy the source of truth for
+ * the parts that DID apply, and the user may want to retry a failed root
+ * after resolving whatever caused the conflict.
+ */
+export async function mergeDevelopRunToRealCheckout(worktrees: DevelopWorktreeInfo[]): Promise<MergeToBranchOutcome[]> {
+  const outcomes: MergeToBranchOutcome[] = [];
+
+  for (const worktree of worktrees) {
+    const taskWorktree: TaskWorktree = {
+      rootPath: worktree.rootPath,
+      worktreePath: worktree.worktreePath,
+      branch: worktree.branch,
+      startCommit: worktree.startCommit,
+    };
+    const result = await applyWorktreeDiffToRoot(taskWorktree);
+    outcomes.push({
+      label: worktree.label,
+      applied: result.applied,
+      changedFiles: result.changedFiles,
+      ...(result.error ? { error: result.error } : {}),
+    });
+  }
+
+  return outcomes;
+}
+
+/**
+ * "Почисти ворктри" (2026-07-18): explicit, user-requested cleanup of a
+ * delivered run's worktrees/branches - the normal path only auto-cleans an
+ * EMPTY, non-paused diff (see executeDevelopRun below); a delivered diff is
+ * deliberately kept around for merge-to-branch/manual review until the user
+ * says they're done with it.
+ */
+export async function cleanupDevelopRunWorktrees(record: DevelopRunStatusRecord): Promise<void> {
+  await Promise.all(
+    record.worktrees.map((worktree) =>
+      removeTaskWorktree(
+        { rootPath: worktree.rootPath, worktreePath: worktree.worktreePath, branch: worktree.branch, startCommit: worktree.startCommit },
+        { deleteBranch: true },
+      ).catch(() => {}),
+    ),
+  );
+  record.worktrees = [];
+}
+
 /**
  * Impact analysis (2026-07-18, docs/architecture/011 §4.13): deterministic
  * "who depends on the files I just edited" lookup against the SAME
@@ -523,6 +582,63 @@ function buildImpactPreviewTool(graph: GraphState, primaryLabel: string, isMulti
     return lines.length > 0
       ? lines.join("\n")
       : "(no statically-resolved dependents found for the edited files - either genuinely none, or they are outside the graph's coverage)";
+  };
+}
+
+// Same embedding model already used for semantic code search
+// (pipeline-runner.ts's SEMANTIC_SEARCH_EMBEDDING_MODEL) - one already-proven
+// model instead of introducing a second embedding provider choice.
+const FINDING_SIMILARITY_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b";
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  const length = Math.min(a.length, b.length);
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < length; i += 1) {
+    const valueA = a[i] ?? 0;
+    const valueB = b[i] ?? 0;
+    dot += valueA * valueB;
+    normA += valueA * valueA;
+    normB += valueB * valueB;
+  }
+
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+/**
+ * Semantic repeat detection (2026-07-18, docs/architecture/011 §4.16
+ * follow-up) - see DevelopRunOptions.computeFindingSimilarity's docstring
+ * for why the string-only repeat check in develop-loop.ts isn't enough.
+ * Embeds the candidate finding together with the comparison texts in ONE
+ * batch call (cheap - short strings, one round-trip) and returns the
+ * highest cosine similarity against any of them. Best-effort by design:
+ * the caller already degrades to string-only matching on any error.
+ */
+function buildFindingSimilarityTool(providerBaseUrl: string, providerApiKey: string): (candidateFinding: string, comparisonTexts: string[]) => Promise<number> {
+  return async (candidateFinding: string, comparisonTexts: string[]): Promise<number> => {
+    if (comparisonTexts.length === 0) {
+      return 0;
+    }
+
+    const embeddings = await embedTexts({
+      providerBaseUrl,
+      providerApiKey,
+      embeddingModel: FINDING_SIMILARITY_EMBEDDING_MODEL,
+      texts: [candidateFinding, ...comparisonTexts],
+    });
+    const [candidateEmbedding, ...comparisonEmbeddings] = embeddings;
+
+    if (!candidateEmbedding) {
+      return 0;
+    }
+
+    return Math.max(0, ...comparisonEmbeddings.map((embedding) => cosineSimilarity(candidateEmbedding, embedding)));
   };
 }
 

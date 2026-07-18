@@ -16,9 +16,9 @@ import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-sta
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
-import { classifyApprovalResponse, classifyChatIntent, classifyProjectScopeDirective, classifyTestsOffer, planDevelopSubtasks } from "@client/ai";
+import { classifyApprovalResponse, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
-import { findLatestDevelopRunForConversation, getDevelopRunStatus, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
+import { cleanupDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, mergeDevelopRunToRealCheckout, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -967,6 +967,42 @@ export function createApp() {
               },
             });
             return reply.code(202).send({ kind: "develop", ...status });
+          }
+
+          // "Занеси в текущую ветку" / "почисти ворктри" (2026-07-18,
+          // explicit product-owner request): unlike the tests-offer
+          // question above, these are not a one-shot window tied to the
+          // message right after completion - the user may ask at any
+          // point while a delivered run's worktrees still exist, so this
+          // checks on every message in that state rather than being
+          // consumed once. The cheap keyword pre-filter inside
+          // classifyPostCompletionCommand keeps this from costing an LLM
+          // call on the common case (an unrelated new question/task).
+          if (priorDevelop?.status === "completed" && priorDevelop.worktrees.length > 0) {
+            const postCompletionAction = await classifyPostCompletionCommand({
+              message: task,
+              providerBaseUrl,
+              providerModel: selectedTeam.criticModel,
+              providerApiKey,
+            });
+
+            if (postCompletionAction === "merge-to-branch") {
+              const outcomes = await mergeDevelopRunToRealCheckout(priorDevelop.worktrees);
+              const allApplied = outcomes.every((outcome) => outcome.applied);
+              const lines = outcomes.map((outcome) =>
+                outcome.applied
+                  ? `✓ ${outcome.label}: применено (${outcome.changedFiles.length} файл(ов)) — незакоммичено, смотри diff в IDE.`
+                  : `✗ ${outcome.label}: не применилось — ${outcome.error ?? "неизвестная ошибка"}`,
+              );
+              const message = [allApplied ? "Занёс в текущую ветку:" : "Частично не удалось занести:", ...lines].join("\n");
+              return reply.code(200).send({ kind: "question", answer: { summary: message, explanation: message } });
+            }
+
+            if (postCompletionAction === "cleanup-worktree") {
+              await cleanupDevelopRunWorktrees(priorDevelop);
+              const message = "Ворктри и служебные ветки этой задачи убраны.";
+              return reply.code(200).send({ kind: "question", answer: { summary: message, explanation: message } });
+            }
           }
 
           // Tests-as-separate-step (2026-07-18, docs/architecture/011
