@@ -203,6 +203,15 @@ export interface DevelopRunOptions {
    * string-only check, never blocking the review on this.
    */
   computeFindingSimilarity?: (candidateFinding: string, comparisonTexts: string[]) => Promise<number>;
+  /**
+   * Read-only DB inspection (2026-07-18, docs/architecture/011 §4.19,
+   * explicit product-owner directive from their own real workflow - see
+   * apps/api/src/db-query-tool.ts for the connection-resolution/safety
+   * design). Undefined when no DB config could be resolved for this
+   * project - the db_query ACTION is simply omitted from the protocol,
+   * same "honest degradation" convention as findReferences/computeImpactPreview.
+   */
+  dbQuery?: (query: string) => Promise<string>;
 }
 
 /**
@@ -253,6 +262,7 @@ type DevelopTool =
   | "read_file"
   | "semantic_search"
   | "find_references"
+  | "db_query"
   | "run_command"
   | "write_file"
   | "edit_file"
@@ -280,7 +290,7 @@ function isMicroCopyTask(task: string): boolean {
   return hasReplaceIntent && hasTextCue && hasTightScope && excludesCodeyTask;
 }
 
-function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean): string {
+function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean): string {
   return [
     "You are an experienced senior fullstack developer implementing a code change in a project you are seeing for the first time. You work in an isolated git worktree - your edits cannot damage the user's checkout, and everything you change will be reviewed as a diff.",
     "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
@@ -292,6 +302,18 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
       : []),
     ...(hasFindReferences
       ? ["ACTION: find_references(ClassOrFunctionOrFileName) - REAL structural callers/dependents from the persisted code graph; use before changing a shared function's signature/behavior to see who depends on it."]
+      : []),
+    ...(hasDbQuery
+      ? [
+          // Live evidence motivating this tool (2026-07-18, explicit
+          // product-owner directive from their own real workflow): seeing
+          // an actual row is often faster than reading a model - and for a
+          // non-trivial query, get it right against real data FIRST, then
+          // translate to this project's ORM/query-builder convention
+          // (checking for an existing scope/relation to reuse along the
+          // way, same as instruction 1 below).
+          "ACTION: db_query(a single SELECT/WITH/EXPLAIN/SHOW statement) - runs read-only against the project's REAL database (resolved from its own .env/docker-compose, not the worktree). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements, this is for INSPECTION not mutation. Use it to: see real example rows instead of guessing from a model's field list; when debugging \"X did not save correctly\", check what actually got persisted before guessing where the bug is; when building a non-trivial query (filters/joins/aggregation), get the raw SQL right against real data FIRST, then translate it into this project's ORM/query-builder style (checking for an already-existing scope/relation to reuse, per instruction 1). All actual schema/data changes still go through run_command's normal DB-safety gate (migrations, seeders) - db_query itself can never write anything.",
+        ]
       : []),
     "ACTION: run_command(shell command) - runs in the project root (180s timeout). Use it to run the project's OWN checks: tests, linter, build, php -l, etc. Also use it to boot local infrastructure this task needs (e.g. docker compose up -d for a database) - check for a docker-compose file / README / .env.example as part of your normal exploration if the task needs a working DB.",
     ...(isMultiRoot
@@ -432,7 +454,7 @@ export const SCHEMA_REVIEW_ADDENDUM = [
   "Only raise these if genuinely visible in the diff - do not demand a full schema redesign for an unrelated small change.",
 ].join("\n");
 
-const DEVELOP_ACTION_PATTERN = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|find_references|run_command|write_file|edit_file|ask_user|task_complete)\s*\(/g;
+const DEVELOP_ACTION_PATTERN = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|find_references|db_query|run_command|write_file|edit_file|ask_user|task_complete)\s*\(/g;
 
 // Same balanced-paren scanning as loop.ts's parseActions (kept separate on
 // purpose: the research parser is proven live and this one adds block
@@ -985,7 +1007,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
     ]
     : [];
   const messages: ChatMessage[] = [
-    { role: "system", content: buildDevelopSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences)) },
+    { role: "system", content: buildDevelopSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery)) },
     {
       role: "user",
       content: [
@@ -1360,6 +1382,10 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
         observation = options.findReferences
           ? await options.findReferences(action.arg)
           : "(find_references is not available for this project)";
+      } else if (action.tool === "db_query") {
+        observation = options.dbQuery
+          ? await options.dbQuery(action.arg)
+          : "(db_query is not available - no resolvable database connection for this project)";
       } else if (action.tool === "run_command") {
         // DB safety (2026-07-18): a command that mutates persisted
         // schema/data (migrations, seeds, destructive DDL) halts the WHOLE

@@ -56,6 +56,7 @@ import {
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { grepContent, runAgenticResearch, type WorkspaceRoot } from "@client/agentic-research";
+import { buildDbQueryTool } from "./db-query-tool.js";
 import { saveGraphSnapshot } from "./graph-store.js";
 import { getRedisClient } from "./redis-client.js";
 import { getSelectedTeam } from "./team-store.js";
@@ -677,6 +678,11 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     // honest-hedging behavior without it - needs real ranking (e.g. match
     // density per cluster) before this is trustworthy enough to re-enable.
     // const graphHintTerms = await findGraphSymbolHints(graphProjectId, computeTaskSearchTokens(task));
+    // Read-only DB inspection (2026-07-18, docs/architecture/011 §4.19):
+    // this is what the debugger's diagnose step (§4.9, routes through this
+    // SAME Q&A pipeline) needs for "check what actually got persisted"
+    // questions - see db-query-tool.ts for the connection-resolution design.
+    const dbQueryTool = await buildDbQueryTool(effectiveProjectRoots.map((root) => root.absolutePath)).catch(() => null);
     const agenticResult = await runAgenticResearch({
       runId,
       // Bug fix (2026-07-15): task used to have observerHint concatenated
@@ -699,6 +705,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       // Architecture review finding (2026-07-16): the graph existed but was
       // never queryable by the Researcher itself - see buildGraphNavigationTool.
       findReferences: buildGraphNavigationTool(graph),
+      ...(dbQueryTool ? { dbQuery: dbQueryTool } : {}),
       // Speed pass (2026-07-16, по одобренному плану): контент топ-файлов
       // семантического индекса кладётся в контекст ДО первого хода (см.
       // AgenticRunOptions.semanticSeedFiles) - главный рычаг задержки на

@@ -162,6 +162,19 @@ export interface AgenticRunOptions {
    */
   findReferences?: (symbolOrFileName: string) => Promise<string>;
   /**
+   * Read-only DB inspection (2026-07-18, docs/architecture/011 §4.19,
+   * explicit product-owner directive from their own real workflow: "when
+   * a bug is reported, I reproduce it, then check what actually got
+   * written to the DB, and work backward from there" - this loop is what
+   * the debugger's diagnose step (§4.9) routes through, so this is exactly
+   * the tool that scenario needs). Injected the same way as
+   * semanticSearch/findReferences (this package stays free of the
+   * connection-resolution/docker dependency - see
+   * apps/api/src/db-query-tool.ts); undefined when no DB config could be
+   * resolved for this project, same "honest degradation" convention.
+   */
+  dbQuery?: (query: string) => Promise<string>;
+  /**
    * Pre-formatted block of previously CONFIRMED project facts (fact store,
    * packages/knowledge) relevant to this task - "verify, then rely" seeds.
    * Team-mode never saw the fact store before 2026-07-16 (only the legacy
@@ -191,7 +204,7 @@ export interface AgenticRunResult {
 }
 
 interface ParsedAction {
-  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "find_references" | "final_answer";
+  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "find_references" | "db_query" | "final_answer";
   arg: string;
 }
 
@@ -204,7 +217,7 @@ interface ParsedAction {
 // hypothetical) - the downstream answer-synthesis prompt (packages/ai) also
 // demands Russian, but this is a deliberate second safety net, not
 // redundant.
-function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean): string {
+function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean): string {
   return [
     "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
     "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
@@ -221,6 +234,12 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
       ? [
         "ACTION: find_references(ClassOrFunctionOrFileName)",
         "find_references looks up REAL structural callers/dependents of a class, function, or file from the persisted code graph - use it instead of grep_content when you need \"who actually calls/uses this\", because grep only matches the literal name as text and misses calls through a renamed variable, an interface, or other indirection. It may come back empty for a name the graph does not have a resolved node for (e.g. purely dynamic dispatch) - that is an honest limit of static analysis, not a sign nothing calls it; fall back to grep_content in that case.",
+      ]
+      : []),
+    ...(hasDbQuery
+      ? [
+        "ACTION: db_query(a single SELECT/WITH/EXPLAIN/SHOW statement)",
+        "db_query runs read-only against the project's REAL database (resolved from its own .env/docker-compose). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements. Use it when a question is really about DATA, not code: what a config/setting is actually set to for a real record, whether a described bug's symptom is visible in the actual stored row (e.g. \"field X did not save\" - check what actually got persisted, not just what the code SHOULD do), what real example values/relationships a table holds instead of guessing from a model's field list alone.",
       ]
       : []),
     "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic)",
@@ -386,7 +405,7 @@ export async function buildSeedGrepObservation(projectRoots: WorkspaceRoot[], ta
 // parens, e.g. grep regex groups), stopping once MAX_ACTIONS_PER_TURN is
 // reached or no further match/close-paren is found.
 function parseActions(content: string): ParsedAction[] {
-  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|find_references|final_answer)\s*\(/g;
+  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|find_references|db_query|final_answer)\s*\(/g;
   const actions: ParsedAction[] = [];
   let searchFrom = 0;
 
@@ -529,7 +548,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
   const messages: ChatMessage[] = [
-    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences)) },
+    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery)) },
     { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnTopicHint}${priorTurnHint}${observerHintBlock}${questionShapeBlock}` },
   ];
 
@@ -840,6 +859,10 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
         observation = options.findReferences
           ? await options.findReferences(action.arg)
           : "(find_references is not available for this project)";
+      } else if (action.tool === "db_query") {
+        observation = options.dbQuery
+          ? await options.dbQuery(action.arg)
+          : "(db_query is not available - no resolvable database connection for this project)";
       } else {
         const parentDir = dirnameOf(action.arg);
 

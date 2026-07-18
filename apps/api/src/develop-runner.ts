@@ -6,6 +6,7 @@ import { getFileDependents } from "@client/graph";
 import { promoteFactsFromDevelopment, queryFactsAcrossPaths, queryGlossaryAcrossPaths } from "@client/knowledge";
 import { applyWorktreeDiffToRoot, collectWorktreeChanges, createTaskWorktree, removeTaskWorktree, type TaskWorktree } from "@client/repository-git";
 import { normalizePath, stableId, type GraphState, type ProjectPathRecord } from "@client/shared";
+import { buildDbQueryTool } from "./db-query-tool.js";
 import { loadGraphSnapshot } from "./graph-store.js";
 import { buildGlossaryHint, buildGraphNavigationTool, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool, buildSemanticSeedLookup } from "./pipeline-runner.js";
 import { runSql } from "./postgres-client.js";
@@ -353,6 +354,14 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
   } catch {
     // no persisted graph, find_references/impact preview simply unavailable this run
   }
+
+  // Read-only DB inspection (2026-07-18, docs/architecture/011 §4.19):
+  // resolved against the ORIGINAL project roots, deliberately NOT the
+  // worktree - a docker-compose service is only reachable/discoverable
+  // from the directory the user's own containers are actually running
+  // under (see db-query-tool.ts's findRunningContainer docstring).
+  const dbQueryTool = await buildDbQueryTool(originalRoots.map((root) => root.absolutePath)).catch(() => null);
+
   const collectDiff = async (): Promise<{ diff: string; changedFiles: string[] }> => {
     const parts = await Promise.all(
       worktrees.map(async (worktree, index) => ({
@@ -383,6 +392,7 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     semanticSeedFiles: semanticSeedFilesTool,
     ...(findReferencesTool ? { findReferences: findReferencesTool } : {}),
     ...(impactPreviewTool ? { computeImpactPreview: impactPreviewTool } : {}),
+    ...(dbQueryTool ? { dbQuery: dbQueryTool } : {}),
     computeFindingSimilarity: buildFindingSimilarityTool(input.providerBaseUrl, input.providerApiKey),
     ...(input.continueFrom
       ? {
