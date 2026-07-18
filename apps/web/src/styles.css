@@ -256,6 +256,20 @@ button {
   margin: 0;
 }
 
+.chat-history-date {
+  margin: 6px 0 0;
+  padding: 0 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+}
+
+.chat-history-date:first-child {
+  margin-top: 0;
+}
+
 .history-select-all {
   display: flex;
   align-items: center;
@@ -435,26 +449,62 @@ button {
   cursor: default;
 }
 
-.environment-status-pill {
-  margin-left: auto;
+.observer-project-card {
   display: grid;
-  gap: 1px;
-  padding: 7px 12px;
-  border-radius: 999px;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
   background: var(--bg-elevated-2);
+}
+
+.observer-project-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.observer-project-head strong {
+  display: block;
+  font-size: 0.92rem;
+}
+
+.observer-project-head span {
   color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.observer-path-list {
+  display: grid;
+  gap: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.observer-path-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   font-size: 0.78rem;
 }
 
-.environment-status-pill-button {
-  border: 1px solid var(--border);
-  cursor: pointer;
-  text-align: left;
-  font-family: inherit;
+.observer-path-name {
+  color: var(--text);
 }
 
-.environment-status-pill-button:hover {
-  background: var(--bg-elevated-1, var(--bg-elevated-2));
+.observer-path-name em {
+  font-style: normal;
+  color: var(--text-faint);
+}
+
+.observer-path-status {
+  color: var(--text-faint);
+  text-align: right;
+}
+
+.observer-path-status-running {
+  color: var(--success);
 }
 
 .observer-global-bar {
@@ -610,6 +660,56 @@ button {
   color: var(--accent-2);
 }
 
+.code-block {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.code-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  background: var(--bg-elevated-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  text-transform: lowercase;
+}
+
+.code-block-copy {
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.code-block-copy:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.code-block-body {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.code-block-body code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text);
+  background: transparent;
+  padding: 0;
+  white-space: pre;
+}
+
 /* Компактный индикатор "система думает" — вместо большой плашки с
    развёрнутым списком стадий pipeline. */
 .thinking-indicator {
@@ -672,6 +772,52 @@ button {
   border-radius: var(--radius-md);
   background: var(--bg-elevated-2);
   border: 1px solid var(--border);
+}
+
+.usage-breakdown {
+  margin-top: 10px;
+  display: grid;
+  gap: 4px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.usage-breakdown-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.usage-breakdown-role {
+  color: var(--text);
+}
+
+.usage-breakdown-role em {
+  font-style: normal;
+  color: var(--text-faint);
+}
+
+.usage-breakdown-value {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.usage-breakdown-total {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.usage-breakdown-total .usage-breakdown-role,
+.usage-breakdown-total .usage-breakdown-value {
+  color: var(--text);
 }
 
 .execution-preview-metrics span {
@@ -802,6 +948,18 @@ button {
   height: 14px;
   accent-color: var(--accent);
   cursor: pointer;
+  /* Скрыт по умолчанию - раньше висел на каждой строке всегда, конкурируя
+     за внимание с названием чата, хотя массовое выделение нужно редко.
+     Появляется по hover строки или пока есть хоть одна выбранная (иначе
+     после первого клика чекбоксы остальных строк пропадали бы). */
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.history-item-row:hover .history-item-checkbox,
+.history-item-checkbox:checked,
+.chat-history-list:has(.history-item-checkbox:checked) .history-item-checkbox {
+  opacity: 1;
 }
 
 .history-item {
@@ -1105,10 +1263,6 @@ button {
   color: #58a6ff;
 }
 
-.develop-summary {
-  white-space: pre-wrap;
-}
-
 .develop-findings ul,
 .develop-verification ul {
   margin: 4px 0 8px;
@@ -1149,4 +1303,36 @@ button {
   background: color-mix(in srgb, currentColor 8%, transparent);
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.develop-worktree-panel {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 6px;
+}
+
+.develop-worktree-entry {
+  display: grid;
+  gap: 4px;
+}
+
+.develop-worktree-meta {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.develop-merge-outcome {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.82rem;
+}
+
+.develop-merge-outcome-ok {
+  color: var(--success);
+}
+
+.develop-merge-outcome-fail {
+  color: var(--danger);
 }

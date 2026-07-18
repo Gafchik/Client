@@ -583,6 +583,15 @@ export async function removeTaskWorktree(worktree: TaskWorktree, options?: { del
   if (options?.deleteBranch) {
     await runGit(worktree.rootPath, ["branch", "-D", worktree.branch]);
   }
+
+  // `worktree remove` only deletes worktreePath itself, never the wrapper
+  // directory createTaskWorktree made for it (path.join(tmpdir, ..., taskId,
+  // label)) - live evidence this session: manually found and removed a dozen+
+  // of these empty husks in client-task-worktrees, three separate times. Only
+  // removes it if genuinely empty (fs.rmdir, not rm -rf) - if anything
+  // unexpected is still in there, leave it for a human to look at rather than
+  // silently deleting it.
+  await fs.rmdir(path.dirname(worktree.worktreePath)).catch(() => {});
 }
 
 export function shouldPreferSelectiveWorkspace(repository: RepositorySnapshot, workspace: WorkspaceSnapshot): boolean {

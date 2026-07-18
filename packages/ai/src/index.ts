@@ -613,8 +613,15 @@ export type PostCompletionCommandAction = "merge-to-branch" | "cleanup-worktree"
 // Cheap keyword pre-filter (same "don't pay for an LLM call on the common
 // case" convention as taskMentionsScopeTrigger above) - most messages after
 // a completed develop run are unrelated follow-ups (a new question, a new
-// task), not one of these two commands.
-const POST_COMPLETION_COMMAND_TRIGGER_PATTERN = /занес|перенес|принес|в\s+ветк|в\s+бранч|в\s+текущ|merge|apply.*branch|почист|убери\s*ворк|удали\s*ворк|clean.*worktree|worktree/i;
+// task), not one of these two commands. Deliberately broad/over-inclusive
+// (2026-07-18, explicit product-owner request: "фраза должна пониматься в
+// любой формулировке" - the user tried "занеси" once and then "пренеси в
+// чекаут", a typo'd variant that hit none of the original stems) - this is
+// ONLY a cost-saving pre-filter before the real LLM classification below, so
+// a false positive here just costs one cheap extra call while a false
+// negative silently drops the user's actual request. Err toward matching.
+const MERGE_INTENT_KEYWORD_PATTERN = /занес|ренес|принес|ветк|бранч|текущ|чекаут|checkout|мердж|merge|apply.*branch|worktree|ворктри/i;
+const POST_COMPLETION_COMMAND_TRIGGER_PATTERN = new RegExp(`${MERGE_INTENT_KEYWORD_PATTERN.source}|почист|убери\\s*ворк|удали\\s*ворк|clean.*worktree`, "i");
 
 /**
  * Recognizes two explicit, opt-in follow-up commands after a delivered
@@ -676,6 +683,64 @@ export async function classifyPostCompletionCommand(input: {
 }
 
 /**
+ * Recognizes "and bring it into my checkout when done" said UP FRONT, inside
+ * the very message that starts a develop task (2026-07-18, explicit
+ * product-owner request after a real miss: they wrote "...и сразу занеси
+ * это в ветку" as part of the task text itself, but merge-to-branch only
+ * ever fires on a FOLLOW-UP message after the run is already `completed` -
+ * at send-time there was no completed run yet, so the phrase just sat
+ * unused inside the task description). Distinct from
+ * classifyPostCompletionCommand: that one classifies a standalone follow-up
+ * message that IS the command; this one classifies whether a message that
+ * is PRIMARILY a feature/change request also carries this instruction as a
+ * side clause. Same fail-closed stance - on any ambiguity, false (the human
+ * can still say it explicitly once the run completes).
+ */
+export async function classifyAutoMergeIntent(input: {
+  taskMessage: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<boolean> {
+  if (!MERGE_INTENT_KEYWORD_PATTERN.test(input.taskMessage)) {
+    return false;
+  }
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "The user's message describes a development task for an AI coding assistant. The assistant will do the work in an isolated copy first, then normally waits for a separate follow-up message before bringing the result into the user's own real checkout.",
+            "Decide: does THIS message, in addition to describing the actual change, ALSO instruct the assistant to automatically bring/apply/merge the result into the user's own current branch/checkout as soon as the work is done - without waiting to be asked again? Any phrasing counts, including typos and casual wording (\"и сразу занеси это в ветку\", \"занеси в текущий чекаут\", \"перенеси в мою ветку как закончишь\", \"bring it into my branch right away\").",
+            "This does NOT mean commit or push - only that files should appear changed in their own checkout, uncommitted.",
+            "If the message is just a task/feature description with no such instruction, answer false.",
+            "Reply with ONLY one line of JSON: {\"autoMerge\": true | false}.",
+          ].join("\n"),
+        },
+        { role: "user", content: input.taskMessage },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return false;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { autoMerge?: unknown };
+    return parsed.autoMerge === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Routes a chat message between the Q&A pipeline and the Developer pipeline
  * (docs/architecture/011-developer-pipeline.md): the user writes questions,
  * development tasks and review feedback into the SAME chat box, and the
@@ -693,6 +758,13 @@ export async function classifyChatIntent(input: {
   providerApiKey: string;
   /** Last delivered develop iteration in this conversation, when one exists. */
   priorDevelop?: { task: string; summary: string };
+  /**
+   * Runs before the Q&A pipeline's own usage accumulator even exists
+   * (app.ts's routing happens first) - without this, every question's real
+   * cost silently excluded this call (2026-07-18, live user report: "Подробнее"
+   * showed too few tokens).
+   */
+  usage?: ProviderUsageAccumulator;
 }): Promise<ChatIntentKind> {
   try {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
@@ -725,6 +797,7 @@ export async function classifyChatIntent(input: {
       ],
     });
     const payload = (await response.json()) as ProviderChatResponse;
+    recordUsage(input.usage, payload);
     const content = extractProviderContent(payload);
     const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
 

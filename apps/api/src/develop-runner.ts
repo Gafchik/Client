@@ -61,6 +61,16 @@ export interface DevelopRunStatusRecord {
    * normal chat-intent routing.
    */
   testsOffered?: boolean;
+  /**
+   * "И сразу занеси это в ветку" said inside the ORIGINAL task message
+   * (2026-07-18, see classifyAutoMergeIntent in packages/ai) - carried
+   * across every link of a decomposed chain (maybeAdvanceChain re-passes it
+   * to each next startDevelopRun call) so it still fires on the link that
+   * actually finishes the whole task, not just the first one.
+   */
+  autoMergeOnCompletion?: boolean;
+  /** Set once autoMergeOnCompletion has actually fired (or a manual merge-to-checkout button/command ran) - lets the frontend show the outcome without the user having to ask again. */
+  autoMergeOutcome?: MergeToBranchOutcome[];
 }
 
 export interface StartDevelopRunInput {
@@ -98,6 +108,8 @@ export interface StartDevelopRunInput {
    */
   chainRemaining?: string[];
   chainInfo?: { subtaskIndex: number; totalSubtasks: number };
+  /** See DevelopRunStatusRecord.autoMergeOnCompletion. */
+  autoMergeOnCompletion?: boolean;
 }
 
 const MAX_TRACKED_RUNS = 100;
@@ -141,6 +153,7 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
     updatedAt: startedAt,
     worktrees: [],
     ...(input.chainInfo ? { chainInfo: input.chainInfo } : {}),
+    ...(input.autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
   };
 
   pruneTrackedRuns();
@@ -152,9 +165,7 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
   });
 
   void executeDevelopRun(record, input)
-    .then(() => {
-      maybeAdvanceChain(record, input);
-    })
+    .then(() => maybeAdvanceChain(record, input))
     .catch((error) => {
       record.status = "failed";
       record.errorMessage = error instanceof Error ? error.message : String(error);
@@ -179,9 +190,10 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
  * on an empty, non-paused diff) so the chain is one continuous worktree,
  * not N independent throwaway ones.
  */
-function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDevelopRunInput): void {
+async function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDevelopRunInput): Promise<void> {
   const result = record.result;
   const cleanApproval = result?.stopped === "task_complete" && result.reviewVerdict === "approved";
+  const wholeTaskDone = cleanApproval && !input.chainRemaining?.length && result;
 
   // Tests-as-separate-step (2026-07-18, docs/architecture/011 §4.12,
   // explicit product-owner directive): real projects, including this one's
@@ -191,9 +203,38 @@ function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDevelopRu
   // buildDevelopSystemPrompt instruction 8). Coverage is offered as an
   // explicit question ONLY once the whole task/chain is genuinely done -
   // not per intermediate chain link, matching "в конце разработки".
-  if (cleanApproval && !input.chainRemaining?.length && result) {
+  if (wholeTaskDone) {
     record.testsOffered = true;
     result.summary = `${result.summary ?? ""}\n\nПокрыть это тестами? (да / нет / свой вариант — какие именно)`;
+  }
+
+  // "И сразу занеси это в ветку" said in the ORIGINAL task message
+  // (2026-07-18, see classifyAutoMergeIntent) - only once the whole
+  // task/chain has reached a genuinely clean approval, same bar as the
+  // tests-offer above. Deliberately not fired on a needs-changes/paused
+  // result - an unreviewed diff should never land in the user's real
+  // checkout without them at least seeing why it wasn't approved.
+  if (wholeTaskDone && record.autoMergeOnCompletion && record.worktrees.length > 0) {
+    try {
+      const outcomes = await mergeDevelopRunToRealCheckout(record.worktrees);
+      record.autoMergeOutcome = outcomes;
+      const allApplied = outcomes.every((outcome) => outcome.applied);
+      const lines = outcomes.map((outcome) =>
+        outcome.applied
+          ? `✓ ${outcome.label}: занесено (${outcome.changedFiles.length} файл(ов)) — незакоммичено, смотри diff в IDE.`
+          : `✗ ${outcome.label}: не удалось занести — ${outcome.error ?? "неизвестная ошибка"}.`,
+      );
+      result.summary = [
+        result.summary ?? "",
+        "",
+        allApplied ? "Занёс в текущую ветку, как просил:" : "Занёс частично — есть проблемы:",
+        ...lines,
+      ].join("\n");
+    } catch (error) {
+      // Best-effort - the run itself already succeeded and is fully usable
+      // via the worktree/manual merge button either way.
+      result.summary = `${result.summary ?? ""}\n\nНе удалось автоматически занести в ветку: ${error instanceof Error ? error.message : String(error)}. Worktree на месте — попробуй кнопкой или напиши "занеси в ветку".`;
+    }
   }
 
   if (!input.chainRemaining?.length) {
@@ -219,6 +260,7 @@ function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDevelopRu
     developerModel: input.developerModel,
     reviewerModel: input.reviewerModel,
     conversationId: record.conversationId,
+    ...(record.autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
     continueFrom: {
       worktrees: record.worktrees,
       priorTask: record.task,

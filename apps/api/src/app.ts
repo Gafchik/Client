@@ -16,7 +16,7 @@ import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-sta
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
-import { classifyApprovalResponse, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, planDevelopSubtasks } from "@client/ai";
+import { classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 import { cleanupDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, mergeDevelopRunToRealCheckout, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 
@@ -837,6 +837,11 @@ export function createApp() {
       : request.body.forceRefresh
       ? `Принудительно пересобери branch-aware project intelligence.\n\nОригинальная задача: ${task}`
       : task;
+    // Declared here, not inside the question-run block below, because it
+    // needs to reach enqueuePipelineRun() further down - classifyChatIntent
+    // runs before any run object exists, so this is the only place its real
+    // cost can be captured and carried forward (see PipelineExecutionRequest.preludeUsage).
+    let chatIntentUsage: ReturnType<typeof createUsageAccumulator> | null = null;
 
     // Chat intent routing (docs/architecture/011-developer-pipeline.md):
     // пользователь пишет в ОДИН чат и вопросы, и задачи разработки, и
@@ -988,6 +993,10 @@ export function createApp() {
 
             if (postCompletionAction === "merge-to-branch") {
               const outcomes = await mergeDevelopRunToRealCheckout(priorDevelop.worktrees);
+              // Stored on the record too (2026-07-18) - same field the
+              // button/auto-merge paths write, so the Developer message
+              // card can show "занесено ✓" without the user re-asking.
+              priorDevelop.autoMergeOutcome = outcomes;
               const allApplied = outcomes.every((outcome) => outcome.applied);
               const lines = outcomes.map((outcome) =>
                 outcome.applied
@@ -1048,11 +1057,19 @@ export function createApp() {
             // fall through to normal classification below.
           }
 
+          // Real cost, spent before any run object exists to attach it to
+          // (2026-07-18, live user report - "Подробнее" showed too few
+          // tokens because this call was invisible to the eventual run's
+          // usage total). Assigned to the outer-scope variable declared
+          // above so it survives to the enqueuePipelineRun() call further
+          // down, once we know the outcome is actually "question".
+          chatIntentUsage = createUsageAccumulator();
           const intent = await classifyChatIntent({
             task,
             providerBaseUrl,
             providerModel: selectedTeam.criticModel,
             providerApiKey,
+            usage: chatIntentUsage,
             ...(priorDevelop?.status === "completed"
               ? { priorDevelop: { task: priorDevelop.task, summary: priorDevelop.result?.summary ?? "" } }
               : {}),
@@ -1093,6 +1110,20 @@ export function createApp() {
               }
             }
 
+            // "И сразу занеси это в ветку" said inside THIS message
+            // (2026-07-18, see classifyAutoMergeIntent) - fired here, in
+            // parallel with decomposition below, against the user's raw
+            // message (not composedTask, which may carry prior-turn context
+            // that would dilute the signal). Only for a fresh task, same
+            // scoping as decomposition - a correction round already has an
+            // existing autoMergeOnCompletion on priorDevelop if the original
+            // task asked for it, and re-classifying a correction's own text
+            // would incorrectly require the user to repeat the instruction
+            // on every follow-up.
+            const autoMergeIntentPromise = intent === "develop"
+              ? classifyAutoMergeIntent({ taskMessage: task, providerBaseUrl, providerModel: selectedTeam.criticModel, providerApiKey })
+              : Promise.resolve(false);
+
             // Task decomposition (2026-07-18, docs/architecture/011 §4.11):
             // only for a FRESH task, never a correction round (a correction
             // is already scoped to what was just delivered - decomposing it
@@ -1123,10 +1154,20 @@ export function createApp() {
               }
             }
 
+            const autoMergeOnCompletion = intent === "develop"
+              ? await autoMergeIntentPromise
+              // A correction round carries the ORIGINAL run's intent forward
+              // (2026-07-18) - otherwise "занеси в ветку" said once on the
+              // first message would silently stop applying the moment the
+              // Reviewer asked for a fix, and the user would have to repeat
+              // it on every correction.
+              : Boolean(priorDevelop?.autoMergeOnCompletion);
+
             const status = startDevelopRun({
               ...developInputBase,
               task: composedTask,
               ...(chain ? chain : {}),
+              ...(autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
               ...(intent === "develop-correction" && priorDevelop
                 ? {
                     continueFrom: {
@@ -1194,6 +1235,15 @@ export function createApp() {
       providerModel,
       providerApiKey,
       appRootPath,
+      ...(chatIntentUsage && chatIntentUsage.callCount > 0
+        ? {
+            preludeUsage: {
+              promptTokens: chatIntentUsage.promptTokens,
+              completionTokens: chatIntentUsage.completionTokens,
+              callCount: chatIntentUsage.callCount,
+            },
+          }
+        : {}),
     });
 
     return reply.code(202).send(acceptedStatus);
@@ -1290,6 +1340,50 @@ export function createApp() {
     }
 
     return status;
+  });
+
+  // Button counterparts of the "занеси в ветку"/"почисти ворктри" chat
+  // commands (2026-07-18, explicit product-owner request: "и через чат и
+  // через кнопку") - same underlying functions, called directly by runId
+  // instead of going through classifyPostCompletionCommand, so a button
+  // click never depends on message classification succeeding.
+  app.post<{ Body: { runId?: string } }>("/api/develop/merge-to-checkout", async (request, reply) => {
+    const runId = request.body.runId?.trim();
+
+    if (!runId) {
+      return reply.code(400).send({ message: "Нужно указать runId." });
+    }
+
+    const record = getDevelopRunStatus(runId);
+
+    if (!record) {
+      return reply.code(404).send({ message: "Run не найден (после перезапуска сервера статусы не сохраняются)." });
+    }
+
+    if (record.worktrees.length === 0) {
+      return reply.code(409).send({ message: "У этого run'а больше нет worktree — уже занесено и очищено, либо ничего не менялось." });
+    }
+
+    const outcomes = await mergeDevelopRunToRealCheckout(record.worktrees);
+    record.autoMergeOutcome = outcomes;
+    return reply.send({ outcomes });
+  });
+
+  app.post<{ Body: { runId?: string } }>("/api/develop/cleanup-worktree", async (request, reply) => {
+    const runId = request.body.runId?.trim();
+
+    if (!runId) {
+      return reply.code(400).send({ message: "Нужно указать runId." });
+    }
+
+    const record = getDevelopRunStatus(runId);
+
+    if (!record) {
+      return reply.code(404).send({ message: "Run не найден (после перезапуска сервера статусы не сохраняются)." });
+    }
+
+    await cleanupDevelopRunWorktrees(record);
+    return reply.send({ ok: true });
   });
 
   app.post<{ Body: EvalRunRequest }>("/api/pipeline/eval", async (request, reply) => {

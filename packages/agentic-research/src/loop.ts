@@ -199,6 +199,12 @@ export interface AgenticRunResult {
   turnsUsed: number;
   totalPromptTokens: number;
   totalCompletionTokens: number;
+  /** Researcher-only slice of the totals above (2026-07-18, per-role usage breakdown - see docs/architecture, "Подробнее" token panel). */
+  researcherPromptTokens: number;
+  researcherCompletionTokens: number;
+  /** Critic-only slice - Critic also classifies chat messages elsewhere, but THIS is only its answer-review calls inside this loop. */
+  criticPromptTokens: number;
+  criticCompletionTokens: number;
   stopped: "final_answer" | "max_turns" | "error" | "aborted";
   error?: string;
 }
@@ -635,6 +641,14 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
+  // Per-role slice of the totals above (2026-07-18) - kept alongside, not
+  // instead of, the totals: every existing consumer of totalPromptTokens/
+  // totalCompletionTokens (develop-runner, crawlUnit, etc.) keeps working
+  // unchanged; only the "Подробнее" token panel needs the split.
+  let researcherPromptTokens = 0;
+  let researcherCompletionTokens = 0;
+  let criticPromptTokens = 0;
+  let criticCompletionTokens = 0;
   const actionsLog: string[] = [...[...seedReadFiles].map((filePath) => `[seed] auto-read ${filePath}`)];
   const touchedFiles = new Set<string>();
   const seenDirs = new Set<string>([
@@ -685,6 +699,10 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       criticRounds,
       totalPromptTokens,
       totalCompletionTokens,
+      researcherPromptTokens,
+      researcherCompletionTokens,
+      criticPromptTokens,
+      criticCompletionTokens,
       ...overrides,
     };
   };
@@ -720,6 +738,8 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     });
     totalPromptTokens += criticResult.promptTokens;
     totalCompletionTokens += criticResult.completionTokens;
+    criticPromptTokens += criticResult.promptTokens;
+    criticCompletionTokens += criticResult.completionTokens;
     criticRounds += 1;
 
     if (criticResult.approved) {
@@ -774,6 +794,8 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
     totalPromptTokens += usage?.prompt_tokens ?? 0;
     totalCompletionTokens += usage?.completion_tokens ?? 0;
+    researcherPromptTokens += usage?.prompt_tokens ?? 0;
+    researcherCompletionTokens += usage?.completion_tokens ?? 0;
 
     if (totalPromptTokens + totalCompletionTokens >= RUN_TOKEN_SAFETY_LIMIT) {
       actionsLog.push(`[turn ${turn}] SAFETY ABORT: run exceeded ${RUN_TOKEN_SAFETY_LIMIT} tokens.`);

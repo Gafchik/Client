@@ -13,7 +13,6 @@ import {
   embedTexts,
   expandTaskSearchKeywords,
   extractDomainGlossaryTerms,
-  summarizeProviderUsage,
   validateEvidence,
   type ProviderUsageAccumulator,
 } from "@client/ai";
@@ -50,6 +49,7 @@ import {
   type PipelineStage,
   type ProjectFile,
   type ProjectPathRecord,
+  type ProviderUsageSummary,
   type ValidationRecommendedAction,
   type ValidationRecommendedResearchProfile,
   type ValidationResult,
@@ -83,6 +83,14 @@ export interface PipelineExecutionRequest {
   providerModel: string;
   providerApiKey: string;
   appRootPath: string;
+  /**
+   * Usage already spent classifying this message (app.ts's classifyChatIntent,
+   * called BEFORE this run exists) - 2026-07-18, folded into the "other"
+   * usage bucket below so a real cost isn't silently excluded from the
+   * "Подробнее" token total just because it happened one function call
+   * earlier than this one.
+   */
+  preludeUsage?: { promptTokens: number; completionTokens: number; callCount: number };
 }
 
 interface QuestionWorkspacePlan {
@@ -417,16 +425,82 @@ async function executePipelineRun(request: PipelineExecutionRequest): Promise<vo
   }
 }
 
+// Per-role usage summary (2026-07-18, "Подробнее" token panel): raw totals
+// alone hid that Researcher/Critic can run on different models with
+// different cost multipliers, and that whole categories of real calls
+// (deterministic pipeline stages, chat-intent classification) weren't being
+// counted at all. `byRole` carries model ids, not multiplier-adjusted
+// numbers - the multiplier itself lives in the provider's OWN model catalog
+// (already loaded client-side for the model picker), so the frontend looks
+// it up there instead of this needing any awareness of billing math. A role
+// with zero calls is omitted entirely rather than shown as a zero row.
+function buildUsageSummary(
+  researcherUsage: ProviderUsageAccumulator,
+  criticUsage: ProviderUsageAccumulator,
+  otherUsage: ProviderUsageAccumulator,
+  researcherModel: string,
+  criticModel: string,
+): ProviderUsageSummary {
+  const byRole: NonNullable<ProviderUsageSummary["byRole"]> = [];
+
+  const pushRole = (role: "researcher" | "critic" | "other", model: string, accumulator: ProviderUsageAccumulator) => {
+    if (accumulator.callCount === 0) {
+      return;
+    }
+
+    byRole.push({
+      role,
+      model,
+      promptTokens: accumulator.promptTokens,
+      completionTokens: accumulator.completionTokens,
+      totalTokens: accumulator.promptTokens + accumulator.completionTokens,
+      callCount: accumulator.callCount,
+    });
+  };
+
+  pushRole("researcher", researcherModel, researcherUsage);
+  pushRole("critic", criticModel, criticUsage);
+  // "other" mixes providerModel (deterministic stages) and criticModel
+  // (chat-intent classification) in general - no single model id to look a
+  // multiplier up for, so left empty on purpose (frontend shows "множитель
+  // не найден" for an empty model, exactly the honest answer here).
+  pushRole("other", "", otherUsage);
+
+  const promptTokens = researcherUsage.promptTokens + criticUsage.promptTokens + otherUsage.promptTokens;
+  const completionTokens = researcherUsage.completionTokens + criticUsage.completionTokens + otherUsage.completionTokens;
+  const callCount = researcherUsage.callCount + criticUsage.callCount + otherUsage.callCount;
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    callCount,
+    ...(byRole.length > 0 ? { byRole } : {}),
+  };
+}
+
 async function buildPipelineRunResult(request: PipelineExecutionRequest): Promise<PipelineRunResult> {
-  const { runId, mode, conversationId, task, projectPath, projectPaths, providerBaseUrl, providerModel, providerApiKey, appRootPath } = request;
+  const { runId, mode, conversationId, task, projectPath, projectPaths, providerBaseUrl, providerModel, providerApiKey, appRootPath, preludeUsage } = request;
   const overview = await scanWorkspaceOverview(projectPath);
   const largeRepositoryProfile = overview.summary.profile === "large-repository";
   const isQuestionRun = mode === "question-run";
   const isHardResync = mode === "hard-resync";
-  // One accumulator per run (local variable, never module-level state) -
-  // covers every LLM call made anywhere in this run, deterministic or
-  // agentic path, keyword-expansion/validation/answer-synthesis alike.
-  const usageAccumulator = createUsageAccumulator();
+  // Per-role accumulators (2026-07-18, "Подробнее" token breakdown; local
+  // variables, never module-level state - each run gets its own). Every
+  // deterministic-path call (keyword expansion, validation, answer
+  // synthesis - all on `providerModel`, not tied to a Team role) plus any
+  // classifier call feeds `otherUsage`; the agentic path's Researcher/Critic
+  // calls (packages/agentic-research) split into their own accumulators
+  // after the fact, once its own already-split totals come back.
+  const researcherUsage = createUsageAccumulator();
+  const criticUsage = createUsageAccumulator();
+  const otherUsage = createUsageAccumulator();
+
+  if (preludeUsage) {
+    otherUsage.promptTokens += preludeUsage.promptTokens;
+    otherUsage.completionTokens += preludeUsage.completionTokens;
+    otherUsage.callCount += preludeUsage.callCount;
+  }
 
   const workspaceStartedAt = startStage(runId, "workspace");
   const repositoryWorkspace = await openWorkspaceSelective(projectPath, {
@@ -727,15 +801,18 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     initialResearch = agenticResult.research;
     teamValidation = agenticResult.validation;
     // The agentic loop already tracks its own (Researcher + Critic) usage
-    // internally (packages/agentic-research) - merge it into the same
-    // per-run accumulator that the deterministic path's calls feed, so
-    // usage reflects the true total regardless of which path answered.
-    usageAccumulator.promptTokens += agenticResult.raw.totalPromptTokens;
-    usageAccumulator.completionTokens += agenticResult.raw.totalCompletionTokens;
+    // internally, split by role (packages/agentic-research) - merged here
+    // into the matching per-run accumulator, not lumped together, so the
+    // "Подробнее" panel can show each role's own model/multiplier (2026-07-18).
     // turnsUsed = Researcher calls, criticRounds = Critic calls - an exact
     // count, not an approximation from actionsLog (which also logs non-LLM
     // tool observations).
-    usageAccumulator.callCount += agenticResult.raw.turnsUsed + agenticResult.raw.criticRounds;
+    researcherUsage.promptTokens += agenticResult.raw.researcherPromptTokens;
+    researcherUsage.completionTokens += agenticResult.raw.researcherCompletionTokens;
+    researcherUsage.callCount += agenticResult.raw.turnsUsed;
+    criticUsage.promptTokens += agenticResult.raw.criticPromptTokens;
+    criticUsage.completionTokens += agenticResult.raw.criticCompletionTokens;
+    criticUsage.callCount += agenticResult.raw.criticRounds;
     completeStage(
       runId,
       "research",
@@ -840,7 +917,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       providerBaseUrl,
       providerModel,
       providerApiKey,
-      usage: usageAccumulator,
+      usage: otherUsage,
     });
     initialResearch = keywordExpansion.research;
     completeStage(
@@ -971,7 +1048,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     ],
     runtimeMode: questionRuntimeMode,
     ...(teamValidation ? { precomputedTeamValidation: teamValidation } : {}),
-    usage: usageAccumulator,
+    usage: otherUsage,
   });
   completeStage(
     runId,
@@ -1066,7 +1143,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     validation,
     validatedAnswerPacket,
     ...(conversationTranscript.length > 0 ? { conversationTranscript } : {}),
-    usage: usageAccumulator,
+    usage: otherUsage,
   });
   completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);
   updatePartialArtifacts(runId, {
@@ -1136,7 +1213,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     focusedResearchResults,
     validatedAnswerPacket,
     answer,
-    usage: summarizeProviderUsage(usageAccumulator),
+    usage: buildUsageSummary(researcherUsage, criticUsage, otherUsage, selectedTeam?.researcherModel ?? "", selectedTeam?.criticModel ?? ""),
   });
   completeStage(runId, "knowledge", knowledgeStartedAt, `Артефакты сохранены в центральное knowledge-хранилище: ${knowledge.artifactCount} групп.`);
 
@@ -1191,7 +1268,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       index,
       graph,
     },
-    usage: summarizeProviderUsage(usageAccumulator),
+    usage: buildUsageSummary(researcherUsage, criticUsage, otherUsage, selectedTeam?.researcherModel ?? "", selectedTeam?.criticModel ?? ""),
   };
 }
 

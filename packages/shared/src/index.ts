@@ -983,6 +983,26 @@ export interface ProviderUsageSummary {
   completionTokens: number;
   totalTokens: number;
   callCount: number;
+  /**
+   * Per-role breakdown (2026-07-18, explicit product-owner request: raw
+   * total alone hid that Researcher/Critic can run on DIFFERENT models with
+   * different cost multipliers, and undercounted classifier calls that ran
+   * outside the deterministic pipeline). "researcher"/"critic" are the
+   * agentic loop's own two roles; "other" lumps every deterministic-stage
+   * and chat-classifier call together (mixed models in general, no single
+   * `model` to look up a multiplier for). `model` is a provider model id -
+   * the frontend looks up its tokenMultiplier from the already-loaded
+   * provider catalog; empty string means "no single model" (always true for
+   * "other").
+   */
+  byRole?: Array<{
+    role: "researcher" | "critic" | "other";
+    model: string;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    callCount: number;
+  }>;
 }
 
 // Auto-detected (2026-07-16, multi-path unification) from generic manifest

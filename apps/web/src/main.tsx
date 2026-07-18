@@ -15,6 +15,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
           <Route path="/projects" element={<App />} />
           <Route path="/providers" element={<App />} />
           <Route path="/teams" element={<App />} />
+          <Route path="/observers" element={<App />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Routes>
       </BrowserRouter>

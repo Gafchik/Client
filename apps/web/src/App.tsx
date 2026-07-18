@@ -15,6 +15,7 @@ import type {
   ProviderCatalogResponse,
   ProviderModelRecord,
   ProviderRecord,
+  ProviderUsageSummary,
   RepositorySnapshot,
   TeamCatalogResponse,
   TeamRecord,
@@ -93,7 +94,23 @@ type ProjectDraft = {
   paths: ProjectDraftPath[];
 };
 
-type AppView = "chat" | "providers" | "projects" | "teams";
+type AppView = "chat" | "providers" | "projects" | "teams" | "observers";
+
+const VIEW_TITLES: Record<AppView, string> = {
+  chat: "Чат по проекту",
+  projects: "Проекты",
+  providers: "Провайдеры",
+  teams: "Команды",
+  observers: "Обсерверы",
+};
+
+const VIEW_SUBTITLES: Record<AppView, string> = {
+  chat: "Задай вопрос и получи инженерный ответ поверх уже собранной карты проекта.",
+  projects: "Редко используемый экран настройки проектов и их путей.",
+  providers: "Редко используемый экран настройки AI-провайдеров.",
+  teams: "Researcher/Critic/Observer — кто ищет, кто проверяет, кто изучает проект в фоне.",
+  observers: "Observer изучает проект в фоне между вопросами. Запускай и следи за ним здесь для любого проекта — не только для открытого в чате.",
+};
 
 type InspectorTab = "overview" | "research" | "impact" | "context" | "plan" | "execution" | "knowledge" | "git" | "diagnostics";
 
@@ -176,10 +193,20 @@ function groupModelsByVendor(models: ProviderModelRecord[]): Array<{ vendor: str
     .map(([vendor, vendorModels]) => ({ vendor, models: vendorModels }));
 }
 
+/** Raw cost multiplier for a model id, as reported by the provider's own /models endpoint - not hardcoded. Null if the model is unknown or the provider didn't report one. */
+function findModelMultiplier(models: ProviderModelRecord[], modelId: string): number | null {
+  if (!modelId) {
+    return null;
+  }
+
+  const match = models.find((model) => model.id === modelId);
+  return typeof match?.tokenMultiplier === "number" ? match.tokenMultiplier : null;
+}
+
 /** Cost multiplier for a model id (e.g. "0.7x", "1.5x"), as reported by the provider's own /models endpoint - not hardcoded. */
 function findModelMultiplierLabel(models: ProviderModelRecord[], modelId: string): string | null {
-  const match = models.find((model) => model.id === modelId);
-  return typeof match?.tokenMultiplier === "number" ? `${match.tokenMultiplier}x` : null;
+  const multiplier = findModelMultiplier(models, modelId);
+  return multiplier === null ? null : `${multiplier}x`;
 }
 
 // Человекочитаемые лейблы для сырых module key из INTENT_PROFILES
@@ -252,21 +279,46 @@ function renderInlineMarkdown(text: string): ReactNode[] {
   return nodes;
 }
 
-function AnswerMarkdown({ text }: { text: string }) {
-  const trimmed = typeof text === "string" ? text.trim() : "";
+type AnswerMarkdownBlock =
+  | { type: "heading"; text: string }
+  | { type: "list"; items: string[] }
+  | { type: "paragraph"; text: string }
+  | { type: "code"; language: string; code: string };
 
-  if (!trimmed) {
-    return null;
-  }
-
-  const blocks: Array<{ type: "heading"; text: string } | { type: "list"; items: string[] } | { type: "paragraph"; text: string }> = [];
+function parseAnswerMarkdownBlocks(trimmed: string): AnswerMarkdownBlock[] {
+  const blocks: AnswerMarkdownBlock[] = [];
   let currentList: string[] | null = null;
+  const lines = trimmed.split("\n");
+  let index = 0;
 
-  for (const rawLine of trimmed.split("\n")) {
+  while (index < lines.length) {
+    const rawLine = lines[index] ?? "";
     const line = rawLine.trim();
+
+    // Fenced code block (```lang ... ```) - the model answers with pure
+    // markdown (see synthesizer prompt), including JSON/code snippets, but
+    // nothing here ever rendered a fence as anything but plain paragraph
+    // text with the backticks left in - unreadable and uncopyable as code.
+    const fenceMatch = /^```(\S*)\s*$/.exec(line);
+    if (fenceMatch) {
+      const language = fenceMatch[1] ?? "";
+      const codeLines: string[] = [];
+      index += 1;
+
+      while (index < lines.length && !/^```\s*$/.test((lines[index] ?? "").trim())) {
+        codeLines.push(lines[index] ?? "");
+        index += 1;
+      }
+
+      index += 1; // skip closing fence (harmless no-op if the fence was never closed)
+      currentList = null;
+      blocks.push({ type: "code", language, code: codeLines.join("\n") });
+      continue;
+    }
 
     if (!line) {
       currentList = null;
+      index += 1;
       continue;
     }
 
@@ -274,6 +326,7 @@ function AnswerMarkdown({ text }: { text: string }) {
     if (headingMatch && headingMatch[1]) {
       currentList = null;
       blocks.push({ type: "heading", text: headingMatch[1].trim() });
+      index += 1;
       continue;
     }
 
@@ -284,12 +337,54 @@ function AnswerMarkdown({ text }: { text: string }) {
         blocks.push({ type: "list", items: currentList });
       }
       currentList.push(bulletMatch[1].trim());
+      index += 1;
       continue;
     }
 
     currentList = null;
     blocks.push({ type: "paragraph", text: line });
+    index += 1;
   }
+
+  return blocks;
+}
+
+function CodeBlock({ language, code }: { language: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API недоступен (например, не-secure context) — тихо игнорируем.
+    }
+  }
+
+  return (
+    <div className="code-block">
+      <div className="code-block-head">
+        <span>{language || "code"}</span>
+        <button type="button" className="code-block-copy" onClick={() => void handleCopy()}>
+          {copied ? "Скопировано" : "Копировать"}
+        </button>
+      </div>
+      <pre className="code-block-body">
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
+}
+
+function AnswerMarkdown({ text }: { text: string }) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+
+  if (!trimmed) {
+    return null;
+  }
+
+  const blocks = parseAnswerMarkdownBlocks(trimmed);
 
   return (
     <div className="answer-markdown">
@@ -306,6 +401,10 @@ function AnswerMarkdown({ text }: { text: string }) {
               ))}
             </ul>
           );
+        }
+
+        if (block.type === "code") {
+          return <CodeBlock key={index} language={block.language} code={block.code} />;
         }
 
         return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
@@ -566,6 +665,36 @@ function buildHistoryTitle(task: string | undefined): string {
   return normalized.length > 72 ? `${normalized.slice(0, 69)}...` : normalized;
 }
 
+// Раньше строка истории показывала только время (formatHistoryTime) без
+// даты — вчерашний и сегодняшний чат выглядели одинаково ("14:32"), и
+// список читался как нерасчленённая свалка. Группировка по дню (в духе
+// обычных чат-клиентов) даёт списку структуру без добавления шума в саму
+// строку.
+function formatHistoryDateBucket(value: string): string {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Ранее";
+  }
+
+  const startOfDay = (input: Date) => new Date(input.getFullYear(), input.getMonth(), input.getDate()).getTime();
+  const dayDiff = Math.round((startOfDay(new Date()) - startOfDay(date)) / (24 * 60 * 60 * 1000));
+
+  if (dayDiff <= 0) {
+    return "Сегодня";
+  }
+
+  if (dayDiff === 1) {
+    return "Вчера";
+  }
+
+  if (dayDiff < 7) {
+    return date.toLocaleDateString("ru-RU", { weekday: "long" });
+  }
+
+  return date.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+}
+
 interface HistoryConversationGroup {
   conversationId: string;
   latest: KnowledgeCatalogEntry;
@@ -659,41 +788,48 @@ function RunHistorySidebar({
 
         <div className="chat-history-list">
           {items.length ? (
-            items.map((group) => (
-              <div
-                key={group.conversationId}
-                className={`history-item-row ${activeConversationId === group.conversationId ? "history-item-row-active" : ""}`}
-              >
-                <input
-                  type="checkbox"
-                  className="history-item-checkbox"
-                  checked={selectedIds.has(group.conversationId)}
-                  onChange={() => onToggleSelect(group.conversationId)}
-                  onClick={(event) => event.stopPropagation()}
-                  aria-label={`Выбрать чат «${buildHistoryTitle(group.latest.task)}»`}
-                />
-                <button type="button" className="history-item" onClick={() => onSelectConversation(group.latest.runId)}>
-                  <strong>{buildHistoryTitle(group.latest.task)}</strong>
-                  <span>
-                    {formatHistoryTime(group.latest.savedAt)}
-                    {group.turnCount > 1 ? ` · ${group.turnCount} реплик` : ""}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className="history-item-delete"
-                  title="Удалить чат"
-                  aria-label={`Удалить чат «${buildHistoryTitle(group.latest.task)}»`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onDeleteOne(group.conversationId);
-                  }}
-                  disabled={deleting}
-                >
-                  ×
-                </button>
-              </div>
-            ))
+            items.map((group, index) => {
+              const bucket = formatHistoryDateBucket(group.latest.savedAt);
+              const previousBucket = index > 0 ? formatHistoryDateBucket(items[index - 1]!.latest.savedAt) : null;
+
+              return (
+                <Fragment key={group.conversationId}>
+                  {bucket !== previousBucket ? <p className="chat-history-date">{bucket}</p> : null}
+                  <div
+                    className={`history-item-row ${activeConversationId === group.conversationId ? "history-item-row-active" : ""}`}
+                  >
+                    <input
+                      type="checkbox"
+                      className="history-item-checkbox"
+                      checked={selectedIds.has(group.conversationId)}
+                      onChange={() => onToggleSelect(group.conversationId)}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-label={`Выбрать чат «${buildHistoryTitle(group.latest.task)}»`}
+                    />
+                    <button type="button" className="history-item" onClick={() => onSelectConversation(group.latest.runId)}>
+                      <strong>{buildHistoryTitle(group.latest.task)}</strong>
+                      <span>
+                        {formatHistoryTime(group.latest.savedAt)}
+                        {group.turnCount > 1 ? ` · ${group.turnCount} реплик` : ""}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="history-item-delete"
+                      title="Удалить чат"
+                      aria-label={`Удалить чат «${buildHistoryTitle(group.latest.task)}»`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onDeleteOne(group.conversationId);
+                      }}
+                      disabled={deleting}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </Fragment>
+              );
+            })
           ) : (
             <div className="empty-card">
               <strong>История появится после первого вопроса</strong>
@@ -762,6 +898,14 @@ function describeProjectObserverStatus(
     return null;
   }
 
+  // Single-path project (e.g. one repo covering a whole monorepo) - the
+  // generic "N/N путей запущено" phrasing below hides the one number that
+  // actually matters here (real crawl %), so just show the richer per-path
+  // text directly instead of a redundant aggregate wrapper around it.
+  if (projectRootPaths.length === 1) {
+    return describeObserverStatus(status, projectRootPaths[0]!) ?? { title: "Observer остановлен", description: "ещё не запускался", running: false };
+  }
+
   const perPathStates = projectRootPaths.map((rootPath) => describeObserverStatus(status, rootPath));
   const runningCount = perPathStates.filter((state) => state?.running).length;
 
@@ -793,12 +937,10 @@ function EnvironmentStrip({
   providers,
   teams,
   selectedTeamId,
-  observerStatus,
   disabled,
   onProjectChange,
   onProviderChange,
   onTeamChange,
-  onObserverToggle,
 }: {
   projects: ProjectRecord[];
   selectedProjectId: string;
@@ -806,21 +948,19 @@ function EnvironmentStrip({
   providers: ProviderRecord[];
   teams: TeamRecord[];
   selectedTeamId: string;
-  observerStatus: ObserverStatusResponse | null;
   disabled: boolean;
   onProjectChange: (projectId: string) => void;
   onProviderChange: (providerId: string) => void;
   onTeamChange: (teamId: string) => void;
-  onObserverToggle: (projectPaths: string[], nextRunning: boolean) => void;
 }) {
   // Multi-path unification (2026-07-16): selecting a project is now enough -
   // no more manually picking "which path" first. Every path of the project
-  // is shown as a read-only badge (so the user still sees what's included)
-  // and Observer starts/stops on all of them with one click.
+  // is shown as a read-only badge (so the user still sees what's included).
+  // Observer start/stop no longer lives here - moved to its own dedicated
+  // panel (ObserversPanel) covering every project, not just the one open in
+  // chat right now.
   const selectedProject = projects.find((item) => item.id === selectedProjectId) ?? null;
   const projectPaths = selectedProject?.paths ?? [];
-  const projectRootPaths = projectPaths.map((pathItem) => pathItem.rootPath);
-  const observerState = describeProjectObserverStatus(observerStatus, projectRootPaths);
 
   return (
     <section className="environment-strip">
@@ -856,18 +996,6 @@ function EnvironmentStrip({
           </option>
         ))}
       </select>
-
-      {projectRootPaths.length > 0 ? (
-        <button
-          type="button"
-          className="environment-status-pill environment-status-pill-button"
-          title={observerState?.description ?? "Ещё не запускался для этого проекта"}
-          onClick={() => onObserverToggle(projectRootPaths, !(observerState?.running ?? false))}
-        >
-          <strong>{observerState?.title ?? "Observer остановлен"}</strong>
-          <span>{observerState?.running ? "Остановить" : "Запустить"} · {observerState?.description ?? "нет данных"}</span>
-        </button>
-      ) : null}
     </section>
   );
 }
@@ -881,16 +1009,23 @@ function shortProjectLabel(projectPath: string): string {
 // по прямому запросу: "2 обсервера параллельно изучают, и было видно на
 // всех чатах, что работают обсерверы по проектам". Плюс быстрый способ
 // остановить все разом перед важным вопросом и запустить снова после.
+// Раньше сюда же печатался activity.unitPath каждого работающего Observer'а
+// (сырой путь файла прямо в топбаре чата) - по прямому запросу убрано:
+// сколько проектов изучается и с каким прогрессом видно и без пути, а сам
+// путь/деталь смотрят в выделенной панели "Обсерверы" (см. ObserversPanel),
+// куда ведёт onOpenPanel.
 function ObserverGlobalBar({
   observerStatus,
   pausedCount,
   onStopAll,
   onResume,
+  onOpenPanel,
 }: {
   observerStatus: ObserverStatusResponse | null;
   pausedCount: number;
   onStopAll: () => void;
   onResume: () => void;
+  onOpenPanel: () => void;
 }) {
   const running = observerStatus?.observers.filter((observer) => observer.status === "running") ?? [];
 
@@ -903,11 +1038,12 @@ function ObserverGlobalBar({
       {running.length > 0 ? (
         <>
           <span className="observer-global-bar-label">
-            Observer работает:{" "}
-            {running
-              .map((observer) => `${shortProjectLabel(observer.projectPath)} (${observer.progress.percent}%${observer.activity ? `, изучает ${observer.activity.unitPath}` : observer.resting ? ", отдыхает" : ""})`)
-              .join(" · ")}
+            Observer работает: {running.map((observer) => shortProjectLabel(observer.projectPath)).join(", ")}
+            {running.length === 1 ? ` · ${running[0]!.progress.percent}%` : ""}
           </span>
+          <button type="button" className="ghost-button" onClick={onOpenPanel}>
+            Обсерверы
+          </button>
           <button type="button" className="ghost-button" onClick={onStopAll}>
             Остановить все
           </button>
@@ -918,6 +1054,97 @@ function ObserverGlobalBar({
         </button>
       )}
     </div>
+  );
+}
+
+function ObserversPanel({
+  projects,
+  observerStatus,
+  pausedCount,
+  onToggleProject,
+  onStopAll,
+  onResume,
+}: {
+  projects: ProjectRecord[];
+  observerStatus: ObserverStatusResponse | null;
+  pausedCount: number;
+  onToggleProject: (projectPaths: string[], nextRunning: boolean) => void;
+  onStopAll: () => void;
+  onResume: () => void;
+}) {
+  const projectList = safeList(projects);
+  const runningCount = observerStatus?.observers.filter((observer) => observer.status === "running").length ?? 0;
+
+  return (
+    <section className="settings-layout">
+      <article className="settings-card">
+        <div className="section-head">
+          <div>
+            <p className="section-kicker">Обсерверы</p>
+            <h2>Все проекты</h2>
+          </div>
+          {runningCount > 0 ? (
+            <button type="button" className="ghost-button" onClick={onStopAll}>
+              Остановить все
+            </button>
+          ) : pausedCount > 0 ? (
+            <button type="button" className="ghost-button" onClick={onResume}>
+              Запустить снова ({pausedCount})
+            </button>
+          ) : null}
+        </div>
+
+        {projectList.length === 0 ? (
+          <div className="empty-card">
+            <strong>Пока нет ни одного проекта</strong>
+            <span>Добавь проект на странице «Проекты», чтобы запускать по нему Observer.</span>
+          </div>
+        ) : (
+          <div className="list">
+            {projectList.map((projectItem) => {
+              const projectRootPaths = projectItem.paths.map((pathItem) => pathItem.rootPath);
+              const aggregate = describeProjectObserverStatus(observerStatus, projectRootPaths);
+
+              return (
+                <div key={projectItem.id} className="observer-project-card">
+                  <div className="observer-project-head">
+                    <div>
+                      <strong>{projectItem.name}</strong>
+                      <span>{aggregate?.title ?? "Ещё не запускался"} · {aggregate?.description ?? "нет данных"}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className={aggregate?.running ? "ghost-button danger-button" : "primary-button"}
+                      onClick={() => onToggleProject(projectRootPaths, !(aggregate?.running ?? false))}
+                    >
+                      {aggregate?.running ? "Остановить" : "Запустить"}
+                    </button>
+                  </div>
+
+                  {projectItem.paths.length > 1 ? (
+                    <div className="observer-path-list">
+                      {projectItem.paths.map((pathItem) => {
+                        const pathState = describeObserverStatus(observerStatus, pathItem.rootPath);
+                        return (
+                          <div key={pathItem.id} className="observer-path-row">
+                            <span className="observer-path-name">
+                              {pathItem.name} <em>({PATH_ROLE_LABELS[pathItem.role] ?? pathItem.role})</em>
+                            </span>
+                            <span className={`observer-path-status ${pathState?.running ? "observer-path-status-running" : ""}`}>
+                              {pathState ? `${pathState.title} · ${pathState.description}` : "ещё не запускался"}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </article>
+    </section>
   );
 }
 
@@ -1061,16 +1288,26 @@ interface DevelopRunResultView {
   totalCompletionTokens: number;
 }
 
+interface DevelopMergeOutcomeView {
+  label: string;
+  applied: boolean;
+  changedFiles: string[];
+  error?: string;
+}
+
 interface DevelopRunStatusView {
   runId: string;
   conversationId: string;
   status: "running" | "completed" | "failed";
   task: string;
   startedAt: string;
+  finishedAt?: string;
   progress?: { turn: number; filesChanged: number; phase: string };
   worktrees: Array<{ label: string; rootPath: string; worktreePath: string; branch: string }>;
   result?: DevelopRunResultView;
   errorMessage?: string;
+  autoMergeOnCompletion?: boolean;
+  autoMergeOutcome?: DevelopMergeOutcomeView[];
 }
 
 function developPhaseLabel(progress?: { turn: number; filesChanged: number; phase: string }): string {
@@ -1111,10 +1348,125 @@ function developVerdictBadge(result: DevelopRunResultView): { label: string; cla
   return { label: result.diff.trim() ? "Без ревью" : "Без изменений кода", className: "develop-verdict" };
 }
 
+/** Дублирует formatRunDuration - тот же формат "N с"/"N мин M с", тот же расчёт что и в Q&A-реплике ("· за X"). */
+function developRunDurationLabel(run: DevelopRunStatusView): string | null {
+  if (!run.finishedAt) {
+    return null;
+  }
+
+  const seconds = Math.round((new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime()) / 1000);
+  return Number.isFinite(seconds) && seconds >= 0 ? formatRunDuration(Math.max(1, seconds)) : null;
+}
+
+function DevelopMergeOutcomeList({ outcomes }: { outcomes: DevelopMergeOutcomeView[] }) {
+  return (
+    <ul className="develop-merge-outcome">
+      {outcomes.map((outcome, index) => (
+        <li key={index} className={outcome.applied ? "develop-merge-outcome-ok" : "develop-merge-outcome-fail"}>
+          {outcome.applied
+            ? `✓ ${outcome.label}: занесено в чекаут (${outcome.changedFiles.length} файл(ов)) — незакоммичено, смотри diff в IDE.`
+            : `✗ ${outcome.label}: не удалось занести — ${outcome.error ?? "неизвестная ошибка"}.`}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * Worktree этой конкретной задачи (2026-07-18, explicit product-owner
+ * request): куда она делась, как в неё зайти из терминала (копируемая `cd`
+ * команда через CodeBlock), кнопки "занести в чекаут"/"удалить" именно для
+ * ЭТОГО run'а - не путать с ObserversPanel-стилем "все сразу", тут заведомо
+ * один run = один набор worktree. Локальный state вместо похода в родительский
+ * developTurns/activeDevelop - после completion эти записи больше не
+ * поллятся (см. pollDevelopStatus), так что действия кнопок обязаны сами
+ * обновлять то, что видно на экране.
+ */
+function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
+  const [worktrees, setWorktrees] = useState(run.worktrees);
+  const [mergeOutcome, setMergeOutcome] = useState<DevelopMergeOutcomeView[] | null>(run.autoMergeOutcome ?? null);
+  const [merging, setMerging] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function handleMerge() {
+    setMerging(true);
+    setActionError(null);
+
+    try {
+      const response = await fetchJsonWithTimeout<{ outcomes: DevelopMergeOutcomeView[] }>(
+        `${API_BASE_URL}/api/develop/merge-to-checkout`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: run.runId }) },
+      );
+      setMergeOutcome(response.outcomes);
+    } catch (mergeError) {
+      setActionError(mergeError instanceof Error ? mergeError.message : "Не удалось занести в чекаут.");
+    } finally {
+      setMerging(false);
+    }
+  }
+
+  async function handleCleanup() {
+    setCleaning(true);
+    setActionError(null);
+
+    try {
+      await fetchJsonWithTimeout(
+        `${API_BASE_URL}/api/develop/cleanup-worktree`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: run.runId }) },
+      );
+      setWorktrees([]);
+    } catch (cleanupError) {
+      setActionError(cleanupError instanceof Error ? cleanupError.message : "Не удалось удалить worktree.");
+    } finally {
+      setCleaning(false);
+    }
+  }
+
+  if (worktrees.length === 0) {
+    if (!mergeOutcome) {
+      return null;
+    }
+
+    return (
+      <div className="develop-worktree-panel">
+        <p className="message-label">Занесено в чекаут</p>
+        <DevelopMergeOutcomeList outcomes={mergeOutcome} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="develop-worktree-panel">
+      <p className="message-label">Worktree этой задачи</p>
+      {worktrees.map((worktree) => (
+        <div key={worktree.label} className="develop-worktree-entry">
+          <span className="develop-worktree-meta">{worktree.label} · ветка {worktree.branch}</span>
+          <CodeBlock language="bash" code={`cd ${worktree.worktreePath}`} />
+        </div>
+      ))}
+
+      {mergeOutcome ? <DevelopMergeOutcomeList outcomes={mergeOutcome} /> : null}
+
+      <div className="action-row">
+        <button type="button" className="ghost-button" onClick={() => void handleMerge()} disabled={merging || cleaning}>
+          {merging ? "Заношу..." : "Занести в текущий чекаут"}
+        </button>
+        <button type="button" className="ghost-button danger-button" onClick={() => void handleCleanup()} disabled={merging || cleaning}>
+          {cleaning ? "Удаляю..." : "Удалить этот worktree"}
+        </button>
+      </div>
+
+      {actionError ? <p className="message-footnote">{actionError}</p> : null}
+    </div>
+  );
+}
+
 function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
   const result = run.result ?? null;
   const running = run.status === "running";
   const lastReview = result?.reviews.length ? result.reviews[result.reviews.length - 1] : null;
+  const durationLabel = !running ? developRunDurationLabel(run) : null;
 
   return (
     <div className="message assistant-message">
@@ -1126,13 +1478,15 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
 
         {!running && run.status === "failed" ? (
           <>
-            <p className="message-label">Разработка завершилась ошибкой</p>
+            <p className="message-label">Разработка завершилась ошибкой{durationLabel ? ` · за ${durationLabel}` : ""}</p>
             <p>{safeText(run.errorMessage || result?.error, "Неизвестная ошибка — детали в телеметрии developer_runs.")}</p>
           </>
         ) : null}
 
         {!running && run.status === "completed" && result ? (
           <>
+            {durationLabel ? <p className="message-label">Готово · за {durationLabel}</p> : null}
+
             {result.stopped === "needs-approval" && result.pendingApproval ? (
               <>
                 <span className="develop-verdict develop-verdict-clarify">Требуется апрув: чувствительная команда БД</span>
@@ -1150,14 +1504,14 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
             ) : (
               <>
                 <span className={developVerdictBadge(result).className}>{developVerdictBadge(result).label}</span>
-                {result.summary ? <p className="develop-summary">{result.summary}</p> : null}
+                {result.summary ? <AnswerMarkdown text={result.summary} /> : null}
 
                 {lastReview && lastReview.findings.length > 0 ? (
                   <div className="develop-findings">
                     <p className="message-label">Замечания ревью (последний раунд)</p>
                     <ul>
                       {lastReview.findings.map((finding, index) => (
-                        <li key={index}>{finding}</li>
+                        <li key={index}>{renderInlineMarkdown(finding)}</li>
                       ))}
                     </ul>
                   </div>
@@ -1168,7 +1522,7 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
                     <p className="message-label">Неблокирующие заметки</p>
                     <ul>
                       {safeList(lastReview.noteFindings).map((finding, index) => (
-                        <li key={index}>{finding}</li>
+                        <li key={index}>{renderInlineMarkdown(finding)}</li>
                       ))}
                     </ul>
                   </div>
@@ -1194,12 +1548,7 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
                   </details>
                 ) : null}
 
-                {run.worktrees.length > 0 ? (
-                  <p className="message-footnote">
-                    Изменения лежат в ветке {run.worktrees.map((worktree) => `${worktree.branch}`).join(", ")} (изолированный worktree, твой чекаут не тронут).
-                    Проверь diff — и либо смёржи ветку, либо напиши здесь, что переделать.
-                  </p>
-                ) : null}
+                <DevelopWorktreePanel run={run} />
               </>
             )}
           </>
@@ -1209,9 +1558,61 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
   );
 }
 
+const USAGE_ROLE_LABELS: Record<string, string> = {
+  researcher: "Researcher",
+  critic: "Critic",
+  other: "Прочее (пайплайн + классификация)",
+};
+
+/**
+ * Раскладка токенов по ролям (2026-07-18, по прямому запросу: "роль - токены
+ * - множитель = столько"). Множитель ищется в уже загруженном каталоге
+ * моделей провайдера (providerModels) - бэкенд отдаёт только id модели, не
+ * сам множитель, чтобы не дублировать источник истины. Роль без известного
+ * множителя (частый случай для "Прочее" - там вперемешку несколько моделей)
+ * показывает только сырые токены и честную подпись, а не молчит и не врёт нулём.
+ */
+function UsageBreakdown({ usage, providerModels }: { usage: ProviderUsageSummary; providerModels: ProviderModelRecord[] }) {
+  const rows = usage.byRole?.length
+    ? usage.byRole
+    : [{ role: "other" as const, model: "", promptTokens: usage.promptTokens, completionTokens: usage.completionTokens, totalTokens: usage.totalTokens, callCount: usage.callCount }];
+
+  return (
+    <div className="usage-breakdown">
+      {rows.map((row) => {
+        const multiplier = findModelMultiplier(providerModels, row.model);
+        const adjusted = multiplier !== null ? Math.round(row.totalTokens * multiplier) : null;
+
+        return (
+          <div key={row.role} className="usage-breakdown-row">
+            <span className="usage-breakdown-role">
+              {USAGE_ROLE_LABELS[row.role] ?? row.role}
+              {row.model ? <em> · {row.model}</em> : null}
+            </span>
+            <span className="usage-breakdown-value">
+              {row.totalTokens.toLocaleString("ru-RU")} ток.
+              {multiplier !== null && adjusted !== null
+                ? ` × ${multiplier}x = ${adjusted.toLocaleString("ru-RU")}`
+                : " (множитель не найден)"}
+              {" · "}{row.callCount} вызов(ов)
+            </span>
+          </div>
+        );
+      })}
+      <div className="usage-breakdown-row usage-breakdown-total">
+        <span className="usage-breakdown-role">Итого</span>
+        <span className="usage-breakdown-value">
+          {usage.totalTokens.toLocaleString("ru-RU")} ток. · {usage.callCount} вызов(ов)
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function AssistantRunMessage({
   runStatus,
   result,
+  providerModels,
   onOpenInspector,
   clarificationRound,
   onSelectClarification,
@@ -1219,6 +1620,7 @@ function AssistantRunMessage({
 }: {
   runStatus: PipelineRunStatus | null;
   result: PipelineRunResult | null;
+  providerModels: ProviderModelRecord[];
   onOpenInspector: (tab?: InspectorTab) => void;
   clarificationRound: number;
   onSelectClarification: (moduleKey: string) => void;
@@ -1376,13 +1778,9 @@ function AssistantRunMessage({
                     <strong>Plan</strong>
                     <span>{safeList(result.plan.steps).length} шагов</span>
                   </div>
-                  {result.usage ? (
-                    <div className="result-card">
-                      <strong>Токены</strong>
-                      <span>{result.usage.totalTokens.toLocaleString("ru-RU")} ({result.usage.callCount} вызовов)</span>
-                    </div>
-                  ) : null}
                 </div>
+
+                {result.usage ? <UsageBreakdown usage={result.usage} providerModels={providerModels} /> : null}
 
                 {safeList(result.answer?.warnings).length ? (
                   <div className="execution-preview-card">
@@ -2176,7 +2574,9 @@ export function App() {
       ? "providers"
       : location.pathname.startsWith("/teams")
         ? "teams"
-        : "chat";
+        : location.pathname.startsWith("/observers")
+          ? "observers"
+          : "chat";
   const routeRunId = routeParams.runId ?? null;
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
@@ -2384,9 +2784,11 @@ export function App() {
   // "стоит и ничего не делает", по прямому запросу пользователя. Глобальный
   // список (не привязан к текущему projectPath) - должно быть видно на любом
   // чате, какие проекты Observer сейчас изучает, а не только для открытого
-  // прямо сейчас.
+  // прямо сейчас. Опрос идёт и на выделенном экране "Обсерверы" (2026-07-18) -
+  // иначе процент/текущий unitPath там были бы статичным снимком на момент
+  // захода на вкладку, а не живой картиной.
   useEffect(() => {
-    if (activeView !== "chat") {
+    if (activeView !== "chat" && activeView !== "observers") {
       return;
     }
 
@@ -3296,19 +3698,6 @@ export function App() {
     }
   }
 
-  async function toggleObserver(observerProjectPath: string, nextRunning: boolean) {
-    try {
-      await fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/observer/${nextRunning ? "start" : "stop"}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectPath: observerProjectPath }),
-      });
-      await loadObserverStatus();
-    } catch (toggleError) {
-      setError(toggleError instanceof Error ? toggleError.message : "Не удалось переключить Observer.");
-    }
-  }
-
   // Project-level toggle (2026-07-16, multi-path unification): one click
   // starts/stops Observer on every physical repo of the selected project -
   // the user no longer has to know or care that a project can have several
@@ -3681,7 +4070,14 @@ export function App() {
           <strong>Client</strong>
         </div>
         <div className="app-topbar-actions">
-          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={startNewChat} disabled={running}>
+          {/* Просто переключение вкладки (2026-07-18 fix) - раньше висело на
+              startNewChat, из-за чего "Чат" в топбаре был не вкладкой, а
+              скрытой кнопкой сброса: уйти на "Обсерверы" посмотреть статус и
+              вернуться "Чатом" стирало текущий диалог и ЖИВОЙ run с экрана
+              (сам run на бэкенде продолжал идти - пропадало только
+              отображение). Явный сброс остаётся только у "+ Новый чат" в
+              сайдбаре (onStartNewChat={startNewChat} ниже). */}
+          <button type="button" className={`top-nav-button ${activeView === "chat" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/chat")} disabled={running}>
             Чат
           </button>
           <button type="button" className={`top-nav-button ${activeView === "projects" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/projects")} disabled={running}>
@@ -3692,6 +4088,9 @@ export function App() {
           </button>
           <button type="button" className={`top-nav-button ${activeView === "teams" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/teams")} disabled={running}>
             Команды
+          </button>
+          <button type="button" className={`top-nav-button ${activeView === "observers" ? "top-nav-button-active" : ""}`} onClick={() => navigate("/observers")} disabled={running}>
+            Обсерверы
           </button>
         </div>
       </header>
@@ -3716,24 +4115,8 @@ export function App() {
         <section className="chat-shell chat-shell-full">
           <header className="chat-header">
           <div>
-            <h1>
-              {activeView === "chat"
-                ? "Чат по проекту"
-                : activeView === "projects"
-                  ? "Проекты"
-                  : activeView === "providers"
-                    ? "Провайдеры"
-                    : "Команды"}
-            </h1>
-            <p className="chat-subtitle">
-              {activeView === "chat"
-                ? "Задай вопрос и получи инженерный ответ поверх уже собранной карты проекта."
-                : activeView === "projects"
-                  ? "Редко используемый экран настройки проектов и их путей."
-                  : activeView === "providers"
-                    ? "Редко используемый экран настройки AI-провайдеров."
-                    : "Researcher/Critic/Observer — кто ищет, кто проверяет, кто изучает проект в фоне."}
-            </p>
+            <h1>{VIEW_TITLES[activeView]}</h1>
+            <p className="chat-subtitle">{VIEW_SUBTITLES[activeView]}</p>
           </div>
 
           <div className="header-actions">
@@ -3754,7 +4137,6 @@ export function App() {
               providers={providers}
               teams={teams}
               selectedTeamId={selectedTeamId}
-              observerStatus={observerStatus}
               disabled={running}
               onProjectChange={(nextProjectId) => {
                 setSelectedProjectId(nextProjectId);
@@ -3770,7 +4152,6 @@ export function App() {
               }}
               onProviderChange={(providerId) => void selectProvider(providerId)}
               onTeamChange={(teamId) => void selectTeam(teamId)}
-              onObserverToggle={(observerProjectPaths, nextRunning) => void toggleProjectObserver(observerProjectPaths, nextRunning)}
             />
 
             <ObserverGlobalBar
@@ -3778,6 +4159,7 @@ export function App() {
               pausedCount={pausedObserverProjects.length}
               onStopAll={() => void stopAllObserversNow()}
               onResume={() => void resumeObservers()}
+              onOpenPanel={() => navigate("/observers")}
             />
 
             <div className="chat-body">
@@ -3838,6 +4220,7 @@ export function App() {
                   <AssistantRunMessage
                     runStatus={null}
                     result={turn}
+                    providerModels={providerModels}
                     // Inspector-панель читает состояние `result`, общее для всей
                     // страницы — при открытии инспектора у конкретной (не
                     // обязательно последней) реплики треда сначала переключаем
@@ -3867,6 +4250,7 @@ export function App() {
                   <AssistantRunMessage
                     runStatus={runStatus}
                     result={result}
+                    providerModels={providerModels}
                     onOpenInspector={openInspector}
                     clarificationRound={clarificationRound}
                     onSelectClarification={(moduleKey) => setTask(moduleKey)}
@@ -4343,6 +4727,17 @@ export function App() {
               </div>
             </article>
           </section>
+        ) : null}
+
+        {activeView === "observers" ? (
+          <ObserversPanel
+            projects={projects}
+            observerStatus={observerStatus}
+            pausedCount={pausedObserverProjects.length}
+            onToggleProject={(observerProjectPaths, nextRunning) => void toggleProjectObserver(observerProjectPaths, nextRunning)}
+            onStopAll={() => void stopAllObserversNow()}
+            onResume={() => void resumeObservers()}
+          />
         ) : null}
 
         {error ? <p className="error">{error}</p> : null}
