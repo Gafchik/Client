@@ -73,6 +73,23 @@ export interface DevelopRunStatusRecord {
   autoMergeOutcome?: MergeToBranchOutcome[];
 }
 
+export interface DevelopWorktreeRegistryEntry {
+  runId: string;
+  conversationId: string;
+  projectPath: string;
+  task: string;
+  status: DevelopRunStatusRecord["status"];
+  startedAt: string;
+  finishedAt?: string;
+  worktrees: DevelopWorktreeInfo[];
+  autoMergeOutcome?: MergeToBranchOutcome[];
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
+}
+
 export interface StartDevelopRunInput {
   task: string;
   projectPath: string;
@@ -117,6 +134,129 @@ const developRunStatuses = new Map<string, DevelopRunStatusRecord>();
 
 export function getDevelopRunStatus(runId: string): DevelopRunStatusRecord | null {
   return developRunStatuses.get(runId) ?? null;
+}
+
+export function listDevelopWorktreeEntries(filters?: { projectPath?: string; conversationId?: string }): DevelopWorktreeRegistryEntry[] {
+  const projectPath = filters?.projectPath?.trim();
+  const conversationId = filters?.conversationId?.trim();
+
+  return [...developRunStatuses.values()]
+    .filter((record) => record.worktrees.length > 0)
+    .filter((record) => !projectPath || record.projectPath === projectPath)
+    .filter((record) => !conversationId || record.conversationId === conversationId)
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
+    .map((record) => ({
+      runId: record.runId,
+      conversationId: record.conversationId,
+      projectPath: record.projectPath,
+      task: record.task,
+      status: record.status,
+      startedAt: record.startedAt,
+      ...(record.finishedAt ? { finishedAt: record.finishedAt } : {}),
+      worktrees: record.worktrees,
+      ...(record.autoMergeOutcome?.length ? { autoMergeOutcome: record.autoMergeOutcome } : {}),
+      ...(record.result
+        ? {
+            usage: {
+              promptTokens: record.result.totalPromptTokens,
+              completionTokens: record.result.totalCompletionTokens,
+              totalTokens: record.result.totalPromptTokens + record.result.totalCompletionTokens,
+            },
+          }
+        : {}),
+    }));
+}
+
+export async function listDevelopWorktreeEntriesFromTelemetry(filters?: { projectPath?: string; conversationId?: string }): Promise<DevelopWorktreeRegistryEntry[]> {
+  const where: string[] = ["jsonb_array_length(worktrees) > 0"];
+  const params: unknown[] = [];
+
+  if (filters?.projectPath?.trim()) {
+    params.push(filters.projectPath.trim());
+    where.push(`project_path = $${params.length}`);
+  }
+
+  if (filters?.conversationId?.trim()) {
+    params.push(filters.conversationId.trim());
+    where.push(`conversation_id = $${params.length}`);
+  }
+
+  const rows = await runSql<{
+    run_id: string;
+    conversation_id: string;
+    project_path: string;
+    task: string;
+    status: "running" | "completed" | "failed";
+    started_at: string;
+    finished_at?: string | null;
+    worktrees: DevelopWorktreeInfo[];
+    prompt_tokens: number;
+    completion_tokens: number;
+  }>(
+    `
+      select
+        run_id,
+        conversation_id,
+        project_path,
+        task,
+        status,
+        started_at,
+        finished_at,
+        worktrees,
+        prompt_tokens,
+        completion_tokens
+      from developer_runs
+      where ${where.join(" and ")}
+      order by started_at desc
+    `,
+    params,
+  );
+
+  return rows.map((row) => ({
+    runId: row.run_id,
+    conversationId: row.conversation_id,
+    projectPath: row.project_path,
+    task: row.task,
+    status: row.status,
+    startedAt: new Date(row.started_at).toISOString(),
+    ...(row.finished_at ? { finishedAt: new Date(row.finished_at).toISOString() } : {}),
+    worktrees: Array.isArray(row.worktrees) ? row.worktrees : [],
+    usage: {
+      promptTokens: Number(row.prompt_tokens ?? 0),
+      completionTokens: Number(row.completion_tokens ?? 0),
+      totalTokens: Number(row.prompt_tokens ?? 0) + Number(row.completion_tokens ?? 0),
+    },
+  }));
+}
+
+export async function loadDevelopRunWorktreesFromTelemetry(runId: string): Promise<DevelopWorktreeInfo[] | null> {
+  const rows = await runSql<{ worktrees: DevelopWorktreeInfo[] }>(
+    `
+      select worktrees
+      from developer_runs
+      where run_id = $1
+      limit 1
+    `,
+    [runId],
+  );
+
+  if (rows.length === 0) {
+    return null;
+  }
+
+  const worktrees = rows[0]?.worktrees;
+  return Array.isArray(worktrees) ? worktrees : [];
+}
+
+async function persistTelemetryWorktrees(runId: string, worktrees: DevelopWorktreeInfo[]): Promise<void> {
+  await runSql(
+    `
+      update developer_runs
+      set worktrees = $2::jsonb
+      where run_id = $1
+    `,
+    [runId, JSON.stringify(worktrees)],
+  );
 }
 
 /**
@@ -578,16 +718,49 @@ export async function mergeDevelopRunToRealCheckout(worktrees: DevelopWorktreeIn
  * deliberately kept around for merge-to-branch/manual review until the user
  * says they're done with it.
  */
-export async function cleanupDevelopRunWorktrees(record: DevelopRunStatusRecord): Promise<void> {
+/**
+ * `label` scopes cleanup to ONE physical repo of a multi-root run (2026-07-19,
+ * live user request: a 4-path run's worktree panel had a single shared
+ * "удалить"/"занести" pair acting on all 4 at once - each path needed its
+ * own). Omitted `label` keeps the original "clean up everything" behavior
+ * (the chat-text "почисти ворктри" command still wants that).
+ */
+export async function cleanupDevelopRunWorktrees(record: DevelopRunStatusRecord, label?: string): Promise<void> {
+  const targets = label ? record.worktrees.filter((worktree) => worktree.label === label) : record.worktrees;
+
   await Promise.all(
-    record.worktrees.map((worktree) =>
+    targets.map((worktree) =>
       removeTaskWorktree(
         { rootPath: worktree.rootPath, worktreePath: worktree.worktreePath, branch: worktree.branch, startCommit: worktree.startCommit },
         { deleteBranch: true },
       ).catch(() => {}),
     ),
   );
-  record.worktrees = [];
+  record.worktrees = label ? record.worktrees.filter((worktree) => worktree.label !== label) : [];
+  await persistTelemetryWorktrees(record.runId, record.worktrees);
+}
+
+export async function cleanupTelemetryDevelopRunWorktrees(runId: string, label?: string): Promise<boolean> {
+  const worktrees = await loadDevelopRunWorktreesFromTelemetry(runId);
+
+  if (!worktrees) {
+    return false;
+  }
+
+  const targets = label ? worktrees.filter((worktree) => worktree.label === label) : worktrees;
+
+  await Promise.all(
+    targets.map((worktree) =>
+      removeTaskWorktree(
+        { rootPath: worktree.rootPath, worktreePath: worktree.worktreePath, branch: worktree.branch, startCommit: worktree.startCommit },
+        { deleteBranch: true },
+      ).catch(() => {}),
+    ),
+  );
+
+  const remaining = label ? worktrees.filter((worktree) => worktree.label !== label) : [];
+  await persistTelemetryWorktrees(runId, remaining);
+  return true;
 }
 
 /**

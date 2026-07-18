@@ -396,7 +396,16 @@ export interface ProjectScopeDirective {
 // Deliberately broad/generic (role-family words, not any one project's
 // naming) - a literal match against the project's OWN registered path
 // labels is checked separately by the caller before even reaching here.
-const SCOPE_TRIGGER_PATTERN = /тольк|не трог|не мен|не пиш|не смотри|исключ|кроме|без\s|backend|frontend|бэкенд|бекенд|\bбэк\b|\bбек\b|фронт|десктоп|desktop|только/i;
+// \bбек\b/\bбэк\b (2026-07-19 fix, live incident: "добавь на бек поддержку
+// испанского языка" touched all 4 repos instead of just the backend) -
+// JS's \b is ASCII-only ([A-Za-z0-9_]), so it NEVER fires around Cyrillic
+// text; \bбек\b silently matched nothing, ever, for any Cyrillic input, so
+// this whole pre-filter always fell through to "no restriction" whenever
+// "бек"/"бэк" was the only scope word used (the colloquial short form
+// people actually type). This is only a cost-saving gate before the real
+// LLM classification below, so a bare substring match here (no \b) just
+// risks one extra cheap classifier call, never a wrong restriction.
+const SCOPE_TRIGGER_PATTERN = /тольк|не трог|не мен|не пиш|не смотри|исключ|кроме|без\s|backend|frontend|бэкенд|бекенд|бэк|бек|фронт|десктоп|desktop|только/i;
 
 function taskMentionsScopeTrigger(task: string, roots: Array<{ label: string }>): boolean {
   if (SCOPE_TRIGGER_PATTERN.test(task)) {

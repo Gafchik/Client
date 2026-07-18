@@ -1310,6 +1310,94 @@ interface DevelopRunStatusView {
   autoMergeOutcome?: DevelopMergeOutcomeView[];
 }
 
+interface DevelopWorktreeRegistryEntryView {
+  runId: string;
+  conversationId: string;
+  projectPath: string;
+  task: string;
+  status: "running" | "completed" | "failed";
+  startedAt: string;
+  finishedAt?: string;
+  worktrees: Array<{ label: string; rootPath: string; worktreePath: string; branch: string }>;
+  autoMergeOutcome?: DevelopMergeOutcomeView[];
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
+}
+
+interface WorktreeChatGroupView {
+  projectPath: string;
+  conversationId: string;
+  entries: DevelopWorktreeRegistryEntryView[];
+  task: string;
+  startedAt: string;
+  status: "running" | "completed" | "failed";
+  worktrees: Array<DevelopWorktreeRegistryEntryView["worktrees"][number] & { runId: string }>;
+  autoMergeOutcome: DevelopMergeOutcomeView[];
+  usage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  } | null;
+}
+
+function worktreeTreeId(runId: string, label: string): string {
+  return `${runId}:${label}`;
+}
+
+function groupWorktreeEntries(entries: DevelopWorktreeRegistryEntryView[]): Array<{
+  projectPath: string;
+  chats: WorktreeChatGroupView[];
+}> {
+  const projectBuckets = new Map<string, Map<string, DevelopWorktreeRegistryEntryView[]>>();
+
+  for (const entry of entries) {
+    const projectBucket = projectBuckets.get(entry.projectPath) ?? new Map<string, DevelopWorktreeRegistryEntryView[]>();
+    const chatBucket = projectBucket.get(entry.conversationId) ?? [];
+    chatBucket.push(entry);
+    projectBucket.set(entry.conversationId, chatBucket);
+    projectBuckets.set(entry.projectPath, projectBucket);
+  }
+
+  return [...projectBuckets.entries()]
+    .map(([projectPath, chats]) => ({
+      projectPath,
+      chats: [...chats.entries()]
+        .map(([conversationId, chatEntries]) => {
+          const sortedEntries = [...chatEntries].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+          const latestEntry = sortedEntries[0] as DevelopWorktreeRegistryEntryView;
+          const usage = sortedEntries.reduce(
+            (accumulator, entry) => ({
+              promptTokens: accumulator.promptTokens + (entry.usage?.promptTokens ?? 0),
+              completionTokens: accumulator.completionTokens + (entry.usage?.completionTokens ?? 0),
+              totalTokens: accumulator.totalTokens + (entry.usage?.totalTokens ?? 0),
+            }),
+            { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          );
+
+          return {
+            projectPath,
+            conversationId,
+            entries: sortedEntries,
+            task: latestEntry.task,
+            startedAt: latestEntry.startedAt,
+            status: latestEntry.status,
+            worktrees: sortedEntries.flatMap((entry) => entry.worktrees.map((worktree) => ({ ...worktree, runId: entry.runId }))),
+            autoMergeOutcome: sortedEntries.flatMap((entry) => safeList(entry.autoMergeOutcome)),
+            usage: usage.totalTokens > 0 ? usage : null,
+          };
+        })
+        .sort((left, right) => right.startedAt.localeCompare(left.startedAt)),
+    }))
+    .sort((left, right) => {
+      const leftLatest = left.chats[0]?.startedAt ?? "";
+      const rightLatest = right.chats[0]?.startedAt ?? "";
+      return rightLatest.localeCompare(leftLatest);
+    });
+}
+
 function developPhaseLabel(progress?: { turn: number; filesChanged: number; phase: string }): string {
   if (!progress) {
     return "Готовлю изолированную копию проекта...";
@@ -1382,9 +1470,26 @@ function DevelopMergeOutcomeList({ outcomes }: { outcomes: DevelopMergeOutcomeVi
  * поллятся (см. pollDevelopStatus), так что действия кнопок обязаны сами
  * обновлять то, что видно на экране.
  */
-function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
-  const [worktrees, setWorktrees] = useState(run.worktrees);
-  const [mergeOutcome, setMergeOutcome] = useState<DevelopMergeOutcomeView[] | null>(run.autoMergeOutcome ?? null);
+/**
+ * Own action state per physical repo (2026-07-19, live user request: a
+ * 4-path run had ONE shared "занести"/"удалить" pair acting on all 4
+ * worktrees at once - each needed its own, since merging/removing api's
+ * worktree has nothing to do with web/gui/cli's). REST calls now carry
+ * `label` so the backend only touches this one.
+ */
+function DevelopWorktreeRow({
+  runId,
+  worktree,
+  outcome,
+  onMerged,
+  onRemoved,
+}: {
+  runId: string;
+  worktree: DevelopRunStatusView["worktrees"][number];
+  outcome: DevelopMergeOutcomeView | null;
+  onMerged: (outcome: DevelopMergeOutcomeView) => void;
+  onRemoved: () => void;
+}) {
   const [merging, setMerging] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1396,9 +1501,13 @@ function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
     try {
       const response = await fetchJsonWithTimeout<{ outcomes: DevelopMergeOutcomeView[] }>(
         `${API_BASE_URL}/api/develop/merge-to-checkout`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: run.runId }) },
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, label: worktree.label }) },
       );
-      setMergeOutcome(response.outcomes);
+      const own = response.outcomes.find((item) => item.label === worktree.label);
+
+      if (own) {
+        onMerged(own);
+      }
     } catch (mergeError) {
       setActionError(mergeError instanceof Error ? mergeError.message : "Не удалось занести в чекаут.");
     } finally {
@@ -1413,9 +1522,9 @@ function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
     try {
       await fetchJsonWithTimeout(
         `${API_BASE_URL}/api/develop/cleanup-worktree`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId: run.runId }) },
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, label: worktree.label }) },
       );
-      setWorktrees([]);
+      onRemoved();
     } catch (cleanupError) {
       setActionError(cleanupError instanceof Error ? cleanupError.message : "Не удалось удалить worktree.");
     } finally {
@@ -1423,30 +1532,12 @@ function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
     }
   }
 
-  if (worktrees.length === 0) {
-    if (!mergeOutcome) {
-      return null;
-    }
-
-    return (
-      <div className="develop-worktree-panel">
-        <p className="message-label">Занесено в чекаут</p>
-        <DevelopMergeOutcomeList outcomes={mergeOutcome} />
-      </div>
-    );
-  }
-
   return (
-    <div className="develop-worktree-panel">
-      <p className="message-label">Worktree этой задачи</p>
-      {worktrees.map((worktree) => (
-        <div key={worktree.label} className="develop-worktree-entry">
-          <span className="develop-worktree-meta">{worktree.label} · ветка {worktree.branch}</span>
-          <CodeBlock language="bash" code={`cd ${worktree.worktreePath}`} />
-        </div>
-      ))}
+    <div className="develop-worktree-entry">
+      <span className="develop-worktree-meta">{worktree.label} · ветка {worktree.branch}</span>
+      <CodeBlock language="bash" code={`cd ${worktree.worktreePath}`} />
 
-      {mergeOutcome ? <DevelopMergeOutcomeList outcomes={mergeOutcome} /> : null}
+      {outcome ? <DevelopMergeOutcomeList outcomes={[outcome]} /> : null}
 
       <div className="action-row">
         <button type="button" className="ghost-button" onClick={() => void handleMerge()} disabled={merging || cleaning}>
@@ -1458,6 +1549,50 @@ function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
       </div>
 
       {actionError ? <p className="message-footnote">{actionError}</p> : null}
+    </div>
+  );
+}
+
+function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
+  const [worktrees, setWorktrees] = useState(run.worktrees);
+  const [outcomes, setOutcomes] = useState<Record<string, DevelopMergeOutcomeView>>(() => {
+    const initial: Record<string, DevelopMergeOutcomeView> = {};
+
+    for (const outcome of run.autoMergeOutcome ?? []) {
+      initial[outcome.label] = outcome;
+    }
+
+    return initial;
+  });
+
+  if (worktrees.length === 0) {
+    const remaining = Object.values(outcomes);
+
+    if (remaining.length === 0) {
+      return null;
+    }
+
+    return (
+      <div className="develop-worktree-panel">
+        <p className="message-label">Занесено в чекаут</p>
+        <DevelopMergeOutcomeList outcomes={remaining} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="develop-worktree-panel">
+      <p className="message-label">Worktree этой задачи</p>
+      {worktrees.map((worktree) => (
+        <DevelopWorktreeRow
+          key={worktree.label}
+          runId={run.runId}
+          worktree={worktree}
+          outcome={outcomes[worktree.label] ?? null}
+          onMerged={(outcome) => setOutcomes((current) => ({ ...current, [outcome.label]: outcome }))}
+          onRemoved={() => setWorktrees((current) => current.filter((item) => item.label !== worktree.label))}
+        />
+      ))}
     </div>
   );
 }
@@ -1541,6 +1676,17 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
                   </div>
                 ) : null}
 
+                {(result.totalPromptTokens > 0 || result.totalCompletionTokens > 0) ? (
+                  <div className="develop-verification">
+                    <p className="message-label">Токены</p>
+                    <ul>
+                      <li>Prompt: {result.totalPromptTokens.toLocaleString("ru-RU")}</li>
+                      <li>Completion: {result.totalCompletionTokens.toLocaleString("ru-RU")}</li>
+                      <li>Итого: {(result.totalPromptTokens + result.totalCompletionTokens).toLocaleString("ru-RU")}</li>
+                    </ul>
+                  </div>
+                ) : null}
+
                 {result.diff.trim() ? (
                   <details className="develop-diff">
                     <summary>Diff ({result.changedFiles.length} файл(ов): {result.changedFiles.join(", ")})</summary>
@@ -1555,6 +1701,374 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
         ) : null}
       </div>
     </div>
+  );
+}
+
+function WorktreeManagerSidebar({
+  projectName,
+  conversationId,
+}: {
+  projectName: string;
+  conversationId: string | null;
+}) {
+  const [entries, setEntries] = useState<DevelopWorktreeRegistryEntryView[]>([]);
+  const [openProjects, setOpenProjects] = useState<Record<string, boolean>>({});
+  const [openChats, setOpenChats] = useState<Record<string, boolean>>({});
+  const [selectedTreeIds, setSelectedTreeIds] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refreshTimerRef = useRef<number | null>(null);
+
+  async function loadWorktrees(signal?: AbortSignal) {
+    setError(null);
+
+    try {
+      const response = await fetchJsonWithTimeout<{ entries: DevelopWorktreeRegistryEntryView[] }>(
+        `${API_BASE_URL}/api/develop/worktrees`,
+        signal ? { signal } : undefined,
+      );
+
+      setEntries(safeList(response.entries));
+      setOpenProjects((current) => {
+        const next = { ...current };
+
+        for (const entry of safeList(response.entries)) {
+          if (next[entry.projectPath] === undefined) {
+            next[entry.projectPath] = entry.conversationId === conversationId;
+          }
+        }
+
+        return next;
+      });
+      setOpenChats((current) => {
+        const next = { ...current };
+
+        for (const entry of safeList(response.entries)) {
+          const chatKey = `${entry.projectPath}::${entry.conversationId}`;
+          if (next[chatKey] === undefined) {
+            next[chatKey] = entry.conversationId === conversationId;
+          }
+        }
+
+        return next;
+      });
+    } catch (loadError) {
+      if (!(loadError instanceof Error) || loadError.name !== "AbortError") {
+        setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить worktree.");
+      }
+    }
+  }
+
+  function scheduleRefresh(delayMs = 0) {
+    if (refreshTimerRef.current !== null) {
+      window.clearTimeout(refreshTimerRef.current);
+    }
+
+    refreshTimerRef.current = window.setTimeout(() => {
+      void loadWorktrees();
+      refreshTimerRef.current = null;
+    }, delayMs);
+  }
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    void loadWorktrees(controller.signal).finally(() => setLoading(false));
+    const timer = window.setInterval(() => {
+      void loadWorktrees();
+    }, 1500);
+
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+      }
+    };
+  }, [conversationId]);
+
+  const groupedProjects = groupWorktreeEntries(entries);
+  const allTreeIds = groupedProjects.flatMap((projectGroup) =>
+    projectGroup.chats.flatMap((chatGroup) => chatGroup.worktrees.map((worktree) => worktreeTreeId(worktree.runId, worktree.label))),
+  );
+  const selectedCount = selectedTreeIds.size;
+  const allSelected = allTreeIds.length > 0 && selectedTreeIds.size === allTreeIds.length;
+
+  function toggleSelectAll() {
+    if (allSelected) {
+      setSelectedTreeIds(new Set());
+      return;
+    }
+
+    setSelectedTreeIds(new Set(allTreeIds));
+  }
+
+  function toggleTreeSelection(treeIds: string[], checked: boolean) {
+    setSelectedTreeIds((current) => {
+      const next = new Set(current);
+
+      for (const treeId of treeIds) {
+        if (checked) {
+          next.add(treeId);
+        } else {
+          next.delete(treeId);
+        }
+      }
+
+      return next;
+    });
+  }
+
+  function collectSelectedTargets() {
+    const targetMap = new Map<string, { runId: string; label?: string }>();
+
+    for (const projectGroup of groupedProjects) {
+      for (const chatGroup of projectGroup.chats) {
+        for (const worktree of chatGroup.worktrees) {
+          const treeId = worktreeTreeId(worktree.runId, worktree.label);
+          if (selectedTreeIds.has(treeId)) {
+            targetMap.set(treeId, { runId: worktree.runId, label: worktree.label });
+          }
+        }
+      }
+    }
+
+    return [...targetMap.values()];
+  }
+
+  async function cleanupTargets(targets: Array<{ runId: string; label?: string }>) {
+    if (!targets.length) {
+      return;
+    }
+
+    setCleaning(true);
+    setError(null);
+
+    try {
+      await Promise.all(
+        targets.map((target) =>
+          fetchJsonWithTimeout(`${API_BASE_URL}/api/develop/cleanup-worktree`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(target),
+          }),
+        ),
+      );
+
+      setEntries((current) =>
+        current
+          .map((entry) => {
+            const touched = targets.filter((target) => target.runId === entry.runId);
+
+            if (touched.length === 0) {
+              return entry;
+            }
+
+            const labelsToRemove = new Set(touched.map((target) => target.label).filter(Boolean) as string[]);
+
+            return {
+              ...entry,
+              worktrees: labelsToRemove.size > 0
+                ? entry.worktrees.filter((worktree) => !labelsToRemove.has(worktree.label))
+                : [],
+            };
+          })
+          .filter((entry) => entry.worktrees.length > 0),
+      );
+      setSelectedTreeIds(new Set());
+      scheduleRefresh(150);
+    } catch (cleanupError) {
+      setError(cleanupError instanceof Error ? cleanupError.message : "Не удалось удалить выбранные worktree.");
+    } finally {
+      setCleaning(false);
+    }
+  }
+
+  return (
+    <aside className="worktree-sidebar">
+      <div className="worktree-sidebar-head">
+        <p className="section-kicker">Git Worktree</p>
+        <h2>Менеджер деревьев</h2>
+        <span>{conversationId ? `${projectName} · текущий чат активен` : "Все проекты и чаты"}</span>
+      </div>
+
+      {groupedProjects.length > 0 ? (
+        <div className="worktree-sidebar-toolbar">
+          <label className="history-select-all">
+            <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
+            Все
+          </label>
+          <span className="worktree-run-meta">
+            {groupedProjects.length} проектов · {groupedProjects.reduce((count, projectGroup) => count + projectGroup.chats.length, 0)} чатов · {allTreeIds.length} деревьев
+          </span>
+        </div>
+      ) : null}
+
+      {loading && entries.length === 0 ? <p className="muted">Загружаю worktree...</p> : null}
+      {error ? <p className="message-footnote">{error}</p> : null}
+      {!loading && entries.length === 0 ? <p className="muted">Активных worktree сейчас нет.</p> : null}
+
+      <div className="worktree-sidebar-list">
+        {groupedProjects.map((projectGroup) => {
+          const projectPathKey = projectGroup.projectPath;
+          const projectOpen = openProjects[projectPathKey] ?? true;
+          const projectTargets = projectGroup.chats.flatMap((chat) => chat.worktrees.map((worktree) => ({ runId: worktree.runId, label: worktree.label })));
+          const projectTreeIds = projectGroup.chats.flatMap((chatGroup) => chatGroup.worktrees.map((worktree) => worktreeTreeId(worktree.runId, worktree.label)));
+          const projectSelected = projectTreeIds.length > 0 && projectTreeIds.every((treeId) => selectedTreeIds.has(treeId));
+
+          return (
+            <section key={projectPathKey} className="worktree-run-card">
+              <div className="worktree-run-toggle worktree-run-toggle-project">
+                <label className="worktree-select-row worktree-select-row-grow">
+                  <input
+                    type="checkbox"
+                    checked={projectSelected}
+                    onChange={(event) => toggleTreeSelection(projectTreeIds, event.target.checked)}
+                  />
+                  <span className="worktree-run-title">{projectPathKey.split("/").filter(Boolean).slice(-1)[0] ?? projectPathKey}</span>
+                </label>
+                <div className="worktree-run-actions">
+                  <span className="worktree-run-meta">{projectGroup.chats.length} чатов · {projectTargets.length} деревьев</span>
+                  <button
+                    type="button"
+                    className="worktree-accordion-button"
+                    onClick={() => setOpenProjects((current) => ({ ...current, [projectPathKey]: !projectOpen }))}
+                    aria-expanded={projectOpen}
+                    aria-label={projectOpen ? "Свернуть проект" : "Развернуть проект"}
+                  >
+                    {projectOpen ? "▾" : "▸"}
+                  </button>
+                  <button type="button" className="ghost-button danger-button" onClick={() => void cleanupTargets(projectTargets)} disabled={cleaning}>
+                    {cleaning ? "..." : "Удалить"}
+                  </button>
+                </div>
+              </div>
+
+              {projectOpen ? (
+                <div className="worktree-run-body">
+                  {projectGroup.chats.map((chatGroup) => {
+                    const chatKey = `${projectPathKey}::${chatGroup.conversationId}`;
+                    const chatTreeIds = chatGroup.worktrees.map((worktree) => worktreeTreeId(worktree.runId, worktree.label));
+                    const chatSelected = chatTreeIds.length > 0 && chatTreeIds.every((treeId) => selectedTreeIds.has(treeId));
+                    const chatOpen = openChats[chatKey] ?? chatGroup.conversationId === conversationId;
+                    const chatTargets = chatGroup.worktrees.map((worktree) => ({ runId: worktree.runId, label: worktree.label }));
+
+                    return (
+                      <section key={`${projectPathKey}:${chatGroup.conversationId}`} className="worktree-chat-card">
+                        <div className="worktree-run-toggle worktree-run-toggle-chat">
+                          <label className="worktree-select-row worktree-select-row-grow">
+                            <input
+                              type="checkbox"
+                              checked={chatSelected}
+                              onChange={(event) => toggleTreeSelection(chatTreeIds, event.target.checked)}
+                            />
+                            <span className="worktree-run-title">{chatGroup.conversationId === conversationId ? "Текущий чат" : `Чат ${chatGroup.conversationId.slice(0, 8)}`}</span>
+                          </label>
+                          <div className="worktree-run-actions">
+                            <span className="worktree-run-meta">
+                              {chatGroup.worktrees.length} деревьев · {chatGroup.status === "running" ? "в работе" : chatGroup.status === "completed" ? "готово" : "ошибка"}
+                            </span>
+                            <button
+                              type="button"
+                              className="worktree-accordion-button"
+                              onClick={() => setOpenChats((current) => ({ ...current, [chatKey]: !chatOpen }))}
+                              aria-expanded={chatOpen}
+                              aria-label={chatOpen ? "Свернуть чат" : "Развернуть чат"}
+                            >
+                              {chatOpen ? "▾" : "▸"}
+                            </button>
+                            <button type="button" className="ghost-button danger-button" onClick={() => void cleanupTargets(chatTargets)} disabled={cleaning}>
+                              {cleaning ? "..." : "Удалить"}
+                            </button>
+                          </div>
+                        </div>
+
+                        {chatOpen ? (
+                          <div className="worktree-run-body">
+                            <p className="worktree-run-task">{chatGroup.task}</p>
+                            {chatGroup.entries.length > 1 ? (
+                              <p className="worktree-run-meta">Ранов в этом чате: {chatGroup.entries.length}</p>
+                            ) : null}
+                            {chatGroup.usage ? (
+                              <p className="worktree-run-usage">
+                                {chatGroup.usage.totalTokens.toLocaleString("ru-RU")} ток. · prompt {chatGroup.usage.promptTokens.toLocaleString("ru-RU")} · completion {chatGroup.usage.completionTokens.toLocaleString("ru-RU")}
+                              </p>
+                            ) : null}
+
+                            {chatGroup.worktrees.map((worktree) => {
+                              const treeId = worktreeTreeId(worktree.runId, worktree.label);
+                              return (
+                                <div key={treeId} className="worktree-tree-block">
+                                  <label className="worktree-select-row worktree-select-row-tree">
+                                    <input
+                                      type="checkbox"
+                                      checked={selectedTreeIds.has(treeId)}
+                                      onChange={() => setSelectedTreeIds((current) => {
+                                        const next = new Set(current);
+                                        if (next.has(treeId)) {
+                                          next.delete(treeId);
+                                        } else {
+                                          next.add(treeId);
+                                        }
+                                        return next;
+                                      })}
+                                    />
+                                    <span className="worktree-run-meta">{worktree.label}</span>
+                                  </label>
+                                  <DevelopWorktreeRow
+                                    runId={worktree.runId}
+                                    worktree={worktree}
+                                    outcome={chatGroup.autoMergeOutcome.find((outcome) => outcome.label === worktree.label) ?? null}
+                                    onMerged={() => {}}
+                                    onRemoved={() => {
+                                      setEntries((current) =>
+                                        current
+                                          .map((candidate) =>
+                                            candidate.runId === worktree.runId
+                                              ? { ...candidate, worktrees: candidate.worktrees.filter((candidateTree) => candidateTree.label !== worktree.label) }
+                                              : candidate,
+                                          )
+                                          .filter((candidate) => candidate.worktrees.length > 0),
+                                      );
+                                      setSelectedTreeIds((current) => {
+                                        const next = new Set(current);
+                                        next.delete(treeId);
+                                        return next;
+                                      });
+                                      scheduleRefresh(150);
+                                    }}
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                      </section>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </section>
+          );
+        })}
+      </div>
+
+      {selectedCount > 0 ? (
+        <div className="worktree-bulk-actions">
+          <button
+            type="button"
+            className="history-delete-selected"
+            disabled={cleaning}
+            onClick={() => {
+              void cleanupTargets(collectSelectedTargets());
+            }}
+          >
+            {cleaning ? "Удаляю..." : `Удалить выбранное (${selectedCount})`}
+          </button>
+        </div>
+      ) : null}
+    </aside>
   );
 }
 
@@ -4112,7 +4626,7 @@ export function App() {
           />
         ) : null}
 
-        <section className="chat-shell chat-shell-full">
+        <section className={`chat-shell ${activeView === "chat" ? "chat-shell-with-worktrees" : "chat-shell-full"}`}>
           <header className="chat-header">
           <div>
             <h1>{VIEW_TITLES[activeView]}</h1>
@@ -4742,6 +5256,13 @@ export function App() {
 
         {error ? <p className="error">{error}</p> : null}
         </section>
+
+        {activeView === "chat" ? (
+          <WorktreeManagerSidebar
+            projectName={safeText(project?.name, "Проект")}
+            conversationId={conversationId}
+          />
+        ) : null}
       </section>
 
       <InspectorDrawer

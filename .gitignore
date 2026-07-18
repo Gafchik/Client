@@ -8,6 +8,8 @@ coverage/
 .turbo/
 .client/
 .claude/
+.agents/
+skills-lock.json
 
 .env
 .env.local

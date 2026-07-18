@@ -63,7 +63,7 @@ button {
 .app-shell {
   min-height: 100vh;
   display: block;
-  padding: 18px;
+  padding: 12px 18px 18px;
 }
 
 .app-shell-product {
@@ -72,14 +72,14 @@ button {
 }
 
 .app-topbar {
-  max-width: 1280px;
+  max-width: min(1800px, calc(100vw - 32px));
   margin: 0 auto;
   width: 100%;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
-  padding: 2px;
+  padding: 0 2px 2px;
 }
 
 .app-topbar-brand strong {
@@ -92,10 +92,11 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  justify-content: flex-end;
 }
 
 .app-workspace {
-  max-width: 1280px;
+  max-width: min(1800px, calc(100vw - 32px));
   margin: 0 auto;
   width: 100%;
   display: grid;
@@ -104,11 +105,160 @@ button {
 }
 
 .app-workspace-with-history {
-  grid-template-columns: 232px minmax(0, 1fr);
+  grid-template-columns: 280px minmax(0, 1fr) 380px;
 }
 
 .app-workspace-single {
   grid-template-columns: minmax(0, 1fr);
+}
+
+.chat-shell-with-worktrees {
+  min-width: 0;
+  align-self: start;
+}
+
+.worktree-sidebar {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  position: sticky;
+  top: 12px;
+  max-height: calc(100vh - 36px);
+  overflow: auto;
+  align-self: start;
+}
+
+.worktree-sidebar-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.worktree-sidebar-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 2px;
+}
+
+.worktree-sidebar-head h2 {
+  margin: 0;
+}
+
+.worktree-sidebar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.worktree-run-card {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.worktree-run-toggle {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+}
+
+.worktree-run-toggle-project,
+.worktree-run-toggle-chat {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.worktree-run-title {
+  font-weight: 700;
+  min-width: 0;
+}
+
+.worktree-run-meta,
+.worktree-run-usage,
+.worktree-run-task {
+  color: var(--text-muted);
+}
+
+.worktree-run-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.worktree-run-body {
+  padding: 0 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.worktree-chat-card {
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.worktree-select-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.worktree-select-row-grow {
+  flex: 1 1 auto;
+}
+
+.worktree-select-row-tree {
+  padding: 8px 0 2px;
+}
+
+.worktree-select-row input[type="checkbox"] {
+  accent-color: var(--accent-2);
+}
+
+.worktree-tree-block {
+  padding: 0 10px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.worktree-accordion-button {
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.worktree-accordion-button:hover {
+  background: var(--bg-hover);
+}
+
+.worktree-bulk-actions {
+  position: sticky;
+  bottom: 0;
+  padding-top: 8px;
+  background: linear-gradient(180deg, rgba(19, 22, 31, 0) 0%, rgba(19, 22, 31, 1) 28%);
 }
 
 .message-card,
@@ -208,8 +358,7 @@ button {
 }
 
 .chat-shell {
-  max-width: 900px;
-  margin: 0 auto;
+  width: 100%;
   min-width: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -224,12 +373,14 @@ button {
   display: grid;
   gap: 12px;
   position: sticky;
-  top: 14px;
+  top: 12px;
   padding: 12px;
   border-radius: var(--radius-lg);
   background: var(--bg-alt);
   border: 1px solid var(--border);
   max-height: calc(100vh - 28px);
+  overflow: auto;
+  align-self: start;
 }
 
 .chat-history-head,
@@ -383,7 +534,9 @@ button {
 }
 
 .chat-header {
-  padding: 2px 2px 0;
+  padding: 0 2px;
+  min-height: 56px;
+  align-items: flex-start;
 }
 
 .chat-header h1 {
@@ -1165,7 +1318,7 @@ button {
 
 @media (max-width: 1280px) {
   .app-workspace-with-history {
-    grid-template-columns: 208px minmax(0, 1fr);
+    grid-template-columns: 240px minmax(0, 1fr) 340px;
   }
 }
 
@@ -1178,6 +1331,7 @@ button {
     grid-template-columns: 1fr;
   }
 
+  .worktree-sidebar,
   .chat-history {
     position: static;
     max-height: none;
@@ -1207,9 +1361,21 @@ button {
   .section-head,
   .panel-header,
   .inspector-head,
-  .app-topbar {
+  .app-topbar,
+  .worktree-run-toggle-project,
+  .worktree-run-toggle-chat {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .worktree-run-toggle-project,
+  .worktree-run-toggle-chat {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .worktree-run-actions {
+    justify-content: flex-start;
   }
 }
 

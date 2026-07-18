@@ -18,7 +18,7 @@ import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProv
 import { initializeSecretCrypto } from "./secret-crypto.js";
 import { classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
-import { cleanupDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, mergeDevelopRunToRealCheckout, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
+import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -1163,12 +1163,13 @@ export function createApp() {
               // it on every correction.
               : Boolean(priorDevelop?.autoMergeOnCompletion);
 
+            const shouldContinueExistingWorktree = Boolean(priorDevelop?.worktrees.length);
             const status = startDevelopRun({
               ...developInputBase,
               task: composedTask,
               ...(chain ? chain : {}),
               ...(autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
-              ...(intent === "develop-correction" && priorDevelop
+              ...((intent === "develop-correction" || shouldContinueExistingWorktree) && priorDevelop
                 ? {
                     continueFrom: {
                       worktrees: priorDevelop.worktrees,
@@ -1342,13 +1343,46 @@ export function createApp() {
     return status;
   });
 
+  app.get<{ Querystring: { projectPath?: string; conversationId?: string } }>("/api/develop/worktrees", async (request, reply) => {
+    const projectPath = request.query.projectPath?.trim()
+      ? normalizePath(path.resolve(request.query.projectPath.trim()))
+      : "";
+    const conversationId = request.query.conversationId?.trim() || "";
+
+    const liveEntries = listDevelopWorktreeEntries({
+      ...(projectPath ? { projectPath } : {}),
+      ...(conversationId ? { conversationId } : {}),
+    });
+    const telemetryEntries = await listDevelopWorktreeEntriesFromTelemetry({
+      ...(projectPath ? { projectPath } : {}),
+      ...(conversationId ? { conversationId } : {}),
+    }).catch(() => []);
+
+    const merged = new Map<string, ReturnType<typeof listDevelopWorktreeEntries>[number]>();
+    for (const entry of telemetryEntries) {
+      merged.set(entry.runId, entry);
+    }
+    for (const entry of liveEntries) {
+      merged.set(entry.runId, entry);
+    }
+
+    return reply.send({
+      entries: [...merged.values()].sort((left, right) => right.startedAt.localeCompare(left.startedAt)),
+    });
+  });
+
   // Button counterparts of the "занеси в ветку"/"почисти ворктри" chat
   // commands (2026-07-18, explicit product-owner request: "и через чат и
   // через кнопку") - same underlying functions, called directly by runId
   // instead of going through classifyPostCompletionCommand, so a button
   // click never depends on message classification succeeding.
-  app.post<{ Body: { runId?: string } }>("/api/develop/merge-to-checkout", async (request, reply) => {
+  // `label` scopes the action to ONE physical repo of a multi-root run
+  // (2026-07-19, live user request - a 4-path run's panel had a single
+  // shared button pair acting on all 4 worktrees at once). Omitted `label`
+  // keeps acting on everything, same as before.
+  app.post<{ Body: { runId?: string; label?: string } }>("/api/develop/merge-to-checkout", async (request, reply) => {
     const runId = request.body.runId?.trim();
+    const label = request.body.label?.trim() || undefined;
 
     if (!runId) {
       return reply.code(400).send({ message: "Нужно указать runId." });
@@ -1360,17 +1394,26 @@ export function createApp() {
       return reply.code(404).send({ message: "Run не найден (после перезапуска сервера статусы не сохраняются)." });
     }
 
-    if (record.worktrees.length === 0) {
+    const targets = label ? record.worktrees.filter((worktree) => worktree.label === label) : record.worktrees;
+
+    if (targets.length === 0) {
       return reply.code(409).send({ message: "У этого run'а больше нет worktree — уже занесено и очищено, либо ничего не менялось." });
     }
 
-    const outcomes = await mergeDevelopRunToRealCheckout(record.worktrees);
-    record.autoMergeOutcome = outcomes;
+    const outcomes = await mergeDevelopRunToRealCheckout(targets);
+    // Merge into the existing outcome list rather than overwrite it - a
+    // per-label merge must not erase what other labels already recorded.
+    const outcomeByLabel = new Map((record.autoMergeOutcome ?? []).map((outcome) => [outcome.label, outcome]));
+    for (const outcome of outcomes) {
+      outcomeByLabel.set(outcome.label, outcome);
+    }
+    record.autoMergeOutcome = [...outcomeByLabel.values()];
     return reply.send({ outcomes });
   });
 
-  app.post<{ Body: { runId?: string } }>("/api/develop/cleanup-worktree", async (request, reply) => {
+  app.post<{ Body: { runId?: string; label?: string } }>("/api/develop/cleanup-worktree", async (request, reply) => {
     const runId = request.body.runId?.trim();
+    const label = request.body.label?.trim() || undefined;
 
     if (!runId) {
       return reply.code(400).send({ message: "Нужно указать runId." });
@@ -1379,10 +1422,16 @@ export function createApp() {
     const record = getDevelopRunStatus(runId);
 
     if (!record) {
-      return reply.code(404).send({ message: "Run не найден (после перезапуска сервера статусы не сохраняются)." });
+      const cleaned = await cleanupTelemetryDevelopRunWorktrees(runId, label);
+
+      if (!cleaned) {
+        return reply.code(404).send({ message: "Run не найден ни в памяти, ни в telemetry developer_runs." });
+      }
+
+      return reply.send({ ok: true });
     }
 
-    await cleanupDevelopRunWorktrees(record);
+    await cleanupDevelopRunWorktrees(record, label);
     return reply.send({ ok: true });
   });
 
