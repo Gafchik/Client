@@ -10,6 +10,8 @@ export { listWorkUnits } from "./worklist.js";
 export {
   parseDevelopActions,
   runDevelopmentTask,
+  REVIEWER_SYSTEM_PROMPT,
+  SCHEMA_REVIEW_ADDENDUM,
   type DevelopReviewRound,
   type DevelopRunOptions,
   type DevelopRunResult,

@@ -538,6 +538,76 @@ export async function classifyApprovalResponse(input: {
   }
 }
 
+export interface TestsOfferResponse {
+  wantsTests: boolean;
+  /** Free-text scope the user gave ("только юнит-тесты на репозиторий", etc.) - undefined means no specific scope was stated. */
+  scope?: string;
+}
+
+/**
+ * Resolves the user's reply to the post-approval "покрыть тестами?"
+ * question (2026-07-18, docs/architecture/011 §4.12 - explicit product-owner
+ * request: real projects, including this one's own primary test target,
+ * are often NOT test-covered by convention, and the Reviewer demanding
+ * acceptance-evidence by default fought that reality instead of respecting
+ * it). Same fail-closed shape as classifyApprovalResponse - an unclear
+ * reply must never silently start writing tests nobody asked for, and must
+ * never silently swallow an unrelated new message either (the caller falls
+ * through to normal chat-intent classification when wantsTests is false
+ * AND the reply does not look like a plain decline).
+ */
+export async function classifyTestsOffer(input: {
+  message: string;
+  task: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<TestsOfferResponse | null> {
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "The assistant just delivered a completed, reviewed code change and asked the user: \"Покрыть это тестами?\" (should this be covered with tests?). Classify the user's reply to THIS specific question.",
+            "If the reply is a clear \"yes\" (\"да\", \"давай\", \"покрой\", \"го\") with no further detail, or names a general scope (\"юнит-тестами\", \"фичер-тестом на этот сценарий\") - reply {\"result\": {\"wantsTests\": true, \"scope\": string|null}} where scope is the user's own wording of what kind of test/scope they asked for, or null if they just said yes with no detail.",
+            "If the reply is a clear \"no\" (\"нет\", \"не надо\", \"не сейчас\", \"пропусти\") - reply {\"result\": {\"wantsTests\": false}}.",
+            "If the reply is NOT actually answering this question at all - a new unrelated request, a question about something else, feedback on the delivered change itself - reply {\"result\": null}. When genuinely unsure whether this is answering the tests question, prefer {\"result\": null} so the caller can route it normally instead of misreading it as a tests answer.",
+            "Reply with ONLY one line of JSON: {\"result\": {\"wantsTests\": boolean, \"scope\": string|null} | null}.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: `Delivered change (task): ${input.task}\n\nUser's reply to "покрыть тестами?": ${input.message}`,
+        },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return null;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { result?: { wantsTests?: unknown; scope?: unknown } | null };
+
+    if (!parsed.result || typeof parsed.result.wantsTests !== "boolean") {
+      return null;
+    }
+
+    return {
+      wantsTests: parsed.result.wantsTests,
+      ...(typeof parsed.result.scope === "string" && parsed.result.scope.trim() ? { scope: parsed.result.scope.trim() } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Routes a chat message between the Q&A pipeline and the Developer pipeline
  * (docs/architecture/011-developer-pipeline.md): the user writes questions,
@@ -609,6 +679,77 @@ export async function classifyChatIntent(input: {
     return "question";
   } catch {
     return "question";
+  }
+}
+
+/**
+ * Task decomposition (2026-07-18, docs/architecture/011 §4.11): live
+ * evidence across this whole session showed large, multi-layer feature
+ * tasks (a dozen+ files, schema + backend + frontend) never reached
+ * task_complete/Reviewer approval in ANY test, regardless of turn/token
+ * ceiling raises or efficiency work - not a model-capability problem
+ * (the diffs that DID land showed correct architectural judgment), but a
+ * scale problem: one continuous agentic conversation trying to do a whole
+ * feature's worth of work in one sitting, the same way asking one engineer
+ * to write an entire feature without ever committing or getting a review
+ * along the way would blow past any single session's attention/budget.
+ * This plans a large task as an ORDERED sequence of small, independently
+ * completable and reviewable steps UP FRONT - each step gets its own
+ * Developer+Reviewer cycle in develop-runner.ts's chain, continuing in the
+ * SAME worktree rather than starting over. Deliberately conservative: a
+ * task already scoped to one file/one layer/a bug fix must come back as a
+ * single step, not be forced into artificial slices - decomposition
+ * overhead on an already-small task is pure waste, not safety.
+ */
+export async function planDevelopSubtasks(input: {
+  task: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<string[]> {
+  const singleStep = [input.task];
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You are a tech lead breaking a development task into an ORDERED sequence of small, independently completable and reviewable steps, for a coding agent that works one step at a time (each step gets its own implement-then-review cycle before the next one starts).",
+            "Only decompose when the task genuinely spans multiple architectural layers or a large number of files (e.g. a new feature needing a DB schema change AND backend logic AND an API endpoint AND frontend UI, or many clearly separable pieces of work). A task already scoped to one file, one layer, or a bug fix must come back as a SINGLE step, unchanged in substance - do not invent artificial slices for something small, that only adds overhead and review friction for no benefit.",
+            "NEVER split a change from its own test/verification into separate steps - writing and verifying a piece of code is part of doing that step, not a separate layer, no matter how the task happens to phrase it (even if the task explicitly asks for a test as an add-on instruction). A step that implements something already includes proving it works.",
+            "When you do decompose: 2 to 5 steps, in the order they must be built (each step can assume all EARLIER steps are already done and merged - e.g. 'add the API endpoint' can assume the DB schema and model from an earlier step already exist). Each step's description must be self-contained and concrete enough to hand to a developer who has not seen the original request - restate exactly what that step needs to do, do not write vague labels like 'backend part'.",
+            "Reply with ONLY one line of JSON: {\"subtasks\": string[]}. A single-item array means no decomposition.",
+          ].join("\n"),
+        },
+        { role: "user", content: input.task },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return singleStep;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { subtasks?: unknown };
+
+    if (!Array.isArray(parsed.subtasks)) {
+      return singleStep;
+    }
+
+    const subtasks = parsed.subtasks
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => item.length >= 10);
+
+    return subtasks.length >= 2 ? subtasks.slice(0, 5) : singleStep;
+  } catch {
+    return singleStep;
   }
 }
 

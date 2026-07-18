@@ -16,7 +16,7 @@ import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-sta
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
-import { classifyApprovalResponse, classifyChatIntent } from "@client/ai";
+import { classifyApprovalResponse, classifyChatIntent, classifyProjectScopeDirective, classifyTestsOffer, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 import { findLatestDevelopRunForConversation, getDevelopRunStatus, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 
@@ -851,9 +851,47 @@ export function createApp() {
         if (selectedTeam && providerBaseUrl && providerApiKey) {
           const conversationKey = request.body.conversationId?.trim() || "";
           const priorDevelop = conversationKey ? findLatestDevelopRunForConversation(conversationKey) : null;
+          // Path-scoped chat directives for the Developer pipeline (2026-07-18,
+          // explicit product-owner directive: "делай только фронт"/"только
+          // бек"/"только gui" must not silently leave the Developer able to
+          // touch every repo). The Q&A pipeline already has this
+          // (classifyProjectScopeDirective, pipeline-runner.ts) but it was
+          // never wired here - a multi-root develop task always got a
+          // worktree for EVERY registered path regardless of what the user
+          // said, relying purely on the model's own judgment not to wander
+          // into repos nobody asked about. Filtering projectPaths BEFORE
+          // createTaskWorktree runs means the Developer has no worktree for
+          // an excluded repo at all - it cannot see or edit it, not "was
+          // asked nicely not to" (same "не полагаться на послушание модели"
+          // stance as every other deterministic gate in this pipeline).
+          // A continuation (needs-clarification/needs-approval/tests-offer
+          // reply, develop-correction) must keep EXACTLY the scope the
+          // original run already committed to, never re-classify from the
+          // reply text - a bare "да"/"нет" obviously doesn't restate scope
+          // and would otherwise reset to "all repos", which both breaks
+          // executeDevelopRun's worktree-reuse match (continueFrom.worktrees
+          // length must equal this run's root count) and silently defeats
+          // whatever restriction the user originally gave.
+          const priorWorktreeLabels = priorDevelop?.worktrees.length
+            ? new Set(priorDevelop.worktrees.map((worktree) => worktree.label))
+            : null;
+          const scopeDirective = !priorWorktreeLabels && projectRecord && projectRecord.paths.length > 1
+            ? await classifyProjectScopeDirective({
+                task,
+                providerBaseUrl,
+                providerModel: selectedTeam.criticModel,
+                providerApiKey,
+                roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
+              })
+            : { restricted: false, allowedLabels: [] as string[] };
+          const effectiveProjectPaths = priorWorktreeLabels
+            ? projectRecord?.paths.filter((pathRecord) => priorWorktreeLabels.has(pathRecord.name))
+            : scopeDirective.restricted
+              ? projectRecord?.paths.filter((pathRecord) => scopeDirective.allowedLabels.includes(pathRecord.name))
+              : projectRecord?.paths;
           const developInputBase = {
             projectPath: normalizePath(path.resolve(projectPath)),
-            ...(projectRecord?.paths.length ? { projectPaths: projectRecord.paths } : {}),
+            ...(effectiveProjectPaths?.length ? { projectPaths: effectiveProjectPaths } : {}),
             providerBaseUrl,
             providerApiKey,
             developerModel: selectedTeam.developerModel,
@@ -931,6 +969,49 @@ export function createApp() {
             return reply.code(202).send({ kind: "develop", ...status });
           }
 
+          // Tests-as-separate-step (2026-07-18, docs/architecture/011
+          // §4.12): the completed run's summary just asked "покрыть
+          // тестами?" - classify THIS message as an answer to that specific
+          // question before treating it as a normal chat message. Consumed
+          // exactly once regardless of outcome (even "unclear") by flipping
+          // testsOffered back off, so a later unrelated message never gets
+          // re-interpreted as answering a stale question.
+          if (priorDevelop?.status === "completed" && priorDevelop.testsOffered) {
+            priorDevelop.testsOffered = false;
+
+            const offerResponse = await classifyTestsOffer({
+              message: task,
+              task: priorDevelop.task,
+              providerBaseUrl,
+              providerModel: selectedTeam.criticModel,
+              providerApiKey,
+            });
+
+            if (offerResponse?.wantsTests) {
+              const testsTask = [
+                `Напиши тесты для уже сделанного и одобренного изменения: "${priorDevelop.task}"`,
+                `Что было сделано: "${(priorDevelop.result?.summary ?? "").slice(0, 1200)}"`,
+                ...(offerResponse.scope ? [`Пользователь уточнил охват: ${offerResponse.scope}`] : []),
+              ].join("\n");
+              const status = startDevelopRun({
+                ...developInputBase,
+                task: testsTask,
+                continueFrom: {
+                  worktrees: priorDevelop.worktrees,
+                  priorTask: priorDevelop.task,
+                  priorSummary: priorDevelop.result?.summary ?? "",
+                },
+              });
+              return reply.code(202).send({ kind: "develop", ...status });
+            }
+
+            if (offerResponse && !offerResponse.wantsTests) {
+              return reply.code(200).send({ kind: "question", answer: { summary: "Хорошо, без тестов.", explanation: "Хорошо, без тестов." } });
+            }
+            // offerResponse === null - not actually an answer to the offer,
+            // fall through to normal classification below.
+          }
+
           const intent = await classifyChatIntent({
             task,
             providerBaseUrl,
@@ -976,9 +1057,40 @@ export function createApp() {
               }
             }
 
+            // Task decomposition (2026-07-18, docs/architecture/011 §4.11):
+            // only for a FRESH task, never a correction round (a correction
+            // is already scoped to what was just delivered - decomposing it
+            // further would just fragment review feedback). Fails closed to
+            // a single step (planDevelopSubtasks itself already returns
+            // [task] on any classification failure), so this can never
+            // block a develop task from starting.
+            let chain: { chainRemaining: string[]; chainInfo: { subtaskIndex: number; totalSubtasks: number } } | undefined;
+
+            if (intent === "develop") {
+              try {
+                const subtasks = await planDevelopSubtasks({
+                  task: composedTask,
+                  providerBaseUrl,
+                  providerModel: selectedTeam.criticModel,
+                  providerApiKey,
+                });
+
+                if (subtasks.length >= 2) {
+                  composedTask = subtasks[0] as string;
+                  chain = {
+                    chainRemaining: subtasks.slice(1),
+                    chainInfo: { subtaskIndex: 0, totalSubtasks: subtasks.length },
+                  };
+                }
+              } catch {
+                // Decomposition is an optimization, never a dependency.
+              }
+            }
+
             const status = startDevelopRun({
               ...developInputBase,
               task: composedTask,
+              ...(chain ? chain : {}),
               ...(intent === "develop-correction" && priorDevelop
                 ? {
                     continueFrom: {

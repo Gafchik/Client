@@ -172,6 +172,21 @@ export interface DevelopRunOptions {
    */
   priorSensitiveActions?: DevelopSensitiveAction[];
   onProgress?: (info: { turn: number; filesChanged: number; phase: "developing" | "reviewing" | "fixing" }) => void;
+  /**
+   * Impact analysis (2026-07-18, docs/architecture/011 §4.13): deterministic
+   * structural-dependents lookup against the SAME persisted graph
+   * find_references already uses - given the files actually edited this
+   * run, returns which OTHER files/symbols in the project structurally call
+   * or depend on them, so the Reviewer's finding (2) ("correctness bugs and
+   * behavior broken for existing callers") is grounded in real graph data
+   * instead of resting entirely on whether the Developer happened to call
+   * find_references enough times. Deliberately NOT a new role/handoff (see
+   * §1's "each handoff is a context loss") - injected straight into the
+   * EXISTING Reviewer call as grounding context, same continuous run.
+   * Sync and cheap (pure graph traversal) - undefined when no graph
+   * snapshot exists yet, degrading silently to today's behavior.
+   */
+  computeImpactPreview?: (editedFiles: string[]) => string;
 }
 
 /**
@@ -294,29 +309,66 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
     "Notice: each marker (\"<<<SEARCH\", \"SEARCH>>>\", \"<<<REPLACE\", \"REPLACE>>>\") is ALONE on its own line, with nothing else on that line - not indented, not combined with code, not followed by extra text. Every SEARCH block you open MUST be closed with \"SEARCH>>>\" before \"<<<REPLACE\" begins - never skip the closing marker.",
     "PREFER edit_file over write_file for existing files: read_file output can be truncated, and rewriting a file from a truncated read destroys the part you never saw. edit_file is immune to that - it only touches the block you matched.",
     "ACTION: ask_user(one clarifying question IN RUSSIAN) - use ONLY if the task is genuinely ambiguous in a way that materially changes what to implement (different behavior, different data model - not naming/details you can decide yourself). It ends the run and asks the human. Ask at the START, before writing code - never after you have already implemented one interpretation.",
-    "ACTION: task_complete(final summary IN RUSSIAN) - call exactly once, when the change is done and verified as well as this project allows. The summary must state: what was changed and why, what was verified (which commands, what they showed), and honestly what was NOT verified and why (e.g. the project has no test suite). No meta commentary.",
+    "ACTION: task_complete(final summary IN RUSSIAN) - call exactly once, when the change is done and verified as well as this project allows. The summary must state: what was changed and why, what was verified (which commands, what they showed), honestly what was NOT verified and why (e.g. the project has no test suite), and - only if genuinely non-empty, do not pad this - remaining risk (something you are not fully certain about, an edge case you could not check) and anything worth a human manually checking before this ships. No meta commentary.",
     "",
     "How to work:",
     "1. STUDY BEFORE WRITING, ACTIVELY, NOT JUST BY LUCK OF GREP. Before implementing anything, explicitly look for whether this project ALREADY has a mechanism for this kind of thing" + (hasSemanticSearch ? " - semantic_search is often the right tool for this (it finds by MEANING: e.g. search \"default records created for a new X\" or \"clone template data for new entity\", not just the task's literal words)" : "") + ". Find 2-3 places where this project already does something similar and read them - then write YOUR change in the same style, same naming, same patterns, same error handling, REUSING an existing mechanism (a shared method/hook/utility) instead of writing a new parallel one when one already exists. Code that reinvents what the codebase already has is wrong even when it runs - it is technical debt from the moment it is written.",
     `2. BEFORE CHANGING WHAT ALREADY EXISTS - never break an existing caller. Before you edit the BODY or SIGNATURE of a function/method that other code might call, or before you rename/remove/move anything existing,${hasFindReferences ? " use find_references(name) to see its real callers/dependents" : " grep_content for its name to see where else it is used"} and make sure your change keeps them working (or update them too, if that is genuinely required and still in scope). State in your task_complete summary which existing callers you checked for anything you changed rather than purely added - \"I did not check\" is an honest thing to write if true, but silently not checking is not.`,
-    "3. STATE A SHORT PLAN before your first write_file/edit_file (a few sentences in your own reasoning text, not a separate tool call): which files need to change and why, which existing pattern from step 1 you are reusing (if any), and explicitly - does this task need a DATABASE MIGRATION/schema change? A feature that adds or reads a new field/column/table needs a real migration in this same task, not just application code that silently assumes the column exists - code referencing a column with no migration creating it is broken, not done. Getting this right BEFORE writing code prevents discovering a missing piece late, when budget is tight.",
+    "3. STATE A SHORT PLAN before your first write_file/edit_file (a few sentences in your own reasoning text, not a separate tool call): which files need to change and why, which existing pattern from step 1 you are reusing (if any), and explicitly - does this task need a DATABASE MIGRATION/schema change? A feature that adds or reads a new field/column/table needs a real migration in this same task, not just application code that silently assumes the column exists - code referencing a column with no migration creating it is broken, not done. If there is a real, non-obvious choice between two reasonable ways to implement this (not a trivial choice with one obvious answer), name it and say which you picked and why - the safer/more consistent one wins over the cleverer one. Getting this right BEFORE writing code prevents discovering a missing piece late, when budget is tight.",
     "4. Read a file (read_file) before editing it - edit_file requires an exact match of existing content, guessing will just bounce.",
     "5. IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet, list_dir it first - a neighboring file may be the real place to change.",
-    "6. Keep the change minimal and coherent: implement what the task asks, do not refactor unrelated code, do not add features nobody asked for. If you must touch a file whose connection to the task is not obvious, say why in your summary.",
+    "6. Keep the change minimal and coherent: implement what the task asks, do not refactor unrelated code, do not add features nobody asked for. Do not add error handling, validation, or defensive checks for scenarios that cannot happen given how this code is actually called - trust the surrounding code's own guarantees the same way it already does. Do not introduce a new abstraction (helper/base class/interface/config flag) for something that only has one or two call sites today - three similar lines beats a premature abstraction. If you must touch a file whose connection to the task is not obvious, say why in your summary.",
     "7. After meaningful changes, verify with run_command using the project's own tooling (look for package.json scripts, composer.json, Makefile, phpunit.xml etc.). A syntax check (php -l, node --check) is the bare minimum when no test suite exists. If verification is impossible, say so honestly in the summary instead of pretending.",
-    "8. ACCEPTANCE EVIDENCE, not just \"nothing broke\": for a BUG FIX, first REPRODUCE the wrong behavior with run_command (a failing test, a script, a command showing the bug), then fix, then show the same check passing - before/after is the strongest evidence there is. For NEW behavior, when the project has a test suite, add or extend a test that covers the new behavior and run it.",
+    // Tests-as-separate-step (2026-07-18, docs/architecture/011 §4.12): the
+    // OLD version of this instruction told the Developer to add/extend
+    // persisted test files as part of every task - directly caused a real
+    // 45-turn spiral (building unrelated test factories/migrations from
+    // scratch to satisfy this). Test coverage is now the user's own
+    // explicit, separate, opt-in decision made AFTER review - writing test
+    // FILES here is scope the task did not ask for, same as any other
+    // unrequested feature (see instruction 6).
+    "8. VERIFY YOUR OWN WORK, but do not write persisted test files unless the task explicitly asked for tests: for a BUG FIX, reproduce the wrong behavior first (an ad hoc run_command - a one-off script, a REPL/tinker call, a manual reproduction), then fix, then show the SAME ad hoc check now passing - before/after with throwaway commands, not a new test file added to the repo. Adding actual test files/test infrastructure is out of scope unless the task says so - that is a separate step the user decides on later.",
     "9. Do not invent APIs, columns, or config keys you have not seen in this codebase. Check first.",
+    "10. Default to no comments in code you write. Add one only when it captures a non-obvious WHY (a hidden constraint, a workaround, something that would genuinely surprise the next reader) - never comments that restate what well-named code already says.",
     `You may batch up to ${MAX_ACTIONS_PER_TURN} ACTION lines per turn (they execute in order, results come back together). Any ACTION beyond the ${MAX_ACTIONS_PER_TURN}th is NOT executed - if you need more, split them across turns and wait for the results. Exceptions: task_complete and ask_user must be called ALONE.`,
     "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
     "If the reviewer later returns findings: fix the ones that are real. If a finding is factually wrong, do NOT change code to appease it - explain why in your next task_complete summary under a line starting with \"Оспорено:\".",
   ].join("\n");
 }
 
-const REVIEWER_SYSTEM_PROMPT = [
+export const REVIEWER_SYSTEM_PROMPT = [
   "You are an independent senior code reviewer (a different model from the author). You are given: the original task, the full unified diff of the change, and the verification journal (commands the author ran, with exit codes).",
   "Form your OWN opinion of how this task should be solved in this codebase, then judge the diff against it. You were deliberately NOT given the author's notes or plan - review the result, not the intention.",
-  "Look for, in order of importance: (1) the diff not actually doing what the task asks, or doing it partially; (2) correctness bugs and behavior broken for existing callers visible from the diff context; (3) changes with no plausible relation to the task (each must be justified or flagged); (4) missing or failed verification - if the journal is empty or a check failed and the diff does not address it, flag it; (5) clear inconsistency with the surrounding code's own style visible in the diff context; (6) duplication and single-responsibility drift VISIBLE IN THE DIFF CONTEXT ITSELF - only flag this if you can point at a SPECIFIC existing function/method shown in the diff's surrounding context that the new code re-implements instead of reusing or extending, or a single new function/method that does two or more clearly unrelated things. Do not lecture about SOLID/DRY/design patterns in the abstract and do not suggest introducing a new abstraction (factory/strategy/interface/base class) unless the diff's own surrounding context already uses that abstraction elsewhere for the same kind of thing - proposing patterns the codebase does not already use is over-engineering, not a real finding; (7) a NEW PERSISTED FIELD WITH NO MIGRATION - if the diff adds a field/column to something that looks like it is meant to be saved to a database (added to a model's fillable/casts array, an ORM entity/@Column decorator, a serializer, a repository insert/update call) but the diff contains NO migration/schema file creating that column anywhere, flag it explicitly as broken - this code will fail at runtime against a real database, not just be incomplete (live evidence: this exact gap shipped a 'tags' field with zero migration); (8) ACCEPTANCE EVIDENCE vs. JUST 'NOTHING BROKE' - the task usually describes USER-OBSERVABLE behavior (a person can do X, sees Y). A verification journal full of ONLY static checks (syntax lint, typecheck, a linter) proves the code parses, not that the described behavior actually works. If the task implies observable behavior and the journal contains no command that actually EXERCISES it (a test that calls the new code path, a manual invocation reproducing the scenario, a query showing the expected data) - flag this explicitly as missing acceptance evidence, distinct from finding (4)'s missing/failed verification. Do not demand a full test suite for a project that has none - flag it as a gap to note, not as grounds to block forever, but it must be visible, not silently accepted as done.",
+  "Look for, in order of importance: (1) the diff not actually doing what the task asks, or doing it partially; (2) correctness bugs and behavior broken for existing callers visible from the diff context - if a \"Structural impact\" block is given below, it lists REAL, deterministically-found dependents of the changed files (not a claim, actual graph data); check whether the diff's behavior change is compatible with each one, this is your strongest source for this finding, stronger than what you can infer from the diff alone; (3) changes with no plausible relation to the task (each must be justified or flagged); (4) a verification command the author actually RAN that FAILED (non-zero exit / visible error in its output) and the diff does not address it - flag it; (5) clear inconsistency with the surrounding code's own style visible in the diff context; (6) duplication and single-responsibility drift VISIBLE IN THE DIFF CONTEXT ITSELF - only flag this if you can point at a SPECIFIC existing function/method shown in the diff's surrounding context that the new code re-implements instead of reusing or extending, or a single new function/method that does two or more clearly unrelated things. Do not lecture about SOLID/DRY/design patterns in the abstract and do not suggest introducing a new abstraction (factory/strategy/interface/base class) unless the diff's own surrounding context already uses that abstraction elsewhere for the same kind of thing - proposing patterns the codebase does not already use is over-engineering, not a real finding; (7) a NEW PERSISTED FIELD WITH NO MIGRATION - if the diff adds a field/column to something that looks like it is meant to be saved to a database (added to a model's fillable/casts array, an ORM entity/@Column decorator, a serializer, a repository insert/update call) but the diff contains NO migration/schema file creating that column anywhere, flag it explicitly as broken - this code will fail at runtime against a real database, not just be incomplete (live evidence: this exact gap shipped a 'tags' field with zero migration).",
+  // Tests-as-separate-step (2026-07-18, docs/architecture/011 §4.12, explicit
+  // product-owner directive): this project's own primary test target (and
+  // the owner's own work projects) are NOT test-covered by convention -
+  // demanding acceptance-evidence/test coverage by default fought that
+  // reality instead of respecting it, and was a major real source of wasted
+  // turns this session (one run burned 45 turns building unrelated test
+  // infrastructure chasing exactly this kind of finding). Test coverage is
+  // now an explicit, separate, opt-in step the USER decides on AFTER a
+  // correctness approval, never something the Reviewer blocks on.
+  "Do NOT flag missing tests, missing acceptance-evidence, or a verification journal limited to static checks (lint/typecheck) as a reason to withhold approval - test coverage is handled as a separate, explicit step after this review, not part of it. Only flag a verification command that was actually run and actually failed (see (4)).",
   "Do NOT invent problems. Every finding must be concrete, grounded in the diff or the journal, and actionable - no vague advice, no style nitpicks the surrounding code itself contradicts, no demands to add features beyond the task.",
+  // Live evidence (2026-07-18): a trivial rename task got the SAME finding
+  // in both review rounds - "there might be other language files you
+  // haven't checked" - even though the author's OWN verification journal
+  // showed a list_dir(lang/) call that already proved only 4 language
+  // directories exist. The finding speculated instead of reading the
+  // evidence already sitting right there in the journal it was given.
+  "Before writing a finding that says something MIGHT be missing/incomplete/unchecked ('there could be other files', 'this might not cover X'), check the verification journal you were given - if a command already shown there (list_dir, grep, a test run) already answers that specific question, use that answer instead of speculating, even if the answer means there is nothing to flag.",
+  "Do NOT enumerate the diff line by line confirming things ARE correct/present/used properly - if something is fine, say nothing about it, do not write a finding that concludes 'this is fine/correct/not required'. A real diff rarely has more than a handful of genuine findings - if you notice yourself listing more than ~6-8, stop and re-read: you have very likely drifted into restating non-problems instead of finding real ones.",
+  // Live evidence (2026-07-18): a confidently-worded finding claimed a class
+  // import was missing and would cause a fatal error - the class was
+  // actually in the SAME namespace as the caller, so no import was needed;
+  // that finding was simply wrong. Another finding re-demanded something
+  // the diff you were given ALREADY contained. Before writing any finding
+  // that says something is missing/absent/not done, look again at the
+  // EXACT diff text you were given for this specific claim - do not rely on
+  // a general expectation of what code like this usually needs. If you are
+  // not certain the diff you can actually see supports the finding, do not
+  // write it.",
   "Reply STRICTLY in this format: either the single word \"APPROVED\", or \"NEEDS_CHANGES:\" followed by a numbered list of findings IN RUSSIAN (one finding per number, each self-contained).",
 ].join("\n");
 
@@ -333,7 +385,7 @@ function touchesSchema(changedFiles: string[]): boolean {
   return changedFiles.some((filePath) => SCHEMA_CHANGE_PATTERN.test(filePath));
 }
 
-const SCHEMA_REVIEW_ADDENDUM = [
+export const SCHEMA_REVIEW_ADDENDUM = [
   "This diff touches a database migration/schema file - additionally check, ONLY to the extent visible in the diff itself:",
   "- repeating groups or comma-packed multi-values in a single column (1NF violation);",
   "- a non-key column that only depends on PART of a composite primary key (2NF violation);",
@@ -527,6 +579,23 @@ function formatVerificationJournal(entries: DevelopVerificationEntry[]): string 
     .join("\n\n");
 }
 
+// Live evidence (2026-07-18): a repetition-loop reviewer response listed
+// items like "missing check for X - used correctly"/"missing Y - not
+// required" over a hundred times, each one admitting in its own text that
+// there is no actual problem. A finding is not a finding if it says so
+// itself - this is a text-pattern filter, not a request for the model to
+// behave differently (see docs/architecture/011 §1: "нельзя полагаться на
+// послушание модели"). Capped as a hard backstop too, in case a genuine
+// diff somehow has more real findings than any diff this size plausibly
+// would - the fix-round conversation already handles a long findings list
+// poorly regardless of whether each one is real.
+const SELF_CONTRADICTING_FINDING_PATTERN = /это корректно|используется корректно|это нормально|не является ошибкой|не является блокирующ|проблем(?:ы)? нет|не требуется\.?\s*$|не обязательно(?:\.|\s*$)|эквивалентно\.?\s*$|по умолчанию.{0,20}(?:это нормально|нормально)\.?\s*$/i;
+const MAX_REVIEWER_FINDINGS = 10;
+
+function filterSelfContradictingFindings(findings: string[]): string[] {
+  return findings.filter((finding) => !SELF_CONTRADICTING_FINDING_PATTERN.test(finding)).slice(0, MAX_REVIEWER_FINDINGS);
+}
+
 async function callReviewer(input: {
   reviewerModel: string;
   providerBaseUrl: string;
@@ -535,6 +604,8 @@ async function callReviewer(input: {
   diff: string;
   changedFiles: string[];
   verificationLog: DevelopVerificationEntry[];
+  /** Deterministic structural-dependents block (see DevelopRunOptions.computeImpactPreview) - grounds finding (2) in real graph data. */
+  impactPreview?: string;
 }): Promise<{ round: DevelopReviewRound | null; promptTokens: number; completionTokens: number; unavailableReason?: string }> {
   const boundedDiff = input.diff.length > MAX_REVIEW_DIFF_CHARS
     ? `${input.diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n... (diff truncated at ${MAX_REVIEW_DIFF_CHARS} chars - flag this if the visible part alone cannot justify approval)`
@@ -549,6 +620,9 @@ async function callReviewer(input: {
         "",
         "Verification journal:",
         formatVerificationJournal(input.verificationLog),
+        ...(input.impactPreview
+          ? ["", "Structural impact (deterministic, from the project's dependency graph - not the author's claim): who actually depends on the changed files:", input.impactPreview]
+          : []),
         "",
         "Unified diff of the change:",
         boundedDiff,
@@ -560,7 +634,7 @@ async function callReviewer(input: {
     const { content, usage } = await callModel(input.providerBaseUrl, input.providerApiKey, input.reviewerModel, messages);
     const trimmed = content.trim();
     const approved = /^APPROVED\b/i.test(trimmed);
-    const findings = approved
+    const rawFindings = approved
       ? []
       : trimmed
         .replace(/^NEEDS_CHANGES:?/i, "")
@@ -568,14 +642,24 @@ async function callReviewer(input: {
         .map((line) => line.trim())
         .filter((line) => /^\d+[.)]/.test(line) || /^[-•]/.test(line))
         .map((line) => line.replace(/^\d+[.)]\s*/, "").replace(/^[-•]\s*/, ""));
+    // Live evidence (task-decomposition test, 2026-07-18): a correct 4-file
+    // Laravel migration+model diff got a NEEDS_CHANGES verdict from a
+    // reviewer response that degenerated into 100+ near-duplicate items
+    // like "missing check for X - used correctly", each one self-admitting
+    // there is no actual problem, running until it hit the completion token
+    // limit mid-sentence. This is a decoding repetition-loop failure mode,
+    // not the model finding real issues - deterministic filtering doesn't
+    // rely on the model not doing this again. A finding whose own text
+    // already says the thing IS correct/not required is not a finding.
+    const findings = filterSelfContradictingFindings(rawFindings);
 
     return {
       round: {
-        verdict: approved ? "approved" : "needs-changes",
+        verdict: approved ? "approved" : findings.length > 0 ? "needs-changes" : "approved",
         // A non-APPROVED reply with no parseable numbered findings still
         // carries its message - keep the raw text as the single finding
         // rather than silently approving a rejection.
-        findings: approved ? [] : (findings.length > 0 ? findings : [trimmed]),
+        findings: approved ? [] : (findings.length > 0 ? findings : rawFindings.length > 0 ? [] : [trimmed]),
         raw: trimmed,
       },
       promptTokens: usage?.prompt_tokens ?? 0,
@@ -820,6 +904,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       diff: latestDiff,
       changedFiles: latestChangedFiles,
       verificationLog,
+      ...(options.computeImpactPreview ? { impactPreview: options.computeImpactPreview([...editedFiles]) } : {}),
     });
     totalPromptTokens += reviewResult.promptTokens;
     totalCompletionTokens += reviewResult.completionTokens;

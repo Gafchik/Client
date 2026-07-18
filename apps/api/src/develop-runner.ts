@@ -2,9 +2,10 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { runDevelopmentTask, runShellCommand, type DevelopRunResult, type DevelopSensitiveAction, type WorkspaceRoot } from "@client/agentic-research";
 import { classifyFactConflict, extractCodePatternFacts } from "@client/ai";
+import { getFileDependents } from "@client/graph";
 import { promoteFactsFromDevelopment, queryFactsAcrossPaths, queryGlossaryAcrossPaths } from "@client/knowledge";
 import { collectWorktreeChanges, createTaskWorktree, removeTaskWorktree, type TaskWorktree } from "@client/repository-git";
-import { normalizePath, stableId, type ProjectPathRecord } from "@client/shared";
+import { normalizePath, stableId, type GraphState, type ProjectPathRecord } from "@client/shared";
 import { loadGraphSnapshot } from "./graph-store.js";
 import { buildGlossaryHint, buildGraphNavigationTool, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool, buildSemanticSeedLookup } from "./pipeline-runner.js";
 import { runSql } from "./postgres-client.js";
@@ -42,6 +43,23 @@ export interface DevelopRunStatusRecord {
   worktrees: DevelopWorktreeInfo[];
   result?: DevelopRunResult;
   errorMessage?: string;
+  /** Task-decomposition chain (2026-07-18) - which link in the planned sequence this run is. */
+  chainInfo?: { subtaskIndex: number; totalSubtasks: number };
+  /**
+   * Set once this link's success auto-starts the next one - lets a caller
+   * that only has THIS runId follow the chain without re-deriving it from
+   * conversationId. Absent means either not chained, or this was the last link.
+   */
+  chainNextRunId?: string;
+  /**
+   * Tests-as-separate-step (2026-07-18, docs/architecture/011 §4.12): set
+   * once (never again for this record) when the "покрыть тестами?" question
+   * has been appended to this run's summary - the chat routing in app.ts
+   * checks this to know whether the conversation's NEXT message should be
+   * classified as an answer to that question before falling through to
+   * normal chat-intent routing.
+   */
+  testsOffered?: boolean;
 }
 
 export interface StartDevelopRunInput {
@@ -68,6 +86,17 @@ export interface StartDevelopRunInput {
     /** Sensitive DB commands already resolved (approved+executed or rejected) earlier in this conversation - see DevelopRunOptions.priorSensitiveActions. */
     priorSensitiveActions?: DevelopSensitiveAction[];
   };
+  /**
+   * Task decomposition (2026-07-18, docs/architecture/011 §4.11): a large,
+   * multi-layer task planned upfront as an ordered sequence of small,
+   * independently reviewable steps (planDevelopSubtasks in packages/ai).
+   * `task` above is always the CURRENT step; chainRemaining holds the
+   * standalone descriptions of the steps still to come. Only ever set
+   * internally (by startDevelopRun advancing its own chain) - never by an
+   * external caller directly.
+   */
+  chainRemaining?: string[];
+  chainInfo?: { subtaskIndex: number; totalSubtasks: number };
 }
 
 const MAX_TRACKED_RUNS = 100;
@@ -110,6 +139,7 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
     startedAt,
     updatedAt: startedAt,
     worktrees: [],
+    ...(input.chainInfo ? { chainInfo: input.chainInfo } : {}),
   };
 
   pruneTrackedRuns();
@@ -121,6 +151,9 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
   });
 
   void executeDevelopRun(record, input)
+    .then(() => {
+      maybeAdvanceChain(record, input);
+    })
     .catch((error) => {
       record.status = "failed";
       record.errorMessage = error instanceof Error ? error.message : String(error);
@@ -132,6 +165,69 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
     });
 
   return record;
+}
+
+/**
+ * Task-decomposition chain advance (2026-07-18, docs/architecture/011
+ * §4.11): only continues past a CLEAN Reviewer approval - anything else
+ * (contested review, a pause for clarification/DB approval, an error, a
+ * budget exhaustion) must surface to the human before more automated work
+ * stacks on top of an unresolved link, same bar a non-chained run already
+ * holds. Fires the next link via startDevelopRun itself, reusing this
+ * link's worktrees (still populated - executeDevelopRun only clears them
+ * on an empty, non-paused diff) so the chain is one continuous worktree,
+ * not N independent throwaway ones.
+ */
+function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDevelopRunInput): void {
+  const result = record.result;
+  const cleanApproval = result?.stopped === "task_complete" && result.reviewVerdict === "approved";
+
+  // Tests-as-separate-step (2026-07-18, docs/architecture/011 §4.12,
+  // explicit product-owner directive): real projects, including this one's
+  // own primary test target, are commonly NOT test-covered by convention -
+  // the Reviewer no longer blocks on missing tests (see REVIEWER_SYSTEM_PROMPT),
+  // and the Developer no longer writes test files unprompted (see
+  // buildDevelopSystemPrompt instruction 8). Coverage is offered as an
+  // explicit question ONLY once the whole task/chain is genuinely done -
+  // not per intermediate chain link, matching "в конце разработки".
+  if (cleanApproval && !input.chainRemaining?.length && result) {
+    record.testsOffered = true;
+    result.summary = `${result.summary ?? ""}\n\nПокрыть это тестами? (да / нет / свой вариант — какие именно)`;
+  }
+
+  if (!input.chainRemaining?.length) {
+    return;
+  }
+
+  if (!cleanApproval) {
+    return;
+  }
+
+  const [nextTask, ...rest] = input.chainRemaining;
+
+  if (!nextTask || !record.chainInfo) {
+    return;
+  }
+
+  const nextRecord = startDevelopRun({
+    task: nextTask,
+    projectPath: input.projectPath,
+    ...(input.projectPaths ? { projectPaths: input.projectPaths } : {}),
+    providerBaseUrl: input.providerBaseUrl,
+    providerApiKey: input.providerApiKey,
+    developerModel: input.developerModel,
+    reviewerModel: input.reviewerModel,
+    conversationId: record.conversationId,
+    continueFrom: {
+      worktrees: record.worktrees,
+      priorTask: record.task,
+      priorSummary: result.summary ?? "",
+    },
+    chainRemaining: rest,
+    chainInfo: { subtaskIndex: record.chainInfo.subtaskIndex + 1, totalSubtasks: record.chainInfo.totalSubtasks },
+  });
+
+  record.chainNextRunId = nextRecord.runId;
 }
 
 async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDevelopRunInput): Promise<void> {
@@ -242,20 +338,21 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
   // mechanism, same "single biggest latency lever measured" as research.
   const semanticSeedFilesTool = buildSemanticSeedLookup(originalRoots, input.providerBaseUrl, input.providerApiKey);
   let findReferencesTool: ((symbolOrFileName: string) => Promise<string>) | undefined;
+  let impactPreviewTool: ((editedFiles: string[]) => string) | undefined;
+  const primaryRoot = originalRoots[0] as WorkspaceRoot;
+  const isMultiRoot = originalRoots.length > 1;
 
   try {
-    const primaryRoot = originalRoots[0] as WorkspaceRoot;
     const primaryProjectId = stableId(["project", primaryRoot.absolutePath]);
     const graph = await loadGraphSnapshot(primaryProjectId);
 
     if (graph) {
       findReferencesTool = buildGraphNavigationTool(graph);
+      impactPreviewTool = buildImpactPreviewTool(graph, primaryRoot.label, isMultiRoot);
     }
   } catch {
-    // no persisted graph, find_references simply unavailable this run
+    // no persisted graph, find_references/impact preview simply unavailable this run
   }
-
-  const isMultiRoot = originalRoots.length > 1;
   const collectDiff = async (): Promise<{ diff: string; changedFiles: string[] }> => {
     const parts = await Promise.all(
       worktrees.map(async (worktree, index) => ({
@@ -285,6 +382,7 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     semanticSearch: semanticSearchTool,
     semanticSeedFiles: semanticSeedFilesTool,
     ...(findReferencesTool ? { findReferences: findReferencesTool } : {}),
+    ...(impactPreviewTool ? { computeImpactPreview: impactPreviewTool } : {}),
     ...(input.continueFrom
       ? {
           priorIteration: {
@@ -379,6 +477,53 @@ export async function resolvePendingApproval(
       executedAt: new Date().toISOString(),
     };
   }
+}
+
+/**
+ * Impact analysis (2026-07-18, docs/architecture/011 §4.13): deterministic
+ * "who depends on the files I just edited" lookup against the SAME
+ * persisted graph find_references already uses (buildGraphNavigationTool,
+ * pipeline-runner.ts) - reused here as a per-run tool instead of a new
+ * role/handoff (see §1). The graph only covers the PRIMARY root (documented
+ * limitation, same one buildCrossRepoStructuralData works around for
+ * find_references) - edited files outside it are silently skipped, same
+ * honest degradation the rest of this file already uses for a missing graph.
+ */
+function buildImpactPreviewTool(graph: GraphState, primaryLabel: string, isMultiRoot: boolean): (editedFiles: string[]) => string {
+  const fileNodeIdByPath = new Map(
+    graph.nodes.filter((node) => node.kind === "file" && node.filePath).map((node) => [node.filePath as string, node.id]),
+  );
+
+  return (editedFiles: string[]): string => {
+    const lines: string[] = [];
+
+    for (const rawPath of editedFiles) {
+      const relativePath = isMultiRoot
+        ? (rawPath.startsWith(`${primaryLabel}/`) ? rawPath.slice(primaryLabel.length + 1) : null)
+        : rawPath;
+
+      if (!relativePath) {
+        continue;
+      }
+
+      const nodeId = fileNodeIdByPath.get(relativePath);
+
+      if (!nodeId) {
+        continue;
+      }
+
+      const dependents = getFileDependents(graph, nodeId);
+
+      if (dependents.length > 0) {
+        const dependentLabels = [...new Set(dependents.map((node) => node.filePath ?? node.label))].slice(0, 8);
+        lines.push(`${relativePath}: called/used by ${dependentLabels.join(", ")}`);
+      }
+    }
+
+    return lines.length > 0
+      ? lines.join("\n")
+      : "(no statically-resolved dependents found for the edited files - either genuinely none, or they are outside the graph's coverage)";
+  };
 }
 
 /**
