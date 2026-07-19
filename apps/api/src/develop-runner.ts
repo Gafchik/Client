@@ -485,7 +485,7 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
   }
 
   try {
-    observerHint = await buildObserverHintSuffix(originalRoots, input.task);
+    observerHint = (await buildObserverHintSuffix(originalRoots, input.task)).text;
   } catch {
     // same
   }

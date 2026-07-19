@@ -72,37 +72,49 @@ const STRING_CONCAT_WITH_VARIABLE_PATTERN = /['"`]\s*\.\s*\$\w+|\$\w+\s*\.\s*['"
 const DANGEROUS_EVAL_PATTERN = /\b(eval|exec|system|shell_exec|passthru|proc_open|popen)\s*\(\s*(\$|['"`]\s*\.|`[^`]*\$\{)|new\s+Function\s*\(/;
 const PATH_TRAVERSAL_PATTERN = /\b(fopen|file_get_contents|file_put_contents|readFileSync|require|include|include_once|require_once)\s*\([^)]*\$_(GET|POST|REQUEST|COOKIE)\b|\.\.\/[^'"]*\$_(GET|POST|REQUEST)\b/i;
 
-export function scanDiffForSecurityFindings(diff: string): SecurityFinding[] {
-  const addedLines = extractAddedLines(diff);
+function checkLineForFindings(file: string, trimmed: string): SecurityFinding[] {
   const findings: SecurityFinding[] = [];
 
-  for (const { file, content } of addedLines) {
-    const trimmed = content.trim();
+  if (!trimmed) {
+    return findings;
+  }
 
-    if (!trimmed) {
-      continue;
-    }
+  const secretMatch = SECRET_ASSIGNMENT_PATTERN.exec(trimmed);
 
-    const secretMatch = SECRET_ASSIGNMENT_PATTERN.exec(trimmed);
+  if (secretMatch && secretMatch[2] && !PLACEHOLDER_VALUE_PATTERN.test(secretMatch[2]) && !TEST_FIXTURE_PATH_PATTERN.test(file)) {
+    findings.push({ category: "hardcoded-secret", file, snippet: trimmed.slice(0, 160) });
+  }
 
-    if (secretMatch && secretMatch[2] && !PLACEHOLDER_VALUE_PATTERN.test(secretMatch[2]) && !TEST_FIXTURE_PATH_PATTERN.test(file)) {
-      findings.push({ category: "hardcoded-secret", file, snippet: trimmed.slice(0, 160) });
-    }
+  if (SQL_KEYWORD_PATTERN.test(trimmed) && STRING_CONCAT_WITH_VARIABLE_PATTERN.test(trimmed)) {
+    findings.push({ category: "sql-injection", file, snippet: trimmed.slice(0, 160) });
+  }
 
-    if (SQL_KEYWORD_PATTERN.test(trimmed) && STRING_CONCAT_WITH_VARIABLE_PATTERN.test(trimmed)) {
-      findings.push({ category: "sql-injection", file, snippet: trimmed.slice(0, 160) });
-    }
+  if (DANGEROUS_EVAL_PATTERN.test(trimmed)) {
+    findings.push({ category: "dangerous-eval", file, snippet: trimmed.slice(0, 160) });
+  }
 
-    if (DANGEROUS_EVAL_PATTERN.test(trimmed)) {
-      findings.push({ category: "dangerous-eval", file, snippet: trimmed.slice(0, 160) });
-    }
-
-    if (PATH_TRAVERSAL_PATTERN.test(trimmed)) {
-      findings.push({ category: "path-traversal", file, snippet: trimmed.slice(0, 160) });
-    }
+  if (PATH_TRAVERSAL_PATTERN.test(trimmed)) {
+    findings.push({ category: "path-traversal", file, snippet: trimmed.slice(0, 160) });
   }
 
   return findings;
+}
+
+export function scanDiffForSecurityFindings(diff: string): SecurityFinding[] {
+  const addedLines = extractAddedLines(diff);
+  return addedLines.flatMap(({ file, content }) => checkLineForFindings(file, content.trim()));
+}
+
+/**
+ * Same pattern set as scanDiffForSecurityFindings, applied to arbitrary
+ * plain text instead of a diff's added lines (2026-07-19, картинки-в-чате
+ * feature) - a screenshot of an IDE/terminal can show a real hardcoded key
+ * or a dangerous shell command just as easily as a diff can. No `+`/`+++`
+ * gating here since OCR'd text has no diff structure; `sourceLabel` (e.g.
+ * the attachment's file name or "screenshot OCR") fills the `file` field.
+ */
+export function scanTextForSecurityFindings(text: string, sourceLabel: string): SecurityFinding[] {
+  return text.split("\n").flatMap((line) => checkLineForFindings(sourceLabel, line.trim()));
 }
 
 const CATEGORY_LABEL: Record<SecurityFinding["category"], string> = {

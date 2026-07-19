@@ -25,6 +25,20 @@ const RUN_TOKEN_SAFETY_LIMIT = 450_000;
 // Matches tools.ts's MAX_READ_FILE_CHARS (7000) - raising the read cap alone
 // without this would just move the same truncation from readFile to here.
 const MAX_OBSERVATION_CHARS = 7000;
+// Bug fix (2026-07-19, live incident): actionsLog used to record ONLY a
+// line count per action ("grep_content(doskey) -> 3 lines") - this is the
+// ENTIRE transcript the Critic sees (callCritic's `transcript` is
+// actionsLog.join("\n")). The Critic's whole job is checking the final
+// answer's claims against what was actually observed, but a line count
+// alone can't confirm OR refute any content-level claim - a live case had
+// the researcher assert "grep пусто" (no matches) for a term that, in
+// reality, WAS present in a file it had itself already opened; the Critic
+// had no way to catch this, since actionsLog never told it what the grep
+// actually returned. A short content preview per action - not the full
+// MAX_OBSERVATION_CHARS text, that would balloon the Critic's own prompt
+// across a multi-turn transcript - gives the Critic just enough to spot-
+// check a suspicious claim without materially changing token cost.
+const ACTIONSLOG_PREVIEW_CHARS = 400;
 // Models frequently want to explore several things at once (list a dir, grep
 // two terms) - letting them batch several ACTION lines into one turn instead
 // of one per round-trip cuts turn count (and the resent-context cost that
@@ -38,6 +52,13 @@ const MAX_ACTIONS_PER_TURN = 4;
 // user-facing answer synthesis prompt (packages/ai, a separate call). Unset
 // (undefined) reproduces the exact current behavior.
 const RESEARCHER_REASONING_EFFORT: string | undefined = undefined;
+
+export interface ObserverEntryRef {
+  projectRootPath: string;
+  unitPath: string;
+  /** Full text (summary + mechanisms + gotchas) the researcher was actually shown for this entry - what the Critic compares the final answer against. */
+  text: string;
+}
 
 export interface AgenticRunOptions {
   task: string;
@@ -53,6 +74,13 @@ export interface AgenticRunOptions {
   providerBaseUrl: string;
   providerApiKey: string;
   maxTurns?: number;
+  /**
+   * Deterministic escalation (2026-07-19) - see the runAgenticLoop closure's
+   * own comment next to `activeResearcherModel` for the full rationale.
+   * Undefined/same-as-researcherModel means escalation never fires, exactly
+   * today's behavior.
+   */
+  researcherEscalationModel?: string;
   /**
    * Checked before every turn - lets a caller (e.g. the Observer background
    * crawler) yield immediately once it returns true, rather than only
@@ -98,6 +126,25 @@ export interface AgenticRunOptions {
    * priorTurnHint below.
    */
   observerHint?: string;
+  /**
+   * Vision Analyzer's structured read of any screenshots attached to this
+   * message (2026-07-19, картинки-в-чате feature) - pipeline-runner.ts's
+   * buildAttachmentContextHint. Same "kept OUT of task" reasoning as
+   * observerHint just above.
+   */
+  attachmentHint?: string;
+  /**
+   * Structured counterpart to observerHint (2026-07-19, architecture review
+   * "safety fuse" request): the SAME entries that hint text was built from,
+   * kept separately because the hint is just a formatted string with no way
+   * back to which specific business_graph_entries row a given claim came
+   * from. Lets the Critic compare the final answer against each entry's own
+   * text (not just trust the researcher's own paraphrase of it) and, when it
+   * finds a genuine contradiction backed by the transcript, name exactly
+   * which (projectRootPath, unitPath) row needs a correction written back -
+   * see callCritic's CORRECTION[...] reply format below.
+   */
+  observerEntries?: ObserverEntryRef[];
   /**
    * Short guidance derived from classifying the question's shape (packages/ai's
    * classifyQuestionShape/buildQuestionShapeHint - 2026-07-16, architecture
@@ -207,6 +254,31 @@ export interface AgenticRunResult {
   criticCompletionTokens: number;
   stopped: "final_answer" | "max_turns" | "error" | "aborted";
   error?: string;
+  /**
+   * Set when the Critic found a genuine, transcript-backed contradiction
+   * between the final answer and a specific Observer entry it was given
+   * (see AgenticRunOptions.observerEntries) - the caller (pipeline-runner.ts)
+   * writes this back to business_graph_entries as a scoped gotcha, not a
+   * full rewrite, so a future reader of the SAME entry doesn't get misled by
+   * the same gap again. Never set by the researcher itself, only by the
+   * independent Critic pass - a self-reported "I found an error in the
+   * hint" claim is exactly the kind of unverified assertion this project's
+   * whole approach exists to distrust.
+   */
+  observerCorrection?: { projectRootPath: string; unitPath: string; note: string };
+  /**
+   * Set only when escalation actually fired this run (2026-07-19) - the
+   * model name it escalated TO, plus its OWN token slice, kept separate
+   * from researcherPromptTokens/researcherCompletionTokens above (those
+   * stay the base-model-only portion) because the escalation model almost
+   * always carries a different cost multiplier; the caller (pipeline-runner.ts's
+   * usage summary) needs both slices to attribute spend correctly instead of
+   * reporting the whole run's cost under whichever model started it.
+   */
+  escalatedResearcherModel?: string;
+  escalatedResearcherPromptTokens?: number;
+  escalatedResearcherCompletionTokens?: number;
+  escalatedResearcherCallCount?: number;
 }
 
 interface ParsedAction {
@@ -262,6 +334,25 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
     "IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet in this conversation, list_dir that directory first. A neighboring file with a similar name might be the one that actually answers the question - blindly guessing a filename skips that discovery.",
     "You have time to think it through properly. Do not rush to final_answer before checking all realistic places, including neighboring files with related meaning (e.g. there may be more than one Service nearby - check the whole directory).",
     "IMPORTANT before giving up: if the question names a specific field/column/variable/parameter (e.g. `personal_claim_number`, `is_active`) and you have not yet grepped that EXACT literal name across the whole project, do that before writing a final_answer that admits you could not find enough. Which file assigns/reads it, and under what condition, is usually only visible by searching for the literal name itself - reading a handful of plausible-looking files that happen to reference it is not the same as tracing where it is actually written to and why. An honest 'insufficient facts' answer is only honest if grep_content for the literal term was actually tried and still came up empty.",
+    // Bug fix (2026-07-19, live incident): asked whether a stateful shell
+    // command would work through a CLI, the model correctly found a
+    // function that blocks it - and ALSO opened the exact file that calls
+    // that function, which contained an early-return branch (an `--shell`
+    // flag) that skips the block entirely and is the whole reason a
+    // separate "shell integration" subsystem exists in that project. It had
+    // read every needed file, but the final answer restated only the
+    // blocking mechanism it found first, never connecting the bypass branch
+    // it had ALSO already seen. Finding ONE function that blocks/restricts
+    // something is not proof every caller reaches it the same way.
+    "IMPORTANT before concluding something is BLOCKED, RESTRICTED, or WON'T WORK: a check/guard found in one function only proves that PARTICULAR call path is blocked - trace backward to whether the same functionality can be reached through a different path (a flag, an alternate function, an early return before the check, a separate mode) that skips it. This especially applies when you notice a whole extra piece of infrastructure nearby (an \"integration\"/\"wrapper\"/\"install\" mechanism, a config flag, a second entrypoint) whose apparent purpose is to make the thing you just called blocked actually work - if you have not traced whether THAT mechanism reaches the guard differently, your answer is incomplete even if the guard function itself is described correctly. Do not let a plausible first explanation stop you from checking the files you already opened for a second path.",
+    // Same live incident, a second gap (a later re-run of the exact same
+    // question skipped the file with the bypass entirely this time, having
+    // seen it only as an import/reference in another file it DID open) -
+    // inferring a called function's behavior from its name or from how a
+    // neighboring file imports/calls it is not the same as having actually
+    // read that function's own body, especially when the call passes a
+    // flag/option argument (exactly the shape that changes behavior).
+    "If a file you opened imports, requires, or calls a function whose ACTUAL behavior matters for answering the question - especially one invoked with a flag/option argument, since that is exactly what usually changes what a function does - open that function's own definition before answering, do not infer its behavior from its name or from how the caller uses it. A reference to something is not evidence of what it does.",
     "When ready, call final_answer exactly once. Do not invent facts you have not seen in the observations. If you did not check something, say so plainly instead of asserting it with confidence.",
   ].join("\n");
 }
@@ -269,8 +360,20 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
 const CRITIC_SYSTEM_PROMPT = [
   "You are an independent critic-validator (a different model from the one that researched the code).",
   "You are given: an engineering question, a full transcript of another model's actions (which files it looked at and what it saw), and its proposed final answer.",
-  "Check strictly: (1) every claim in the answer must be directly confirmed by what is actually in the transcript - not invented, not guessed; (2) if the answer itself mentions that something 'needs checking' or 'was not checked', but the transcript shows this was NOT checked before the final answer - that is grounds for rejection; (3) if the answer confidently asserts something for which the transcript has insufficient grounds (e.g. only one file out of a chain), that is also grounds for rejection; (4) if the answer is essentially 'I cannot answer without reading files X, Y' while the transcript shows those files were never read - REJECT and tell it to actually read them: giving up without reading the files it itself names is not an acceptable final answer; (5) if the question names a specific field/column/variable/parameter and the answer gives up ('not enough facts', 'needs manual debugging') without the transcript showing a grep_content call for that EXACT literal name anywhere - REJECT and tell it to grep that literal term first. A give-up answer is not automatically honest just because it makes no false claims - it must show the obvious literal search was actually tried.",
-  "Reply STRICTLY in one line: either \"APPROVED\", or \"REJECTED: <a short, specific note IN RUSSIAN on exactly what needs to be checked before answering again>\".",
+  "Check strictly: (1) every claim in the answer must be directly confirmed by what is actually in the transcript - not invented, not guessed; (2) if the answer itself mentions that something 'needs checking' or 'was not checked', but the transcript shows this was NOT checked before the final answer - that is grounds for rejection; (3) if the answer confidently asserts something for which the transcript has insufficient grounds (e.g. only one file out of a chain), that is also grounds for rejection; (4) if the answer is essentially 'I cannot answer without reading files X, Y' while the transcript shows those files were never read - REJECT and tell it to actually read them: giving up without reading the files it itself names is not an acceptable final answer; (5) if the question names a specific field/column/variable/parameter and the answer gives up ('not enough facts', 'needs manual debugging') without the transcript showing a grep_content call for that EXACT literal name anywhere - REJECT and tell it to grep that literal term first. A give-up answer is not automatically honest just because it makes no false claims - it must show the obvious literal search was actually tried; (6) if the answer concludes something is BLOCKED/RESTRICTED/WON'T WORK, but the transcript shows the model ALSO opened a file that contains an alternate path reaching the same functionality (a flag, an early return, a second entrypoint, an \"integration\"/\"wrapper\"/\"install\" mechanism whose evident purpose is to enable exactly the thing being called blocked) and the final answer never addresses whether that alternate path bypasses the block - REJECT and name the specific file/branch it needs to reconcile. Seeing contradicting evidence in your own transcript and not mentioning it in the answer is exactly the kind of gap this check exists to catch, not a matter of the researcher model's stylistic choice.",
+  // Bug fix (2026-07-19, architecture review "safety fuse" request): the
+  // Observer's own cached hints (business_graph_entries) are themselves
+  // written by an LLM crawl and can be stale/wrong in the exact same ways
+  // this whole prompt worries about the RESEARCHER being wrong - but until
+  // now nothing ever fed a discovered Observer inaccuracy back into that
+  // store, so the same wrong hint kept getting reused as "prior knowledge"
+  // indefinitely, even after the code that would prove it wrong had been
+  // sitting right there the whole time (live incident: an Observer hint
+  // said a mechanism has no bypass; the transcript showed the researcher
+  // opening the exact file that IS the bypass, but that never made it back
+  // into the Observer's own record).
+  "(7) You may ALSO be given \"Observer hints\" (background-scan leads the researcher was told to verify, not confirmed facts). If the transcript+answer together clearly PROVE a specific hint's claim is wrong or incomplete (not just that the answer phrased something differently) - i.e. the transcript itself contains direct evidence contradicting that hint - append a SECOND line after APPROVED: \"CORRECTION[<the exact unit path from the hint's brackets>]: <a short, specific note IN RUSSIAN stating exactly what the hint got wrong and what the transcript actually showed>\". Only do this when the contradiction is directly grounded in the transcript, never from the answer's own wording alone - an unsupported correction is worse than no correction, since it gets written back as if it were verified fact. If there is no genuine, transcript-backed contradiction, do not add this line at all - most runs will have nothing to correct.",
+  "Reply STRICTLY: either just \"APPROVED\" (plus an optional CORRECTION line per (7) above), or \"REJECTED: <a short, specific note IN RUSSIAN on exactly what needs to be checked before answering again>\" (no CORRECTION line on a rejection - the researcher will re-investigate before the answer is settled).",
 ].join("\n");
 
 // Live evidence (2026-07-15): asked "что такое папка w9" against a real
@@ -486,7 +589,8 @@ async function callCritic(input: {
   task: string;
   transcript: string;
   proposedAnswer: string;
-}): Promise<{ approved: boolean; reason: string; promptTokens: number; completionTokens: number }> {
+  observerEntries?: ObserverEntryRef[];
+}): Promise<{ approved: boolean; reason: string; promptTokens: number; completionTokens: number; correction: { projectRootPath: string; unitPath: string; note: string } | null }> {
   const messages: ChatMessage[] = [
     { role: "system", content: CRITIC_SYSTEM_PROMPT },
     {
@@ -498,6 +602,13 @@ async function callCritic(input: {
         input.transcript,
         "",
         `Proposed final answer: ${input.proposedAnswer}`,
+        ...(input.observerEntries?.length
+          ? [
+              "",
+              "Observer hints the researcher was given (unverified leads it was told to verify, tagged by unit path - check #6 against these):",
+              ...input.observerEntries.map((entry) => `[${entry.unitPath}] ${entry.text}`),
+            ]
+          : []),
       ].join("\n"),
     },
   ];
@@ -507,6 +618,14 @@ async function callCritic(input: {
     const trimmed = content.trim();
     const approved = /^APPROVED/i.test(trimmed);
     const reasonMatch = /^REJECTED:\s*(.*)/is.exec(trimmed);
+    // Only ever trusted when paired with APPROVED - a rejected answer means
+    // the researcher goes back and re-investigates anyway, and a correction
+    // derived from a not-yet-settled answer would be premature.
+    const correctionMatch = approved ? /CORRECTION\[([^\]]+)\]:\s*(.+)/is.exec(trimmed) : null;
+    const correctionUnitPath = correctionMatch?.[1]?.trim();
+    const matchingEntry = correctionUnitPath
+      ? input.observerEntries?.find((entry) => entry.unitPath === correctionUnitPath)
+      : undefined;
 
     // Kept in Russian, not translated (2026-07-16 prompt sweep): this is the
     // fallback for when the critic's own reply is malformed/empty - the
@@ -518,6 +637,12 @@ async function callCritic(input: {
       reason: approved ? "" : (reasonMatch?.[1]?.trim() || trimmed || "Критик отклонил ответ без указанной причины."),
       promptTokens: usage?.prompt_tokens ?? 0,
       completionTokens: usage?.completion_tokens ?? 0,
+      // matchingEntry required (not just a well-formed CORRECTION[...] line) -
+      // a unit path the critic invented that doesn't match any entry it was
+      // actually given is not trustworthy enough to write back.
+      correction: matchingEntry && correctionMatch?.[2]
+        ? { projectRootPath: matchingEntry.projectRootPath, unitPath: matchingEntry.unitPath, note: correctionMatch[2].trim() }
+        : null,
     };
   } catch (error) {
     // Critic being unavailable should not deadlock the run - approve by
@@ -527,6 +652,7 @@ async function callCritic(input: {
       reason: `Критик недоступен (${error instanceof Error ? error.message : String(error)}), ответ принят без проверки.`,
       promptTokens: 0,
       completionTokens: 0,
+      correction: null,
     };
   }
 }
@@ -544,6 +670,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ? `\n\nIn the previous turn of this conversation you already found and read these files: ${priorTurnFiles.join(", ")}. If the new question continues the same topic - start by reading these files (read_file) instead of researching from scratch. If the question is clearly about something else - check whether they are still relevant or search anew, do not rely on them blindly.`
     : "";
   const observerHintBlock = options.observerHint ? `\n\n${options.observerHint}` : "";
+  const attachmentHintBlock = options.attachmentHint ? `\n\n${options.attachmentHint}` : "";
   const questionShapeBlock = options.questionShapeHint ? `\n\n${options.questionShapeHint}` : "";
   const isMultiRoot = options.projectRoots.length > 1;
   // Single-repo projects keep the exact original "Project: <path>" line -
@@ -555,7 +682,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
   const messages: ChatMessage[] = [
     { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery)) },
-    { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnTopicHint}${priorTurnHint}${observerHintBlock}${questionShapeBlock}` },
+    { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnTopicHint}${priorTurnHint}${observerHintBlock}${attachmentHintBlock}${questionShapeBlock}` },
   ];
 
   // Seed semantic search runs in parallel with the seed grep (2026-07-16) -
@@ -649,6 +776,24 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   let researcherCompletionTokens = 0;
   let criticPromptTokens = 0;
   let criticCompletionTokens = 0;
+  // Deterministic escalation (2026-07-19, architecture review "dream team"
+  // follow-up): the Critic REJECTING the proposed answer is a real,
+  // code-level signal the base model struggled - not a self-assessment the
+  // researcher model makes about its own confidence (deliberately avoided
+  // elsewhere in this project, see the architecture review's rejection of
+  // self-reported confidence scores). On the FIRST rejection, if an
+  // escalation model is configured and differs from what's active, switch
+  // to it for the rest of this run - cheap by default, stronger only when
+  // there's concrete evidence the cheap pass wasn't enough. Tracked
+  // separately from researcherPromptTokens/researcherCompletionTokens
+  // because the escalation model almost always has a DIFFERENT cost
+  // multiplier - lumping them together would misattribute spend in the
+  // "Подробнее" usage panel.
+  let activeResearcherModel = options.researcherModel;
+  let hasEscalated = false;
+  let escalatedResearcherPromptTokens = 0;
+  let escalatedResearcherCompletionTokens = 0;
+  let escalatedResearcherCalls = 0;
   const actionsLog: string[] = [...[...seedReadFiles].map((filePath) => `[seed] auto-read ${filePath}`)];
   const touchedFiles = new Set<string>();
   const seenDirs = new Set<string>([
@@ -703,6 +848,14 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       researcherCompletionTokens,
       criticPromptTokens,
       criticCompletionTokens,
+      ...(hasEscalated
+        ? {
+            escalatedResearcherModel: activeResearcherModel,
+            escalatedResearcherPromptTokens,
+            escalatedResearcherCompletionTokens,
+            escalatedResearcherCallCount: escalatedResearcherCalls,
+          }
+        : {}),
       ...overrides,
     };
   };
@@ -735,6 +888,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       task: options.task,
       transcript: actionsLog.join("\n"),
       proposedAnswer: candidate,
+      ...(options.observerEntries ? { observerEntries: options.observerEntries } : {}),
     });
     totalPromptTokens += criticResult.promptTokens;
     totalCompletionTokens += criticResult.completionTokens;
@@ -744,11 +898,29 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
     if (criticResult.approved) {
       actionsLog.push(`[turn ${turn}] critic: APPROVED`);
+
+      if (criticResult.correction) {
+        actionsLog.push(`[turn ${turn}] critic: CORRECTION flagged for Observer entry "${criticResult.correction.unitPath}"`);
+      }
+
       criticVerdict = criticRounds > 1 ? "rejected-once-then-accepted" : "approved";
-      return finalize({ turnsUsed: turn, stopped: "final_answer", finalAnswer: candidate, criticVerdict, criticRounds });
+      return finalize({
+        turnsUsed: turn,
+        stopped: "final_answer",
+        finalAnswer: candidate,
+        criticVerdict,
+        criticRounds,
+        ...(criticResult.correction ? { observerCorrection: criticResult.correction } : {}),
+      });
     }
 
     actionsLog.push(`[turn ${turn}] critic: REJECTED - ${criticResult.reason}`);
+
+    if (!hasEscalated && options.researcherEscalationModel && options.researcherEscalationModel !== activeResearcherModel) {
+      activeResearcherModel = options.researcherEscalationModel;
+      hasEscalated = true;
+      actionsLog.push(`[turn ${turn}] ESCALATED to ${activeResearcherModel} after critic rejection.`);
+    }
 
     if (turn >= maxTurns) {
       criticVerdict = "rejected-budget-exhausted";
@@ -778,7 +950,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       const result = await callModel(
         options.providerBaseUrl,
         options.providerApiKey,
-        options.researcherModel,
+        activeResearcherModel,
         messages,
         RESEARCHER_REASONING_EFFORT,
       );
@@ -794,8 +966,15 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
     totalPromptTokens += usage?.prompt_tokens ?? 0;
     totalCompletionTokens += usage?.completion_tokens ?? 0;
-    researcherPromptTokens += usage?.prompt_tokens ?? 0;
-    researcherCompletionTokens += usage?.completion_tokens ?? 0;
+
+    if (hasEscalated) {
+      escalatedResearcherPromptTokens += usage?.prompt_tokens ?? 0;
+      escalatedResearcherCompletionTokens += usage?.completion_tokens ?? 0;
+      escalatedResearcherCalls += 1;
+    } else {
+      researcherPromptTokens += usage?.prompt_tokens ?? 0;
+      researcherCompletionTokens += usage?.completion_tokens ?? 0;
+    }
 
     if (totalPromptTokens + totalCompletionTokens >= RUN_TOKEN_SAFETY_LIMIT) {
       actionsLog.push(`[turn ${turn}] SAFETY ABORT: run exceeded ${RUN_TOKEN_SAFETY_LIMIT} tokens.`);
@@ -905,7 +1084,13 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
         }
       }
 
-      actionsLog.push(`[turn ${turn}] ${action.tool}(${action.arg}) -> ${observation.split("\n").length} lines`);
+      const observationPreview = observation.trim()
+        ? observation.trim().replace(/\s+/g, " ").slice(0, ACTIONSLOG_PREVIEW_CHARS)
+        : "";
+      actionsLog.push(
+        `[turn ${turn}] ${action.tool}(${action.arg}) -> ${observation.split("\n").length} lines`
+        + (observationPreview ? `\n    preview: ${observationPreview}${observation.trim().length > ACTIONSLOG_PREVIEW_CHARS ? "..." : ""}` : ""),
+      );
 
       const boundedObservation = observation.length > MAX_OBSERVATION_CHARS
         ? `${observation.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`

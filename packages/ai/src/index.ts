@@ -1,4 +1,5 @@
 import {
+  type AttachmentStructuredContext,
   type BackgroundProjectState,
   clamp,
   detectResearchAmbiguity,
@@ -1018,6 +1019,186 @@ export async function extractDomainGlossaryTerms(input: {
       .slice(0, 3);
   } catch {
     return [];
+  }
+}
+
+export interface VisionAnalysisInput {
+  /** Raw base64, no "data:mime;base64," prefix - added here, once, right before the request. */
+  imageDataBase64: string;
+  mimeType: string;
+  providerBaseUrl: string;
+  providerApiKey: string;
+  visionModel: string;
+  /** Cheap text model for pass 2 (free text -> strict JSON) - falls back to visionModel if unset, same "one config field, sane fallback" pattern as team-store's developerModel/researcherModel fallback. */
+  extractionModel: string;
+}
+
+export interface VisionAnalysisResult {
+  /** Pass 1's raw free-text description (includes verbatim-transcribed on-screen text) - kept alongside the structured extraction since pass 2 only keeps what it judged worth structuring, and the raw description is cheap to store and occasionally has detail pass 2 dropped. */
+  ocrText: string;
+  structuredContext: AttachmentStructuredContext;
+}
+
+const VISION_ANALYSIS_FALLBACK: AttachmentStructuredContext = {
+  kind: "other",
+  uiLabels: [],
+  files: [],
+  symbols: [],
+  errors: [],
+  annotations: [],
+  summary: "Vision-анализ недоступен или не удался - изображение сохранено без структурного контекста.",
+};
+
+/**
+ * Two-pass Vision Analyzer (2026-07-19, картинки-в-чате feature).
+ *
+ * Pass 1 (this model, vision-capable): looks at the actual image and
+ * produces a thorough FREE-TEXT description - deliberately not asked for
+ * JSON here, matching the router-compatibility reasoning already documented
+ * on performProviderRequest above (short/strict JSON asks fail on some
+ * models via rout.my) and because a vision model reasoning about pixels AND
+ * fighting a strict JSON grammar simultaneously produces worse descriptions
+ * than either alone.
+ *
+ * Pass 2 (extractionModel, plain text, usually a cheap model): the same
+ * "structured JSON from free text" pattern as extractDomainGlossaryTerms
+ * above - turns pass 1's description into the AttachmentStructuredContext
+ * shape the Researcher actually consumes.
+ *
+ * The Orchestrator/Researcher agentic loop never receives the raw image or
+ * even pass 1's raw description directly - only the final structuredContext
+ * (plus ocrText, stored for the record) reaches it, as plain text in a
+ * normal chat message. See pipeline-runner.ts's attachment-hint builder.
+ */
+export async function analyzeAttachmentImage(input: VisionAnalysisInput): Promise<VisionAnalysisResult> {
+  if (!input.visionModel.trim()) {
+    return { ocrText: "", structuredContext: VISION_ANALYSIS_FALLBACK };
+  }
+
+  let visionDescription = "";
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.visionModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You are looking at a screenshot a developer or tester attached to a task in a software project. Describe it thoroughly and precisely for a teammate who cannot see the image.",
+            "Report, in this order:",
+            "1. What kind of screen this is (IDE, browser/web app, terminal, native app, a document/diagram, or a plain photo) and, if identifiable, which application.",
+            "2. ALL text visible on screen that looks like a UI label - tab names, button labels, menu items, headings, field names - transcribed VERBATIM, exactly as written (do not translate or paraphrase them).",
+            "3. Any error message, stack trace, or terminal output visible, transcribed verbatim.",
+            "4. Any file paths, function/class/variable names, or git branch/commit info visible.",
+            "5. The BUSINESS meaning of what's shown - what real-world task or data this screen represents (e.g. \"a patient's insurance claim details form\", not just \"a form with several fields\").",
+            "6. Whether a HUMAN has drawn any annotation on top of the screenshot itself - an arrow, circle, highlight box, or similar marking added by whoever took the screenshot to point at something. If so, describe exactly what it points at and what that seems to mean. Do NOT confuse this with arrows or icons that are part of the application's own UI (e.g. a progress-stepper widget, a dropdown caret, a navigation icon) - those are not annotations.",
+            "Be concrete and literal. If something is unclear or not present, say so plainly instead of guessing.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this screenshot." },
+            { type: "image_url", image_url: { url: `data:${input.mimeType};base64,${input.imageDataBase64}` } },
+          ],
+        },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    visionDescription = extractProviderContent(payload);
+  } catch {
+    return { ocrText: "", structuredContext: VISION_ANALYSIS_FALLBACK };
+  }
+
+  if (!visionDescription.trim()) {
+    return { ocrText: "", structuredContext: VISION_ANALYSIS_FALLBACK };
+  }
+
+  const structuredContext = await extractAttachmentStructuredContext({
+    visionDescription,
+    providerBaseUrl: input.providerBaseUrl,
+    providerModel: input.extractionModel.trim() || input.visionModel,
+    providerApiKey: input.providerApiKey,
+  });
+
+  return { ocrText: visionDescription, structuredContext };
+}
+
+async function extractAttachmentStructuredContext(input: {
+  visionDescription: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<AttachmentStructuredContext> {
+  const textFallback = { ...VISION_ANALYSIS_FALLBACK, summary: input.visionDescription.slice(0, 300) };
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "Convert the following free-text description of a screenshot into ONE line of strict JSON, this exact shape:",
+            '{"kind": "ide_screenshot"|"browser_screenshot"|"terminal_screenshot"|"app_screenshot"|"document"|"diagram"|"photo"|"other", "application": string|null, "language": string|null, "businessArea": string|null, "uiLabels": string[], "files": string[], "symbols": string[], "stackTrace": string|null, "errors": string[], "terminalContent": string|null, "gitInfo": string|null, "annotations": string[], "summary": string}',
+            "Use only information actually present in the description - never invent fields it doesn't support. Arrays default to []. summary is one or two sentences, in Russian, standing on its own (understandable without re-reading the description).",
+            "Reply with ONLY the JSON line, nothing else.",
+          ].join("\n"),
+        },
+        { role: "user", content: input.visionDescription.slice(0, 6000) },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return textFallback;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+    const stringArray = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    const optionalString = (value: unknown): string | undefined =>
+      typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+    const validKinds: AttachmentStructuredContext["kind"][] = [
+      "ide_screenshot", "browser_screenshot", "terminal_screenshot", "app_screenshot", "document", "diagram", "photo", "other",
+    ];
+    const kind = validKinds.includes(parsed.kind as AttachmentStructuredContext["kind"])
+      ? (parsed.kind as AttachmentStructuredContext["kind"])
+      : "other";
+    const summary = typeof parsed.summary === "string" && parsed.summary.trim()
+      ? parsed.summary.trim()
+      : input.visionDescription.slice(0, 300);
+
+    const application = optionalString(parsed.application);
+    const language = optionalString(parsed.language);
+    const businessArea = optionalString(parsed.businessArea);
+    const stackTrace = optionalString(parsed.stackTrace);
+    const terminalContent = optionalString(parsed.terminalContent);
+    const gitInfo = optionalString(parsed.gitInfo);
+
+    return {
+      kind,
+      uiLabels: stringArray(parsed.uiLabels),
+      files: stringArray(parsed.files),
+      symbols: stringArray(parsed.symbols),
+      errors: stringArray(parsed.errors),
+      annotations: stringArray(parsed.annotations),
+      summary,
+      ...(application ? { application } : {}),
+      ...(language ? { language } : {}),
+      ...(businessArea ? { businessArea } : {}),
+      ...(stackTrace ? { stackTrace } : {}),
+      ...(terminalContent ? { terminalContent } : {}),
+      ...(gitInfo ? { gitInfo } : {}),
+    };
+  } catch {
+    return textFallback;
   }
 }
 

@@ -214,3 +214,42 @@ export async function upsertBusinessGraphEntry(input: UpsertBusinessGraphEntryIn
     console.warn("[graph-entries] upsertBusinessGraphEntry failed:", error);
   }
 }
+
+const MAX_GOTCHAS_PER_ENTRY = 15;
+
+/**
+ * Opportunistic correction (2026-07-19, architecture review "safety fuse"
+ * request): isStale only ever catches "the code changed since the crawl" -
+ * it has no way to express "the crawl was wrong/incomplete from day one and
+ * the code never changed since." Appends a scoped correction note to an
+ * EXISTING entry's gotchas - not a full rewrite - when an independent Critic
+ * pass (packages/agentic-research's callCritic, never the researcher's own
+ * self-assertion) finds a transcript-backed contradiction between a real
+ * run's answer and this entry's own text. A `where` clause matching the
+ * exact row (not a read-modify-write in application code) keeps the array
+ * append atomic against a concurrent Observer crawl overwriting the same
+ * row - Postgres's own `||` array concat operator does the append inside
+ * the UPDATE itself. Capped so an entry that keeps getting flagged doesn't
+ * grow its gotchas list forever; the reset-knowledge button (apps/api's
+ * /api/observer/reset-knowledge) is the real fix for an entry that has
+ * accumulated enough corrections to mean the summary itself needs redoing.
+ */
+export async function appendBusinessGraphEntryCorrection(input: {
+  projectRootPath: string;
+  unitPath: string;
+  note: string;
+}): Promise<void> {
+  try {
+    const taggedNote = `[ПОПРАВКА ${new Date().toISOString().slice(0, 10)}] ${input.note}`;
+    await runSql(
+      `
+        update business_graph_entries
+        set gotchas = gotchas || $3::text[]
+        where project_root_path = $1 and unit_path = $2 and coalesce(array_length(gotchas, 1), 0) < ${MAX_GOTCHAS_PER_ENTRY}
+      `,
+      [input.projectRootPath, input.unitPath, [taggedNote]],
+    );
+  } catch (error) {
+    console.warn("[graph-entries] appendBusinessGraphEntryCorrection failed:", error);
+  }
+}

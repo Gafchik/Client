@@ -10,6 +10,7 @@ coverage/
 .claude/
 .agents/
 skills-lock.json
+test_img/
 
 .env
 .env.local

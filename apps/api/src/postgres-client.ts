@@ -248,6 +248,17 @@ export async function initializePostgresSchema(): Promise<void> {
   // живёт в team-store.mapTeamRow, не в схеме.
   await runSql(`alter table teams add column if not exists developer_model text not null default ''`);
   await runSql(`alter table teams add column if not exists reviewer_model text not null default ''`);
+  // researcher_escalation_model (2026-07-19, deterministic escalation
+  // feature): NULL = escalation disabled, same as today. Nullable rather
+  // than empty-string-default like developer/reviewer above, since "" would
+  // be indistinguishable from "not configured" either way but NULL makes
+  // the SQL/JS `|| null` round-trip in team-store.ts unambiguous.
+  await runSql(`alter table teams add column if not exists researcher_escalation_model text`);
+  // vision_model (2026-07-19, картинки-в-чате feature): NULL = image
+  // analysis disabled for that team (uploads still stored, structuredContext
+  // stays empty) - same nullable-means-off convention as
+  // researcher_escalation_model just above, for the same reason.
+  await runSql(`alter table teams add column if not exists vision_model text`);
 
   // knowledge_artifacts — полное тело каждого завершённого run'а (весь
   // research/impact/context/answer), раньше жило файлами в
@@ -263,6 +274,38 @@ export async function initializePostgresSchema(): Promise<void> {
       saved_at timestamptz not null
     )
   `);
+
+  // chat_attachments (2026-07-19, картинки-в-чате feature): image bytes
+  // stored directly as bytea, not on disk - same "ничего в файлах, всё в
+  // Postgres" convention as knowledge_artifacts above. One row per uploaded
+  // image; conversation_id + turn_index (same pairing as knowledge_catalog)
+  // let a later turn's Researcher pull in an EARLIER turn's attachments'
+  // structured_context without re-running the Vision Analyzer, and let the
+  // chat UI re-render past images on reload. image_data is only ever read by
+  // the single-attachment view/download endpoint (see
+  // loadChatAttachmentWithImage in packages/knowledge) - every other reader
+  // (follow-up-turn context, history list) uses the metadata-only query.
+  await runSql(`
+    create table if not exists chat_attachments (
+      id text primary key,
+      conversation_id text not null,
+      project_root_path text not null,
+      turn_index integer not null default 0,
+      mime_type text not null,
+      file_size_bytes integer not null default 0,
+      image_data bytea not null,
+      ocr_text text not null default '',
+      structured_context jsonb not null default '{}',
+      vision_model text not null default '',
+      created_at timestamptz not null
+    )
+  `);
+  await runSql(
+    `create index if not exists idx_chat_attachments_conversation on chat_attachments(conversation_id, turn_index asc)`,
+  );
+  await runSql(
+    `create index if not exists idx_chat_attachments_project on chat_attachments(project_root_path)`,
+  );
 
   // Semantic code search (2026-07-16, per rout.my's embeddings endpoint -
   // see project-state.md's docs-research entry). One row per file, not

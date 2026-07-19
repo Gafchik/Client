@@ -10,6 +10,8 @@ export interface SaveTeamInput {
   observerModel: string;
   developerModel?: string;
   reviewerModel?: string;
+  researcherEscalationModel?: string;
+  visionModel?: string;
   isSelected?: boolean;
 }
 
@@ -21,6 +23,8 @@ interface TeamRow {
   observer_model: string;
   developer_model: string;
   reviewer_model: string;
+  researcher_escalation_model: string | null;
+  vision_model: string | null;
   is_selected: boolean;
   created_at: Date;
   updated_at: Date;
@@ -80,8 +84,8 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
 
     await client.query(
       `
-        insert into teams (id, name, researcher_model, critic_model, observer_model, developer_model, reviewer_model, is_selected, created_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+        insert into teams (id, name, researcher_model, critic_model, observer_model, developer_model, reviewer_model, researcher_escalation_model, vision_model, is_selected, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
         on conflict (id) do update set
           name = $2,
           researcher_model = $3,
@@ -89,8 +93,10 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
           observer_model = $5,
           developer_model = $6,
           reviewer_model = $7,
-          is_selected = $8,
-          updated_at = $9
+          researcher_escalation_model = $8,
+          vision_model = $9,
+          is_selected = $10,
+          updated_at = $11
       `,
       [
         nextId,
@@ -100,6 +106,8 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
         input.observerModel.trim(),
         input.developerModel?.trim() ?? "",
         input.reviewerModel?.trim() ?? "",
+        input.researcherEscalationModel?.trim() || null,
+        input.visionModel?.trim() || null,
         shouldBeSelected,
         now,
       ],
@@ -187,6 +195,8 @@ function mapTeamRow(row: TeamRow): TeamRecord {
     // видит, какая модель реально пойдёт в работу.
     developerModel: row.developer_model || row.researcher_model,
     reviewerModel: row.reviewer_model || DEFAULT_REVIEWER_MODEL,
+    ...(row.researcher_escalation_model ? { researcherEscalationModel: row.researcher_escalation_model } : {}),
+    ...(row.vision_model ? { visionModel: row.vision_model } : {}),
     isSelected: Boolean(row.is_selected),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),

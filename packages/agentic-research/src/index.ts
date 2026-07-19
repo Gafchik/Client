@@ -1,12 +1,13 @@
 import { extractSectionBullets, extractSectionText, parseMarkdownSections, stableId, type ResearchReport, type ValidationResult } from "@client/shared";
 import { toResearchReport, toValidationResult } from "./adapter.js";
-import { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult } from "./loop.js";
+import { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult, type ObserverEntryRef } from "./loop.js";
 import type { WorkspaceRoot } from "./tools.js";
 
-export { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult } from "./loop.js";
+export { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult, type ObserverEntryRef } from "./loop.js";
 export { toResearchReport, toValidationResult } from "./adapter.js";
 export * from "./tools.js";
 export { listWorkUnits, listUnitFilePaths } from "./worklist.js";
+export { scanDiffForSecurityFindings, scanTextForSecurityFindings, formatSecurityFindingsForReviewer, type SecurityFinding } from "./security-scan.js";
 export {
   parseDevelopActions,
   runDevelopmentTask,
@@ -120,6 +121,8 @@ export interface RunAgenticResearchInput {
   providerBaseUrl: string;
   providerApiKey: string;
   maxTurns?: number;
+  /** See AgenticRunOptions.researcherEscalationModel. */
+  researcherEscalationModel?: string;
   /** See AgenticRunOptions.priorTurnFiles - files already found in the previous turn of this conversation. */
   priorTurnFiles?: string[];
   /** See AgenticRunOptions.priorTurnTopic - the previous turn's own question text and answer summary. */
@@ -128,6 +131,10 @@ export interface RunAgenticResearchInput {
   graphHintTerms?: string[];
   /** See AgenticRunOptions.observerHint - kept separate from `task` so it never leaks into ResearchReport.task (the chat UI's "Задача" display). */
   observerHint?: string;
+  /** See AgenticRunOptions.attachmentHint. */
+  attachmentHint?: string;
+  /** See AgenticRunOptions.observerEntries - structured counterpart to observerHint, lets the Critic name a specific entry to correct. */
+  observerEntries?: ObserverEntryRef[];
   /** See AgenticRunOptions.questionShapeHint. */
   questionShapeHint?: string;
   /** See AgenticRunOptions.semanticSearch. */
@@ -160,10 +167,13 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     providerBaseUrl: input.providerBaseUrl,
     providerApiKey: input.providerApiKey,
     ...(input.maxTurns ? { maxTurns: input.maxTurns } : {}),
+    ...(input.researcherEscalationModel ? { researcherEscalationModel: input.researcherEscalationModel } : {}),
     ...(input.priorTurnFiles?.length ? { priorTurnFiles: input.priorTurnFiles } : {}),
     ...(input.priorTurnTopic ? { priorTurnTopic: input.priorTurnTopic } : {}),
     ...(input.graphHintTerms?.length ? { graphHintTerms: input.graphHintTerms } : {}),
     ...(input.observerHint ? { observerHint: input.observerHint } : {}),
+    ...(input.attachmentHint ? { attachmentHint: input.attachmentHint } : {}),
+    ...(input.observerEntries?.length ? { observerEntries: input.observerEntries } : {}),
     ...(input.questionShapeHint ? { questionShapeHint: input.questionShapeHint } : {}),
     ...(input.semanticSearch ? { semanticSearch: input.semanticSearch } : {}),
     ...(input.findReferences ? { findReferences: input.findReferences } : {}),

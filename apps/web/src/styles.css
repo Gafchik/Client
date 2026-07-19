@@ -709,6 +709,13 @@ button {
   font-size: 0.8rem;
 }
 
+.observer-project-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .observer-path-list {
   display: grid;
   gap: 4px;
@@ -719,13 +726,13 @@ button {
 .observer-path-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
   font-size: 0.78rem;
 }
 
 .observer-path-name {
   color: var(--text);
+  flex-shrink: 0;
 }
 
 .observer-path-name em {
@@ -736,6 +743,13 @@ button {
 .observer-path-status {
   color: var(--text-faint);
   text-align: right;
+  flex: 1;
+}
+
+.observer-path-reset-button {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 0.72rem;
 }
 
 .observer-path-status-running {
@@ -1155,6 +1169,173 @@ button {
 
 .composer-meta span {
   font-size: 0.76rem;
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.composer-attachment-thumb {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.composer-attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.composer-attachment-status {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  text-align: center;
+  font-size: 0.62rem;
+  line-height: 1.1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.composer-attachment-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.composer-attachment-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.message-attachment-thumb {
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.message-attachment-thumb img {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: calc(var(--radius-sm) - 1px);
+  display: block;
+}
+
+.attachment-lightbox-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgba(0, 0, 0, 0.78);
+}
+
+.attachment-lightbox {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: 92vw;
+  max-height: 92vh;
+}
+
+.attachment-lightbox img {
+  max-width: 92vw;
+  max-height: 74vh;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  display: block;
+}
+
+.attachment-lightbox-close {
+  position: absolute;
+  top: -16px;
+  right: -16px;
+  width: 32px;
+  height: 32px;
+  line-height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #fff;
+  color: #111;
+  font-size: 1.1rem;
+  cursor: pointer;
+}
+
+.attachment-lightbox-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  color: #111;
+  font-size: 1.6rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.attachment-lightbox-prev {
+  left: -12px;
+}
+
+.attachment-lightbox-next {
+  right: -12px;
+}
+
+.attachment-lightbox-footer {
+  display: grid;
+  gap: 4px;
+  justify-items: center;
+  text-align: center;
+  color: #fff;
+  max-width: 70vw;
+}
+
+.attachment-lightbox-caption {
+  font-size: 0.84rem;
+}
+
+.attachment-lightbox-counter {
+  font-size: 0.72rem;
+  opacity: 0.75;
 }
 
 .stack {

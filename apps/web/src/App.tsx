@@ -1,7 +1,8 @@
 import { Fragment, startTransition, useEffect, useRef, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { ClipboardEvent as ReactClipboardEvent, FormEvent, ReactNode } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import type {
+  AttachmentStructuredContext,
   BackgroundProjectState,
   ContextCandidate,
   ConversationTurnsResponse,
@@ -20,6 +21,34 @@ import type {
   TeamCatalogResponse,
   TeamRecord,
 } from "@client/shared";
+
+/** A screenshot pasted into the composer, from paste to upload completion (2026-07-19, картинки-в-чате feature). */
+interface PendingAttachment {
+  /** Client-generated, stable for the lifetime of this pending item - the server id (below) only exists once the upload responds. */
+  localId: string;
+  id: string | null;
+  mimeType: string;
+  /** Object URL for an instant thumbnail while the upload/analysis is still in flight. */
+  previewUrl: string;
+  uploading: boolean;
+  error: string | null;
+  structuredContext: AttachmentStructuredContext | null;
+}
+
+/**
+ * An attachment already handed off to a message - either a just-sent
+ * message still running (built client-side from PendingAttachment at send
+ * time, see submitPipelineRun's `sentAttachments`) or an already-completed
+ * turn (loaded from GET /api/attachments?conversationId=). turnIndex is
+ * meaningless for the former (the run hasn't been assigned one yet) - only
+ * the transcript's turns.map lookup relies on it.
+ */
+interface ConversationAttachment {
+  id: string;
+  turnIndex: number;
+  mimeType: string;
+  structuredContext: AttachmentStructuredContext;
+}
 
 interface ProjectInfo {
   projectRecord?: ProjectRecord | null;
@@ -71,6 +100,8 @@ type TeamDraft = {
   observerModel: string;
   developerModel: string;
   reviewerModel: string;
+  researcherEscalationModel: string;
+  visionModel: string;
 };
 
 const TEAM_ROLE_DESCRIPTIONS = {
@@ -79,6 +110,8 @@ const TEAM_ROLE_DESCRIPTIONS = {
   observer: "Изучает проект в фоне между вопросами, чтобы будущие ответы были быстрее.",
   developer: "Пишет код по задаче из чата в изолированном worktree. Пусто — используется модель Researcher.",
   reviewer: "Независимое ревью diff перед выдачей. Должна быть не слабее Developer по коду — слабый ревьюер шумит неверными замечаниями. Пусто — code-дефолт (Kimi K2.7 Code).",
+  researcherEscalation: "Если Critic отклонил первый ответ Researcher — следующие ходы пойдут этой моделью вместо обычной. Дешёво по умолчанию, сильнее только когда реально понадобилось. Пусто — эскалация выключена.",
+  vision: "Анализирует прикреплённые к чату скриншоты — читает текст, UI-элементы и бизнес-смысл экрана. Нужна модель с поддержкой изображений. Пусто — анализ картинок выключен.",
 } as const;
 
 type ProjectDraftPath = {
@@ -1064,6 +1097,7 @@ function ObserversPanel({
   onToggleProject,
   onStopAll,
   onResume,
+  onResetKnowledge,
 }: {
   projects: ProjectRecord[];
   observerStatus: ObserverStatusResponse | null;
@@ -1071,6 +1105,7 @@ function ObserversPanel({
   onToggleProject: (projectPaths: string[], nextRunning: boolean) => void;
   onStopAll: () => void;
   onResume: () => void;
+  onResetKnowledge: (projectPath: string, pathLabel: string) => void;
 }) {
   const projectList = safeList(projects);
   const runningCount = observerStatus?.observers.filter((observer) => observer.status === "running").length ?? 0;
@@ -1117,13 +1152,25 @@ function ObserversPanel({
                       <strong>{projectItem.name}</strong>
                       <span>{aggregate?.title ?? "Ещё не запускался"} · {aggregate?.description ?? "нет данных"}</span>
                     </div>
-                    <button
-                      type="button"
-                      className={aggregate?.running ? "ghost-button danger-button" : "primary-button"}
-                      onClick={() => onToggleProject(projectRootPaths, !(aggregate?.running ?? false))}
-                    >
-                      {aggregate?.running ? "Остановить" : "Запустить"}
-                    </button>
+                    <div className="observer-project-actions">
+                      <button
+                        type="button"
+                        className={aggregate?.running ? "ghost-button danger-button" : "primary-button"}
+                        onClick={() => onToggleProject(projectRootPaths, !(aggregate?.running ?? false))}
+                      >
+                        {aggregate?.running ? "Остановить" : "Запустить"}
+                      </button>
+                      {projectItem.paths.length === 1 ? (
+                        <button
+                          type="button"
+                          className="ghost-button danger-button"
+                          title="Удалить всё, что Observer узнал про этот путь, и начать заново"
+                          onClick={() => onResetKnowledge(projectItem.paths[0]!.rootPath, projectItem.name)}
+                        >
+                          Сбросить знания
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
 
                   {projectItem.paths.length > 1 ? (
@@ -1138,6 +1185,14 @@ function ObserversPanel({
                             <span className={`observer-path-status ${pathState?.running ? "observer-path-status-running" : ""}`}>
                               {pathState ? `${pathState.title} · ${pathState.description}` : "ещё не запускался"}
                             </span>
+                            <button
+                              type="button"
+                              className="ghost-button danger-button observer-path-reset-button"
+                              title="Удалить всё, что Observer узнал про этот путь, и начать заново"
+                              onClick={() => onResetKnowledge(pathItem.rootPath, `${projectItem.name} / ${pathItem.name}`)}
+                            >
+                              Сбросить знания
+                            </button>
                           </div>
                         );
                       })}
@@ -1202,14 +1257,129 @@ async function fetchJsonWithTimeout<T>(input: string, init?: RequestInit, timeou
   }
 }
 
-function UserTaskMessage({ task, projectName, projectPath }: { task: string; projectName: string; projectPath: string }) {
+function UserTaskMessage({
+  task,
+  projectName,
+  projectPath,
+  attachments,
+  onOpenAttachment,
+}: {
+  task: string;
+  projectName: string;
+  projectPath: string;
+  /** Screenshots pasted into THIS turn (2026-07-19, картинки-в-чате feature) - undefined/empty for turns that had none, and for the develop-pipeline call sites which don't support attachments yet. */
+  attachments?: ConversationAttachment[];
+  /** Opens the full-size slider (AttachmentLightbox) starting at the clicked thumbnail's index. */
+  onOpenAttachment?: (attachments: ConversationAttachment[], index: number) => void;
+}) {
   return (
     <div className="message user-message">
       <div className="message-badge">Ты</div>
       <div className="message-card">
         <p className="message-label">Задача · {safeText(projectName, "Проект не выбран")}</p>
+        {attachments?.length ? (
+          <div className="message-attachments">
+            {attachments.map((attachment, index) => (
+              <button
+                key={attachment.id}
+                type="button"
+                className="message-attachment-thumb"
+                onClick={() => onOpenAttachment?.(attachments, index)}
+              >
+                <img src={`${API_BASE_URL}/api/attachments/${attachment.id}/image`} alt={attachment.structuredContext.summary || "Скриншот"} title={attachment.structuredContext.summary} />
+              </button>
+            ))}
+          </div>
+        ) : null}
         <p>{safeText(task)}</p>
         {projectPath ? null : <p className="message-footnote">Проект не выбран</p>}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Full-size viewer with prev/next navigation between all attachments of one
+ * message (2026-07-20, explicit request) - opened by clicking a thumbnail in
+ * UserTaskMessage. Arrow keys/Escape work in addition to the on-screen
+ * buttons; clicking the dark backdrop closes it, clicking the image itself
+ * does not (stopPropagation) so a stray click while inspecting doesn't
+ * dismiss the viewer.
+ */
+function AttachmentLightbox({
+  attachments,
+  index,
+  onClose,
+  onNavigate,
+}: {
+  attachments: ConversationAttachment[];
+  index: number;
+  onClose: () => void;
+  onNavigate: (nextIndex: number) => void;
+}) {
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+        return;
+      }
+
+      if (attachments.length <= 1) {
+        return;
+      }
+
+      if (event.key === "ArrowLeft") {
+        onNavigate((index - 1 + attachments.length) % attachments.length);
+      } else if (event.key === "ArrowRight") {
+        onNavigate((index + 1) % attachments.length);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [attachments.length, index, onClose, onNavigate]);
+
+  const current = attachments[index] ?? attachments[0];
+
+  if (!current) {
+    return null;
+  }
+
+  return (
+    <div className="attachment-lightbox-overlay" onClick={onClose}>
+      <div className="attachment-lightbox" onClick={(event) => event.stopPropagation()}>
+        <button type="button" className="attachment-lightbox-close" onClick={onClose} aria-label="Закрыть">
+          ×
+        </button>
+        {attachments.length > 1 ? (
+          <button
+            type="button"
+            className="attachment-lightbox-nav attachment-lightbox-prev"
+            onClick={() => onNavigate((index - 1 + attachments.length) % attachments.length)}
+            aria-label="Предыдущий скриншот"
+          >
+            ‹
+          </button>
+        ) : null}
+        <img src={`${API_BASE_URL}/api/attachments/${current.id}/image`} alt={current.structuredContext.summary || "Скриншот"} />
+        {attachments.length > 1 ? (
+          <button
+            type="button"
+            className="attachment-lightbox-nav attachment-lightbox-next"
+            onClick={() => onNavigate((index + 1) % attachments.length)}
+            aria-label="Следующий скриншот"
+          >
+            ›
+          </button>
+        ) : null}
+        <div className="attachment-lightbox-footer">
+          {current.structuredContext.summary ? <p className="attachment-lightbox-caption">{current.structuredContext.summary}</p> : null}
+          {attachments.length > 1 ? (
+            <p className="attachment-lightbox-counter">
+              {index + 1} / {attachments.length}
+            </p>
+          ) : null}
+        </div>
       </div>
     </div>
   );
@@ -2164,6 +2334,7 @@ function WorktreeManagerSidebar({
 
 const USAGE_ROLE_LABELS: Record<string, string> = {
   researcher: "Researcher",
+  "researcher-escalated": "Researcher (эскалация)",
   critic: "Critic",
   other: "Прочее (пайплайн + классификация)",
 };
@@ -3226,6 +3397,8 @@ export function App() {
     observerModel: "",
     developerModel: "",
     reviewerModel: "",
+    researcherEscalationModel: "",
+    visionModel: "",
   });
   const [teams, setTeams] = useState<TeamRecord[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState<string>("");
@@ -3251,6 +3424,21 @@ export function App() {
   const [activeDevelop, setActiveDevelop] = useState<DevelopRunStatusView | null>(null);
   const activeDevelopRunIdRef = useRef<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  // Screenshots staged in the composer (2026-07-19, картинки-в-чате feature) -
+  // uploaded+analyzed immediately on paste, attached to whichever message is
+  // sent next (see submitPipelineRun). conversationAttachments is the same
+  // shape but for ALREADY-sent turns of this conversation, keyed by
+  // turnIndex for the transcript render below.
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [conversationAttachments, setConversationAttachments] = useState<ConversationAttachment[]>([]);
+  // Snapshot of pendingAttachments taken at send time (2026-07-20) - pendingAttachments
+  // itself gets cleared right after send so the composer is free for the next
+  // message, but the "live" bubble for the run still in flight needs SOMETHING
+  // to render for the whole duration of the run (can be 60-100s+) - otherwise
+  // the picture the user just attached visibly disappears the instant they hit
+  // send, only to reappear once the turn lands in `turns`/conversationAttachments.
+  const [sentAttachments, setSentAttachments] = useState<ConversationAttachment[]>([]);
+  const [lightbox, setLightbox] = useState<{ attachments: ConversationAttachment[]; index: number } | null>(null);
   const [clarificationRound, setClarificationRound] = useState(0);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set());
@@ -3572,6 +3760,8 @@ export function App() {
           observerModel: selectedTeam.observerModel,
           developerModel: selectedTeam.developerModel,
           reviewerModel: selectedTeam.reviewerModel,
+          researcherEscalationModel: selectedTeam.researcherEscalationModel ?? "",
+          visionModel: selectedTeam.visionModel ?? "",
         });
       }
     });
@@ -3697,6 +3887,116 @@ export function App() {
     await submitPipelineRun(false);
   }
 
+  function blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result;
+
+        if (typeof result !== "string") {
+          reject(new Error("Не удалось прочитать изображение."));
+          return;
+        }
+
+        // "data:image/png;base64,AAAA..." -> "AAAA..."
+        resolve(result.slice(result.indexOf(",") + 1));
+      };
+      reader.onerror = () => reject(reader.error ?? new Error("Не удалось прочитать изображение."));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function clearPendingAttachments() {
+    setPendingAttachments((current) => {
+      for (const attachment of current) {
+        URL.revokeObjectURL(attachment.previewUrl);
+      }
+
+      return [];
+    });
+  }
+
+  function removePendingAttachment(localId: string) {
+    setPendingAttachments((current) => {
+      const target = current.find((attachment) => attachment.localId === localId);
+
+      if (target) {
+        URL.revokeObjectURL(target.previewUrl);
+      }
+
+      return current.filter((attachment) => attachment.localId !== localId);
+    });
+  }
+
+  // Vision-анализ занимает 15-20с вживую (два прохода: сама модель + JSON-
+  // структурирование) - дефолтный REQUEST_TIMEOUT_MS (15s) периодически не
+  // хватало бы. Пользователь видит статус "Анализирую…" на превью, пока идёт.
+  const ATTACHMENT_UPLOAD_TIMEOUT_MS = 45000;
+
+  async function handleImagePaste(blob: File) {
+    if (!projectPath.trim()) {
+      setError("Сначала выбери проект - потом можно вставлять скриншоты.");
+      return;
+    }
+
+    const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const previewUrl = URL.createObjectURL(blob);
+
+    setPendingAttachments((current) => [
+      ...current,
+      { localId, id: null, mimeType: blob.type, previewUrl, uploading: true, error: null, structuredContext: null },
+    ]);
+
+    try {
+      const imageDataBase64 = await blobToBase64(blob);
+      const response = await fetchJsonWithTimeout<{ id: string; structuredContext: AttachmentStructuredContext }>(
+        `${API_BASE_URL}/api/attachments`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectRootPath: projectPath, mimeType: blob.type, imageDataBase64 }),
+        },
+        ATTACHMENT_UPLOAD_TIMEOUT_MS,
+      );
+
+      setPendingAttachments((current) =>
+        current.map((attachment) =>
+          attachment.localId === localId
+            ? { ...attachment, id: response.id, uploading: false, structuredContext: response.structuredContext }
+            : attachment,
+        ),
+      );
+    } catch (uploadError) {
+      setPendingAttachments((current) =>
+        current.map((attachment) =>
+          attachment.localId === localId
+            ? { ...attachment, uploading: false, error: uploadError instanceof Error ? uploadError.message : "Не удалось загрузить изображение." }
+            : attachment,
+        ),
+      );
+    }
+  }
+
+  function handleComposerPaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const items = Array.from(event.clipboardData?.items ?? []);
+    const imageItems = items.filter((item) => item.type.startsWith("image/"));
+
+    if (imageItems.length === 0) {
+      return;
+    }
+
+    // Иначе браузер параллельно вставит имя файла/бинарный мусор в текст.
+    event.preventDefault();
+
+    for (const item of imageItems) {
+      const blob = item.getAsFile();
+
+      if (blob) {
+        void handleImagePaste(blob);
+      }
+    }
+  }
+
   async function submitPipelineRun(forceRefresh: boolean, hardResync = false) {
     if (!selectedProjectId && !projectPath.trim()) {
       setError("Нужно выбрать проект перед отправкой вопроса.");
@@ -3721,6 +4021,19 @@ export function App() {
     const composedTask = isFollowUpClarification
       ? `${selectedTask}\n\nУточнение пользователя: ${task.trim()}`
       : task.trim();
+    // Только уже успешно загруженные (id != null) - вложение, всё ещё
+    // анализирующееся в момент отправки, в эту реплику просто не попадёт
+    // (см. disabled на кнопке отправки: пока идёт загрузка, отправка заблокирована).
+    const attachmentIds = pendingAttachments
+      .filter((attachment): attachment is PendingAttachment & { id: string } => attachment.id !== null)
+      .map((attachment) => attachment.id);
+    // Снимок для "живого" пузыря сообщения, пока идёт run (см. sentAttachments) -
+    // берём только те, что реально успели проанализироваться (structuredContext
+    // не null); ещё-загружающиеся сюда и так не попали бы (см. attachmentIds выше).
+    const attachmentsToSend: ConversationAttachment[] = pendingAttachments
+      .filter((attachment): attachment is PendingAttachment & { id: string; structuredContext: AttachmentStructuredContext } =>
+        attachment.id !== null && attachment.structuredContext !== null)
+      .map((attachment) => ({ id: attachment.id, turnIndex: -1, mimeType: attachment.mimeType, structuredContext: attachment.structuredContext }));
 
     try {
       const accepted = await fetchJsonWithTimeout<PipelineRunStatus & { kind?: string }>(`${API_BASE_URL}/api/pipeline/run`, {
@@ -3745,8 +4058,11 @@ export function App() {
           // получит доступ к evidence/контексту предыдущей реплики (см. §7-8
           // в apps/api/src/pipeline-runner.ts).
           conversationId: !hardResync && !forceRefresh ? conversationId ?? undefined : undefined,
+          ...(attachmentIds.length ? { attachmentIds } : {}),
         }),
       });
+      setSentAttachments(attachmentsToSend);
+      clearPendingAttachments();
 
       // Сервер распознал в сообщении задачу разработки (или корректировку
       // предыдущей) и запустил Developer pipeline вместо Q&A — совсем другой
@@ -4018,6 +4334,24 @@ export function App() {
           || project?.rootPath
           || projectPath;
 
+        // Если в этой реплике были вложения — они уже привязаны к
+        // conversationId/turnIndex на бэкенде (см. linkChatAttachmentsToTurn
+        // в pipeline-runner.ts) к моменту completed; подтягиваем список,
+        // чтобы транскрипт показал скриншот сразу, без перезагрузки чата.
+        let freshAttachments: ConversationAttachment[] | null = null;
+
+        if (status.result) {
+          try {
+            const attachmentsParams = new URLSearchParams({ conversationId: status.result.conversationId });
+            const attachmentsResponse = await fetchJsonWithTimeout<{ attachments: ConversationAttachment[] }>(
+              `${API_BASE_URL}/api/attachments?${attachmentsParams.toString()}`,
+            );
+            freshAttachments = attachmentsResponse.attachments;
+          } catch {
+            // транскрипт без картинок лучше, чем ошибка на весь экран.
+          }
+        }
+
         startTransition(() => {
           setResult(status.result ?? null);
           if (status.result) {
@@ -4027,6 +4361,14 @@ export function App() {
             // происходить в норме — pollPipelineStatus возвращается сразу после
             // completed — но дешёвая защита от задвоения реплики в транскрипте).
             setTurns((current) => [...current.filter((turn) => turn.runId !== completedResult.runId), completedResult]);
+
+            if (freshAttachments) {
+              setConversationAttachments(freshAttachments);
+            }
+            // Реплика теперь в turns - её вложения найдутся через
+            // conversationAttachments (по turnIndex), sentAttachments-снимок
+            // отслужил своё.
+            setSentAttachments([]);
           }
           updateActiveRunId(null);
           setProject((current) =>
@@ -4231,6 +4573,8 @@ export function App() {
           observerModel: teamDraft.observerModel,
           developerModel: teamDraft.developerModel,
           reviewerModel: teamDraft.reviewerModel,
+          researcherEscalationModel: teamDraft.researcherEscalationModel,
+          visionModel: teamDraft.visionModel,
           isSelected: true,
         }),
       });
@@ -4274,6 +4618,8 @@ export function App() {
             observerModel: selected.observerModel,
             developerModel: selected.developerModel,
             reviewerModel: selected.reviewerModel,
+            researcherEscalationModel: selected.researcherEscalationModel ?? "",
+            visionModel: selected.visionModel ?? "",
           });
         }
       });
@@ -4307,6 +4653,8 @@ export function App() {
           observerModel: selected?.observerModel ?? "",
           developerModel: selected?.developerModel ?? "",
           reviewerModel: selected?.reviewerModel ?? "",
+          researcherEscalationModel: selected?.researcherEscalationModel ?? "",
+          visionModel: selected?.visionModel ?? "",
         });
       });
     } catch (removeError) {
@@ -4334,6 +4682,30 @@ export function App() {
       await loadObserverStatus();
     } catch (toggleError) {
       setError(toggleError instanceof Error ? toggleError.message : "Не удалось переключить Observer.");
+    }
+  }
+
+  // Explicit, destructive, user-triggered (2026-07-19): isStale alone can't
+  // express "the crawl was wrong/incomplete from day one and we've since
+  // improved the Observer's own prompt" - only "the code changed since
+  // then." Wipes every learned business_graph_entries row for ONE physical
+  // repo path so it re-crawls from scratch under whatever the Observer's
+  // current (hopefully better) logic is, instead of trusting old rows
+  // forever just because the underlying files never changed.
+  async function resetObserverKnowledge(observerProjectPath: string, pathLabel: string) {
+    if (!window.confirm(`Удалить всё, что Observer узнал про «${pathLabel}»? Он остановится (если запущен) и начнёт изучение заново с нуля при следующем запуске.`)) {
+      return;
+    }
+
+    try {
+      await fetchJsonWithTimeout<{ ok: true }>(`${API_BASE_URL}/api/observer/reset-knowledge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectPath: observerProjectPath }),
+      });
+      await loadObserverStatus();
+    } catch (resetError) {
+      setError(resetError instanceof Error ? resetError.message : "Не удалось сбросить знания Observer'а.");
     }
   }
 
@@ -4541,12 +4913,28 @@ export function App() {
         // равно лучше, чем пустой экран.
       }
 
+      // Скриншоты уже отправленных реплик этого диалога (2026-07-19) - тот же
+      // best-effort принцип, что и выше: транскрипт без картинок лучше, чем
+      // ошибка на весь экран.
+      let attachments: ConversationAttachment[] = [];
+
+      try {
+        const attachmentsParams = new URLSearchParams({ conversationId: artifact.conversationId });
+        const attachmentsResponse = await fetchJsonWithTimeout<{ attachments: ConversationAttachment[] }>(
+          `${API_BASE_URL}/api/attachments?${attachmentsParams.toString()}`,
+        );
+        attachments = attachmentsResponse.attachments;
+      } catch {
+        // см. выше
+      }
+
       startTransition(() => {
         setResult(artifact);
         setRunStatus(null);
         updateActiveRunId(null);
         setSelectedTask(artifact.knowledge?.runId ? safeText(artifact.research?.summary, selectedTask) : selectedTask);
         setTurns(conversationTurns);
+        setConversationAttachments(attachments);
         // Открыт другой (Q&A) диалог из истории — develop-реплики прежней
         // сессии к нему не относятся.
         setDevelopTurns([]);
@@ -4594,6 +4982,10 @@ export function App() {
       setDevelopTurns([]);
       setActiveDevelop(null);
       setConversationId(null);
+      setConversationAttachments([]);
+      setSentAttachments([]);
+      setLightbox(null);
+      clearPendingAttachments();
     });
     activeDevelopRunIdRef.current = null;
     navigate("/chat");
@@ -4836,7 +5228,13 @@ export function App() {
 
               {turns.map((turn) => (
                 <Fragment key={turn.runId}>
-                  <UserTaskMessage task={turn.research.task} projectName={safeText(project?.name, "")} projectPath={projectPath} />
+                  <UserTaskMessage
+                    task={turn.research.task}
+                    projectName={safeText(project?.name, "")}
+                    projectPath={projectPath}
+                    attachments={conversationAttachments.filter((attachment) => attachment.turnIndex === turn.turnIndex)}
+                    onOpenAttachment={(turnAttachments, index) => setLightbox({ attachments: turnAttachments, index })}
+                  />
                   <AssistantRunMessage
                     runStatus={null}
                     result={turn}
@@ -4866,7 +5264,13 @@ export function App() {
               */}
               {selectedTask && !turns.some((turn) => turn.runId === result?.runId) ? (
                 <Fragment>
-                  <UserTaskMessage task={selectedTask} projectName={safeText(project?.name, "")} projectPath={projectPath} />
+                  <UserTaskMessage
+                    task={selectedTask}
+                    projectName={safeText(project?.name, "")}
+                    projectPath={projectPath}
+                    attachments={sentAttachments}
+                    onOpenAttachment={(turnAttachments, index) => setLightbox({ attachments: turnAttachments, index })}
+                  />
                   <AssistantRunMessage
                     runStatus={runStatus}
                     result={result}
@@ -4897,20 +5301,57 @@ export function App() {
 
             <form className="composer" onSubmit={runPipeline}>
               <div className="composer-box">
+                {pendingAttachments.length > 0 ? (
+                  <div className="composer-attachments">
+                    {pendingAttachments.map((attachment) => {
+                      // Готовые (id + structuredContext уже пришли) можно открыть в
+                      // том же слайдере, что и вложения отправленных сообщений -
+                      // индекс считаем среди ТАКИХ ЖЕ готовых вложений композера.
+                      const readyAttachments: ConversationAttachment[] = pendingAttachments
+                        .filter((item): item is PendingAttachment & { id: string; structuredContext: AttachmentStructuredContext } =>
+                          item.id !== null && item.structuredContext !== null)
+                        .map((item) => ({ id: item.id, turnIndex: -1, mimeType: item.mimeType, structuredContext: item.structuredContext }));
+                      const readyIndex = attachment.id ? readyAttachments.findIndex((item) => item.id === attachment.id) : -1;
+
+                      return (
+                        <div key={attachment.localId} className="composer-attachment-thumb">
+                          <img
+                            src={attachment.previewUrl}
+                            alt="Прикреплённый скриншот"
+                            onClick={readyIndex >= 0 ? () => setLightbox({ attachments: readyAttachments, index: readyIndex }) : undefined}
+                            style={readyIndex >= 0 ? { cursor: "pointer" } : undefined}
+                          />
+                          {attachment.uploading ? <span className="composer-attachment-status">Анализирую…</span> : null}
+                          {attachment.error ? <span className="composer-attachment-status composer-attachment-error">{attachment.error}</span> : null}
+                          <button
+                            type="button"
+                            className="composer-attachment-remove"
+                            onClick={() => removePendingAttachment(attachment.localId)}
+                            aria-label="Убрать скриншот"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+
                 <textarea
                   value={task}
                   onChange={(event) => setTask(event.target.value)}
+                  onPaste={handleComposerPaste}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
 
-                      if (!running && selectedProjectId && task.trim()) {
+                      if (!running && selectedProjectId && task.trim() && !pendingAttachments.some((attachment) => attachment.uploading)) {
                         void submitPipelineRun(false);
                       }
                     }
                   }}
                   rows={4}
-                  placeholder="Напиши инженерную задачу или вопрос по проекту… (Enter — отправить, Shift+Enter — новая строка)"
+                  placeholder="Напиши инженерную задачу или вопрос по проекту… (Enter — отправить, Shift+Enter — новая строка, Cmd+V — вставить скриншот)"
                   disabled={running}
                 />
 
@@ -4921,12 +5362,31 @@ export function App() {
                     </span>
                     {runStatus ? <span>{safeText(runStatus.currentStageLabel, "Ожидание")}</span> : null}
                   </div>
-                  <button type="submit" className="primary-button" disabled={running || loading || !selectedProjectId}>
-                    {running ? "Собираю ответ…" : !selectedProjectId ? "Сначала выбери проект" : "Получить ответ по проекту"}
+                  <button
+                    type="submit"
+                    className="primary-button"
+                    disabled={running || loading || !selectedProjectId || pendingAttachments.some((attachment) => attachment.uploading)}
+                  >
+                    {running
+                      ? "Собираю ответ…"
+                      : pendingAttachments.some((attachment) => attachment.uploading)
+                        ? "Анализирую скриншот…"
+                        : !selectedProjectId
+                          ? "Сначала выбери проект"
+                          : "Получить ответ по проекту"}
                   </button>
                 </div>
               </div>
             </form>
+
+            {lightbox ? (
+              <AttachmentLightbox
+                attachments={lightbox.attachments}
+                index={lightbox.index}
+                onClose={() => setLightbox(null)}
+                onNavigate={(nextIndex) => setLightbox((current) => (current ? { ...current, index: nextIndex } : current))}
+              />
+            ) : null}
           </>
         ) : null}
 
@@ -5021,7 +5481,7 @@ export function App() {
                 <button
                   type="button"
                   className="ghost-button"
-                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "", developerModel: "", reviewerModel: "" })}
+                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "", developerModel: "", reviewerModel: "", researcherEscalationModel: "", visionModel: "" })}
                 >
                   Новая
                 </button>
@@ -5045,6 +5505,50 @@ export function App() {
                         формы МОЛЧА затирало реальную модель команды пустой строкой. */}
                     {teamDraft.researcherModel && !safeList(providerModels).some((model) => model.id === teamDraft.researcherModel) ? (
                       <option value={teamDraft.researcherModel}>{teamDraft.researcherModel} (вне каталога)</option>
+                    ) : null}
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Researcher — эскалация</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.researcherEscalation}</span>
+                  <select
+                    value={teamDraft.researcherEscalationModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, researcherEscalationModel: event.target.value }))}
+                  >
+                    <option value="">Эскалация выключена</option>
+                    {teamDraft.researcherEscalationModel && !safeList(providerModels).some((model) => model.id === teamDraft.researcherEscalationModel) ? (
+                      <option value={teamDraft.researcherEscalationModel}>{teamDraft.researcherEscalationModel} (вне каталога)</option>
+                    ) : null}
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Vision</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.vision}</span>
+                  <select
+                    value={teamDraft.visionModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, visionModel: event.target.value }))}
+                  >
+                    <option value="">Анализ картинок выключен</option>
+                    {teamDraft.visionModel && !safeList(providerModels).some((model) => model.id === teamDraft.visionModel) ? (
+                      <option value={teamDraft.visionModel}>{teamDraft.visionModel} (вне каталога)</option>
                     ) : null}
                     {groupModelsByVendor(safeList(providerModels)).map((group) => (
                       <optgroup key={group.vendor} label={group.vendor}>
@@ -5216,6 +5720,30 @@ export function App() {
                         </span>
                         <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.observer}</span>
                       </div>
+                      {team.researcherEscalationModel ? (
+                        <div className="team-role-card">
+                          <strong>Researcher (эскалация)</strong>
+                          <span>
+                            {team.researcherEscalationModel}
+                            {findModelMultiplierLabel(providerModels, team.researcherEscalationModel) ? (
+                              <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.researcherEscalationModel)}</span>
+                            ) : null}
+                          </span>
+                          <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.researcherEscalation}</span>
+                        </div>
+                      ) : null}
+                      {team.visionModel ? (
+                        <div className="team-role-card">
+                          <strong>Vision</strong>
+                          <span>
+                            {team.visionModel}
+                            {findModelMultiplierLabel(providerModels, team.visionModel) ? (
+                              <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.visionModel)}</span>
+                            ) : null}
+                          </span>
+                          <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.vision}</span>
+                        </div>
+                      ) : null}
                     </div>
                     <div className="action-row">
                       <button
@@ -5230,6 +5758,8 @@ export function App() {
                             observerModel: team.observerModel,
                             developerModel: team.developerModel,
                             reviewerModel: team.reviewerModel,
+                            researcherEscalationModel: team.researcherEscalationModel ?? "",
+                            visionModel: team.visionModel ?? "",
                           })
                         }
                       >
@@ -5361,6 +5891,7 @@ export function App() {
             onToggleProject={(observerProjectPaths, nextRunning) => void toggleProjectObserver(observerProjectPaths, nextRunning)}
             onStopAll={() => void stopAllObserversNow()}
             onResume={() => void resumeObservers()}
+            onResetKnowledge={(observerProjectPath, pathLabel) => void resetObserverKnowledge(observerProjectPath, pathLabel)}
           />
         ) : null}
 

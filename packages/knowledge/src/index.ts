@@ -4,6 +4,7 @@ import { deleteFactsForPath } from "./facts.js";
 import { deleteBusinessGraphEntriesForPath } from "./graph-entries.js";
 import { pruneCodeEmbeddings } from "./code-embeddings.js";
 import { deleteGlossaryEntriesForPath } from "./glossary.js";
+import { deleteChatAttachmentsForPath } from "./attachments.js";
 
 export { setSharedPool, clearSharedPool, runWithTransaction } from "./postgres-client.js";
 export { setSharedRedisClient, clearSharedRedisClient } from "./redis-client.js";
@@ -25,6 +26,7 @@ function knowledgeArtifactCacheKey(runId: string): string {
 
 export { deleteFactsForPath, promoteFactsFromDevelopment, promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
 export {
+  appendBusinessGraphEntryCorrection,
   deleteBusinessGraphEntriesForPath,
   hashFiles,
   queryBusinessGraphEntries,
@@ -40,6 +42,17 @@ export {
   type DomainGlossaryEntry,
   type UpsertGlossaryEntryInput,
 } from "./glossary.js";
+export {
+  deleteChatAttachmentsForPath,
+  linkChatAttachmentsToTurn,
+  loadChatAttachmentsByIds,
+  loadChatAttachmentsForConversation,
+  loadChatAttachmentWithImage,
+  saveChatAttachment,
+  type AttachmentStructuredContext,
+  type ChatAttachmentRecord,
+  type SaveChatAttachmentInput,
+} from "./attachments.js";
 export {
   findSemanticMatches,
   findSemanticMatchesAcrossPaths,
@@ -525,6 +538,7 @@ export async function forgetProjectPath(projectRootPath: string): Promise<void> 
   await deleteBusinessGraphEntriesForPath(projectRootPath);
   await deleteGlossaryEntriesForPath(projectRootPath);
   await pruneCodeEmbeddings(projectRootPath, []);
+  await deleteChatAttachmentsForPath(projectRootPath);
 }
 
 export async function loadPipelineRunArtifact(

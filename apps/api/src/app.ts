@@ -1,9 +1,10 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, setSharedPool, setSharedRedisClient } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteBusinessGraphEntriesForPath, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
+import { scanTextForSecurityFindings } from "@client/agentic-research";
 import { inspectRepository } from "@client/repository-git";
-import { normalizePath, stableId, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
+import { normalizePath, stableId, type AttachmentStructuredContext, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { startEmbeddingIndexer, stopEmbeddingIndexer } from "./embedding-indexer.js";
 import { initializeGraphStore } from "./graph-store.js";
@@ -16,7 +17,7 @@ import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-sta
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
-import { classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
+import { analyzeAttachmentImage, classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 
@@ -32,6 +33,8 @@ interface PipelineRunRequest {
   hardResync?: boolean;
   /** Продолжение существующего диалога — если не передан, стартует новый (см. §7 в pipeline-runner.ts). */
   conversationId?: string;
+  /** IDs from /api/attachments — screenshots pasted into this message, already uploaded+analyzed before send. */
+  attachmentIds?: string[];
 }
 
 interface CompactPipelineRunStatusResponse {
@@ -106,6 +109,8 @@ interface SaveTeamRequest {
   observerModel?: string;
   developerModel?: string;
   reviewerModel?: string;
+  researcherEscalationModel?: string;
+  visionModel?: string;
   isSelected?: boolean;
 }
 
@@ -220,6 +225,11 @@ function buildEvalSummary(status: PipelineRunStatus | null, elapsedMs: number, m
 export function createApp() {
   const app = Fastify({
     logger: true,
+    // Default 1MB is too small for base64-encoded screenshots (картинки-в-чате
+    // feature, 2026-07-19) - a single decent-resolution PNG already inflates
+    // past it once base64-encoded (+33%), and multiple images per message is
+    // an explicit requirement. 25MB comfortably fits several screenshots.
+    bodyLimit: 25 * 1024 * 1024,
   });
   const appRootPath = process.cwd();
   const defaultProviderBaseUrl = process.env.CLIENT_PROVIDER_BASE_URL?.trim() || "";
@@ -448,6 +458,33 @@ export function createApp() {
     return { ok: true, stopped };
   });
 
+  // Explicit, destructive, user-triggered reset (2026-07-19, live product-owner
+  // request): isStale only ever catches "the code changed since the crawl" -
+  // it has no way to express "the crawl itself was wrong/incomplete from day
+  // one, and we've since improved the Observer's own prompt/model, so old
+  // rows are trustworthy-looking but were never re-derived under the better
+  // logic." Wipes every business_graph_entries row for this ONE physical repo
+  // path (reuses forgetProjectPath's own per-path delete, same as removing a
+  // path from a project) - stopped first so a live crawl can't write a fresh
+  // row back in the middle of the delete.
+  app.post<{ Body: { projectPath?: string } }>("/api/observer/reset-knowledge", async (request, reply) => {
+    const projectPath = request.body.projectPath?.trim();
+
+    if (!projectPath) {
+      return reply.code(400).send({ message: "Нужно указать projectPath." });
+    }
+
+    // Not normalized/resolved on purpose - same reasoning as
+    // /api/observer/status above: business_graph_entries.project_root_path
+    // is written using this exact string (see observer-monitor.ts's
+    // runner.projectRootPath, set verbatim from startObserver's argument),
+    // so the delete must match it exactly rather than a re-resolved variant
+    // that could silently miss every row.
+    stopObserver(projectPath);
+    await deleteBusinessGraphEntriesForPath(projectPath);
+    return { ok: true };
+  });
+
   app.post<{ Body: SaveTeamRequest }>("/api/teams", async (request, reply) => {
     const name = request.body.name?.trim();
 
@@ -465,10 +502,137 @@ export function createApp() {
       observerModel: request.body.observerModel?.trim() || "",
       developerModel: request.body.developerModel?.trim() || "",
       reviewerModel: request.body.reviewerModel?.trim() || "",
+      ...(request.body.researcherEscalationModel?.trim() ? { researcherEscalationModel: request.body.researcherEscalationModel.trim() } : {}),
+      ...(request.body.visionModel?.trim() ? { visionModel: request.body.visionModel.trim() } : {}),
       isSelected: request.body.isSelected ?? false,
     });
 
     return reply.code(200).send(team);
+  });
+
+  const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+
+  interface UploadAttachmentRequest {
+    projectRootPath?: string;
+    mimeType?: string;
+    imageDataBase64?: string;
+  }
+
+  interface UploadAttachmentResponse {
+    id: string;
+    mimeType: string;
+    fileSizeBytes: number;
+    structuredContext: AttachmentStructuredContext;
+  }
+
+  // Uploaded and analyzed BEFORE the user sends the message it's attached to
+  // (2026-07-19, картинки-в-чате feature) - see linkChatAttachmentsToTurn in
+  // packages/knowledge/src/attachments.ts for why conversation_id/turn_index
+  // start empty/0 here and get backfilled once the message is actually sent.
+  app.post<{ Body: UploadAttachmentRequest }>("/api/attachments", async (request, reply) => {
+    const projectRootPath = request.body.projectRootPath?.trim();
+    const mimeType = request.body.mimeType?.trim();
+    const imageDataBase64 = request.body.imageDataBase64?.trim();
+
+    if (!projectRootPath || !mimeType || !imageDataBase64) {
+      return reply.code(400).send({
+        message: "Нужны projectRootPath, mimeType и imageDataBase64.",
+      });
+    }
+
+    if (!mimeType.startsWith("image/")) {
+      return reply.code(400).send({
+        message: "Поддерживаются только изображения.",
+      });
+    }
+
+    const imageBuffer = Buffer.from(imageDataBase64, "base64");
+
+    if (imageBuffer.byteLength === 0) {
+      return reply.code(400).send({
+        message: "Пустое изображение.",
+      });
+    }
+
+    if (imageBuffer.byteLength > MAX_ATTACHMENT_BYTES) {
+      return reply.code(413).send({
+        message: "Изображение слишком большое (максимум 15MB).",
+      });
+    }
+
+    const [selectedTeam, currentProvider] = await Promise.all([getSelectedTeam(), getCurrentProvider()]);
+    const providerBaseUrl = currentProvider?.baseUrl || defaultProviderBaseUrl;
+    const providerApiKey = currentProvider?.apiKey || defaultProviderApiKey;
+    const visionModel = selectedTeam?.visionModel?.trim() ?? "";
+
+    const analysis = await analyzeAttachmentImage({
+      imageDataBase64,
+      mimeType,
+      providerBaseUrl,
+      providerApiKey,
+      visionModel,
+      extractionModel: selectedTeam?.criticModel?.trim() || visionModel,
+    });
+
+    // Screenshots of an IDE/terminal can show a real hardcoded secret just
+    // as easily as a diff can (see scanTextForSecurityFindings's comment) -
+    // redact any matched snippet before it ever reaches Postgres or the
+    // Researcher's context, rather than just flagging it after the fact.
+    const findings = scanTextForSecurityFindings(analysis.ocrText, "screenshot OCR");
+    const sanitizedOcrText = findings.reduce(
+      (text, finding) => text.replaceAll(finding.snippet, "[REDACTED — похоже на секрет]"),
+      analysis.ocrText,
+    );
+
+    const id = await saveChatAttachment({
+      conversationId: "",
+      projectRootPath: normalizePath(path.resolve(projectRootPath)),
+      turnIndex: 0,
+      mimeType,
+      imageData: imageBuffer,
+      ocrText: sanitizedOcrText,
+      structuredContext: analysis.structuredContext,
+      visionModel,
+    });
+
+    return reply.code(200).send({
+      id,
+      mimeType,
+      fileSizeBytes: imageBuffer.byteLength,
+      structuredContext: analysis.structuredContext,
+    } satisfies UploadAttachmentResponse);
+  });
+
+  // Past attachments of an already-loaded conversation (2026-07-19) - lets
+  // the chat transcript show the screenshots a user pasted into earlier
+  // turns, not just the one currently being composed. Metadata only, same
+  // no-image-bytes reasoning as loadChatAttachmentsForConversation itself;
+  // the UI fetches actual pixels per-thumbnail via /api/attachments/:id/image.
+  app.get<{ Querystring: { conversationId?: string } }>("/api/attachments", async (request, reply) => {
+    const conversationId = request.query.conversationId?.trim();
+
+    if (!conversationId) {
+      return reply.code(400).send({
+        message: "Нужно указать conversationId.",
+      });
+    }
+
+    const attachments = await loadChatAttachmentsForConversation(conversationId);
+    return { attachments };
+  });
+
+  app.get<{ Params: { id: string } }>("/api/attachments/:id/image", async (request, reply) => {
+    const attachment = await loadChatAttachmentWithImage(request.params.id);
+
+    if (!attachment) {
+      return reply.code(404).send({
+        message: "Вложение не найдено.",
+      });
+    }
+
+    reply.header("Content-Type", attachment.mimeType);
+    reply.header("Cache-Control", "private, max-age=31536000, immutable");
+    return reply.send(attachment.imageData);
   });
 
   app.post<{ Params: { id: string } }>("/api/teams/:id/select", async (request, reply) => {
@@ -1261,6 +1425,7 @@ export function createApp() {
             },
           }
         : {}),
+      ...(request.body.attachmentIds?.length ? { attachmentIds: request.body.attachmentIds } : {}),
     });
 
     return reply.code(202).send(acceptedStatus);

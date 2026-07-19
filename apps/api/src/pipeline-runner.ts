@@ -20,7 +20,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph, getFileDependencies, getFileDependents, getSymbolDependencies, getSymbolDependents, linkHttpCallsToRoutes } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { buildBackgroundProjectState, findSemanticMatchesAcrossPaths, loadBestBaselineRunArtifact, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryGlossaryAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts, upsertGlossaryEntry } from "@client/knowledge";
+import { appendBusinessGraphEntryCorrection, buildBackgroundProjectState, findSemanticMatchesAcrossPaths, linkChatAttachmentsToTurn, loadBestBaselineRunArtifact, loadChatAttachmentsByIds, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryGlossaryAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts, upsertGlossaryEntry } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { computeFileChurnSignals, deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -55,7 +55,7 @@ import {
   type ValidationResult,
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
-import { grepContent, runAgenticResearch, type WorkspaceRoot } from "@client/agentic-research";
+import { grepContent, runAgenticResearch, type ObserverEntryRef, type WorkspaceRoot } from "@client/agentic-research";
 import { buildDbQueryTool } from "./db-query-tool.js";
 import { saveGraphSnapshot } from "./graph-store.js";
 import { getRedisClient } from "./redis-client.js";
@@ -91,6 +91,14 @@ export interface PipelineExecutionRequest {
    * earlier than this one.
    */
   preludeUsage?: { promptTokens: number; completionTokens: number; callCount: number };
+  /**
+   * Images pasted into the composer for this message (2026-07-19,
+   * картинки-в-чате feature) - already uploaded and analyzed by the time the
+   * run starts (see the /api/attachments route), this is just the list of
+   * IDs to link to this turn and fold into the Researcher's context. See
+   * buildAttachmentContextHint below.
+   */
+  attachmentIds?: string[];
 }
 
 interface QuestionWorkspacePlan {
@@ -440,10 +448,15 @@ function buildUsageSummary(
   otherUsage: ProviderUsageAccumulator,
   researcherModel: string,
   criticModel: string,
+  // Deterministic escalation (2026-07-19) - undefined/null on the (vast
+  // majority of) runs where the Critic never rejected the base model's
+  // first answer, so escalation never fired.
+  escalatedResearcherUsage?: ProviderUsageAccumulator,
+  escalatedResearcherModel?: string | null,
 ): ProviderUsageSummary {
   const byRole: NonNullable<ProviderUsageSummary["byRole"]> = [];
 
-  const pushRole = (role: "researcher" | "critic" | "other", model: string, accumulator: ProviderUsageAccumulator) => {
+  const pushRole = (role: "researcher" | "researcher-escalated" | "critic" | "other", model: string, accumulator: ProviderUsageAccumulator) => {
     if (accumulator.callCount === 0) {
       return;
     }
@@ -459,6 +472,11 @@ function buildUsageSummary(
   };
 
   pushRole("researcher", researcherModel, researcherUsage);
+
+  if (escalatedResearcherUsage && escalatedResearcherModel) {
+    pushRole("researcher-escalated", escalatedResearcherModel, escalatedResearcherUsage);
+  }
+
   pushRole("critic", criticModel, criticUsage);
   // "other" mixes providerModel (deterministic stages) and criticModel
   // (chat-intent classification) in general - no single model id to look a
@@ -466,9 +484,9 @@ function buildUsageSummary(
   // не найден" for an empty model, exactly the honest answer here).
   pushRole("other", "", otherUsage);
 
-  const promptTokens = researcherUsage.promptTokens + criticUsage.promptTokens + otherUsage.promptTokens;
-  const completionTokens = researcherUsage.completionTokens + criticUsage.completionTokens + otherUsage.completionTokens;
-  const callCount = researcherUsage.callCount + criticUsage.callCount + otherUsage.callCount;
+  const promptTokens = researcherUsage.promptTokens + (escalatedResearcherUsage?.promptTokens ?? 0) + criticUsage.promptTokens + otherUsage.promptTokens;
+  const completionTokens = researcherUsage.completionTokens + (escalatedResearcherUsage?.completionTokens ?? 0) + criticUsage.completionTokens + otherUsage.completionTokens;
+  const callCount = researcherUsage.callCount + (escalatedResearcherUsage?.callCount ?? 0) + criticUsage.callCount + otherUsage.callCount;
 
   return {
     promptTokens,
@@ -480,7 +498,7 @@ function buildUsageSummary(
 }
 
 async function buildPipelineRunResult(request: PipelineExecutionRequest): Promise<PipelineRunResult> {
-  const { runId, mode, conversationId, task, projectPath, projectPaths, providerBaseUrl, providerModel, providerApiKey, appRootPath, preludeUsage } = request;
+  const { runId, mode, conversationId, task, projectPath, projectPaths, providerBaseUrl, providerModel, providerApiKey, appRootPath, preludeUsage, attachmentIds } = request;
   const overview = await scanWorkspaceOverview(projectPath);
   const largeRepositoryProfile = overview.summary.profile === "large-repository";
   const isQuestionRun = mode === "question-run";
@@ -493,6 +511,13 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   // calls (packages/agentic-research) split into their own accumulators
   // after the fact, once its own already-split totals come back.
   const researcherUsage = createUsageAccumulator();
+  // Deterministic escalation (2026-07-19) - populated only on the rare run
+  // where the Critic rejected the base model's answer and escalation
+  // actually fired; kept as its own accumulator (not folded into
+  // researcherUsage) purely so buildUsageSummary can report it under the
+  // escalation model's OWN id/multiplier instead of the base researcher's.
+  const escalatedResearcherUsage = createUsageAccumulator();
+  let escalatedResearcherModelUsed: string | null = null;
   const criticUsage = createUsageAccumulator();
   const otherUsage = createUsageAccumulator();
 
@@ -531,6 +556,10 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     : [];
   const priorConversationTurn = conversationTurns[conversationTurns.length - 1] ?? null;
   const turnIndex = conversationTurns.length;
+
+  if (isQuestionRun && attachmentIds?.length) {
+    void linkChatAttachmentsToTurn(attachmentIds, conversationId, turnIndex).catch(() => {});
+  }
   const baselineSelection = await loadBestBaselineRunArtifact(appRootPath, projectRootPath, repository);
   const previousRun = isHardResync ? null : baselineSelection.run;
   const latestBackgroundEntry = await loadLatestBackgroundRunCatalogEntry(appRootPath, projectRootPath);
@@ -703,7 +732,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       );
     }
 
-    const observerHint = await buildObserverHintSuffix(effectiveProjectRoots, task);
+    const observerHintResult = await buildObserverHintSuffix(effectiveProjectRoots, task);
+    const observerHint = observerHintResult.text;
+    const attachmentHint = await buildAttachmentContextHint(attachmentIds);
     const teamKnownFacts = await queryFactsAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
     const teamGlossary = await queryGlossaryAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
     const knownFactsHintText = [buildKnownFactsHint(effectiveProjectRoots, teamKnownFacts), buildGlossaryHint(teamGlossary)]
@@ -772,9 +803,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       criticModel: selectedTeam.criticModel,
       providerBaseUrl,
       providerApiKey,
+      ...(selectedTeam.researcherEscalationModel ? { researcherEscalationModel: selectedTeam.researcherEscalationModel } : {}),
       ...(priorTurnFiles.length ? { priorTurnFiles } : {}),
       ...(priorTurnTopic ? { priorTurnTopic } : {}),
       ...(observerHint ? { observerHint } : {}),
+      ...(observerHintResult.entries.length ? { observerEntries: observerHintResult.entries } : {}),
+      ...(attachmentHint ? { attachmentHint } : {}),
       semanticSearch: buildSemanticSearchTool(effectiveProjectRoots, providerBaseUrl, providerApiKey),
       // Architecture review finding (2026-07-16): the graph existed but was
       // never queryable by the Researcher itself - see buildGraphNavigationTool.
@@ -800,6 +834,18 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     });
     initialResearch = agenticResult.research;
     teamValidation = agenticResult.validation;
+    // Opportunistic Observer correction (2026-07-19, architecture review
+    // "safety fuse" request): the Critic (never the researcher's own
+    // self-assertion, see callCritic's gating) found a transcript-backed
+    // contradiction between this run's answer and a specific Observer
+    // entry. Written back as an appended, dated gotcha - never a full
+    // rewrite - so the SAME wrong hint doesn't keep misleading future runs
+    // just because the underlying files haven't changed (isStale alone
+    // can't catch a crawl that was wrong from day one). Best-effort: never
+    // blocks or slows down returning the actual answer to the user.
+    if (agenticResult.raw.observerCorrection) {
+      void appendBusinessGraphEntryCorrection(agenticResult.raw.observerCorrection).catch(() => {});
+    }
     // The agentic loop already tracks its own (Researcher + Critic) usage
     // internally, split by role (packages/agentic-research) - merged here
     // into the matching per-run accumulator, not lumped together, so the
@@ -809,7 +855,18 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     // tool observations).
     researcherUsage.promptTokens += agenticResult.raw.researcherPromptTokens;
     researcherUsage.completionTokens += agenticResult.raw.researcherCompletionTokens;
-    researcherUsage.callCount += agenticResult.raw.turnsUsed;
+    // turnsUsed covers ALL researcher turns including any post-escalation
+    // ones - subtract those out so this call count matches the tokens above
+    // (base-model-only); escalatedResearcherUsage gets its own exact count.
+    researcherUsage.callCount += agenticResult.raw.turnsUsed - (agenticResult.raw.escalatedResearcherCallCount ?? 0);
+
+    if (agenticResult.raw.escalatedResearcherModel) {
+      escalatedResearcherModelUsed = agenticResult.raw.escalatedResearcherModel;
+      escalatedResearcherUsage.promptTokens += agenticResult.raw.escalatedResearcherPromptTokens ?? 0;
+      escalatedResearcherUsage.completionTokens += agenticResult.raw.escalatedResearcherCompletionTokens ?? 0;
+      escalatedResearcherUsage.callCount += agenticResult.raw.escalatedResearcherCallCount ?? 0;
+    }
+
     criticUsage.promptTokens += agenticResult.raw.criticPromptTokens;
     criticUsage.completionTokens += agenticResult.raw.criticCompletionTokens;
     criticUsage.callCount += agenticResult.raw.criticRounds;
@@ -1213,7 +1270,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     focusedResearchResults,
     validatedAnswerPacket,
     answer,
-    usage: buildUsageSummary(researcherUsage, criticUsage, otherUsage, selectedTeam?.researcherModel ?? "", selectedTeam?.criticModel ?? ""),
+    usage: buildUsageSummary(researcherUsage, criticUsage, otherUsage, selectedTeam?.researcherModel ?? "", selectedTeam?.criticModel ?? "", escalatedResearcherUsage, escalatedResearcherModelUsed),
   });
   completeStage(runId, "knowledge", knowledgeStartedAt, `Артефакты сохранены в центральное knowledge-хранилище: ${knowledge.artifactCount} групп.`);
 
@@ -1268,7 +1325,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       index,
       graph,
     },
-    usage: buildUsageSummary(researcherUsage, criticUsage, otherUsage, selectedTeam?.researcherModel ?? "", selectedTeam?.criticModel ?? ""),
+    usage: buildUsageSummary(researcherUsage, criticUsage, otherUsage, selectedTeam?.researcherModel ?? "", selectedTeam?.criticModel ?? "", escalatedResearcherUsage, escalatedResearcherModelUsed),
   };
 }
 
@@ -2216,13 +2273,21 @@ export function buildGlossaryHint(entries: Awaited<ReturnType<typeof queryGlossa
   ].join("\n");
 }
 
-export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: string): Promise<string> {
+export interface ObserverHintSuffixResult {
+  text: string;
+  /** Structured counterpart to `text` (2026-07-19, architecture review "safety fuse" request) - see ObserverEntryRef in packages/agentic-research; lets the Critic name a specific entry to correct instead of only ever reading the flattened hint text. */
+  entries: ObserverEntryRef[];
+}
+
+export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: string): Promise<ObserverHintSuffixResult> {
+  const empty: ObserverHintSuffixResult = { text: "", entries: [] };
+
   try {
     const entries = await queryBusinessGraphEntriesAcrossPaths(roots.map((root) => root.absolutePath));
     const freshEntries = entries.filter((entry) => !entry.isStale && entry.featureSummary.trim());
 
     if (freshEntries.length === 0) {
-      return "";
+      return empty;
     }
 
     const taskTokens = computeTaskSearchTokens(task);
@@ -2234,7 +2299,7 @@ export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: stri
       .slice(0, OBSERVER_HINT_MAX_ENTRIES);
 
     if (relevant.length === 0) {
-      return "";
+      return empty;
     }
 
     // Structured layers (2026-07-15) - keyMechanisms/gotchas are now real,
@@ -2247,15 +2312,74 @@ export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: stri
     // (AgenticRunOptions.observerHint, loop.ts), never shown to the human
     // user directly (see the 2026-07-15 fix that stopped it from leaking
     // into ResearchReport.task/"Задача").
+    const entryText = (entry: (typeof relevant)[number]): string =>
+      [
+        entry.featureSummary,
+        ...(entry.keyMechanisms.length ? [`Mechanisms: ${entry.keyMechanisms.join("; ")}`] : []),
+        ...(entry.gotchas.length ? [`Gotchas: ${entry.gotchas.join("; ")}`] : []),
+      ].join(" ");
+
     const hintLines = relevant.flatMap((entry) => [
       `- "${toVirtualPath(roots, entry.projectRootPath, entry.unitPath)}": ${entry.featureSummary}`,
       ...(entry.keyMechanisms.length ? [`  Mechanisms: ${entry.keyMechanisms.join("; ")}`] : []),
       ...(entry.gotchas.length ? [`  Gotchas: ${entry.gotchas.join("; ")}`] : []),
     ]);
 
+    return {
+      text: [
+        "Hint from the project's background scan (Observer) - NOT a confirmed fact, just a lead on where to start. Make sure to verify it against the current code before relying on it, the code may have changed since the scan:",
+        ...hintLines,
+      ].join("\n"),
+      entries: relevant.map((entry) => ({
+        projectRootPath: entry.projectRootPath,
+        unitPath: entry.unitPath,
+        text: entryText(entry),
+      })),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * Vision Analyzer's structured read of any screenshots attached to this
+ * message, formatted for the Researcher (2026-07-19, картинки-в-чате
+ * feature). Same "hint, not ground truth, verify against real code" framing
+ * as buildObserverHintSuffix above - a screenshot only shows one moment of
+ * the RENDERED UI, which the Researcher must still map to actual source.
+ */
+export async function buildAttachmentContextHint(attachmentIds: string[] | undefined): Promise<string> {
+  if (!attachmentIds?.length) {
+    return "";
+  }
+
+  try {
+    const attachments = await loadChatAttachmentsByIds(attachmentIds);
+    const withContent = attachments.filter((attachment) => attachment.structuredContext.summary.trim());
+
+    if (withContent.length === 0) {
+      return "";
+    }
+
+    const attachmentLines = withContent.flatMap((attachment, index) => {
+      const context = attachment.structuredContext;
+      const header = [`kind: ${context.kind}`, context.application ? `app: ${context.application}` : "", context.businessArea ? `business area: ${context.businessArea}` : ""]
+        .filter(Boolean)
+        .join(", ");
+
+      return [
+        `${index + 1}. [${header}] ${context.summary}`,
+        ...(context.uiLabels.length ? [`   Visible UI labels (verbatim): ${context.uiLabels.slice(0, 25).join(" | ")}`] : []),
+        ...(context.annotations.length ? [`   Human-drawn annotations on the screenshot: ${context.annotations.join("; ")}`] : []),
+        ...(context.errors.length ? [`   Errors visible: ${context.errors.join("; ")}`] : []),
+        ...(context.files.length ? [`   File paths visible: ${context.files.join(", ")}`] : []),
+        ...(context.symbols.length ? [`   Symbols visible: ${context.symbols.join(", ")}`] : []),
+      ];
+    });
+
     return [
-      "Hint from the project's background scan (Observer) - NOT a confirmed fact, just a lead on where to start. Make sure to verify it against the current code before relying on it, the code may have changed since the scan:",
-      ...hintLines,
+      "Screenshot(s) attached to this message - Vision Analyzer's read of them, NOT ground truth (a screenshot shows one rendered moment of the UI, not the source) - use the visible UI labels to locate the actual FRONTEND component/route before answering:",
+      ...attachmentLines,
     ].join("\n");
   } catch {
     return "";

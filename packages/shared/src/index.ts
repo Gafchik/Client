@@ -941,6 +941,29 @@ export interface TeamRecord {
    * слабее developer по code-способности.
    */
   reviewerModel: string;
+  /**
+   * Deterministic escalation (2026-07-19, architecture review "dream team"
+   * follow-up): when the Critic REJECTS the Researcher's proposed answer -
+   * a real, code-level signal the cheap default model struggled, not a
+   * self-assessment - subsequent turns switch to THIS model instead of
+   * retrying with the same one. Empty/unset means no escalation (today's
+   * behavior, unchanged). Deliberately its own field, not reused from
+   * developerModel/reviewerModel - this is specifically about the Q&A
+   * Researcher's own investigation quality, a different cost/quality
+   * tradeoff than Developer/Reviewer's.
+   */
+  researcherEscalationModel?: string;
+  /**
+   * Vision Analyzer (2026-07-19, картинки-в-чате feature): the model that
+   * looks at an uploaded screenshot's raw pixels. Deliberately its own role,
+   * not reused from researcherModel - vision-capability is a model property
+   * most cheap text-only models simply don't have, so this needs its own
+   * explicit choice rather than falling back to a role that may not support
+   * images at all. Empty/unset disables image analysis for that team (the
+   * upload is stored, but structuredContext stays empty and the Researcher
+   * gets no hint from it).
+   */
+  visionModel?: string;
   isSelected: boolean;
   createdAt: string;
   updatedAt: string;
@@ -949,6 +972,44 @@ export interface TeamRecord {
 export interface TeamCatalogResponse {
   teams: TeamRecord[];
   selectedTeam: TeamRecord | null;
+}
+
+/**
+ * Structured output of the Vision Analyzer (2026-07-19) - what an uploaded
+ * screenshot concretely means, kept in @client/shared (not packages/knowledge,
+ * where the Postgres row type lives) since both packages/ai (produces it) and
+ * packages/knowledge (persists it) need to reference the same shape without
+ * a knowledge->ai or ai->knowledge dependency either way.
+ */
+export interface AttachmentStructuredContext {
+  kind: "ide_screenshot" | "browser_screenshot" | "terminal_screenshot" | "app_screenshot" | "document" | "diagram" | "photo" | "other";
+  application?: string;
+  language?: string;
+  /**
+   * The business-domain meaning of what's shown (explicit product-owner
+   * request: the system must understand screenshots "по бизнес
+   * составляющей") - e.g. "Patient case main screen - insurance claim
+   * details" rather than just "a web app screenshot". This is what lets a
+   * later research step search the FRONTEND codebase for the right
+   * component instead of just describing pixels.
+   */
+  businessArea?: string;
+  /** Visible tab/section/button labels verbatim - e.g. ["EHR", "Billing", "Patient Summary"] - exact strings a grep against the frontend can match. */
+  uiLabels: string[];
+  files: string[];
+  symbols: string[];
+  stackTrace?: string;
+  errors: string[];
+  terminalContent?: string;
+  gitInfo?: string;
+  /**
+   * Pointer annotations a HUMAN added on top of the screenshot (arrows,
+   * circles, highlight boxes - testers commonly draw these) and what each
+   * one indicates, DISTINCT from arrows/steppers that are part of the app's
+   * own UI (e.g. a progress-stepper widget). Empty when none are present.
+   */
+  annotations: string[];
+  summary: string;
 }
 
 export interface ObserverActivityInfo {
@@ -1000,7 +1061,7 @@ export interface ProviderUsageSummary {
    * "other").
    */
   byRole?: Array<{
-    role: "researcher" | "critic" | "other";
+    role: "researcher" | "researcher-escalated" | "critic" | "other";
     model: string;
     promptTokens: number;
     completionTokens: number;
@@ -1167,9 +1228,28 @@ export function tokenize(value: string): string[] {
 // reuse the same "## Section Name" markdown-heading convention instead of
 // re-inventing a parser - generic text structuring, not tied to any one
 // caller's prompt.
+// Bug fix (2026-07-19, live model-comparison test): a real model
+// (deepseek/deepseek-v4-pro, tested as an Observer candidate) returned its
+// entire "## Summary\n...## Key mechanisms\n...## Gotchas\n..." answer with
+// LITERAL two-character "\n" sequences instead of real newline bytes - the
+// section split below never saw more than one physical line, so the whole
+// answer got swallowed into a single "Summary" section and
+// keyMechanisms/gotchas came back silently empty even though the model's
+// own analysis was accurate and complete. Only fires when the content has
+// NO real newlines at all but DOES contain the literal "\n" text - genuine
+// multi-line markdown (the overwhelming normal case) is completely
+// unaffected, so this can't corrupt content that was already correct.
+function normalizeEscapedNewlines(content: string): string {
+  if (content.includes("\n") || !content.includes("\\n")) {
+    return content;
+  }
+
+  return content.replace(/\\n/g, "\n");
+}
+
 export function parseMarkdownSections(content: string): Map<string, string> {
   const result = new Map<string, string>();
-  const lines = content.split("\n");
+  const lines = normalizeEscapedNewlines(content).split("\n");
 
   let currentSection = "";
   let currentLines: string[] = [];
