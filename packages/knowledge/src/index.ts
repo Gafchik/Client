@@ -389,6 +389,19 @@ export async function loadKnowledgeCatalog(_appRootPath: string, projectRootPath
  * длиннее 20 последних действий проекта (background-sync и другие чаты не
  * должны вытеснять реплики этого же треда).
  */
+// Bug fix (2026-07-19, full-project review): still no cap on TOTAL turns
+// loaded (deliberate, see above - a long conversation must keep its full
+// context), but the fan-out to load them used to be one giant
+// unbounded Promise.all - every turn's full artifact (Redis GET, falling
+// back to a Postgres SELECT) fired at once. For a long-running thread
+// (50+ turns) that's 50+ simultaneous queries competing for the SAME
+// shared pool apps/api's whole process now runs through (see
+// setSharedPool/setSharedRedisClient) every time the NEXT question in
+// that thread runs - and the fan-out only grows with the conversation.
+// Bounded to a fixed batch size instead: still loads everything, just a
+// few at a time.
+const CONVERSATION_TURN_LOAD_CONCURRENCY = 8;
+
 export async function loadConversationTurns(
   appRootPath: string,
   projectRootPath: string,
@@ -403,9 +416,15 @@ export async function loadConversationTurns(
     [projectRootPath, conversationId],
   );
 
-  const results = await Promise.all(
-    rows.map((row) => loadPipelineRunArtifact(appRootPath, projectRootPath, row.run_id)),
-  );
+  const results: Array<PipelineRunResult | null> = [];
+
+  for (let i = 0; i < rows.length; i += CONVERSATION_TURN_LOAD_CONCURRENCY) {
+    const batch = rows.slice(i, i + CONVERSATION_TURN_LOAD_CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map((row) => loadPipelineRunArtifact(appRootPath, projectRootPath, row.run_id)),
+    );
+    results.push(...batchResults);
+  }
 
   return results.filter((item): item is PipelineRunResult => Boolean(item));
 }

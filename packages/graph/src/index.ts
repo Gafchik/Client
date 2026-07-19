@@ -1019,7 +1019,7 @@ function buildSymbolLookupKey(filePath: string, name: string): string {
   return `${filePath}::${name}`;
 }
 
-function isCodeNode(kind: GraphNodeKind): boolean {
+export function isCodeNode(kind: GraphNodeKind): boolean {
   return ["class", "interface", "enum", "function", "method", "route", "http-call", "middleware", "variable", "type"].includes(kind);
 }
 

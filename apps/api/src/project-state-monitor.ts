@@ -47,20 +47,11 @@ async function resolveMonitorProvider(config: ProjectStateMonitorConfig): Promis
   };
 }
 
-interface ProjectMonitorSnapshot {
-  projectId: string;
-  projectPathId: string;
-  projectPath: string;
-  backgroundState: BackgroundProjectState;
-  observedAt: string;
-}
-
 const DEFAULT_INTERVAL_MS = 15_000;
 const DEFAULT_MIN_AUTO_SYNC_INTERVAL_MS = 60_000;
 
 let monitorTimer: NodeJS.Timeout | null = null;
 let monitorRunning = false;
-const observedStates = new Map<string, ProjectMonitorSnapshot>();
 const recentAutoSyncAttempts = new Map<string, number>();
 
 export function startProjectStateMonitor(config: ProjectStateMonitorConfig): void {
@@ -86,11 +77,6 @@ export function stopProjectStateMonitor(): void {
   monitorTimer = null;
 }
 
-export function getObservedProjectState(projectPath: string): ProjectMonitorSnapshot | null {
-  const normalizedPath = normalizePath(projectPath);
-  return observedStates.get(normalizedPath) ?? null;
-}
-
 async function pollProjectStates(config: ProjectStateMonitorConfig): Promise<void> {
   if (monitorRunning) {
     return;
@@ -104,7 +90,7 @@ async function pollProjectStates(config: ProjectStateMonitorConfig): Promise<voi
 
     for (const project of projects) {
       for (const projectPath of project.paths) {
-        await observeProjectPath(config, resolvedProvider, project.id, projectPath.id, projectPath.rootPath);
+        await observeProjectPath(config, resolvedProvider, projectPath.rootPath);
       }
     }
   } catch (error) {
@@ -121,8 +107,6 @@ async function pollProjectStates(config: ProjectStateMonitorConfig): Promise<voi
 async function observeProjectPath(
   config: ProjectStateMonitorConfig,
   resolvedProvider: ResolvedMonitorProvider,
-  projectId: string,
-  projectPathId: string,
   projectPath: string,
 ): Promise<void> {
   try {
@@ -147,14 +131,6 @@ async function observeProjectPath(
       baselineSource: baselineSelection.source,
     });
     const normalizedPath = normalizePath(overview.rootPath);
-
-    observedStates.set(normalizedPath, {
-      projectId,
-      projectPathId,
-      projectPath: normalizedPath,
-      backgroundState,
-      observedAt: new Date().toISOString(),
-    });
 
     await maybeEnqueueAutoBackgroundSync(config, resolvedProvider, normalizedPath, backgroundState);
   } catch {

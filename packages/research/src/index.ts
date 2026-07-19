@@ -1486,15 +1486,35 @@ function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): Module
     symbolHaystacks.set(symbol.filePath, `${current} ${label}`.trim());
   }
 
-  return INTENT_PROFILES.map((profile) => {
-    const taskMentionsDomain = profile.aliases.some((alias) => tokens.some((token) => isMeaningfulAliasMatch(token, alias)));
-    const matchedFiles: Array<{ filePath: string; score: number; reasons: string[] }> = [];
-    let totalScore = 0;
+  const taskMentionsDomainByProfile = new Map(
+    INTENT_PROFILES.map((profile) => [
+      profile.key,
+      profile.aliases.some((alias) => tokens.some((token) => isMeaningfulAliasMatch(token, alias))),
+    ]),
+  );
+  const accumulatorByProfile = new Map(
+    INTENT_PROFILES.map((profile) => [
+      profile.key,
+      { matchedFiles: [] as Array<{ filePath: string; score: number; reasons: string[] }>, totalScore: 0 },
+    ]),
+  );
 
-    for (const file of input.workspace.files) {
-      const pathText = file.relativePath.toLowerCase();
-      const symbolText = symbolHaystacks.get(file.relativePath) ?? "";
-      const contentText = file.content.slice(0, 2000).toLowerCase();
+  // Bug fix (2026-07-19, full-project review): pathText/symbolText/contentText
+  // used to be recomputed IDENTICALLY for every one of INTENT_PROFILES on
+  // every file (O(profiles × files) redundant work) - contentText in
+  // particular lowercases up to 2000 chars per file, real, measurable,
+  // purely wasted cost on a repo with many files and many profiles (a
+  // question run rebuilds this from scratch every time). Computed ONCE per
+  // file in this outer loop; the inner loop over profiles only does the
+  // genuinely profile-specific alias counting and scoring adjustments -
+  // same scores, same output, just without the redundant recomputation.
+  for (const file of input.workspace.files) {
+    const pathText = file.relativePath.toLowerCase();
+    const symbolText = symbolHaystacks.get(file.relativePath) ?? "";
+    const contentText = file.content.slice(0, 2000).toLowerCase();
+
+    for (const profile of INTENT_PROFILES) {
+      const taskMentionsDomain = taskMentionsDomainByProfile.get(profile.key) ?? false;
       const pathMatches = countAliasMatches(pathText, profile.aliases);
       const symbolMatches = countAliasMatches(symbolText, profile.aliases);
       const contentMatches = countAliasMatches(contentText, profile.aliases);
@@ -1563,7 +1583,8 @@ function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): Module
         continue;
       }
 
-      totalScore += fileScore;
+      const accumulator = accumulatorByProfile.get(profile.key)!;
+      accumulator.totalScore += fileScore;
       const reasons: string[] = [];
 
       if (pathMatches > 0) {
@@ -1578,18 +1599,23 @@ function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): Module
         reasons.push("совпадение по содержимому");
       }
 
-      matchedFiles.push({
+      accumulator.matchedFiles.push({
         filePath: file.relativePath,
         score: fileScore,
         reasons,
       });
     }
+  }
 
-    if (totalScore <= 0) {
+  return INTENT_PROFILES.map((profile) => {
+    const accumulator = accumulatorByProfile.get(profile.key)!;
+
+    if (accumulator.totalScore <= 0) {
       return null;
     }
 
-    const strongestFiles = matchedFiles.sort((left, right) => right.score - left.score).slice(0, 4);
+    const taskMentionsDomain = taskMentionsDomainByProfile.get(profile.key) ?? false;
+    const strongestFiles = accumulator.matchedFiles.sort((left, right) => right.score - left.score).slice(0, 4);
     const reasons = [
       taskMentionsDomain
         ? `Термины задачи совпали с доменным профилем "${profile.key}".`
@@ -1599,7 +1625,7 @@ function detectModuleIntents(input: ResearchInput, ctx: ResearchContext): Module
 
     return {
       module: profile.key,
-      score: totalScore,
+      score: accumulator.totalScore,
       reasons,
       matchedFiles: strongestFiles.map((item) => item.filePath),
     } satisfies ModuleIntentMatch;
@@ -4143,12 +4169,6 @@ function detectEnvKeys(input: ResearchInput): string[] {
   return [...keys].sort();
 }
 
-
-function hasSpecificIntentSignal(tokens: string[]): boolean {
-  return INTENT_PROFILES.some((profile) =>
-    profile.aliases.some((alias) => tokens.some((token) => token.includes(alias) || alias.includes(token))),
-  );
-}
 
 function deriveBroadEntryPoints(input: ResearchInput, topFiles: string[]): string[] {
   const candidates = [

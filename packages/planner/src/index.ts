@@ -578,7 +578,15 @@ function deriveSemanticPrefix(filePath: string, matchedModule: string | undefine
     return "email-verification";
   }
 
-  if (normalized.includes("/auth/") || normalized.includes("authcontroller") || normalized.includes("accesstype") || normalized.includes("status.php")) {
+  // Bug fix (2026-07-19, full-project review): "accesstype" and "status.php"
+  // used to also count as "auth" evidence - neither has any generic semantic
+  // tie to authentication (a literal filename fragment like "status.php" is
+  // exactly the anti-pattern this codebase has ruled out elsewhere - see
+  // packages/research's own parallel extractResearchZonesFromPath, which
+  // never had these two). On a project whose OWN unrelated domain happens to
+  // have a file named e.g. "BillStatus.php" or an "AccessType" enum, this
+  // would misclassify it as an auth-related file for no real reason.
+  if (normalized.includes("/auth/") || normalized.includes("authcontroller")) {
     return "auth";
   }
 

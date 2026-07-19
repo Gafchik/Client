@@ -7,6 +7,16 @@ import {
   getNodesForQueryProfile,
   getOutgoingNeighbors,
   getStructuralNeighbors,
+  // Bug fix (2026-07-19, full-project review): this package used to keep
+  // its OWN local isCodeNode with a hand-maintained kind list that had
+  // already drifted from packages/graph's canonical one (missing
+  // "http-call", and missing "variable"/"type" once those were added there)
+  // - a route/http-call/variable/type node counted as "affected" for
+  // affectedFiles purposes but silently never showed up in affectedSymbols
+  // here. Same drift class already fixed once this session for
+  // graph-store.ts's symbolCount (see buildGraphSummary) - importing the
+  // one real implementation instead of a second hand-copy.
+  isCodeNode,
 } from "@client/graph";
 import { clamp, deriveStructuralModuleLabel, isConfigPath, isLocalizationPath, normalizePath, type GraphState, type ImpactReport, type ResearchReport } from "@client/shared";
 
@@ -93,7 +103,7 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
       expandFileImpact(input.graph, node.id, affectedFiles, affectedModules);
     }
 
-    if (isGraphCodeNode(node.kind)) {
+    if (isCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
       if (node.filePath) {
         affectedModules.add(deriveStructuralModuleLabel(node.filePath));
@@ -123,7 +133,7 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
         expandFileImpact(input.graph, neighbor.id, affectedFiles, affectedModules);
       }
 
-      if (isGraphCodeNode(neighbor.kind)) {
+      if (isCodeNode(neighbor.kind)) {
         affectedSymbols.add(neighbor.label);
         if (neighbor.filePath) {
           affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
@@ -201,7 +211,7 @@ function expandEntrypointImpact(
         affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
       }
 
-      if (isGraphCodeNode(neighbor.kind)) {
+      if (isCodeNode(neighbor.kind)) {
         affectedSymbols.add(neighbor.label);
       }
     }
@@ -244,7 +254,7 @@ function expandInventoryImpact(
     affectedFiles.add(node.filePath);
     affectedModules.add(deriveStructuralModuleLabel(node.filePath));
 
-    if (isGraphCodeNode(node.kind)) {
+    if (isCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
     }
   }
@@ -308,7 +318,7 @@ function expandInfrastructureImpact(
     affectedFiles.add(node.filePath!);
     affectedModules.add(deriveStructuralModuleLabel(node.filePath!));
 
-    if (isGraphCodeNode(node.kind)) {
+    if (isCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
     }
   }
@@ -335,7 +345,7 @@ function expandBroadImpact(
     affectedFiles.add(node.filePath);
     affectedModules.add(deriveStructuralModuleLabel(node.filePath));
 
-    if (isGraphCodeNode(node.kind)) {
+    if (isCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
     }
   }
@@ -467,10 +477,6 @@ function buildValidationScope(files: string[]): string[] {
 function computeConfidence(researchConfidence: number, affectedFileCount: number, riskCount: number): number {
   let confidence = researchConfidence - riskCount * 3 + Math.min(affectedFileCount * 2, 12);
   return clamp(Math.round(confidence), 10, 95);
-}
-
-function isGraphCodeNode(kind: GraphState["nodes"][number]["kind"]): boolean {
-  return ["class", "interface", "enum", "function", "method", "route", "middleware"].includes(kind);
 }
 
 function isInfrastructureQuestion(task: string): boolean {
