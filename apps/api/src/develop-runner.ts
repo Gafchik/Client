@@ -3,12 +3,12 @@ import { promises as fs } from "node:fs";
 import { runDevelopmentTask, runShellCommand, type DevelopRunResult, type DevelopSensitiveAction, type WorkspaceRoot } from "@client/agentic-research";
 import { classifyFactConflict, embedTexts, extractCodePatternFacts } from "@client/ai";
 import { getFileDependents } from "@client/graph";
-import { promoteFactsFromDevelopment, queryFactsAcrossPaths, queryGlossaryAcrossPaths } from "@client/knowledge";
+import { loadChatAttachmentsByIds, promoteFactsFromDevelopment, queryFactsAcrossPaths, queryGlossaryAcrossPaths } from "@client/knowledge";
 import { applyWorktreeDiffToRoot, collectWorktreeChanges, createTaskWorktree, removeTaskWorktree, type TaskWorktree } from "@client/repository-git";
 import { normalizePath, stableId, type GraphState, type ProjectPathRecord } from "@client/shared";
 import { buildDbQueryTool } from "./db-query-tool.js";
 import { loadGraphSnapshot, refreshGraphForChangedFiles } from "./graph-store.js";
-import { buildGlossaryHint, buildGraphNavigationTool, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool, buildSemanticSeedLookup } from "./pipeline-runner.js";
+import { buildAttachmentContextHint, buildGlossaryHint, buildGraphNavigationTool, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool, buildSemanticSeedLookup } from "./pipeline-runner.js";
 import { runSql } from "./postgres-client.js";
 
 /**
@@ -98,6 +98,7 @@ export interface StartDevelopRunInput {
   providerApiKey: string;
   developerModel: string;
   reviewerModel: string;
+  attachmentIds?: string[];
   conversationId?: string;
   /**
    * Review-feedback continuation ("он сделал, я проверил, сказал переделать"):
@@ -399,6 +400,7 @@ async function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDev
     providerApiKey: input.providerApiKey,
     developerModel: input.developerModel,
     reviewerModel: input.reviewerModel,
+    ...(input.attachmentIds?.length ? { attachmentIds: input.attachmentIds } : {}),
     conversationId: record.conversationId,
     ...(record.autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
     continueFrom: {
@@ -469,6 +471,7 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
   // degrades to a memory-less (but still correct) run.
   let knownFactsHint = "";
   let observerHint = "";
+  let attachmentHint = "";
 
   try {
     const originalPaths = originalRoots.map((root) => root.absolutePath);
@@ -488,6 +491,14 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     observerHint = (await buildObserverHintSuffix(originalRoots, input.task)).text;
   } catch {
     // same
+  }
+
+  if (input.attachmentIds?.length) {
+    try {
+      attachmentHint = await buildAttachmentContextHint(input.attachmentIds);
+    } catch {
+      // same graceful degradation as other memory channels
+    }
   }
 
   // Reuse-discovery tools (2026-07-18, explicit user request after the
@@ -570,6 +581,7 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     providerApiKey: input.providerApiKey,
     ...(knownFactsHint ? { knownFactsHint } : {}),
     ...(observerHint ? { observerHint } : {}),
+    ...(attachmentHint ? { attachmentHint } : {}),
     semanticSearch: semanticSearchTool,
     semanticSeedFiles: semanticSeedFilesTool,
     ...(findReferencesTool ? { findReferences: findReferencesTool } : {}),

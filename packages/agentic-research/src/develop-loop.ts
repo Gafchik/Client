@@ -140,6 +140,8 @@ export interface DevelopRunOptions {
   /** Same memory-injection channels the research loop uses (fact store / glossary / observer graph). */
   knownFactsHint?: string;
   observerHint?: string;
+  /** Vision Analyzer's structured read of screenshots attached to this develop task. */
+  attachmentHint?: string;
   /**
    * Review-feedback continuation: the previous develop iteration in this
    * conversation. When worktreeCarriesChanges is true, the current worktree
@@ -1080,6 +1082,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
         ...priorIterationBlock,
         ...sensitiveActionsBlock,
         ...(options.observerHint ? ["", options.observerHint] : []),
+        ...(options.attachmentHint ? ["", options.attachmentHint] : []),
       ].join("\n"),
     },
   ];

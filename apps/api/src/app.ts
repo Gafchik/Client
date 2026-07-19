@@ -1,7 +1,7 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteBusinessGraphEntriesForPath, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
 import { scanTextForSecurityFindings } from "@client/agentic-research";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type AttachmentStructuredContext, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
@@ -894,6 +894,7 @@ export function createApp() {
     }
 
     const normalizedProjectPath = normalizePath(path.resolve(explicitProjectPath));
+    await deleteChatAttachmentsForRuns(normalizedProjectPath, runIds);
     const result = await deleteKnowledgeRuns(appRootPath, normalizedProjectPath, runIds);
 
     return { ok: true, ...result };
@@ -1081,6 +1082,7 @@ export function createApp() {
             providerApiKey,
             developerModel: selectedTeam.developerModel,
             reviewerModel: selectedTeam.reviewerModel,
+            ...(request.body.attachmentIds?.length ? { attachmentIds: request.body.attachmentIds } : {}),
             ...(conversationKey ? { conversationId: conversationKey } : {}),
           };
 

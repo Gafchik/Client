@@ -44,6 +44,7 @@ export {
 } from "./glossary.js";
 export {
   deleteChatAttachmentsForPath,
+  deleteChatAttachmentsForRuns,
   linkChatAttachmentsToTurn,
   loadChatAttachmentsByIds,
   loadChatAttachmentsForConversation,

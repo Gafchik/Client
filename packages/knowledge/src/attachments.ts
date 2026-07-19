@@ -158,6 +158,48 @@ export async function deleteChatAttachmentsForPath(projectRootPath: string): Pro
   }
 }
 
+export async function deleteChatAttachmentsForRuns(projectRootPath: string, runIds: string[]): Promise<void> {
+  const ids = [...new Set(runIds.map((id) => id.trim()).filter(Boolean))];
+
+  if (ids.length === 0) {
+    return;
+  }
+
+  try {
+    const rows = await runSql<{ conversation_id: string; turn_index: number }>(
+      `
+        select conversation_id, turn_index
+        from knowledge_catalog
+        where project_root_path = $1 and run_id = any($2::text[])
+      `,
+      [projectRootPath, ids],
+    );
+
+    if (rows.length === 0) {
+      return;
+    }
+
+    const conversationIds = [...new Set(rows.map((row) => row.conversation_id).filter(Boolean))];
+    const turnIndexes = [...new Set(rows.map((row) => row.turn_index).filter((value) => Number.isFinite(value)))];
+
+    if (conversationIds.length === 0 || turnIndexes.length === 0) {
+      return;
+    }
+
+    await runSql(
+      `
+        delete from chat_attachments
+        where project_root_path = $1
+          and conversation_id = any($2::text[])
+          and turn_index = any($3::int[])
+      `,
+      [projectRootPath, conversationIds, turnIndexes],
+    );
+  } catch (error) {
+    console.warn("[attachments] deleteChatAttachmentsForRuns failed:", error);
+  }
+}
+
 function mapAttachmentRow(row: ChatAttachmentRow): ChatAttachmentRecord {
   return {
     id: row.id,
