@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { crawlUnit, listWorkUnits } from "@client/agentic-research";
+import { crawlUnit, listUnitFilePaths, listWorkUnits } from "@client/agentic-research";
 import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
 import type { ObserverActivityInfo, ObserverProgressInfo } from "@client/shared";
 import { hasAnyActiveQuestionRun } from "./pipeline-runner.js";
@@ -312,6 +312,15 @@ async function crawlOneStaleUnit(
     const sourceFileHashes = result.raw.stopped === "final_answer"
       ? await hashFiles(projectRootPath, result.touchedFiles)
       : {};
+    // Snapshot of every file under the unit right now, not just the ones the
+    // LLM touched (2026-07-19, full-project review) - lets a later read
+    // notice a brand new file added after this crawl, which sourceFileHashes
+    // alone can't (see graph-entries.ts's mapRow). Only meaningful paired
+    // with a genuine success - [] on failure is fine since empty
+    // sourceFileHashes already forces isStale regardless.
+    const knownFilePaths = result.raw.stopped === "final_answer"
+      ? await listUnitFilePaths(projectRootPath, nextUnit)
+      : [];
 
     // Written either way (cheap diagnostic breadcrumb, and isStale is always
     // true when sourceFileHashes is empty, so a failed attempt self-heals on
@@ -323,6 +332,7 @@ async function crawlOneStaleUnit(
       keyMechanisms: result.keyMechanisms,
       gotchas: result.gotchas,
       sourceFileHashes,
+      knownFilePaths,
       confidence: result.confidence,
     });
 

@@ -7,7 +7,7 @@ import { promoteFactsFromDevelopment, queryFactsAcrossPaths, queryGlossaryAcross
 import { applyWorktreeDiffToRoot, collectWorktreeChanges, createTaskWorktree, removeTaskWorktree, type TaskWorktree } from "@client/repository-git";
 import { normalizePath, stableId, type GraphState, type ProjectPathRecord } from "@client/shared";
 import { buildDbQueryTool } from "./db-query-tool.js";
-import { loadGraphSnapshot } from "./graph-store.js";
+import { loadGraphSnapshot, refreshGraphForChangedFiles } from "./graph-store.js";
 import { buildGlossaryHint, buildGraphNavigationTool, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool, buildSemanticSeedLookup } from "./pipeline-runner.js";
 import { runSql } from "./postgres-client.js";
 
@@ -706,6 +706,18 @@ export async function mergeDevelopRunToRealCheckout(worktrees: DevelopWorktreeIn
       changedFiles: result.changedFiles,
       ...(result.error ? { error: result.error } : {}),
     });
+
+    // Bug fix (2026-07-19, full-project review): keep the persisted graph in
+    // sync with what was actually just written to disk - see
+    // refreshGraphForChangedFiles's own comment for why this can't just wait
+    // for the normal background-sync path. Best-effort: a stale graph is the
+    // pre-existing (now-narrowed) failure mode, not a new one, so a refresh
+    // error here must not fail the merge that already succeeded on disk.
+    if (result.applied && result.changedFiles.length > 0) {
+      await refreshGraphForChangedFiles(worktree.rootPath, result.changedFiles).catch((error) => {
+        console.warn(`[develop-runner] graph refresh after merge failed for ${worktree.rootPath}:`, error);
+      });
+    }
   }
 
   return outcomes;

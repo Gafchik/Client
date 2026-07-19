@@ -1,4 +1,7 @@
-import type { GraphEdge, GraphNode, GraphState } from "@client/shared";
+import type { GraphEdge, GraphNode, GraphState, PipelineRunResult } from "@client/shared";
+import { buildGraph, buildGraphSummary } from "@client/graph";
+import { runFullIndex } from "@client/indexer";
+import { openWorkspaceSelective } from "@client/workspace";
 import { openSession } from "./neo4j-client.js";
 
 /**
@@ -119,6 +122,50 @@ export async function loadGraphSnapshot(projectId: string): Promise<GraphState |
   } finally {
     await session.close();
   }
+}
+
+/**
+ * Bug fix (2026-07-19, full-project review, follow-up to the CRITICAL
+ * mergePreviousGraphState fix above): mergeDevelopRunToRealCheckout applies
+ * a Developer's diff onto the user's real checkout as UNCOMMITTED changes -
+ * nothing ever told the persisted graph those files changed. The normal
+ * invalidation path (buildGraphInvalidationPlan, driven by git-detected
+ * changedFiles) only runs inside a full pipeline run, and
+ * maybeEnqueueAutoBackgroundSync explicitly SKIPS auto-scheduling while
+ * `hasLocalChanges` is true (project-state-monitor.ts) - which becomes
+ * permanently true the moment a merge lands, until the user commits. So a
+ * merged file's graph nodes/edges silently kept describing the
+ * pre-merge code, for as long as a whole session, unless the user happened
+ * to ask an unrelated question whose OWN narrow scan incidentally swept the
+ * same file back in.
+ *
+ * This closes that gap directly and deterministically - no LLM/provider
+ * credentials needed, since indexing/graph-building is pure static
+ * analysis. Opens a workspace scoped to exactly the merged files, indexes
+ * just those, and merges the result into the persisted graph exactly the
+ * way a real selective pipeline run would (previous graph nodes for these
+ * paths dropped via invalidatedPaths, fresh ones added from the tiny
+ * workspace scan). Silently no-ops if there's no persisted graph yet or
+ * none of the files still exist (e.g. everything in this merge got
+ * deleted) - there's nothing to refresh into, and the next real
+ * background-sync will pick it up from scratch regardless.
+ */
+export async function refreshGraphForChangedFiles(projectRootPath: string, changedFiles: string[]): Promise<void> {
+  if (changedFiles.length === 0) {
+    return;
+  }
+
+  const scoped = await openWorkspaceSelective(projectRootPath, { includePaths: changedFiles, maxFiles: changedFiles.length });
+  const previousGraph = await loadGraphSnapshot(scoped.projectId);
+
+  if (!previousGraph) {
+    return;
+  }
+
+  const index = await runFullIndex(scoped, {});
+  const fakePreviousRun = { runtimeCache: { graph: previousGraph } } as unknown as PipelineRunResult;
+  const refreshed = buildGraph(scoped, index, { previousRun: fakePreviousRun, invalidatedPaths: changedFiles });
+  await saveGraphSnapshot(refreshed);
 }
 
 // Live evidence (2026-07-15): a raw grep for "relation" pulled in Eloquent's
@@ -245,22 +292,13 @@ function deserializeEdge(row: Record<string, unknown>): GraphEdge {
   };
 }
 
+// Bug fix (2026-07-19, full-project review): this used to hand-duplicate
+// packages/graph's buildGraphSummary with its own, already-diverged symbol
+// list (missing route/http-call/middleware entirely, and later missing
+// variable/type once those were added) - a graph loaded back from Neo4j
+// reported different symbolCount than the same graph fresh out of
+// buildGraph(). Reusing the single real implementation keeps both paths
+// identical by construction instead of by manual upkeep.
 function buildSummaryFromNodesAndEdges(nodes: GraphNode[], edges: GraphEdge[]): GraphState["summary"] {
-  return {
-    nodeCount: nodes.length,
-    edgeCount: edges.length,
-    fileCount: nodes.filter((node) => node.kind === "file").length,
-    symbolCount: nodes.filter((node) =>
-      node.kind === "class"
-      || node.kind === "interface"
-      || node.kind === "enum"
-      || node.kind === "function"
-      || node.kind === "method",
-    ).length,
-    dependencyCount: nodes.filter((node) => node.kind === "dependency").length,
-    repositoryCount: nodes.filter((node) => node.kind === "repository").length,
-    moduleCount: nodes.filter((node) => node.kind === "module").length,
-    folderCount: nodes.filter((node) => node.kind === "folder").length,
-    routeCount: nodes.filter((node) => node.kind === "route").length,
-  };
+  return buildGraphSummary(nodes, edges);
 }

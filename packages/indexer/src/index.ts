@@ -1431,12 +1431,56 @@ function extractPhpRoutes(
   const prefixStack: Array<{ prefix: string; depth: number }> = [];
   const middlewareStack: Array<{ names: string[]; depth: number }> = [];
   let depth = 0;
+  let consumedThroughIndex = -1;
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
     const trimmed = line.trim();
 
-    const prefixMatch = /Route::prefix\(\s*['"]([^'"]+)['"]\s*\)->group/.exec(trimmed);
+    if (index <= consumedThroughIndex) {
+      depth += countOccurrences(line, "{");
+      depth -= countOccurrences(line, "}");
+
+      while (prefixStack.length && depth <= prefixStack[prefixStack.length - 1]!.depth) {
+        prefixStack.pop();
+      }
+
+      while (middlewareStack.length && depth <= middlewareStack[middlewareStack.length - 1]!.depth) {
+        middlewareStack.pop();
+      }
+
+      continue;
+    }
+
+    // Bug fix (2026-07-19, full-project review): a leaf Route::verb(...) call
+    // whose ARGUMENTS span multiple physical lines (long controller/action
+    // names, a multi-line `[Controller::class, 'method']` array - a common
+    // real-world Laravel/Pint formatting style) used to be completely
+    // invisible below: every regex here only ever saw ONE `trimmed` physical
+    // line at a time, so the opening line (just "Route::get(") matched
+    // nothing and the route silently never became a symbol/node/search hit -
+    // not degraded, just gone. Only LEAF verb calls get joined, never
+    // Route::group/prefix opens - those legitimately open a multi-line
+    // closure body that must stay matched line-by-line, and joining until
+    // parens balance there would swallow the entire block (every nested
+    // route inside it) into one opaque blob. Scope boundary, not a bug: a
+    // ->middleware()/->name() chained AFTER the call's closing paren, on its
+    // own separate line, is still not picked up (join stops the moment the
+    // call's own parens balance, deliberately, to stay bounded) - the route
+    // itself is still indexed either way, just without that one edge; the
+    // same as this codebase's pre-existing single-line behavior for that style.
+    let matchable = trimmed;
+
+    if (ROUTE_VERB_OPEN_PATTERN.test(trimmed) && countUnquotedParenBalance(trimmed) > 0) {
+      const joined = joinMultilineRouteStatement(lines, index);
+
+      if (joined.endIndex > index) {
+        matchable = joined.text;
+        consumedThroughIndex = joined.endIndex;
+      }
+    }
+
+    const prefixMatch = /Route::prefix\(\s*['"]([^'"]+)['"]\s*\)->group/.exec(matchable);
 
     if (prefixMatch?.[1]) {
       prefixStack.push({
@@ -1445,7 +1489,7 @@ function extractPhpRoutes(
       });
     }
 
-    const middlewareGroupMatch = /Route::middleware\(([^)]+)\)->group/.exec(trimmed);
+    const middlewareGroupMatch = /Route::middleware\(([^)]+)\)->group/.exec(matchable);
 
     if (middlewareGroupMatch?.[1]) {
       middlewareStack.push({
@@ -1455,8 +1499,17 @@ function extractPhpRoutes(
     }
 
     const routeMatch =
-      /Route::(?:middleware\(([^)]+)\)->)?(get|post|put|patch|delete|options)\(\s*['"]([^'"]+)['"]\s*,\s*\[([A-Za-z0-9_\\]+)::class\s*,\s*['"]([A-Za-z0-9_]+)['"]\s*\]\s*\)(?:->middleware\(([^)]+)\))?/i.exec(
-        trimmed,
+      // \s* right after the opening [ (2026-07-19, full-project review): a
+      // multi-line array literal - `[` on its own line, `Controller::class`
+      // indented on the next - is completely ordinary PHP formatting, and
+      // joinMultilineRouteStatement above joins lines with a single space,
+      // not by deleting the original newline's whitespace entirely -
+      // without this the joined text ends up as "[ Controller::class" and
+      // silently fails to match even though the statement was joined
+      // correctly. Also fixes the same gap for genuinely single-line routes
+      // written with a space after [ (e.g. `[ UserController::class, 'show']`).
+      /Route::(?:middleware\(([^)]+)\)->)?(get|post|put|patch|delete|options)\(\s*['"]([^'"]+)['"]\s*,\s*\[\s*([A-Za-z0-9_\\]+)::class\s*,\s*['"]([A-Za-z0-9_]+)['"]\s*\]\s*\)(?:->middleware\(([^)]+)\))?/i.exec(
+        matchable,
       );
 
     if (routeMatch) {
@@ -1509,7 +1562,7 @@ function extractPhpRoutes(
         const inlineMiddleware = [
           ...parseMiddlewareNames(inlineLeadingMiddleware),
           ...parseMiddlewareNames(inlineTrailingMiddleware),
-          ...parseMiddlewareNamesFromLine(trimmed),
+          ...parseMiddlewareNamesFromLine(matchable),
         ];
         const allMiddleware = uniqueStringList([...inheritedMiddleware, ...inlineMiddleware]);
 
@@ -1540,6 +1593,94 @@ function extractPhpRoutes(
       middlewareStack.pop();
     }
   }
+}
+
+const ROUTE_VERB_OPEN_PATTERN = /^Route::(?:middleware\([^)]*\)->)?(get|post|put|patch|delete|options|any|match)\(/i;
+const MAX_ROUTE_STATEMENT_JOIN_LINES = 12;
+
+// Ignores parens inside string literals ('/users/(archived)' is a real,
+// if unusual, valid route path) so a quoted paren can't throw the balance
+// off and either truncate a real multi-line join early or make a
+// perfectly ordinary single-line route look "unbalanced".
+function countUnquotedParenBalance(text: string): number {
+  let depth = 0;
+
+  for (const ch of stripQuotedContent(text)) {
+    if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+    }
+  }
+
+  return depth;
+}
+
+// Removes the CONTENTS of single/double-quoted strings (keeping the quote
+// characters themselves as boundary markers) so callers can safely test for
+// structural PHP characters/keywords without tripping on a route path
+// placeholder like '/users/{id}' or a literal '(' inside a string.
+function stripQuotedContent(text: string): string {
+  let result = "";
+  let quote: string | null = null;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (quote) {
+      if (ch === "\\") {
+        i += 1;
+      } else if (ch === quote) {
+        quote = null;
+        result += ch;
+      }
+
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      result += ch;
+    } else {
+      result += ch;
+    }
+  }
+
+  return result;
+}
+
+// Joins a leaf Route::verb(...) call's continuation lines until its parens
+// balance. Bails out (returns the original single line, unjoined) the
+// moment a continuation line looks like anything other than plain call
+// arguments OUTSIDE of a string literal - a real brace or a `function`
+// keyword means this isn't actually a leaf call (or the source has a
+// syntax error) and blindly swallowing lines would risk hiding real routes
+// inside whatever it consumed. Checked against the string-stripped form so
+// an entirely ordinary route path placeholder like '/users/{id}' can't
+// trip the bail-out (a route path is exactly where `{param}` segments live
+// in real Laravel code - the common case this whole fix exists for). Capped
+// at MAX_ROUTE_STATEMENT_JOIN_LINES so a genuinely unbalanced/malformed
+// statement can't run away and consume the rest of the file.
+function joinMultilineRouteStatement(lines: string[], startIndex: number): { text: string; endIndex: number } {
+  const startLine = (lines[startIndex] ?? "").trim();
+  let text = startLine;
+  let endIndex = startIndex;
+  let balance = countUnquotedParenBalance(text);
+
+  while (balance > 0 && endIndex + 1 < lines.length && endIndex - startIndex < MAX_ROUTE_STATEMENT_JOIN_LINES) {
+    const nextLine = (lines[endIndex + 1] ?? "").trim();
+    const structural = stripQuotedContent(nextLine);
+
+    if (structural.includes("{") || /\bfunction\b/.test(structural)) {
+      return { text: startLine, endIndex: startIndex };
+    }
+
+    endIndex += 1;
+    text += ` ${nextLine}`;
+    balance += countUnquotedParenBalance(nextLine);
+  }
+
+  return balance === 0 ? { text, endIndex } : { text: startLine, endIndex: startIndex };
 }
 
 function resolvePhpControllerReference(

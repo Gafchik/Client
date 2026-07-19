@@ -1,9 +1,12 @@
-import { runSql } from "./postgres-client.js";
+import { runSql, runWithTransaction } from "./postgres-client.js";
 import { getRedisClient } from "./redis-client.js";
 import { deleteFactsForPath } from "./facts.js";
 import { deleteBusinessGraphEntriesForPath } from "./graph-entries.js";
 import { pruneCodeEmbeddings } from "./code-embeddings.js";
 import { deleteGlossaryEntriesForPath } from "./glossary.js";
+
+export { setSharedPool, clearSharedPool, runWithTransaction } from "./postgres-client.js";
+export { setSharedRedisClient, clearSharedRedisClient } from "./redis-client.js";
 
 // Read-through cache over knowledge_artifacts (2026-07-15, user's explicit
 // request): Postgres stays the durable source of truth - Redis here has no
@@ -256,62 +259,73 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
   // Тот же upsert-приём теперь и для тела артефакта (knowledge_artifacts) -
   // было файлом на диске, требование пользователя (2026-07-15): ничего в
   // файлах, всё в Postgres.
-  await runSql(
-    `
-      insert into knowledge_artifacts (run_id, body, saved_at)
-      values ($1, $2::jsonb, $3)
-      on conflict (run_id) do update set
-        body = $2::jsonb,
-        saved_at = $3
-    `,
-    [input.runId, JSON.stringify(artifact), savedAt],
-  );
+  //
+  // Bug fix (2026-07-19, full-project review): these two inserts used to be
+  // independent runSql() calls with no transaction around them - a crash or
+  // connection drop between them left a knowledge_artifacts row with no
+  // matching knowledge_catalog row (or the reverse on an update), and every
+  // reader of the catalog (loadKnowledgeCatalog, loadConversationTurns, the
+  // baseline-selection functions below) silently never sees that run again,
+  // or sees a catalog entry whose artifact body 404s. Both rows are exactly
+  // one logical "this run was saved" fact - either both land or neither does.
+  await runWithTransaction(async (runSqlInTx) => {
+    await runSqlInTx(
+      `
+        insert into knowledge_artifacts (run_id, body, saved_at)
+        values ($1, $2::jsonb, $3)
+        on conflict (run_id) do update set
+          body = $2::jsonb,
+          saved_at = $3
+      `,
+      [input.runId, JSON.stringify(artifact), savedAt],
+    );
 
-  await runSql(
-    `
-      insert into knowledge_catalog
-        (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index, prompt_tokens, completion_tokens, total_tokens, provider_call_count, file_count)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-      on conflict (run_id) do update set
-        project_root_path = $2,
-        task = $3,
-        saved_at = $4,
-        storage_path = $5,
-        summary = $6,
-        mode = $7,
-        repository_id = $8,
-        branch = $9,
-        head_commit = $10,
-        head_fingerprint = $11,
-        conversation_id = $12,
-        turn_index = $13,
-        prompt_tokens = $14,
-        completion_tokens = $15,
-        total_tokens = $16,
-        provider_call_count = $17,
-        file_count = $18
-    `,
-    [
-      input.runId,
-      input.workspace.rootPath,
-      input.task,
-      savedAt,
-      knowledge.storagePath,
-      input.research.summary,
-      input.mode,
-      input.repository.repositoryId ?? null,
-      input.repository.branch ?? null,
-      input.repository.headCommit ?? null,
-      input.repository.headFingerprint ?? null,
-      input.conversationId,
-      input.turnIndex,
-      input.usage?.promptTokens ?? 0,
-      input.usage?.completionTokens ?? 0,
-      input.usage?.totalTokens ?? 0,
-      input.usage?.callCount ?? 0,
-      input.index.manifest.fileCount,
-    ],
-  );
+    await runSqlInTx(
+      `
+        insert into knowledge_catalog
+          (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index, prompt_tokens, completion_tokens, total_tokens, provider_call_count, file_count)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        on conflict (run_id) do update set
+          project_root_path = $2,
+          task = $3,
+          saved_at = $4,
+          storage_path = $5,
+          summary = $6,
+          mode = $7,
+          repository_id = $8,
+          branch = $9,
+          head_commit = $10,
+          head_fingerprint = $11,
+          conversation_id = $12,
+          turn_index = $13,
+          prompt_tokens = $14,
+          completion_tokens = $15,
+          total_tokens = $16,
+          provider_call_count = $17,
+          file_count = $18
+      `,
+      [
+        input.runId,
+        input.workspace.rootPath,
+        input.task,
+        savedAt,
+        knowledge.storagePath,
+        input.research.summary,
+        input.mode,
+        input.repository.repositoryId ?? null,
+        input.repository.branch ?? null,
+        input.repository.headCommit ?? null,
+        input.repository.headFingerprint ?? null,
+        input.conversationId,
+        input.turnIndex,
+        input.usage?.promptTokens ?? 0,
+        input.usage?.completionTokens ?? 0,
+        input.usage?.totalTokens ?? 0,
+        input.usage?.callCount ?? 0,
+        input.index.manifest.fileCount,
+      ],
+    );
+  });
 
   return knowledge;
 }
@@ -441,11 +455,18 @@ export async function deleteKnowledgeRuns(
   const deleted = idsToDelete.filter((runId) => existingIds.has(runId));
   const notFound = idsToDelete.filter((runId) => !existingIds.has(runId));
 
-  await runSql(`delete from knowledge_artifacts where run_id = any($1::text[])`, [idsToDelete]);
-  await runSql(
-    `delete from knowledge_catalog where project_root_path = $1 and run_id = any($2::text[])`,
-    [projectRootPath, idsToDelete],
-  );
+  // Bug fix (2026-07-19, full-project review): same orphan-row risk as
+  // saveKnowledgeArtifacts above, in reverse - an interruption between these
+  // two deletes used to leave a knowledge_catalog row pointing at an
+  // already-gone knowledge_artifacts body (a run that "shows up in history"
+  // but 404s the moment it's opened), or the opposite orphan.
+  await runWithTransaction(async (runSqlInTx) => {
+    await runSqlInTx(`delete from knowledge_artifacts where run_id = any($1::text[])`, [idsToDelete]);
+    await runSqlInTx(
+      `delete from knowledge_catalog where project_root_path = $1 and run_id = any($2::text[])`,
+      [projectRootPath, idsToDelete],
+    );
+  });
 
   if (idsToDelete.length > 0) {
     try {

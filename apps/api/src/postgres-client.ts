@@ -189,6 +189,15 @@ export async function initializePostgresSchema(): Promise<void> {
   await runSql(
     `create index if not exists idx_business_graph_entries_project on business_graph_entries(project_root_path, unit_path)`,
   );
+  // known_file_paths (2026-07-19, full-project review bug fix): the full
+  // directory listing under a unit AT CRAWL TIME, separate from
+  // source_file_hashes (only the subset the LLM actually chose to read) -
+  // lets queryBusinessGraphEntries notice a brand new file dropped into an
+  // already-crawled unit, which content-hash comparison alone can never
+  // detect since a file that didn't exist yet was never in that set to
+  // begin with. Existing rows default to '{}' and simply degrade to
+  // hash-only staleness (see graph-entries.ts's mapRow) until their next crawl.
+  await runSql(`alter table business_graph_entries add column if not exists known_file_paths text[] not null default '{}'`);
 
   // domain_glossary_entries (2026-07-17, architecture review Tier 3) — a
   // structured counterpart to project_facts: facts are one-off statements

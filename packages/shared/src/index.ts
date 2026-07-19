@@ -43,6 +43,10 @@ export type GraphNodeKind =
   | "route"
   | "http-call"
   | "middleware"
+  | "variable"
+  | "type"
+  | "heading"
+  | "json-key"
   | "dependency";
 
 export type GraphRelationType =

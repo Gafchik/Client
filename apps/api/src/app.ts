@@ -1,15 +1,15 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, setSharedPool, setSharedRedisClient } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { startEmbeddingIndexer, stopEmbeddingIndexer } from "./embedding-indexer.js";
 import { initializeGraphStore } from "./graph-store.js";
 import { closeNeo4jDriver, verifyNeo4jConnectivity } from "./neo4j-client.js";
-import { closePostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
-import { closeRedisClient, verifyRedisConnectivity } from "./redis-client.js";
+import { closePostgresPool, getPostgresPool, initializePostgresSchema, verifyPostgresConnectivity } from "./postgres-client.js";
+import { closeRedisClient, getRedisClient, verifyRedisConnectivity } from "./redis-client.js";
 import { bootstrapPipelineRunStatuses, enqueuePipelineRun, findActivePipelineRun, findPipelineRunByRepositoryHead, loadPipelineRunStatus, waitForPipelineRunCompletion } from "./pipeline-runner.js";
 import { getObserverProgress, listObserverRunners, startObserver, stopAllObservers, stopObserver } from "./observer-monitor.js";
 import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-state-monitor.js";
@@ -235,6 +235,16 @@ export function createApp() {
   void bootstrapPipelineRunStatuses(appRootPath);
 
   app.addHook("onReady", async () => {
+    // Bug fix (2026-07-19, full-project review): packages/knowledge used to
+    // create its OWN independent Pool/Redis client against the same
+    // database/cache - doubling real connection pressure for no reason, and
+    // never closed on shutdown (see closePostgresPool/closeRedisClient
+    // below). Must run before initializePostgresSchema (the first thing to
+    // actually touch Postgres) so every query from that package - including
+    // ones made during this very boot sequence - goes through this app's
+    // one shared pool/client from the start.
+    setSharedPool(getPostgresPool());
+    setSharedRedisClient(getRedisClient());
     await initializePostgresSchema();
     await initializeSecretCrypto(appRootPath);
     await initializeProviderStore();
@@ -277,6 +287,12 @@ export function createApp() {
     stopEmbeddingIndexer();
     stopAllObservers();
     await closeNeo4jDriver();
+    // Drop packages/knowledge's references to these BEFORE closing them
+    // (order matters only for clarity here, not correctness - either order
+    // leaves both sides consistent) so nothing still holding onto that
+    // package can accidentally query an already-.end()'d pool/quit()'d client.
+    clearSharedPool();
+    clearSharedRedisClient();
     await closePostgresPool();
     await closeRedisClient();
   });

@@ -6,7 +6,7 @@ import type { WorkspaceRoot } from "./tools.js";
 export { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult } from "./loop.js";
 export { toResearchReport, toValidationResult } from "./adapter.js";
 export * from "./tools.js";
-export { listWorkUnits } from "./worklist.js";
+export { listWorkUnits, listUnitFilePaths } from "./worklist.js";
 export {
   parseDevelopActions,
   runDevelopmentTask,

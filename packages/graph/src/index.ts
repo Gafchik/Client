@@ -967,6 +967,15 @@ function ensureFolderNodes(
   return lastFolderId;
 }
 
+// Bug fix (2026-07-19, full-project review): this switch used to fall
+// through EVERY unmapped SymbolKind ("variable" | "type" | "heading" |
+// "json-key") to the generic "dependency" kind - the same kind used for
+// genuinely external/unresolved relation targets a few lines up. That
+// conflation corrupted dependencyCount and made getCodeNodes/isCodeNode
+// (and anything built on them, like impact-analysis symbol counts)
+// indistinguishable from actual external references. Each known SymbolKind
+// now maps to its own GraphNodeKind; only a truly unrecognized future kind
+// still falls back to "dependency".
 function mapSymbolKindToGraphKind(symbolKind: IndexResult["symbols"][number]["kind"]): GraphNodeKind {
   switch (symbolKind) {
     case "class":
@@ -985,6 +994,14 @@ function mapSymbolKindToGraphKind(symbolKind: IndexResult["symbols"][number]["ki
       return "http-call";
     case "middleware":
       return "middleware";
+    case "variable":
+      return "variable";
+    case "type":
+      return "type";
+    case "heading":
+      return "heading";
+    case "json-key":
+      return "json-key";
     default:
       return "dependency";
   }
@@ -995,7 +1012,7 @@ function buildSymbolLookupKey(filePath: string, name: string): string {
 }
 
 function isCodeNode(kind: GraphNodeKind): boolean {
-  return ["class", "interface", "enum", "function", "method", "route", "http-call", "middleware"].includes(kind);
+  return ["class", "interface", "enum", "function", "method", "route", "http-call", "middleware", "variable", "type"].includes(kind);
 }
 
 function normalizeRelationType(
@@ -1096,7 +1113,7 @@ function mergePreviousGraphState(
   };
 }
 
-function buildGraphSummary(nodes: GraphNode[], edges: GraphEdge[]) {
+export function buildGraphSummary(nodes: GraphNode[], edges: GraphEdge[]) {
   return {
     nodeCount: nodes.length,
     edgeCount: edges.length,

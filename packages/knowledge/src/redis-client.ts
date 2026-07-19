@@ -1,6 +1,21 @@
 import { Redis } from "ioredis";
 
 let client: Redis | null = null;
+let usingInjectedClient = false;
+
+/** Same duplicate-connection fix as postgres-client.ts's setSharedPool - see that comment. apps/api calls this once at boot with its own Redis client. */
+export function setSharedRedisClient(sharedClient: Redis): void {
+  client = sharedClient;
+  usingInjectedClient = true;
+}
+
+/** Companion to apps/api's closeRedisClient. */
+export function clearSharedRedisClient(): void {
+  if (usingInjectedClient) {
+    client = null;
+    usingInjectedClient = false;
+  }
+}
 
 export function getRedisClient(): Redis {
   if (!client) {

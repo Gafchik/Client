@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { listUnitFilePaths } from "@client/agentic-research";
 import { contentHash, stableId } from "@client/shared";
 import { runSql } from "./postgres-client.js";
 
@@ -11,6 +12,8 @@ export interface BusinessGraphEntry {
   keyMechanisms: string[];
   gotchas: string[];
   sourceFileHashes: Record<string, string>;
+  /** Full file listing under this unit AT CRAWL TIME (not just the files the LLM chose to read) - see isStale's "new file" check below. */
+  knownFilePaths: string[];
   confidence: number;
   createdAt: string;
   lastCrawledAt: string;
@@ -26,6 +29,7 @@ interface BusinessGraphEntryRow {
   key_mechanisms: string[];
   gotchas: string[];
   source_file_hashes: Record<string, string>;
+  known_file_paths: string[] | null;
   confidence: number;
   created_at: Date;
   last_crawled_at: Date;
@@ -42,6 +46,7 @@ async function currentHashOf(projectRootPath: string, filePath: string): Promise
 
 async function mapRow(row: BusinessGraphEntryRow): Promise<BusinessGraphEntry> {
   const sourceFileHashes = row.source_file_hashes ?? {};
+  const knownFilePaths = row.known_file_paths ?? [];
   const paths = Object.keys(sourceFileHashes);
   // Content-hash equality, not commit order or date - a developer switching
   // to an older branch can make files "go back in time," and staleness must
@@ -61,6 +66,30 @@ async function mapRow(row: BusinessGraphEntryRow): Promise<BusinessGraphEntry> {
     }
   }
 
+  // Bug fix (2026-07-19, full-project review): the hash loop above can only
+  // ever notice a file it ALREADY knew about changing - a brand new file
+  // dropped into an already-crawled unit was never in sourceFileHashes to
+  // begin with, so it was never checked and the unit stayed "fresh" forever
+  // regardless of what got added. Compares against knownFilePaths (the full
+  // directory listing AT CRAWL TIME, not just the subset the LLM chose to
+  // read - crawls are deliberately selective, see crawlUnit, so a file it
+  // skipped as irrelevant is not "new"). Only runs when the hash check
+  // didn't already decide staleness, and only when we HAVE a crawl-time
+  // listing to compare against (older rows written before this fix carry
+  // an empty array - degrades to hash-only staleness for those, exactly
+  // today's behavior, rather than falsely flagging every pre-existing row
+  // stale on the next read). Never throws - a filesystem hiccup here must
+  // degrade to "assume no new files," not take staleness detection down.
+  if (!isStale && knownFilePaths.length > 0) {
+    try {
+      const currentFilePaths = await listUnitFilePaths(row.project_root_path, row.unit_path);
+      const knownSet = new Set(knownFilePaths);
+      isStale = currentFilePaths.some((filePath) => !knownSet.has(filePath));
+    } catch {
+      // Filesystem unavailable/unit path gone - leave isStale as decided by hashes above.
+    }
+  }
+
   return {
     id: row.id,
     projectRootPath: row.project_root_path,
@@ -69,6 +98,7 @@ async function mapRow(row: BusinessGraphEntryRow): Promise<BusinessGraphEntry> {
     keyMechanisms: row.key_mechanisms ?? [],
     gotchas: row.gotchas ?? [],
     sourceFileHashes,
+    knownFilePaths,
     confidence: row.confidence,
     createdAt: new Date(row.created_at).toISOString(),
     lastCrawledAt: new Date(row.last_crawled_at).toISOString(),
@@ -142,6 +172,8 @@ export interface UpsertBusinessGraphEntryInput {
   keyMechanisms: string[];
   gotchas: string[];
   sourceFileHashes: Record<string, string>;
+  /** Full file listing under this unit at crawl time - see BusinessGraphEntry.knownFilePaths. */
+  knownFilePaths: string[];
   confidence: number;
 }
 
@@ -154,13 +186,14 @@ export async function upsertBusinessGraphEntry(input: UpsertBusinessGraphEntryIn
     await runSql(
       `
         insert into business_graph_entries
-          (id, project_root_path, unit_path, feature_summary, key_mechanisms, gotchas, source_file_hashes, confidence, created_at, last_crawled_at)
-        values ($1, $2, $3, $4, $5::text[], $6::text[], $7::jsonb, $8, $9, $9)
+          (id, project_root_path, unit_path, feature_summary, key_mechanisms, gotchas, source_file_hashes, known_file_paths, confidence, created_at, last_crawled_at)
+        values ($1, $2, $3, $4, $5::text[], $6::text[], $7::jsonb, $8::text[], $9, $10, $10)
         on conflict (id) do update set
           feature_summary = excluded.feature_summary,
           key_mechanisms = excluded.key_mechanisms,
           gotchas = excluded.gotchas,
           source_file_hashes = excluded.source_file_hashes,
+          known_file_paths = excluded.known_file_paths,
           confidence = excluded.confidence,
           last_crawled_at = excluded.last_crawled_at
       `,
@@ -172,6 +205,7 @@ export async function upsertBusinessGraphEntry(input: UpsertBusinessGraphEntryIn
         input.keyMechanisms,
         input.gotchas,
         JSON.stringify(input.sourceFileHashes),
+        input.knownFilePaths,
         Math.max(5, Math.min(100, Math.round(input.confidence))),
         now,
       ],
