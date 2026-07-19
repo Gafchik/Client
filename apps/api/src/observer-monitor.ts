@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { crawlUnit, listUnitFilePaths, listWorkUnits } from "@client/agentic-research";
 import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
+import { computeFileChurnSignals, type FileChurnSignal } from "@client/repository-git";
 import type { ObserverActivityInfo, ObserverProgressInfo } from "@client/shared";
 import { hasAnyActiveQuestionRun } from "./pipeline-runner.js";
 import { getCurrentProvider } from "./provider-store.js";
@@ -241,6 +242,57 @@ async function runnerLoop(runner: ObserverRunner): Promise<void> {
   }
 }
 
+// Bug fix (2026-07-19, architecture review #11/#16): unit selection used to
+// just take the first stale, non-backoff unit in whatever order
+// listWorkUnits happened to return - no notion of "cover the whole project
+// before re-deepening" or "this area is under active development, refresh
+// it sooner." Two deterministic, already-available signals now drive
+// order instead of an LLM guess: (1) a unit with NO entry at all yet
+// (never crawled) always goes before one that's merely stale - full first-
+// pass coverage beats repeatedly refreshing what's already at least
+// partially known; (2) among already-crawled-but-stale units, higher git
+// churn (commits touching files under that unit, last 6 months - same
+// signal impact-analysis's buildRisks already uses, not a new one) goes
+// first, on the theory that a unit under active development is more likely
+// to already be stale again by the time anyone reads its summary. Fix
+// commits count double, mirroring impact-analysis's own established
+// "fixCommitCount is a stronger risk signal than raw commitCount" weighting.
+function scoreUnitChurn(unit: string, churnByFile: Map<string, FileChurnSignal>): number {
+  let score = 0;
+
+  for (const [filePath, signal] of churnByFile) {
+    if (filePath === unit || filePath.startsWith(`${unit}/`)) {
+      score += signal.commitCount + signal.fixCommitCount * 2;
+    }
+  }
+
+  return score;
+}
+
+function prioritizeStaleUnits(
+  staleUnits: string[],
+  everCrawledUnitPaths: Set<string>,
+  churnByFile: Map<string, FileChurnSignal>,
+): string[] {
+  return [...staleUnits].sort((left, right) => {
+    const leftNeverCrawled = !everCrawledUnitPaths.has(left);
+    const rightNeverCrawled = !everCrawledUnitPaths.has(right);
+
+    if (leftNeverCrawled !== rightNeverCrawled) {
+      return leftNeverCrawled ? -1 : 1;
+    }
+
+    if (leftNeverCrawled && rightNeverCrawled) {
+      // Both never crawled - no churn signal is more meaningful than
+      // "hasn't been looked at yet" here, keep listWorkUnits' own order
+      // (Array.sort is stable in Node, so returning 0 preserves it).
+      return 0;
+    }
+
+    return scoreUnitChurn(right, churnByFile) - scoreUnitChurn(left, churnByFile);
+  });
+}
+
 async function crawlOneStaleUnit(
   runner: ObserverRunner,
   models: { observerModel: string; criticModel: string; providerBaseUrl: string; providerApiKey: string },
@@ -248,17 +300,24 @@ async function crawlOneStaleUnit(
   const projectRootPath = runner.projectRootPath;
 
   try {
-    const [units, entries] = await Promise.all([
+    const [units, entries, churnByFile] = await Promise.all([
       listWorkUnits(projectRootPath),
       queryBusinessGraphEntries(projectRootPath),
+      // Best-effort: no git history (fresh repo, git unavailable, timeout)
+      // just means every unit scores 0 churn - falls back to listWorkUnits'
+      // own order among already-crawled-but-stale units, exactly today's
+      // pre-fix behavior for that subset.
+      computeFileChurnSignals(projectRootPath).catch(() => new Map<string, FileChurnSignal>()),
     ]);
     const freshUnitPaths = new Set(entries.filter((entry) => !entry.isStale).map((entry) => entry.unitPath));
+    const everCrawledUnitPaths = new Set(entries.map((entry) => entry.unitPath));
     const staleUnits = units.filter((unit) => !freshUnitPaths.has(unit));
+    const prioritizedStaleUnits = prioritizeStaleUnits(staleUnits, everCrawledUnitPaths, churnByFile);
     const now = Date.now();
     // Skips a unit still in backoff (see ObserverRunner.retryState) and
     // falls through to the next stale one instead - a hard-to-crawl unit no
     // longer blocks the rest of the worklist just by sitting first in order.
-    const nextUnit = staleUnits.find((unit) => (runner.retryState.get(unit)?.nextRetryAt ?? 0) <= now);
+    const nextUnit = prioritizedStaleUnits.find((unit) => (runner.retryState.get(unit)?.nextRetryAt ?? 0) <= now);
 
     if (staleUnits.length === 0) {
       // Genuinely nothing left to do - a real "fully studied" rest.
@@ -354,8 +413,8 @@ async function crawlOneStaleUnit(
     // (sourceFileHashes empty -> immediately stale again, see
     // graph-entries.ts's isStale). Exponential, capped backoff instead -
     // this unit stops hogging every cycle but still gets retried
-    // eventually, and staleUnits.find() above now falls through to the
-    // NEXT stale unit in the meantime instead of blocking on this one.
+    // eventually, and prioritizedStaleUnits.find() above now falls through
+    // to the NEXT stale unit in the meantime instead of blocking on this one.
     const previous = runner.retryState.get(nextUnit);
     const failureCount = (previous?.failureCount ?? 0) + 1;
     const delayMs = Math.min(UNIT_RETRY_BASE_MS * 2 ** (failureCount - 1), UNIT_RETRY_MAX_MS);

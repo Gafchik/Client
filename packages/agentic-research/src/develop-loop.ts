@@ -1,5 +1,6 @@
 import { callModel, type ChatMessage } from "./provider.js";
 import { buildSeedGrepObservation } from "./loop.js";
+import { formatSecurityFindingsForReviewer, scanDiffForSecurityFindings } from "./security-scan.js";
 import {
   dirnameOf,
   editFile,
@@ -864,6 +865,8 @@ async function callReviewer(input: {
    * talked out of noticing it.
    */
   diffUnchangedSinceLastReview?: boolean;
+  /** Deterministic pattern-scan findings (see security-scan.ts) - evidence handed to the Reviewer, not an auto-block; the Reviewer still judges each as real or a false positive. */
+  securityFindings?: string[];
 }): Promise<{ round: DevelopReviewRound | null; promptTokens: number; completionTokens: number; unavailableReason?: string }> {
   const boundedDiff = input.diff.length > MAX_REVIEW_DIFF_CHARS
     ? `${input.diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n... (diff truncated at ${MAX_REVIEW_DIFF_CHARS} chars - flag this if the visible part alone cannot justify approval)`
@@ -920,6 +923,21 @@ async function callReviewer(input: {
           : []),
         ...(input.impactPreview
           ? ["", "Structural impact (deterministic, from the project's dependency graph - not the author's claim): who actually depends on the changed files:", input.impactPreview]
+          : []),
+        // Architecture review #15 "Security Review Pass" (2026-07-19): a
+        // deterministic pattern scan (not this model, not you) flagged these
+        // lines in the diff below. This is evidence to weigh, not a verdict -
+        // some of these WILL be false positives (a test fixture, a
+        // placeholder value the scanner's own filters missed). For each:
+        // decide for yourself whether it is a genuine issue in THIS diff's
+        // actual context; a genuine one is always a BLOCKER regardless of
+        // how small the rest of the change is.
+        ...(input.securityFindings?.length
+          ? [
+              "",
+              "Automated security pattern scan found these in the diff (verify each - real issue or false positive - then treat confirmed ones as blockers):",
+              ...input.securityFindings,
+            ]
           : []),
         "",
         "Unified diff of the change:",
@@ -1251,6 +1269,15 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
     options.onProgress?.({ turn, filesChanged: latestChangedFiles.length, phase });
 
     const diffUnchangedSinceLastReview = reviews.length > 0 && lastReviewedDiff === latestDiff;
+    // Security Review Pass (2026-07-19, architecture review #15): re-scanned
+    // every round, not just once - a "fix" round can just as easily
+    // introduce a NEW hardcoded secret (e.g. while adding a quick test) as
+    // it can remove one.
+    const securityFindings = scanDiffForSecurityFindings(latestDiff);
+
+    if (securityFindings.length > 0) {
+      actionsLog.push(`[turn ${turn}] security scan: ${securityFindings.length} pattern match(es) flagged for reviewer.`);
+    }
 
     const reviewResult = await callReviewer({
       reviewerModel: options.reviewerModel,
@@ -1258,6 +1285,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       providerApiKey: options.providerApiKey,
       task: options.task,
       diff: latestDiff,
+      ...(securityFindings.length > 0 ? { securityFindings: formatSecurityFindingsForReviewer(securityFindings).split("\n") } : {}),
       changedFiles: latestChangedFiles,
       verificationLog,
       ...(options.computeImpactPreview ? { impactPreview: options.computeImpactPreview([...editedFiles]) } : {}),
