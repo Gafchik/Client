@@ -37,6 +37,17 @@ export async function initializeSecretCrypto(appRootPath: string): Promise<void>
     // ключа ещё нет — сгенерируем ниже
   }
 
+  // Loud on purpose (2026-07-19, full-project review fix): this used to be
+  // completely silent - if `.client/secret.key` doesn't survive a restart
+  // (any deployment where that directory isn't on durable storage), a fresh
+  // key gets generated here with zero indication anything happened, every
+  // already-encrypted providers.api_key row in Postgres becomes
+  // undecryptable (see decryptSecret's own new log below), and the operator
+  // just sees every provider silently show no API key with no diagnostic
+  // trail connecting the two events. Harmless noise on a genuine first-ever
+  // run; the one log line that actually explains a real key-loss incident
+  // otherwise.
+  console.warn(`[secret-crypto] Generating a NEW encryption key at ${keyFilePath} (none found there). If this is not the very first run of this app, every previously-encrypted secret (provider API keys) will fail to decrypt from now on - restore the old .client/secret.key or CLIENT_SECRET_KEY instead of proceeding, if that data matters.`);
   const generated = randomBytes(32).toString("hex");
   await fs.mkdir(path.dirname(keyFilePath), { recursive: true });
   await fs.writeFile(keyFilePath, generated, { mode: 0o600 });
@@ -90,7 +101,15 @@ export function decryptSecret(payload: string): string {
     decipher.setAuthTag(Buffer.from(tagB64, "base64"));
     const decrypted = Buffer.concat([decipher.update(Buffer.from(dataB64, "base64")), decipher.final()]);
     return decrypted.toString("utf8");
-  } catch {
+  } catch (error) {
+    // Loud on purpose (2026-07-19, full-project review fix): this used to
+    // swallow the failure completely, returning "" indistinguishable from a
+    // genuinely-empty secret. A GCM auth-tag failure here almost always
+    // means the encryption key changed since this value was written (see
+    // initializeSecretCrypto's new log above) - without this, an operator
+    // just sees providers silently missing their API key with no way to
+    // tell "never set" apart from "undecryptable now".
+    console.error("[secret-crypto] Failed to decrypt a stored secret - returning empty. Likely cause: the encryption key changed since this value was saved (see any recent \"Generating a NEW encryption key\" log).", error);
     return "";
   }
 }

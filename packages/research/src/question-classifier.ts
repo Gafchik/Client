@@ -30,6 +30,33 @@ import {
   BackgroundProjectState 
 } from "@client/shared";
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Bug fix (2026-07-19, full-project review): extractContextKeys used a bare
+// `.includes()` for every domain key - "port" matches as a raw substring of
+// "exported"/"support"/"transport"/"import", silently misrouting the whole
+// research strategy toward a storage/schema framing for questions that have
+// nothing to do with either (verified live: "Where is user data exported to
+// third party analytics?" -> false "port" match -> storageContext routing).
+// This is the SAME bug class this package's own index.ts already found and
+// fixed once (see its isMeaningfulAliasMatch's comment on "транспортировка"
+// falsely matching alias "порт") - that fix never propagated here because
+// index.ts imports FROM this file, so importing the fix back would be
+// circular. Reuses the SAME Unicode-safe boundary pattern index.ts's
+// countAliasMatches already uses correctly elsewhere (`\p{L}`/`\p{N}`
+// property escapes with the `u` flag, not the ASCII-only `\b` this codebase
+// has separately learned never works on Cyrillic).
+function includesWholeWord(haystack: string, needle: string): boolean {
+  if (!needle) {
+    return false;
+  }
+
+  const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_])${escapeRegExp(needle)}([^\\p{L}\\p{N}_]|$)`, "u");
+  return pattern.test(haystack);
+}
+
 interface ResearchInput {
   runId: string;
   task: string;
@@ -101,7 +128,7 @@ export class QuestionClassifier {
     // Ключи из contextualProfiles зарегистрированного типа
     if (typeConfig?.contextualProfiles) {
       for (const [key] of Object.entries(typeConfig.contextualProfiles)) {
-        if (lower.includes(key.toLowerCase())) {
+        if (includesWholeWord(lower, key.toLowerCase())) {
           keys.add(key);
         }
       }
@@ -130,7 +157,7 @@ export class QuestionClassifier {
     ];
 
     for (const key of domainKeys) {
-      if (lower.includes(key)) {
+      if (includesWholeWord(lower, key)) {
         keys.add(key);
       }
     }

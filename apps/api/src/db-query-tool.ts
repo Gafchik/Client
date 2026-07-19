@@ -268,7 +268,16 @@ export async function resolveDbConnectionPlan(rootPath: string): Promise<DbConne
 // that could exfiltrate/write data even from within a nominally read-only
 // statement (COPY ... TO, INTO OUTFILE, pg_read_file, LOAD_FILE, dblink).
 const READ_ONLY_QUERY_PATTERN = /^\s*(select|with|explain|show|desc|describe)\b/i;
-const DANGEROUS_QUERY_PATTERN = /\b(pg_read_file|pg_read_binary_file|lo_export|dblink|into\s+outfile|into\s+dumpfile|load_file)\b|copy\s+\S+\s+to\b/i;
+// Widened (2026-07-19, full-project review): the leading-verb check alone
+// lets a genuinely destructive statement through as long as it is wrapped
+// in a SELECT - `SELECT pg_terminate_backend(pid)` starts with SELECT and
+// matched none of the (exfiltration-focused) names below, despite killing a
+// real connection. A denylist can never be complete against every
+// side-effecting function in two SQL dialects, but the ones that are
+// destructive/DoS-capable rather than merely "reads a file" belong here too
+// - not just exfiltration, per the product owner's own "перестраховаться"
+// (better safe) directive for this tool's code-level layer.
+const DANGEROUS_QUERY_PATTERN = /\b(pg_read_file|pg_read_binary_file|lo_export|lo_import|lo_create|lo_unlink|dblink|dblink_exec|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_switch_wal|set_config|sleep|benchmark)\s*\(|into\s+outfile|into\s+dumpfile|load_file\b|copy\s+\S+\s+to\b/i;
 
 export function isReadOnlyQuery(query: string): boolean {
   const trimmed = query.trim();

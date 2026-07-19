@@ -1355,8 +1355,17 @@ export function deriveStructuralModuleLabel(filePath: string): string {
     return "root";
   }
 
+  // Bug fix (2026-07-19, full-project review): was `container:` (singular)
+  // for a `Containers/` (plural) directory. packages/context's
+  // candidateMatchesZone reconstructs a path fragment from the zone label
+  // via `zone.toLowerCase().replace(":", "/")` to test against real file
+  // paths - "container/user" never occurs in a real path like
+  // ".../Containers/User/...", so every file in this zone silently missed
+  // its own zone reservation and fell through to the stricter
+  // MAX_OUTSIDE_ZONE_CANDIDATES cap instead of the intended per-zone one.
+  // Matching the real directory's plural fixes the roundtrip.
   if (parts[0] === "app" && parts[1] === "src" && parts[2] === "Containers" && parts[3]) {
-    return `container:${parts[3]}`;
+    return `containers:${parts[3]}`;
   }
 
   if (parts[0] === "app" && parts[1] === "src" && parts[2] === "Ship") {

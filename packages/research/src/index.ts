@@ -3957,7 +3957,9 @@ function extractResearchZonesFromPath(filePath: string): string[] {
 
   const structuralModule = deriveStructuralModuleLabel(filePath);
 
-  if (structuralModule.startsWith("container:")) {
+  // "containers:" (plural) - matches deriveStructuralModuleLabel's own
+  // label after its 2026-07-19 plural-mismatch fix (packages/shared).
+  if (structuralModule.startsWith("containers:")) {
     zones.push(structuralModule);
   }
 

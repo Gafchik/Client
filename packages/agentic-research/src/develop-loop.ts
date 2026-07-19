@@ -854,6 +854,16 @@ async function callReviewer(input: {
   priorRound?: DevelopReviewRound;
   authorDisputeSummary?: string;
   computeFindingSimilarity?: (candidateFinding: string, comparisonTexts: string[]) => Promise<number>;
+  /**
+   * True when this round's diff is byte-identical to what was shown to the
+   * reviewer LAST round (2026-07-19, live evidence: a round-2 diff came
+   * back unchanged while the author's dispute summary confidently claimed
+   * fixes were made - the reviewer approved anyway, apparently persuaded by
+   * the prose rather than checking the diff). A deterministic fact, not a
+   * model judgment - injected into the prompt so the reviewer cannot be
+   * talked out of noticing it.
+   */
+  diffUnchangedSinceLastReview?: boolean;
 }): Promise<{ round: DevelopReviewRound | null; promptTokens: number; completionTokens: number; unavailableReason?: string }> {
   const boundedDiff = input.diff.length > MAX_REVIEW_DIFF_CHARS
     ? `${input.diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n... (diff truncated at ${MAX_REVIEW_DIFF_CHARS} chars - flag this if the visible part alone cannot justify approval)`
@@ -888,6 +898,18 @@ async function callReviewer(input: {
               "",
               "The author's response to that earlier pass (fixes made and/or points disputed as wrong):",
               input.authorDisputeSummary,
+            ]
+          : []),
+        // Live evidence (2026-07-19): a round-2 diff came back BYTE-IDENTICAL
+        // to round 1's while the author's summary above confidently claimed
+        // specific fixes were made - and got approved anyway, apparently on
+        // the strength of the prose rather than the actual (unchanged) diff.
+        // This is a deterministic fact (computed by string comparison, not
+        // asserted by anyone), stated plainly so it cannot be argued around.
+        ...(input.diffUnchangedSinceLastReview
+          ? [
+              "",
+              "DETERMINISTIC FACT, not a claim from either side: the diff below is BYTE-IDENTICAL to what you (or a prior reviewer pass) were shown last round - the code has not changed AT ALL since then, regardless of what the author's summary above says was fixed. If that summary claims specific changes were made, that claim is false for THIS diff - verify this yourself by comparing, then judge the round-1 findings against the diff as it actually is, not as the summary describes it.",
             ]
           : []),
         ...(input.priorRound
@@ -948,10 +970,24 @@ async function callReviewer(input: {
     const roundTwoRepeatedNotes = dedupeNotes((input.priorRound
       ? dedupedNotes.filter((finding) => !priorKeys.has(normalizeFindingKey(finding)))
       : dedupedNotes).concat(repeatedAdjusted.notes));
+    // Bug fix (2026-07-19, full-project review): a non-APPROVED reply whose
+    // findings failed to parse as a numbered/bulleted list (a real risk -
+    // this file documents multiple live cases of reviewer models not
+    // following the strict output format) used to compute verdict from
+    // repeatedAdjusted.blockers.length ALONE, which is 0 in exactly this
+    // case - silently flipping a genuine NEEDS_CHANGES into "approved" even
+    // though the comment two lines below already knew to preserve the raw
+    // text as a finding "rather than silently approving a rejection". The
+    // verdict computation just never matched that intent. This directly
+    // gates auto-merge-on-completion and chain auto-advance (see
+    // develop-runner.ts maybeAdvanceChain's "only past a CLEAN approval"),
+    // so a parse miss here could ship/auto-advance an unreviewed diff.
+    const usesRawFallback = !approved && repeatedAdjusted.blockers.length === 0 && filteredFindings.length === 0 && trimmed.length > 0;
+    const hasBlockingContent = repeatedAdjusted.blockers.length > 0 || usesRawFallback;
 
     return {
       round: {
-        verdict: approved ? "approved" : repeatedAdjusted.blockers.length > 0 ? "needs-changes" : "approved",
+        verdict: approved ? "approved" : hasBlockingContent ? "needs-changes" : "approved",
         noteFindings: roundTwoRepeatedNotes,
         // A non-APPROVED reply with no parseable numbered findings still
         // carries its message - keep the raw text as the single finding
@@ -1113,6 +1149,16 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   const sensitiveActions: DevelopSensitiveAction[] = [...(options.priorSensitiveActions ?? [])];
   let latestDiff = "";
   let latestChangedFiles: string[] = [];
+  // Live evidence (2026-07-19, full-project review, 3-iteration validation):
+  // a round-2 diff came back BYTE-IDENTICAL to round 1's (the author's
+  // "task_complete" summary confidently claimed a function was added and
+  // JSDoc updated - neither actually happened, the diff genuinely never
+  // changed) - and the reviewer, given that confident but false summary as
+  // authorDisputeSummary, rubber-stamped APPROVED without independently
+  // re-checking. Tracks what was actually shown to the reviewer last round,
+  // so a later round can carry a DETERMINISTIC "nothing changed" fact into
+  // the prompt instead of leaving the model to be talked out of noticing.
+  let lastReviewedDiff: string | null = null;
   let phase: "developing" | "reviewing" | "fixing" = "developing";
   let zeroMutationBounceSent = false;
   let zeroVerificationBounceSent = false;
@@ -1204,6 +1250,8 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
     phase = "reviewing";
     options.onProgress?.({ turn, filesChanged: latestChangedFiles.length, phase });
 
+    const diffUnchangedSinceLastReview = reviews.length > 0 && lastReviewedDiff === latestDiff;
+
     const reviewResult = await callReviewer({
       reviewerModel: options.reviewerModel,
       providerBaseUrl: options.providerBaseUrl,
@@ -1216,7 +1264,9 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ...(reviews.length > 0 ? { priorRound: reviews[reviews.length - 1] } : {}),
       ...(reviews.length > 0 && summary ? { authorDisputeSummary: summary } : {}),
       ...(options.computeFindingSimilarity ? { computeFindingSimilarity: options.computeFindingSimilarity } : {}),
+      diffUnchangedSinceLastReview,
     });
+    lastReviewedDiff = latestDiff;
     totalPromptTokens += reviewResult.promptTokens;
     totalCompletionTokens += reviewResult.completionTokens;
 

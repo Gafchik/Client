@@ -1034,6 +1034,21 @@ function mergePreviousGraphState(
   }
 
   const invalidatedPathSet = new Set(invalidatedPaths.map((value) => normalizePath(value)));
+  // Bug fix (2026-07-19, full-project review, CRITICAL): a selective/narrow
+  // workspace scan (a single Q&A question touching ~100-250 files out of a
+  // much larger repo, see openWorkspaceSelective) used to be pruned exactly
+  // like a full scan here - any previous-graph node whose file wasn't in
+  // THIS narrow scan's file set was dropped as if it no longer existed, and
+  // saveGraphSnapshot does a full replace (not a merge) into Neo4j - so one
+  // narrow question silently shrank the whole project's persisted graph
+  // down to the handful of files it happened to touch. find_references/
+  // impact-analysis for any OTHER file then falsely reported "no
+  // dependents" until the next full background-sync ran (which can be a
+  // whole session away - it fires on HEAD changes, not on a timer). A
+  // selective scan can only trust EXPLICIT invalidation (a file that
+  // genuinely changed/was deleted) - "this file wasn't part of what I
+  // looked at this time" is not evidence it's gone.
+  const isFullScan = workspace.summary.selectionMode !== "selective";
   const currentPathSet = new Set(workspace.files.map((file) => normalizePath(file.relativePath)));
   const retainedNodes = new Map<string, GraphNode>();
   const retainedEdges = new Map<string, GraphEdge>();
@@ -1041,7 +1056,11 @@ function mergePreviousGraphState(
   for (const node of previousGraph.nodes) {
     const nodePath = node.filePath ? normalizePath(node.filePath) : undefined;
 
-    if (nodePath && (!currentPathSet.has(nodePath) || invalidatedPathSet.has(nodePath))) {
+    if (nodePath && invalidatedPathSet.has(nodePath)) {
+      continue;
+    }
+
+    if (nodePath && isFullScan && !currentPathSet.has(nodePath)) {
       continue;
     }
 

@@ -35,7 +35,41 @@ interface ObserverRunner {
   lastCheckedHead: string | null;
   /** Set once a full pass finds nothing stale; cleared the moment HEAD moves. */
   resting: boolean;
+  /**
+   * Per-unit backoff state (2026-07-19 full-project review fix): a unit that
+   * hits max_turns/error/an empty-content final_answer used to be treated
+   * identically to a real success - no idle sleep, and since unit selection
+   * always picks the FIRST non-fresh unit in worklist order, the exact same
+   * hard-to-crawl unit got re-selected and re-crawled (a fresh 40-turn LLM
+   * run) on literally the next loop iteration, forever - permanently
+   * starving every other unit in the worklist while burning budget. Tracked
+   * per runner (per project), not globally, and cleared the moment a unit
+   * genuinely completes with real content.
+   */
+  retryState: Map<string, { failureCount: number; nextRetryAt: number }>;
+  /**
+   * Resolves once THIS runner's own loop has actually stopped iterating -
+   * not merely when stopRequested was set (2026-07-19 fix). A stop can take
+   * up to one full crawlUnit turn to actually take effect (shouldAbort is
+   * only polled once per turn), so a stop-then-immediately-start sequence
+   * used to leave the OLD loop invisibly still running (overwritten in the
+   * `runners` map, so listObserverRunners could no longer see it) while a
+   * NEW loop started fresh over the SAME project path - since the DB write
+   * for whatever unit the old loop was mid-crawling only lands after ITS
+   * crawlUnit call finishes, the new loop could legitimately pick that same
+   * still-stale unit and run a second, concurrent LLM crawl of it.
+   * startObserver chains off the previous runner's copy of this instead of
+   * racing it.
+   */
+  loopExited: Promise<void>;
 }
+
+// Backoff for a unit that failed/didn't complete (2026-07-19 fix) - doubles
+// per consecutive failure, capped at RESTING_RECHECK_MS so a permanently
+// broken unit still gets rechecked eventually (e.g. after a fix lands)
+// without hammering it every idle tick in the meantime.
+const UNIT_RETRY_BASE_MS = 30_000;
+const UNIT_RETRY_MAX_MS = RESTING_RECHECK_MS;
 
 async function getCurrentHead(projectRootPath: string): Promise<string | null> {
   try {
@@ -55,15 +89,23 @@ export function startObserver(projectRootPath: string): void {
     return;
   }
 
+  // Chain off the previous runner's own exit instead of racing it (see
+  // ObserverRunner.loopExited) - non-blocking for the caller (the new
+  // runner is registered in `runners` immediately, so status/stop calls
+  // against it work right away), it only delays this runner's OWN first
+  // loop iteration until the old one is confirmed gone.
+  const readyPromise = existing ? existing.loopExited : Promise.resolve();
   const runner: ObserverRunner = {
     projectRootPath,
     stopRequested: false,
     activity: null,
     lastCheckedHead: null,
     resting: false,
+    retryState: new Map(),
+    loopExited: Promise.resolve(),
   };
   runners.set(projectRootPath, runner);
-  void runnerLoop(runner);
+  runner.loopExited = readyPromise.then(() => runnerLoop(runner));
 }
 
 export function stopObserver(projectRootPath: string): void {
@@ -211,10 +253,24 @@ async function crawlOneStaleUnit(
       queryBusinessGraphEntries(projectRootPath),
     ]);
     const freshUnitPaths = new Set(entries.filter((entry) => !entry.isStale).map((entry) => entry.unitPath));
-    const nextUnit = units.find((unit) => !freshUnitPaths.has(unit));
+    const staleUnits = units.filter((unit) => !freshUnitPaths.has(unit));
+    const now = Date.now();
+    // Skips a unit still in backoff (see ObserverRunner.retryState) and
+    // falls through to the next stale one instead - a hard-to-crawl unit no
+    // longer blocks the rest of the worklist just by sitting first in order.
+    const nextUnit = staleUnits.find((unit) => (runner.retryState.get(unit)?.nextRetryAt ?? 0) <= now);
+
+    if (staleUnits.length === 0) {
+      // Genuinely nothing left to do - a real "fully studied" rest.
+      runner.resting = true;
+      return false;
+    }
 
     if (!nextUnit) {
-      runner.resting = true;
+      // Everything still stale is in backoff right now - NOT the same as
+      // fully studied, just waiting out a cooldown; do not report false
+      // completion (2026-07-19 fix).
+      runner.resting = false;
       return false;
     }
 
@@ -270,7 +326,31 @@ async function crawlOneStaleUnit(
       confidence: result.confidence,
     });
 
-    return result.raw.stopped !== "error";
+    const genuinelySucceeded = result.raw.stopped === "final_answer" && Object.keys(sourceFileHashes).length > 0;
+
+    if (genuinelySucceeded) {
+      runner.retryState.delete(nextUnit);
+      return true;
+    }
+
+    // Bug fix (2026-07-19, full-project review): max_turns used to be
+    // indistinguishable from a real success here (this function used to
+    // just return `stopped !== "error"`, which is true for max_turns) - a
+    // unit that genuinely cannot be crawled within CRAWL_MAX_TURNS got
+    // re-selected and re-crawled (a fresh 40-turn LLM run) on literally the
+    // next loop iteration, forever, since unit selection always picks the
+    // first stale unit in order - permanently starving every other unit in
+    // the worklist. Same fate for a "final_answer" with zero touched files
+    // (sourceFileHashes empty -> immediately stale again, see
+    // graph-entries.ts's isStale). Exponential, capped backoff instead -
+    // this unit stops hogging every cycle but still gets retried
+    // eventually, and staleUnits.find() above now falls through to the
+    // NEXT stale unit in the meantime instead of blocking on this one.
+    const previous = runner.retryState.get(nextUnit);
+    const failureCount = (previous?.failureCount ?? 0) + 1;
+    const delayMs = Math.min(UNIT_RETRY_BASE_MS * 2 ** (failureCount - 1), UNIT_RETRY_MAX_MS);
+    runner.retryState.set(nextUnit, { failureCount, nextRetryAt: Date.now() + delayMs });
+    return false;
   } catch (error) {
     console.warn(`[observer-monitor] crawl of ${projectRootPath} failed:`, error);
     return false;
