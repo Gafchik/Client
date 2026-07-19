@@ -164,6 +164,14 @@ export function buildGraph(
         label,
         metadata: {
           external: String(relation.metadata?.external ?? "true"),
+          // Bug fix (2026-07-19, full-project review): propagates the
+          // indexer's unresolvedLocal signal (see its own comment) onto the
+          // synthetic node itself, not just the relation that first created
+          // it - a graph consumer inspecting the node in isolation (e.g.
+          // getNodesByKind(graph, "dependency")) couldn't otherwise tell a
+          // genuine external package apart from a same-project import this
+          // indexer simply failed to resolve.
+          ...(relation.metadata?.unresolvedLocal ? { unresolvedLocal: String(relation.metadata.unresolvedLocal) } : {}),
         },
       });
     }

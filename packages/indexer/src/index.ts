@@ -308,6 +308,19 @@ function extractScriptFile(
           specifier,
           targetLabel: resolvedTarget?.relativePath ?? specifier,
           external: resolvedTarget ? "false" : "true",
+          // Bug fix (2026-07-19, full-project review): "external" alone
+          // conflated a genuine package import (bare specifier - "react",
+          // "@client/shared") with a relative/absolute import ("./utils",
+          // "@/components/x") whose target file just didn't resolve - the
+          // second case is a real gap (a path-mapped alias resolveImportTarget
+          // doesn't handle, or a file outside the selective workspace scan),
+          // not a package boundary. Derived from the specifier syntax alone
+          // (already at hand, no extra resolution work) - "." and "/" are
+          // the only prefixes that can ever mean "local" in ESM/CJS/TS
+          // resolution, everything else is unambiguously a package specifier.
+          ...(!resolvedTarget && (specifier.startsWith(".") || specifier.startsWith("/"))
+            ? { unresolvedLocal: "true" }
+            : {}),
         },
       });
     }
@@ -876,15 +889,15 @@ function extractPhpFileViaAst(
         continue;
       }
 
-      const targetId = resolvePhpSymbolOrDependencyId(parentName, useMap, symbolByContainerAndName);
+      const extendsTarget = resolvePhpReferenceTarget(parentName, useMap, symbolByContainerAndName, fileByRelativePath);
       relations.push({
-        id: stableId(["extends", classSymbol.id, targetId, parentName]),
+        id: stableId(["extends", classSymbol.id, extendsTarget.targetId, parentName]),
         type: "EXTENDS",
         sourceId: classSymbol.id,
-        targetId,
+        targetId: extendsTarget.targetId,
         metadata: {
           targetLabel: parentName,
-          external: String(!isLocalPhpSymbol(parentName, useMap, symbolByContainerAndName)),
+          external: String(extendsTarget.external),
         },
       });
     }
@@ -896,15 +909,15 @@ function extractPhpFileViaAst(
         continue;
       }
 
-      const targetId = resolvePhpSymbolOrDependencyId(contractName, useMap, symbolByContainerAndName);
+      const implementsTarget = resolvePhpReferenceTarget(contractName, useMap, symbolByContainerAndName, fileByRelativePath);
       relations.push({
-        id: stableId(["implements", classSymbol.id, targetId, contractName]),
+        id: stableId(["implements", classSymbol.id, implementsTarget.targetId, contractName]),
         type: "IMPLEMENTS",
         sourceId: classSymbol.id,
-        targetId,
+        targetId: implementsTarget.targetId,
         metadata: {
           targetLabel: contractName,
-          external: String(!isLocalPhpSymbol(contractName, useMap, symbolByContainerAndName)),
+          external: String(implementsTarget.external),
         },
       });
     }
@@ -1140,30 +1153,30 @@ function extractPhpFileViaRegex(
     const classSymbol = className ? classSymbols.get(className) : null;
 
     if (classSymbol && parentName) {
-      const targetId = resolvePhpSymbolOrDependencyId(parentName, useMap, symbolByContainerAndName);
+      const extendsTarget = resolvePhpReferenceTarget(parentName, useMap, symbolByContainerAndName, fileByRelativePath);
       relations.push({
-        id: stableId(["extends", classSymbol.id, targetId, parentName]),
+        id: stableId(["extends", classSymbol.id, extendsTarget.targetId, parentName]),
         type: "EXTENDS",
         sourceId: classSymbol.id,
-        targetId,
+        targetId: extendsTarget.targetId,
         metadata: {
           targetLabel: parentName,
-          external: String(!isLocalPhpSymbol(parentName, useMap, symbolByContainerAndName)),
+          external: String(extendsTarget.external),
         },
       });
     }
 
     if (classSymbol && implemented) {
       for (const contract of implemented.split(",").map((value) => value.trim()).filter(Boolean)) {
-        const targetId = resolvePhpSymbolOrDependencyId(contract, useMap, symbolByContainerAndName);
+        const implementsTarget = resolvePhpReferenceTarget(contract, useMap, symbolByContainerAndName, fileByRelativePath);
         relations.push({
-          id: stableId(["implements", classSymbol.id, targetId, contract]),
+          id: stableId(["implements", classSymbol.id, implementsTarget.targetId, contract]),
           type: "IMPLEMENTS",
           sourceId: classSymbol.id,
-          targetId,
+          targetId: implementsTarget.targetId,
           metadata: {
             targetLabel: contract,
-            external: String(!isLocalPhpSymbol(contract, useMap, symbolByContainerAndName)),
+            external: String(implementsTarget.external),
           },
         });
       }
@@ -1182,15 +1195,15 @@ function extractPhpFileViaRegex(
     }
 
     for (const parent of parents.split(",").map((value) => value.trim()).filter(Boolean)) {
-      const targetId = resolvePhpSymbolOrDependencyId(parent, useMap, symbolByContainerAndName);
+      const extendsTarget = resolvePhpReferenceTarget(parent, useMap, symbolByContainerAndName, fileByRelativePath);
       relations.push({
-        id: stableId(["extends", interfaceSymbol.id, targetId, parent]),
+        id: stableId(["extends", interfaceSymbol.id, extendsTarget.targetId, parent]),
         type: "EXTENDS",
         sourceId: interfaceSymbol.id,
-        targetId,
+        targetId: extendsTarget.targetId,
         metadata: {
           targetLabel: parent,
-          external: String(!isLocalPhpSymbol(parent, useMap, symbolByContainerAndName)),
+          external: String(extendsTarget.external),
         },
       });
     }
@@ -2041,13 +2054,40 @@ function resolvePhpSymbolOrDependencyId(
   return symbolByContainerAndName.get(buildSymbolLookupKey(undefined, shortName))?.id ?? stableId(["dependency", symbolRef]);
 }
 
-function isLocalPhpSymbol(
+/**
+ * Bug fix (2026-07-19, full-project review): extends/implements targets
+ * that failed an exact symbol-table lookup used to be marked "external"
+ * unconditionally - the same conflation the
+ * route-controller resolution a few functions up (resolvePhpControllerReference)
+ * already avoids, by ALSO trying a file-path-based resolution (the same
+ * "App\..." convention) before giving up. A parent class whose FILE
+ * resolves locally but whose exact symbol was never indexed (an abstract
+ * base class this AST pass didn't reach, a trait, a file outside the
+ * selective workspace scan) is a real gap in THIS indexer, not a
+ * vendor/package boundary - collapsing both into the same "dependency"
+ * node with external:"true" made them indistinguishable to every graph
+ * consumer (impact-analysis, find_references, dependencyCount).
+ */
+function resolvePhpReferenceTarget(
   symbolRef: string,
   useMap: Map<string, string>,
   symbolByContainerAndName: Map<string, IndexSymbol>,
-): boolean {
+  fileByRelativePath: Map<string, ProjectFile>,
+): { targetId: string; external: boolean } {
   const shortName = extractControllerShortName(symbolRef, useMap) ?? symbolRef;
-  return symbolByContainerAndName.has(buildSymbolLookupKey(undefined, shortName));
+  const exactSymbol = symbolByContainerAndName.get(buildSymbolLookupKey(undefined, shortName));
+
+  if (exactSymbol) {
+    return { targetId: exactSymbol.id, external: false };
+  }
+
+  const resolvedFile = resolvePhpControllerReference(symbolRef, useMap, fileByRelativePath);
+
+  if (resolvedFile) {
+    return { targetId: resolvedFile.id, external: false };
+  }
+
+  return { targetId: stableId(["dependency", symbolRef]), external: true };
 }
 
 function findMatchingBraceIndex(content: string, openBraceIndex: number): number {

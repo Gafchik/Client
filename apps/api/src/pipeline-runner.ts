@@ -2111,6 +2111,33 @@ export function buildSemanticSearchTool(
 // оптимизация, а не зависимость.
 const SEMANTIC_SEED_MIN_SCORE = 0.45;
 
+// Bug fix (2026-07-19, live 3-iteration validation): a task naming a fully-
+// qualified PHP class (e.g. "Src\Containers\Billing\BillStatus\Models\
+// BillStatus") got seeded with .js files from a DIFFERENT physical root of
+// the same multi-root project - a frontend file literally named
+// "useBillStatus.js" out-scored the real backend .php file on raw cosine
+// similarity (shared surface vocabulary, wrong language). The Developer
+// trusted the seed ("most semantically relevant files, read in advance"),
+// concluded the target class didn't exist, and delivered nothing - a
+// completely avoidable failure, since the task text itself already
+// contained an unambiguous language signal the embedding search ignored.
+// A PHP-style FQCN (2+ backslash-separated PascalCase segments) is checked
+// for and, when present, seed candidates are filtered to .php files. When
+// that filter empties the set - the real .php file exists but simply didn't
+// clear SEMANTIC_SEED_MIN_SCORE within the top 8, a live-observed case, not
+// hypothetical - the seed returns EMPTY rather than falling back to the
+// unfiltered (wrong-language) ranked list: presenting those to the
+// Developer as "the most semantically relevant files" when the task itself
+// already names a class in a different language is actively misleading, not
+// a neutral degrade. An empty seed just means the Developer does its own
+// grep/list_dir research instead, exactly what should happen when this
+// optimization has no trustworthy answer.
+const PHP_FQCN_PATTERN = /[A-Z][A-Za-z0-9]*(?:\\[A-Z][A-Za-z0-9]*){2,}/;
+
+function preferredSeedExtension(query: string): string | null {
+  return PHP_FQCN_PATTERN.test(query) ? ".php" : null;
+}
+
 // Exported (2026-07-18) for develop-runner.ts - the exact same "single
 // biggest latency lever measured" mechanism the Q&A path already uses.
 export function buildSemanticSeedLookup(
@@ -2131,10 +2158,19 @@ export function buildSemanticSeedLookup(
         return [];
       }
 
-      const matches = await findSemanticMatchesAcrossPaths(roots.map((root) => root.absolutePath), queryEmbedding, 3);
-      return matches
-        .filter((match) => match.score >= SEMANTIC_SEED_MIN_SCORE)
-        .map((match) => toVirtualPath(roots, match.projectRootPath, match.filePath));
+      // topK raised from 3 to 8 here (2026-07-19) so the language filter
+      // below has a real ranked pool to filter from before taking the top 3
+      // - filtering an already-3-item list to .php could easily leave zero
+      // candidates even when a correct .php match existed just outside the
+      // original top 3.
+      const matches = await findSemanticMatchesAcrossPaths(roots.map((root) => root.absolutePath), queryEmbedding, 8);
+      const scored = matches.filter((match) => match.score >= SEMANTIC_SEED_MIN_SCORE);
+      const preferredExtension = preferredSeedExtension(query);
+      const finalMatches = preferredExtension
+        ? scored.filter((match) => match.filePath.toLowerCase().endsWith(preferredExtension)).slice(0, 3)
+        : scored.slice(0, 3);
+
+      return finalMatches.map((match) => toVirtualPath(roots, match.projectRootPath, match.filePath));
     } catch {
       return [];
     }

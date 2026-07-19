@@ -165,20 +165,34 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
   const name = input.name.trim();
   const description = input.description?.trim() || "";
 
+  const nextRootPaths = new Set(normalizedPaths.map((path) => path.rootPath));
+
   // Cleanup for paths removed from an EXISTING project (2026-07-16, live bug
   // found during multi-path verification): saveProject always deletes and
   // re-inserts every project_paths row, but a path the user removed from the
   // form (e.g. dropped "gui" from slay) previously left every other table
   // (knowledge_catalog/facts/business_graph_entries/code_embeddings) keyed by
-  // that rootPath orphaned forever - see forgetProjectPath. Computed BEFORE
-  // the transaction below deletes the old project_paths rows.
-  const previousRootPaths = input.id?.trim()
-    ? new Set((await getProjectById(input.id.trim()))?.paths.map((path) => path.rootPath) ?? [])
-    : new Set<string>();
-  const nextRootPaths = new Set(normalizedPaths.map((path) => path.rootPath));
-  const removedRootPaths = [...previousRootPaths].filter((rootPath) => !nextRootPaths.has(rootPath));
+  // that rootPath orphaned forever - see forgetProjectPath.
+  //
+  // Bug fix (2026-07-19, full-project review, TOCTOU): the "which paths were
+  // removed" read used to happen via a SEPARATE getProjectById call, on its
+  // own connection, entirely BEFORE this transaction opened - two
+  // near-simultaneous saveProject calls for the SAME project (e.g. a
+  // double-submit) could both read the same pre-edit path list, then each
+  // write a DIFFERENT next state, and the one whose transaction committed
+  // first could have its own freshly-added path treated as "removed" and
+  // cleaned up by the second call's stale diff. `select ... for update` runs
+  // as the FIRST statement in the SAME transaction as the delete/insert
+  // below - it takes a row lock, so a second concurrent saveProject for this
+  // project_id blocks here until the first one commits, then reads that
+  // first call's ACTUAL committed state rather than a pre-transaction snapshot.
+  const removedRootPaths = await withTransaction(async (client) => {
+    const previousRows = input.id?.trim()
+      ? await client.query<{ root_path: string }>(`select root_path from project_paths where project_id = $1 for update`, [input.id.trim()])
+      : { rows: [] };
+    const previousRootPaths = new Set(previousRows.rows.map((row) => row.root_path));
+    const removed = [...previousRootPaths].filter((rootPath) => !nextRootPaths.has(rootPath));
 
-  await withTransaction(async (client) => {
     await client.query(
       `
         insert into projects (id, name, description, created_at, updated_at)
@@ -199,6 +213,8 @@ export async function saveProject(input: SaveProjectInput): Promise<ProjectRecor
         [pathItem.id, nextId, pathItem.name, pathItem.rootPath, pathItem.role, index, now],
       );
     }
+
+    return removed;
   });
 
   for (const removedRootPath of removedRootPaths) {

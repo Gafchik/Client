@@ -407,6 +407,20 @@ export interface ProjectScopeDirective {
 // risks one extra cheap classifier call, never a wrong restriction.
 const SCOPE_TRIGGER_PATTERN = /тольк|не трог|не мен|не пиш|не смотри|исключ|кроме|без\s|backend|frontend|бэкенд|бекенд|бэк|бек|фронт|десктоп|desktop|только/i;
 
+// Bug fix (2026-07-19, live final-validation pass): classifyProjectScopeDirective
+// is a single cheap-model call at temperature 0, but live-repeated identical
+// requests still came back restricted:true roughly 3 times out of 5 and
+// restricted:false the other 2 - genuine model non-determinism, not
+// something another prompt tweak can fully close. A STRICT subset of
+// SCOPE_TRIGGER_PATTERN - only real platform/role words, none of the
+// generic "не трог"/"только"/"кроме" filler that can fire on unrelated
+// phrasing (see the false-trigger comment above) - is required to ALSO
+// match before a restricted:true verdict is trusted at all. This is a
+// deterministic, code-level check, not another LLM call: "never trust the
+// model, verify deterministically" applied to the model's own classification
+// output, not just to what it's classifying.
+const SCOPE_ROLE_KEYWORD_PATTERN = /backend|frontend|бэкенд|бекенд|бэк|бек|фронт|десктоп|desktop/i;
+
 function taskMentionsScopeTrigger(task: string, roots: Array<{ label: string }>): boolean {
   if (SCOPE_TRIGGER_PATTERN.test(task)) {
     return true;
@@ -452,7 +466,21 @@ export async function classifyProjectScopeDirective(input: {
           role: "system",
           content: [
             `This project has several physical repos, each with a short label and a role: ${rootsDescription}.`,
-            "Decide whether the user's question explicitly restricts which of these repos should be searched/worked on - either by naming which one(s) to use exclusively (\"only in gui\", \"only work on the frontend\"), or by naming which one(s) to leave alone (\"don't touch the backend\").",
+            "Decide whether the user's question explicitly restricts which of these repos should be searched/worked on - either by naming which one(s) to use exclusively (\"only in gui\", \"only work on the frontend\"), or by naming which one(s) to leave alone (\"don't touch the backend\") - a restriction MUST name an actual repo, by its label or role, not just SOME file or files.",
+            // Bug fix (2026-07-19, live 3-iteration validation): a task like
+            // "add method X to class Y, don't touch any other files" got
+            // misclassified as restricting to ONE (wrong) repo out of 3 -
+            // "don't touch other files" is boilerplate scope discipline
+            // about which FILES to edit inside whichever repo the work
+            // actually belongs to, it says nothing about which REPO that is.
+            // The pre-filter that decides whether to even call this classifier
+            // is deliberately broad (matches "не трог"/"don't touch" etc. on
+            // its own, cheaply, before this real check) - false positives
+            // reaching this point are expected and fine AS LONG AS this
+            // classifier correctly says not-restricted for them, which it
+            // was not reliably doing.
+            "Common false trigger to watch for: a phrase like \"don't change anything else\", \"больше ничего не меняй\", \"не трогай другие файлы\" is about which FILES within the work get touched, NOT which repo does the work - on its own (with no repo name/role mentioned anywhere else in the message) this is NOT a scope restriction, reply {\"restricted\": false, \"allowedLabels\": []}.",
+            "Repo labels are arbitrary internal nicknames an operator picked (often abbreviations of the project name), NOT domain vocabulary - a label merely SHARING a word with something the task talks about (e.g. a repo labeled \"billing\" and a task about a class inside a \"Billing\" module/namespace/folder) is a coincidence, not a match. Only restrict scope when the task is clearly instructing you about which REPO/CODEBASE to work in - a fully-qualified class/namespace path, file path, or technology mentioned in the task is evidence about WHERE INSIDE a repo the work is, never evidence about WHICH repo.",
             "Reply with ONLY one line of JSON: {\"restricted\": boolean, \"allowedLabels\": string[]}.",
             "allowedLabels must always be the labels that SHOULD be searched - if the user says 'do not touch backend', allowedLabels is every OTHER label, not backend.",
             "If the question does not restrict scope at all (most questions don't, even ones that happen to mention a role in passing), reply {\"restricted\": false, \"allowedLabels\": []}.",
@@ -481,6 +509,10 @@ export async function classifyProjectScopeDirective(input: {
     // Empty (misfired) or "everything" (no real restriction) both collapse
     // to "no restriction" - only a genuine, resolvable SUBSET counts.
     if (allowedLabels.length === 0 || allowedLabels.length === input.roots.length) {
+      return noRestriction;
+    }
+
+    if (!SCOPE_ROLE_KEYWORD_PATTERN.test(input.task)) {
       return noRestriction;
     }
 

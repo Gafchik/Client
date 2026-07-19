@@ -126,7 +126,21 @@ async function walkCodeFiles(rootPath: string): Promise<string[]> {
   const results: string[] = [];
 
   async function walk(dir: string): Promise<void> {
-    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    // Bug fix (2026-07-19, full-project review): silently returning [] here
+    // on ANY readdir failure (permission denied, a broken symlink target,
+    // the whole rootPath vanishing mid-walk) made a subtree just quietly
+    // never get indexed, with zero trace of why - unlike packages/indexer's
+    // own per-file parse-failure logging (see its "PHP AST parse failed"
+    // warning), this sibling indexer gave no diagnostic at all. Root path
+    // itself missing entirely (project deleted/unmounted between ticks) is
+    // routine enough to skip silently; anything past that first level is a
+    // genuine anomaly worth a trace.
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error) => {
+      if (dir !== rootPath) {
+        console.warn(`[embedding-indexer] readdir failed for ${dir}, skipping subtree:`, error);
+      }
+      return [];
+    });
 
     for (const entry of entries) {
       if (entry.name.startsWith(".") || IGNORED_DIRS.has(entry.name)) {
@@ -184,7 +198,19 @@ async function indexOneProject(rootPath: string, role: PathRole, provider: Resol
       }
 
       candidates.push({ relPath, content: content.slice(0, MAX_FILE_CHARS_FOR_EMBEDDING), hash });
-    } catch {
+    } catch (error) {
+      // Bug fix (2026-07-19, full-project review): silent on purpose only
+      // for ENOENT - a file legitimately disappearing between readdir and
+      // stat/read (deleted, renamed) is a routine, expected race in any file
+      // walker and not worth a log line every tick. Anything else (EACCES,
+      // an encoding error from treating a binary file as utf8, a genuine I/O
+      // failure) previously vanished the exact same way, silently - no way
+      // to tell "this file is just permanently unreadable" apart from "the
+      // whole project has zero recently-changed files this tick".
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        console.warn(`[embedding-indexer] failed to read ${absolutePath}, skipping this file:`, error);
+      }
+
       continue;
     }
   }
