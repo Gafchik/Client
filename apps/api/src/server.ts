@@ -6,7 +6,7 @@ import { markInFlightRunsInterrupted } from "./pipeline-runner.js";
 loadLocalEnv();
 
 const app = createApp();
-const port = Number(process.env.PORT ?? 3001);
+const port = Number(process.env.PORT ?? 3031);
 
 app
   .listen({

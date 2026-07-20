@@ -147,7 +147,7 @@ const VIEW_SUBTITLES: Record<AppView, string> = {
 
 type InspectorTab = "overview" | "research" | "impact" | "context" | "plan" | "execution" | "knowledge" | "git" | "diagnostics";
 
-const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
+const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3031";
 const PROVIDER_STORAGE_KEY = "client.provider-config";
 const PROJECT_STORAGE_KEY = "client.selected-project";
 
