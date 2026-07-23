@@ -2815,13 +2815,38 @@ async function runValidationLoop(input: {
   };
 }
 
+// Bug fix (2026-07-23, found via live verification of the Phase-1 lane
+// rework): packages/research (see detectUnknowns) always appends one of
+// these 5 generic structural-coverage caveats whenever an AUXILIARY signal
+// (moduleIntents/entryPoints/sideEffects/dataSources/dependencyCount) comes
+// back empty - which is common on most real, messy projects, regardless of
+// whether the actual question at hand was answered well. Counting these
+// toward the fast-path gate's `unknowns.length >= 2` check made it trip on
+// almost any substantive real-world question (confirmed live: a locate
+// question with 84% confidence and 12 evidence files still got vetoed,
+// purely by 2 of these generic caveats) - defeating Phase 1's whole point.
+// Only unknowns NOT matching one of these markers count as "material" here;
+// the raw list (including these) is still shown to the user in the final
+// answer as-is, this only narrows what routing treats as material.
+const GENERIC_STRUCTURAL_UNKNOWN_MARKERS = [
+  "доменный модуль задачи",
+  "Явные entry points не найдены",
+  "Побочные эффекты не были подтверждены",
+  "Источники данных не выделены уверенно",
+  "Граф зависимостей пока неглубокий",
+];
+
+function countMaterialUnknowns(unknowns: string[]): number {
+  return unknowns.filter((item) => !GENERIC_STRUCTURAL_UNKNOWN_MARKERS.some((marker) => item.includes(marker))).length;
+}
+
 function shouldUseChatFastPath(input: {
   task: string;
   diagnostics: string[];
   research: PipelineRunResult["research"];
   impact: PipelineRunResult["impact"];
 }): boolean {
-  if (looksLikeHighRiskChangeTask(input.task, input.impact)) {
+  if (looksLikeHighRiskChangeTask(input.task)) {
     return false;
   }
 
@@ -2833,11 +2858,57 @@ function shouldUseChatFastPath(input: {
     return false;
   }
 
-  if (input.research.unknowns.length >= 2) {
+  // Bug fix (2026-07-23): found live AFTER the fixes above started routing
+  // real questions to the lean path - the deterministic scorer can report
+  // high confidence (84-95%) while its evidence is mostly the SAME 1-2 files
+  // matched repeatedly (a known weak spot: keyword/substring collisions like
+  // "relation"/"Relationship", see the disabled findGraphSymbolHints comment
+  // above). Confirmed on magendamd: "replicated cases" scored 95% confidence
+  // but returned CausalRelationship.php/BillArbitration.php/AcuNote.php (2x
+  // each, completely wrong topic); "claim_numbers... в UpdateCaseDataAction"
+  // scored 84% but returned the SAME file 8 times with a hedged, wrong
+  // explanation. Neither ambiguity nor unknowns caught this - low evidence
+  // DIVERSITY is a distinct signal from low confidence and needs its own
+  // check: a repetitive match is a sign the scorer is flailing, not that
+  // it's confident, regardless of what the confidence number itself says.
+  const uniqueEvidenceFiles = new Set(
+    input.research.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)),
+  ).size;
+
+  if (uniqueEvidenceFiles < 3 || uniqueEvidenceFiles / input.research.evidence.length < 0.6) {
     return false;
   }
 
-  if (input.diagnostics.length >= 2) {
+  if (countMaterialUnknowns(input.research.unknowns) >= 2) {
+    return false;
+  }
+
+  // Bug fix (2026-07-23): `index.diagnostics` is already seeded with
+  // `[...workspace.diagnostics]` (packages/indexer) - spreading both into
+  // one array double-counts every workspace notice, including the routine
+  // "Selective workspace limit достигнут" message that fires on essentially
+  // any real project bigger than the selective-scan cap. A single benign
+  // notice was silently satisfying this `>= 2` check on its own. Dedup first,
+  // then drop routine environment/state notices that describe how the scan
+  // ran, not whether it FAILED - confirmed live on magendamd (a real, ~120+
+  // file project with no upstream branch configured): "Selective workspace
+  // limit достигнут" + "Upstream ветка не определена" alone, both totally
+  // benign, satisfied `>= 2` on their own and forced team-mode escalation on
+  // an otherwise clean 95%-confidence/12-evidence research probe. Genuine
+  // failure signals (Failed to read/index, git timeout, merge-base failure,
+  // merge conflicts) still count - those really can mean evidence is
+  // incomplete or unsafe, unlike "this repo has no upstream configured".
+  const ROUTINE_DIAGNOSTIC_MARKERS = [
+    "Selective workspace limit",
+    "Upstream ветка не определена",
+    "Detached HEAD",
+    "Есть untracked файлы",
+  ];
+  const materialDiagnostics = [...new Set(input.diagnostics)].filter(
+    (item) => !ROUTINE_DIAGNOSTIC_MARKERS.some((marker) => item.includes(marker)),
+  );
+
+  if (materialDiagnostics.length >= 2) {
     return false;
   }
 
@@ -2859,10 +2930,26 @@ function shouldUseChatFastPath(input: {
   return true;
 }
 
-function looksLikeHighRiskChangeTask(task: string, impact: PipelineRunResult["impact"]): boolean {
+function looksLikeHighRiskChangeTask(task: string): boolean {
   const normalized = task.toLowerCase();
 
-  if (
+  // Bug fix (2026-07-23, found via live verification of the Phase-1 lane
+  // rework): this used to also treat impact.affectedFiles.length >= 10 (or
+  // risks.length >= 2) as "high risk", regardless of task wording. That's a
+  // reasonable blast-radius signal for an actual CHANGE task, but this
+  // function is only ever called from shouldUseChatFastPath (both call sites
+  // are question-run routing decisions, never develop-mode gating - see
+  // grep). For a pure question, "12 evidence files across the feature area"
+  // just means the topic is broad, not that answering it is risky - a real
+  // regression this caused: "откуда появляеться claim_numbers массив в
+  // UpdateCaseDataAction" (a plain locate/explain question, no change
+  // wording at all) tripped this fallback purely because claim_numbers
+  // touches many related files, forcing an unnecessary team-mode escalation
+  // (11 calls/112K tokens/163s) for a question that used to answer cheaply
+  // and correctly. The only textually-grounded signal that a QUESTION-run
+  // task is actually asking for a change is the keyword check below - file/
+  // risk breadth is left for develop-loop.ts's own scope-bounce guards.
+  return (
     normalized.includes("измени")
     || normalized.includes("передел")
     || normalized.includes("реализ")
@@ -2872,11 +2959,7 @@ function looksLikeHighRiskChangeTask(task: string, impact: PipelineRunResult["im
     || normalized.includes("implement")
     || normalized.includes("change")
     || normalized.includes("rewrite")
-  ) {
-    return true;
-  }
-
-  return impact.risks.length >= 2 || impact.affectedFiles.length >= 10;
+  );
 }
 
 function shouldUseFastValidationPath(
