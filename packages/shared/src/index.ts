@@ -872,6 +872,36 @@ export interface KnowledgeSaveResult {
   artifactCount: number;
 }
 
+export interface ConversationMemoryTurn {
+  runId: string;
+  task: string;
+  summary: string;
+  directAnswer: string;
+  dominantModule: string;
+  intentClass: ResearchIntentClass;
+  strategyKey: ResearchStrategyKey;
+  queryProfileKey: ResearchQueryProfileKey;
+  evidence: ScoredReference[];
+  moduleIntents: ModuleIntentMatch[];
+  includedFiles: string[];
+  savedAt: string;
+}
+
+export interface ConversationMemorySnapshot {
+  conversationId: string;
+  projectRootPath: string;
+  headFingerprint: string;
+  updatedAt: string;
+  /**
+   * Полный номер следующего хода в этом диалоге для данного HEAD, а не
+   * длина усечённого массива `turns`. Redis держит только последние
+   * несколько turn'ов для быстрого continuation-контекста, поэтому
+   * `turns.length` после длинного диалога уже НЕ равен real turn_index.
+   */
+  totalTurnCount: number;
+  turns: ConversationMemoryTurn[];
+}
+
 export interface PipelineStage {
   key: "workspace" | "repository" | "index" | "graph" | "research" | "impact" | "context" | "validation" | "plan" | "preview" | "runtime" | "answer" | "knowledge";
   label: string;

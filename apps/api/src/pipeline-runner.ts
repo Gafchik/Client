@@ -20,7 +20,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph, getFileDependencies, getFileDependents, getSymbolDependencies, getSymbolDependents, linkHttpCallsToRoutes } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { appendBusinessGraphEntryCorrection, buildBackgroundProjectState, findSemanticMatchesAcrossPaths, linkChatAttachmentsToTurn, loadBestBaselineRunArtifact, loadChatAttachmentsByIds, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryGlossaryAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts, upsertGlossaryEntry } from "@client/knowledge";
+import { appendBusinessGraphEntryCorrection, buildBackgroundProjectState, findSemanticMatchesAcrossPaths, linkChatAttachmentsToTurn, loadBestBaselineRunArtifact, loadChatAttachmentsByIds, loadConversationMemorySnapshot, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryGlossaryAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts, upsertGlossaryEntry } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { computeFileChurnSignals, deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -546,16 +546,27 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
   const projectRootPath = overview.rootPath;
   const projectId = overview.projectId;
+  const conversationMemory = isQuestionRun
+    ? await loadConversationMemorySnapshot(projectRootPath, conversationId)
+    : null;
   // Реплики этого же диалога, по порядку — источник prior-turn контекста для
   // research/context/answer ниже (см. §8 плана: applyPriorTurnEvidence и
   // conversationTranscript). Отдельно от loadBestBaselineRunArtifact — тот
   // отвечает только за structural graph/index reuse через background-sync
   // baseline и никогда не выбирает question-run в качестве previousRun.
   const conversationTurns = isQuestionRun
-    ? await loadConversationTurns(appRootPath, projectRootPath, conversationId)
+    ? conversationMemory?.headFingerprint === repository.headFingerprint
+      ? []
+      : await loadConversationTurns(appRootPath, projectRootPath, conversationId)
     : [];
   const priorConversationTurn = conversationTurns[conversationTurns.length - 1] ?? null;
-  const turnIndex = conversationTurns.length;
+  const priorConversationMemoryTurn =
+    conversationMemory?.headFingerprint === repository.headFingerprint
+      ? conversationMemory.turns[conversationMemory.turns.length - 1] ?? null
+      : null;
+  const turnIndex = conversationMemory?.headFingerprint === repository.headFingerprint
+    ? conversationMemory.totalTurnCount
+    : conversationTurns.length;
 
   if (isQuestionRun && attachmentIds?.length) {
     void linkChatAttachmentsToTurn(attachmentIds, conversationId, turnIndex).catch(() => {});
@@ -682,13 +693,18 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
 
   const researchStartedAt = startStage(runId, "research");
   const knownFacts = await queryRelevantFacts(projectRootPath, index, repository);
+  const questionShape = classifyQuestionShape(task);
   // Team-mode: если для вопроса выбрана команда (Researcher/Critic/Observer,
   // см. team-store.ts), agentic-исследование (packages/agentic-research)
   // заменяет детерминированный runResearch целиком — сама модель ходит
   // list_dir/grep_content/read_file по проекту вместо готового промпта от
   // алгоритма. Kill-switch по конструкции: без выбранной команды пайплайн
   // работает ровно как раньше.
-  const selectedTeam = isQuestionRun ? await getSelectedTeam() : null;
+  const configuredTeam = isQuestionRun ? await getSelectedTeam() : null;
+  const shouldPreferSimpleQuestionPath =
+    isQuestionRun
+    && (questionShape === "locate" || questionShape === "compare");
+  const selectedTeam = shouldPreferSimpleQuestionPath ? null : configuredTeam;
   let initialResearch: PipelineRunResult["research"];
   let teamValidation: ValidationResult | null = null;
 
@@ -745,13 +761,15 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     // final answer's tone (packages/ai's resolveAnswerMode, called much
     // later). Reuses the same cheap, no-LLM-call regex classification -
     // just surfaced earlier, to the loop itself.
-    const questionShapeHintText = buildQuestionShapeHint(classifyQuestionShape(task));
+    const questionShapeHintText = buildQuestionShapeHint(questionShape);
     // Тот же conversationTurns, что уже питает приоритетную evidence для
     // детерминированного пути (см. priorTurn чуть ниже) - agentic-путь
     // раньше вообще не участвовал в этом механизме, из-за чего каждая
     // следующая реплика диалога заново исследовала с нуля вместо того чтобы
     // опереться на уже найденные в прошлой реплике файлы.
-    const priorTurnFiles = priorConversationTurn
+    const priorTurnFiles = priorConversationMemoryTurn
+      ? [...new Set(priorConversationMemoryTurn.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)))]
+      : priorConversationTurn
       ? [...new Set(priorConversationTurn.research.evidence.map((item) => item.filePath).filter((item): item is string => Boolean(item)))]
       : [];
     // Bug fix (2026-07-17): priorTurnFiles alone is bare paths, no topic text -
@@ -762,7 +780,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     // that decides investigation strategy, not just into the later answer-
     // synthesis prompt (conversationTranscript, below) which was too late to
     // help - research scope was already fixed by then.
-    const priorTurnTopic = priorConversationTurn
+    const priorTurnTopic = priorConversationMemoryTurn
+      ? { task: priorConversationMemoryTurn.task, summary: priorConversationMemoryTurn.summary }
+      : priorConversationTurn
       ? { task: priorConversationTurn.research.task, summary: priorConversationTurn.research.summary }
       : undefined;
     // Graph-symbol hints: DISABLED after live testing (2026-07-15), not
@@ -953,7 +973,20 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       repository,
       backgroundState,
       knownFacts,
-      ...(priorConversationTurn
+      ...(priorConversationMemoryTurn
+        ? {
+            priorTurn: {
+              task: priorConversationMemoryTurn.task,
+              summary: priorConversationMemoryTurn.summary,
+              dominantModule: priorConversationMemoryTurn.dominantModule,
+              evidence: priorConversationMemoryTurn.evidence,
+              moduleIntents: priorConversationMemoryTurn.moduleIntents,
+              intentClass: priorConversationMemoryTurn.intentClass,
+              strategyKey: priorConversationMemoryTurn.strategyKey,
+              queryProfileKey: priorConversationMemoryTurn.queryProfileKey,
+            },
+          }
+        : priorConversationTurn
         ? {
             priorTurn: {
               task: priorConversationTurn.research.task,
@@ -1065,7 +1098,11 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     graph,
     research: initialResearch,
     impact: initialImpact,
-    ...(priorConversationTurn ? { priorIncludedFiles: priorConversationTurn.context.includedFiles } : {}),
+    ...(priorConversationMemoryTurn
+      ? { priorIncludedFiles: priorConversationMemoryTurn.includedFiles }
+      : priorConversationTurn
+      ? { priorIncludedFiles: priorConversationTurn.context.includedFiles }
+      : {}),
   });
   completeStage(runId, "context", contextStartedAt, `Собран контекстный пакет: ${initialContext.selectedChunks.length} фрагментов при бюджете ${initialContext.tokenBudget}.`);
   updatePartialArtifacts(runId, {
@@ -1135,50 +1172,83 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const focusedResearchRequests = validationLoop.focusedResearchRequests;
   const focusedResearchResults = validationLoop.focusedResearchResults;
   const validatedAnswerPacket = validationLoop.validatedAnswerPacket;
+  const shouldUseLightweightExecutionArtifacts =
+    isQuestionRun && (questionRuntimeMode === "chat-fast-path" || shouldPreferSimpleQuestionPath);
+  let plan: PipelineRunResult["plan"];
+  let executionPreview: PipelineRunResult["executionPreview"];
+  let executionRuntime: PipelineRunResult["executionRuntime"];
 
-  const planStartedAt = startStage(runId, "plan");
-  const plan = buildExecutionPlan({
-    runId,
-    task,
-    research,
-    impact,
-    context,
-    graph,
-  });
-  completeStage(runId, "plan", planStartedAt, `Построен план выполнения: ${plan.steps.length} шагов, требуется согласование: ${plan.approvalRequired ? "да" : "нет"}.`);
-  updatePartialArtifacts(runId, {
-    plan,
-  });
-  await yieldToEventLoop();
+  if (shouldUseLightweightExecutionArtifacts) {
+    const planStartedAt = startStage(runId, "plan");
+    plan = buildLightweightQuestionPlan(runId, research, impact);
+    completeStage(runId, "plan", planStartedAt, "Question-run fast-path: execution plan свёрнут до lightweight placeholder.");
+    updatePartialArtifacts(runId, {
+      plan,
+    });
 
-  const previewStartedAt = startStage(runId, "preview");
-  const executionPreview = buildExecutionPreview(runId, plan);
-  completeStage(runId, "preview", previewStartedAt, `Подготовлено безопасное превью выполнения с ${executionPreview.allowedActions.length} разрешёнными действиями.`);
-  updatePartialArtifacts(runId, {
-    executionPreview,
-  });
-  await yieldToEventLoop();
+    const previewStartedAt = startStage(runId, "preview");
+    executionPreview = buildLightweightQuestionPreview(runId);
+    completeStage(runId, "preview", previewStartedAt, "Question-run fast-path: execution preview не строился полноценно.");
+    updatePartialArtifacts(runId, {
+      executionPreview,
+    });
 
-  const runtimeStartedAt = startStage(runId, "runtime");
-  const executionRuntime = buildControlledExecutionRuntime({
-    runId,
-    research,
-    plan,
-    preview: executionPreview,
-  });
-  completeStage(runId, "runtime", runtimeStartedAt, `Подготовлен controlled runtime: статус ${executionRuntime.status}, write scope ${executionRuntime.allowedWriteFiles.length} файлов.`);
-  updatePartialArtifacts(runId, {
-    executionRuntime,
-  });
-  await yieldToEventLoop();
+    const runtimeStartedAt = startStage(runId, "runtime");
+    executionRuntime = buildLightweightQuestionRuntime(runId);
+    completeStage(runId, "runtime", runtimeStartedAt, "Question-run fast-path: controlled runtime не строился.");
+    updatePartialArtifacts(runId, {
+      executionRuntime,
+    });
+  } else {
+    const planStartedAt = startStage(runId, "plan");
+    plan = buildExecutionPlan({
+      runId,
+      task,
+      research,
+      impact,
+      context,
+      graph,
+    });
+    completeStage(runId, "plan", planStartedAt, `Построен план выполнения: ${plan.steps.length} шагов, требуется согласование: ${plan.approvalRequired ? "да" : "нет"}.`);
+    updatePartialArtifacts(runId, {
+      plan,
+    });
+    await yieldToEventLoop();
+
+    const previewStartedAt = startStage(runId, "preview");
+    executionPreview = buildExecutionPreview(runId, plan);
+    completeStage(runId, "preview", previewStartedAt, `Подготовлено безопасное превью выполнения с ${executionPreview.allowedActions.length} разрешёнными действиями.`);
+    updatePartialArtifacts(runId, {
+      executionPreview,
+    });
+    await yieldToEventLoop();
+
+    const runtimeStartedAt = startStage(runId, "runtime");
+    executionRuntime = buildControlledExecutionRuntime({
+      runId,
+      research,
+      plan,
+      preview: executionPreview,
+    });
+    completeStage(runId, "runtime", runtimeStartedAt, `Подготовлен controlled runtime: статус ${executionRuntime.status}, write scope ${executionRuntime.allowedWriteFiles.length} файлов.`);
+    updatePartialArtifacts(runId, {
+      executionRuntime,
+    });
+    await yieldToEventLoop();
+  }
 
   // Компактная история треда для reference resolution в финальном синтезе
   // ("при регистрации через гугл" отсылает к предыдущему вопросу про Google
   // OAuth) — последние 3 реплики, чтобы не раздувать промпт на длинных диалогах.
-  const conversationTranscript = conversationTurns.slice(-3).map((turn) => ({
-    task: turn.research.task,
-    directAnswer: turn.answer.summary,
-  }));
+  const conversationTranscript = conversationMemory?.headFingerprint === repository.headFingerprint
+    ? conversationMemory.turns.slice(-3).map((turn) => ({
+        task: turn.task,
+        directAnswer: turn.directAnswer,
+      }))
+    : conversationTurns.slice(-3).map((turn) => ({
+        task: turn.research.task,
+        directAnswer: turn.answer.summary,
+      }));
 
   const answerStartedAt = startStage(runId, "answer");
   const answer = await buildAnswerPackage({
@@ -1200,6 +1270,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     validation,
     validatedAnswerPacket,
     ...(conversationTranscript.length > 0 ? { conversationTranscript } : {}),
+    ...(questionRuntimeMode === "chat-fast-path" ? { compactPrompt: true } : {}),
     usage: otherUsage,
   });
   completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);
@@ -1346,6 +1417,54 @@ function createInitialStages(): PipelineStage[] {
     createPendingStage("answer", "Ответ", now),
     createPendingStage("knowledge", "Знания", now),
   ];
+}
+
+function buildLightweightQuestionPlan(runId: string, research: PipelineRunResult["research"], impact: PipelineRunResult["impact"]): PipelineRunResult["plan"] {
+  return {
+    planId: stableId(["plan-lightweight-question", runId]),
+    runId,
+    summary: "Для question-run отдельный execution plan не строился: ответ подготовлен по исследованию и валидации без execution-фазы.",
+    strategy: "sequential",
+    risks: impact.risks,
+    targetModules: research.affectedModules ?? [],
+    targetFiles: impact.affectedFiles ?? [],
+    entryPoints: research.entryPoints ?? [],
+    validationScope: impact.validationScope ?? [],
+    planningNotes: ["Question-run fast-path: planner/runtime слой свёрнут, чтобы не тратить лишнее время на обычный ответ."],
+    dependencyChains: [],
+    approvalRequired: false,
+    steps: [],
+  };
+}
+
+function buildLightweightQuestionPreview(runId: string): PipelineRunResult["executionPreview"] {
+  return {
+    previewId: stableId(["preview-lightweight-question", runId]),
+    runId,
+    mode: "safe-preview",
+    summary: "Question-run не выполняет код и не пишет файлы: execution preview свёрнут до безопасного placeholder.",
+    allowedActions: [],
+    blockedActions: [],
+    reindexRequired: true,
+    graphRefreshRequired: true,
+    knowledgeRefreshRequired: true,
+  };
+}
+
+function buildLightweightQuestionRuntime(runId: string): PipelineRunResult["executionRuntime"] {
+  return {
+    runtimeId: stableId(["runtime-lightweight-question", runId]),
+    runId,
+    mode: "controlled-runtime",
+    status: "blocked",
+    summary: "Question-run не открывает controlled execution runtime: это read-only ответ, не execution-задача.",
+    allowedWriteFiles: [],
+    blockedWriteZones: [".git", ".client/knowledge"],
+    scopeGuards: ["Question-run fast-path не выполняет write-actions."],
+    approvalChecks: ["Execution approval не требуется, потому что execution-фаза не запускалась."],
+    refreshPlan: ["Следующий question-run при необходимости пересоберёт index/graph/knowledge как обычно."],
+    executionAllowed: false,
+  };
 }
 
 function createPendingStage(key: PipelineStage["key"], label: string, now: string): PipelineStage {

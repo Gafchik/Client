@@ -56,6 +56,13 @@ interface BuildAnswerInput {
    * Только для LLM-пути; deterministic fallback его не использует.
    */
   conversationTranscript?: Array<{ task: string; directAnswer: string }>;
+  /**
+   * Question-run fast path: для простых locate/compare/config вопросов не
+   * тащим в финальный синтез весь расширенный внутренний бриф, а даём модели
+   * компактный validated summary. Это уменьшает latency и лучше соответствует
+   * ожидаемому UX "ответь как живой разработчик, а не как отчёт".
+   */
+  compactPrompt?: boolean;
   usage?: ProviderUsageAccumulator;
 }
 
@@ -525,6 +532,18 @@ export async function classifyProjectScopeDirective(input: {
 
 export type ChatIntentKind = "question" | "develop" | "develop-correction";
 
+const EXPLICIT_RESEARCH_ONLY_PATTERN = /код\s+не\s+пиши|не\s+пиши\s+код|без\s+кода|код\s+не\s+нужен|только\s+разбор|только\s+исследуй|только\s+найди|только\s+объясни/i;
+const RESEARCH_DISCOVERY_PATTERN = /найди|откуда|где\s+именно|как\s+устроен|как\s+работает|собери\s+.*точк(?:и|у)\s+входа|объясни|проанализируй|расскажи|покажи\s+маршрут|какой\s+файл|какой\s+роут/i;
+const HARD_DEVELOP_PATTERN = /(^|\s)(сделай|исправь|почини|реализуй|добавь|убери|переименуй|перепиши|напиши\s+код|отрефактор|refactor|implement|fix|change|rewrite)(\s|$)/i;
+
+function isExplicitResearchOnlyTask(task: string): boolean {
+  if (EXPLICIT_RESEARCH_ONLY_PATTERN.test(task)) {
+    return true;
+  }
+
+  return RESEARCH_DISCOVERY_PATTERN.test(task) && !HARD_DEVELOP_PATTERN.test(task);
+}
+
 export type ApprovalResponseKind = "approved" | "rejected" | "unclear";
 
 /**
@@ -808,6 +827,10 @@ export async function classifyChatIntent(input: {
    */
   usage?: ProviderUsageAccumulator;
 }): Promise<ChatIntentKind> {
+  if (isExplicitResearchOnlyTask(input.task)) {
+    return "question";
+  }
+
   try {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
@@ -1756,6 +1779,10 @@ export async function buildAnswerPackage(input: BuildAnswerInput): Promise<Answe
         synthesis: "deterministic-fallback",
       };
     }
+  }
+
+  if (shouldUseUltraFastDeterministicAnswer(input)) {
+    return fallback;
   }
 
   const canUseProvider =
@@ -2996,6 +3023,51 @@ function resolveAnswerMode(input: BuildAnswerInput): AnswerMode {
   return "direct-answer";
 }
 
+function shouldUseUltraFastDeterministicAnswer(input: BuildAnswerInput): boolean {
+  if (!input.compactPrompt) {
+    return false;
+  }
+
+  if (looksLikeChangeTask(input.task) || looksLikeDiagnosticTask(input.task)) {
+    return false;
+  }
+
+  if (!input.validation || !input.validatedAnswerPacket) {
+    return false;
+  }
+
+  if (input.validation.status !== "ready-for-answer") {
+    return false;
+  }
+
+  if (input.validatedAnswerPacket.directAnswerAllowed === false) {
+    return false;
+  }
+
+  if (input.research.confidence < 84) {
+    return false;
+  }
+
+  if (input.research.unknowns.length > 1) {
+    return false;
+  }
+
+  if (input.backgroundState?.freshness === "missing") {
+    return false;
+  }
+
+  const questionType = input.validatedAnswerPacket.questionType;
+
+  if (!["location", "existence", "configuration", "compare"].includes(questionType)) {
+    return false;
+  }
+
+  const fileBackedEvidence = input.research.evidence.filter((item) => Boolean(item.filePath)).length;
+  const strongEvidence = input.research.evidence.filter((item) => item.score >= 16).length;
+
+  return fileBackedEvidence >= 3 && strongEvidence >= 3;
+}
+
 // Debugger-flow live evidence (2026-07-18): a bug report ("не удаляется
 // старый проброс портов, почему?") got a textbook-precise root cause from
 // research - exact file, exact line, exact reasoning - and STILL got
@@ -3189,11 +3261,62 @@ function buildDeterministicExplanation(
   evidenceHighlights: AnswerEvidenceHighlight[],
   unknowns: string[],
 ): string {
+  if (!shouldForceEvidenceLockedMode(input) && mode === "direct-answer") {
+    return buildConversationalDeterministicExplanation(input, brief, evidenceHighlights, unknowns);
+  }
+
   if (shouldForceEvidenceLockedMode(input)) {
     return buildStructuredFallbackExplanation(input, brief, mode, evidenceHighlights, unknowns, true);
   }
 
   return buildStructuredFallbackExplanation(input, brief, mode, evidenceHighlights, unknowns, false);
+}
+
+function buildConversationalDeterministicExplanation(
+  input: BuildAnswerInput,
+  brief: AnswerBrief,
+  evidenceHighlights: AnswerEvidenceHighlight[],
+  unknowns: string[],
+): string {
+  const parts: string[] = [];
+  const topFiles = getPrioritizedEvidence(input)
+    .filter((item) => Boolean(item.filePath))
+    .slice(0, 3)
+    .map((item) => item.filePath as string);
+  const uniqueTopFiles = [...new Set(topFiles)];
+  const topFinding = input.research.findings[0]?.trim();
+  const freshnessNote = buildFreshnessExplanation(input);
+
+  if (brief.explanationLead.trim().length > 0 && brief.explanationLead !== brief.directAnswer) {
+    parts.push(brief.explanationLead.trim());
+  } else if (input.research.functionalSummary.trim().length > 0 && input.research.functionalSummary !== brief.directAnswer) {
+    parts.push(input.research.functionalSummary.trim());
+  }
+
+  if (uniqueTopFiles.length > 0) {
+    const fileList = uniqueTopFiles.map((filePath) => `\`${filePath}\``).join(", ");
+    parts.push(
+      uniqueTopFiles.length === 1
+        ? `Сильнее всего это подтверждается в ${fileList}.`
+        : `Основные опорные места тут: ${fileList}.`,
+    );
+  } else if (evidenceHighlights.length > 0) {
+    parts.push(`Держусь за такие подтверждения: ${evidenceHighlights.slice(0, 2).map((item) => `${item.label} — ${item.detail}`).join("; ")}.`);
+  }
+
+  if (topFinding && !parts.some((part) => part.includes(topFinding))) {
+    parts.push(topFinding);
+  }
+
+  if (unknowns.length > 0) {
+    parts.push(`Из того, что ещё не до конца подтверждено: ${unknowns.slice(0, 2).join("; ")}.`);
+  }
+
+  if (freshnessNote) {
+    parts.push(freshnessNote);
+  }
+
+  return parts.filter(Boolean).join(" ");
 }
 
 function buildStructuredFallbackExplanation(
@@ -3580,6 +3703,10 @@ function buildEvidenceProvenanceExplanation(research: ResearchReport): string {
 }
 
 function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, brief: AnswerBrief): string {
+  if (input.compactPrompt) {
+    return buildCompactAnswerPrompt(input, fallback, brief);
+  }
+
   const evidenceList = getPrioritizedEvidence(input).length > 0
     ? getPrioritizedEvidence(input).slice(0, 8).map((item) =>
         `- \`${item.filePath ?? "?"}\`: ${item.label} — ${item.reason}`,
@@ -3741,6 +3868,47 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
   ]
     .filter((line) => line !== "")
     .join("\n");
+}
+
+function buildCompactAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, brief: AnswerBrief): string {
+  const prioritizedEvidence = getPrioritizedEvidence(input).slice(0, 5);
+  const transcriptSection = (input.conversationTranscript ?? []).length > 0
+    ? [
+        "Previous turns in this same conversation:",
+        ...(input.conversationTranscript ?? []).map((turn, index) => `${index + 1}. Q: ${turn.task}\n   A: ${turn.directAnswer}`),
+        "",
+      ]
+    : [];
+
+  const evidenceSection = prioritizedEvidence.length > 0
+    ? prioritizedEvidence.map((item) => `- ${item.filePath ? `\`${item.filePath}\`` : item.label}: ${item.reason}`).join("\n")
+    : "(no strong evidence)";
+
+  return [
+    ...transcriptSection,
+    "User request:",
+    input.task,
+    "",
+    `Question type: ${brief.questionContract.questionType}`,
+    `Expected shape: ${brief.questionContract.expectedAnswerShape}`,
+    `Direct claim: ${brief.directAnswer}`,
+    `Best explanation lead: ${brief.explanationLead}`,
+    "",
+    "Best confirmed locations/evidence:",
+    evidenceSection,
+    "",
+    "Important unknowns:",
+    brief.materialUnknowns.length > 0
+      ? brief.materialUnknowns.slice(0, 2).map((item) => `- ${item}`).join("\n")
+      : "(none)",
+    "",
+    `Fallback answer mode: ${fallback.answerMode}`,
+    "Answer in Russian like a senior teammate in chat.",
+    "First sentence must answer directly.",
+    "Keep it concise: usually 2-5 sentences total.",
+    "Use only confirmed facts from this prompt.",
+    "If context is insufficient, say so plainly in one sentence.",
+  ].join("\n");
 }
 
 function validateProviderAnswer(

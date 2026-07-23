@@ -293,6 +293,13 @@ function isMicroCopyTask(task: string): boolean {
   return hasReplaceIntent && hasTextCue && hasTightScope && excludesCodeyTask;
 }
 
+function isSmallScopedTask(task: string): boolean {
+  const normalized = task.toLowerCase();
+  const broadImplementationCue = /архитект|рефактор|refactor|перепиши|rewrite|миграц|schema|endpoint|api|таблиц|column|поле|service layer|module/.test(normalized);
+  const narrowCue = /только|локально|точечно|в одном месте|в одном файле|не трогай|не меняй лишнее|почини|исправь|замени|переименуй|подправь|placeholder|label|кнопк|текст|верстк|ui|gui|chat/.test(normalized);
+  return narrowCue && !broadImplementationCue;
+}
+
 function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean): string {
   return [
     "You are an experienced senior fullstack developer implementing a code change in a project you are seeing for the first time. You work in an isolated git worktree - your edits cannot damage the user's checkout, and everything you change will be reviewed as a diff.",
@@ -1035,6 +1042,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   const maxTurns = options.maxTurns ?? DEFAULT_DEVELOP_CEILING_TURNS;
   const isMultiRoot = options.projectRoots.length > 1;
   const microCopyTask = isMicroCopyTask(options.task);
+  const smallScopedTask = isSmallScopedTask(options.task);
   const projectLine = isMultiRoot
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
@@ -1262,6 +1270,24 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
     const collected = await options.collectDiff();
     latestDiff = collected.diff;
     latestChangedFiles = collected.changedFiles;
+
+    if (microCopyTask && latestChangedFiles.length > 2 && turn < maxTurns - 2) {
+      actionsLog.push(`[turn ${turn}] task_complete bounced: micro-copy task touched ${latestChangedFiles.length} files.`);
+      messages.push({
+        role: "user",
+        content: `This task was classified as MICRO-COPY MODE, but your diff currently touches ${latestChangedFiles.length} files (${latestChangedFiles.slice(0, 6).join(", ")}). That is suspiciously broad for a narrow text-edit task. Re-read the task, revert any file that is not directly required by the exact wording, keep only the minimum necessary text change, then call task_complete again. If you genuinely believe more than 2 files are required, say exactly why in the next summary.`,
+      });
+      return "continue-loop";
+    }
+
+    if (smallScopedTask && latestChangedFiles.length > 6 && turn < maxTurns - 2) {
+      actionsLog.push(`[turn ${turn}] task_complete bounced: small-scoped task touched ${latestChangedFiles.length} files.`);
+      messages.push({
+        role: "user",
+        content: `This task looks SMALL AND LOCAL, but your diff currently touches ${latestChangedFiles.length} files (${latestChangedFiles.slice(0, 8).join(", ")}). That is suspiciously broad. Narrow the change to the minimum files truly required by the task, revert opportunistic cleanup/refactors, then call task_complete again. If more than 6 files are genuinely required, explicitly justify that blast radius in your next summary and tie it to concrete callers/dependents you checked.`,
+      });
+      return "continue-loop";
+    }
 
     if (!latestDiff.trim()) {
       actionsLog.push(`[turn ${turn}] task_complete with empty diff - delivered without review.`);

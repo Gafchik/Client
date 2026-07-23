@@ -150,12 +150,33 @@ type InspectorTab = "overview" | "research" | "impact" | "context" | "plan" | "e
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3031";
 const PROVIDER_STORAGE_KEY = "client.provider-config";
 const PROJECT_STORAGE_KEY = "client.selected-project";
+const LAST_CHAT_STORAGE_KEY = "client.last-chat-by-project";
 
 function readPersistedProjectId(): string {
   try {
     return window.localStorage.getItem(PROJECT_STORAGE_KEY) ?? "";
   } catch {
     return "";
+  }
+}
+
+function readPersistedLastChatMap(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(LAST_CHAT_STORAGE_KEY);
+
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return parsed as Record<string, string>;
+  } catch {
+    return {};
   }
 }
 const REQUEST_TIMEOUT_MS = 15000;
@@ -790,7 +811,7 @@ function RunHistorySidebar({
   onDeleteOne: (conversationId: string) => void;
   deleting: boolean;
 }) {
-  const items = groupHistoryByConversation(recentRuns).slice(0, 10);
+  const items = groupHistoryByConversation(recentRuns);
   const allIds = items.map((group) => group.conversationId);
   const allSelected = items.length > 0 && selectedIds.size === items.length;
 
@@ -3456,6 +3477,7 @@ export function App() {
   }
   const selectedProjectIdRef = useRef<string>(readPersistedProjectId());
   const projectPathRef = useRef<string>("");
+  const lastChatByProjectRef = useRef<Record<string, string>>(readPersistedLastChatMap());
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const readiness = projectReadinessState(project);
   const backgroundSyncStatus = backgroundSyncState(project);
@@ -3535,6 +3557,23 @@ export function App() {
   useEffect(() => {
     projectPathRef.current = projectPath;
   }, [projectPath]);
+
+  useEffect(() => {
+    if (!projectPath || !conversationId) {
+      return;
+    }
+
+    lastChatByProjectRef.current = {
+      ...lastChatByProjectRef.current,
+      [projectPath]: conversationId,
+    };
+
+    try {
+      window.localStorage.setItem(LAST_CHAT_STORAGE_KEY, JSON.stringify(lastChatByProjectRef.current));
+    } catch {
+      // localStorage недоступен (приватный режим и т.п.) — переживём без восстановления последнего чата.
+    }
+  }, [projectPath, conversationId]);
 
   useEffect(() => {
     if (!project?.backgroundState || !selectedProjectId || running) {
@@ -3657,7 +3696,27 @@ export function App() {
           ? selectedProjectIdRef.current
           : loadedProjects[0]?.id ?? "";
       const preferredProject = loadedProjects.find((projectItem) => projectItem.id === preferredProjectId) ?? null;
-      await loadProject(preferredProject?.paths[0]?.rootPath, preferredProjectId || undefined);
+      const preferredProjectPath = preferredProject?.paths[0]?.rootPath ?? "";
+      await loadProject(preferredProjectPath, preferredProjectId || undefined);
+
+      if (!routeRunId && preferredProjectPath) {
+        const persistedConversationId = lastChatByProjectRef.current[preferredProjectPath] ?? "";
+
+        if (persistedConversationId) {
+          const projectResponse = normalizeProjectInfo(
+            await fetchJsonWithTimeout<ProjectInfo>(`${API_BASE_URL}/api/project?${new URLSearchParams({
+              projectId: preferredProjectId,
+              projectPath: preferredProjectPath,
+            }).toString()}`),
+          );
+          const matchingEntry = groupHistoryByConversation(safeList(projectResponse.recentRuns))
+            .find((group) => group.conversationId === persistedConversationId)?.latest;
+
+          if (matchingEntry) {
+            await fetchRunArtifact(matchingEntry.runId);
+          }
+        }
+      }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Не удалось инициализировать приложение.");
       setLoading(false);
@@ -5053,6 +5112,22 @@ export function App() {
           : previous,
       );
       setSelectedHistoryIds(new Set());
+
+      if (projectPath) {
+        const nextLastChatMap = { ...lastChatByProjectRef.current };
+        const persistedConversationId = nextLastChatMap[projectPath];
+
+        if (persistedConversationId && conversationIds.includes(persistedConversationId)) {
+          delete nextLastChatMap[projectPath];
+          lastChatByProjectRef.current = nextLastChatMap;
+
+          try {
+            window.localStorage.setItem(LAST_CHAT_STORAGE_KEY, JSON.stringify(nextLastChatMap));
+          } catch {
+            // ignore localStorage cleanup failures
+          }
+        }
+      }
 
       // Раньше проверялся только `conversationId` (state для ПРОДОЛЖЕНИЯ
       // треда) — но после фикса "чаты перемешиваются" отображение (`turns`)

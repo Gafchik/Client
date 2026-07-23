@@ -19,9 +19,14 @@ export { setSharedRedisClient, clearSharedRedisClient } from "./redis-client.js"
 // This exists for the "reads should come from RAM, not disk" principle, not
 // because DB reads were ever the bottleneck.
 const KNOWLEDGE_ARTIFACT_CACHE_TTL_SECONDS = 60 * 60 * 6;
+const CONVERSATION_MEMORY_CACHE_TTL_SECONDS = 60 * 60 * 12;
 
 function knowledgeArtifactCacheKey(runId: string): string {
   return `knowledge-artifact:${runId}`;
+}
+
+function conversationMemoryCacheKey(projectRootPath: string, conversationId: string): string {
+  return `conversation-memory:${projectRootPath}:${conversationId}`;
 }
 
 export { deleteFactsForPath, promoteFactsFromDevelopment, promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
@@ -68,6 +73,8 @@ import type { PipelineRunMode } from "@client/shared";
 import {
   type AnswerPackage,
   type BackgroundProjectState,
+  type ConversationMemorySnapshot,
+  type ConversationMemoryTurn,
   type ControlledExecutionRuntime,
   type ContextPackage,
   type ExecutionPlan,
@@ -121,6 +128,87 @@ interface SaveKnowledgeInput {
   validatedAnswerPacket?: ValidatedAnswerPacket;
   answer: AnswerPackage;
   usage?: ProviderUsageSummary;
+}
+
+function buildConversationMemoryTurn(input: SaveKnowledgeInput, savedAt: string): ConversationMemoryTurn {
+  return {
+    runId: input.runId,
+    task: input.task,
+    summary: input.research.summary,
+    directAnswer: input.answer.summary,
+    dominantModule: input.research.dominantModule,
+    intentClass: input.research.intentClass,
+    strategyKey: input.research.strategyKey,
+    queryProfileKey: input.research.queryProfileKey,
+    evidence: input.research.evidence.slice(0, 8),
+    moduleIntents: input.research.moduleIntents.slice(0, 6),
+    includedFiles: input.context.includedFiles.slice(0, 16),
+    savedAt,
+  };
+}
+
+export async function loadConversationMemorySnapshot(projectRootPath: string, conversationId: string): Promise<ConversationMemorySnapshot | null> {
+  try {
+    const cached = await getRedisClient().get(conversationMemoryCacheKey(projectRootPath, conversationId));
+
+    if (!cached) {
+      return null;
+    }
+
+    const parsed = JSON.parse(cached) as Partial<ConversationMemorySnapshot>;
+
+    if (
+      typeof parsed.conversationId !== "string"
+      || typeof parsed.projectRootPath !== "string"
+      || typeof parsed.headFingerprint !== "string"
+      || typeof parsed.updatedAt !== "string"
+      || !Array.isArray(parsed.turns)
+    ) {
+      return null;
+    }
+
+    return {
+      conversationId: parsed.conversationId,
+      projectRootPath: parsed.projectRootPath,
+      headFingerprint: parsed.headFingerprint,
+      updatedAt: parsed.updatedAt,
+      totalTurnCount: typeof parsed.totalTurnCount === "number" ? parsed.totalTurnCount : parsed.turns.length,
+      turns: parsed.turns as ConversationMemoryTurn[],
+    };
+  } catch (error) {
+    console.warn("[knowledge] conversation memory cache read failed:", error);
+    return null;
+  }
+}
+
+export async function saveConversationMemorySnapshot(input: {
+  projectRootPath: string;
+  conversationId: string;
+  headFingerprint: string;
+  turnIndex: number;
+  turn: ConversationMemoryTurn;
+}): Promise<void> {
+  const key = conversationMemoryCacheKey(input.projectRootPath, input.conversationId);
+
+  try {
+    const existingRaw = await getRedisClient().get(key);
+    const existing = existingRaw ? JSON.parse(existingRaw) as ConversationMemorySnapshot : null;
+    const turns = existing?.headFingerprint === input.headFingerprint
+      ? [...existing.turns, input.turn].slice(-6)
+      : [input.turn];
+    const snapshot: ConversationMemorySnapshot = {
+      conversationId: input.conversationId,
+      projectRootPath: input.projectRootPath,
+      headFingerprint: input.headFingerprint,
+      updatedAt: input.turn.savedAt,
+      totalTurnCount: input.turnIndex + 1,
+      turns,
+    };
+
+    await getRedisClient().set(key, JSON.stringify(snapshot), "EX", CONVERSATION_MEMORY_CACHE_TTL_SECONDS);
+  } catch (error) {
+    console.warn("[knowledge] conversation memory cache write failed:", error);
+  }
 }
 
 interface PersistedWorkspaceSummary {
@@ -341,6 +429,16 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
     );
   });
 
+  if (input.mode === "question-run") {
+    void saveConversationMemorySnapshot({
+      projectRootPath: input.workspace.rootPath,
+      conversationId: input.conversationId,
+      headFingerprint: input.repository.headFingerprint,
+      turnIndex: input.turnIndex,
+      turn: buildConversationMemoryTurn(input, savedAt),
+    });
+  }
+
   return knowledge;
 }
 
@@ -388,7 +486,7 @@ export async function loadKnowledgeCatalog(_appRootPath: string, projectRootPath
       select * from knowledge_catalog
       where project_root_path = $1
       order by saved_at desc
-      limit 20
+      limit 200
     `,
     [projectRootPath],
   );
