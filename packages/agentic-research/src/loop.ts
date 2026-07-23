@@ -49,9 +49,15 @@ const MAX_ACTIONS_PER_TURN = 4;
 // accepted and has a real latency effect): applies only to the Researcher's
 // own turn-by-turn tool-selection calls in this loop, never to the critic
 // (kept at full effort - it is the quality gate) and never to the final
-// user-facing answer synthesis prompt (packages/ai, a separate call). Unset
-// (undefined) reproduces the exact current behavior.
-const RESEARCHER_REASONING_EFFORT: string | undefined = undefined;
+// user-facing answer synthesis prompt (packages/ai, a separate call).
+// Turned on (2026-07-23, team-mode latency work): deciding which grep/read
+// to do next is a mechanical tool-selection choice, not deep reasoning, and
+// the Critic staying at full effort means a worse-judged exploration turn
+// just gets rejected and redone (more turns on THAT case) rather than a
+// wrong answer slipping through - the safety net this loop exists for is
+// unaffected either way. "low" is the conservative end of the documented
+// range, not "minimal" - reduce further only after live comparison.
+const RESEARCHER_REASONING_EFFORT: string | undefined = "low";
 
 export interface ObserverEntryRef {
   projectRootPath: string;
@@ -731,9 +737,17 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   // Auto-read seed (2026-07-16, speed pass): content of the top semantic
   // matches goes straight into the pre-turn context. Tracked separately from
   // touchedFiles - a seed file only becomes evidence if the final answer
-  // actually mentions it (see finalize), otherwise 3 speculative pre-reads
+  // actually mentions it (see finalize), otherwise speculative pre-reads
   // would pollute evidence/impact/context on every question they turned out
-  // irrelevant for.
+  // irrelevant for. Widened 3 -> 5 then reverted back to 3 (2026-07-23):
+  // widening was meant to trade a bigger first prompt for fewer turns, but
+  // live data showed the real bottleneck was the embeddings call itself
+  // (a flaky provider, now fixed with a short fail-fast timeout - see
+  // embedTexts) and the unindexed Postgres scan behind it (also fixed, see
+  // findSemanticMatches*) - widening just meant hitting that same expensive
+  // path more per run, for no measured turn-count benefit once those were
+  // still broken. Revisit widening again only with the underlying fixes in
+  // place and fresh measurements, not as a first lever.
   const seedReadFiles = new Set<string>();
 
   if (options.semanticSeedFiles) {

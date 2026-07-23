@@ -2395,7 +2395,9 @@ export function buildSemanticSeedLookup(
       // below has a real ranked pool to filter from before taking the top 3
       // - filtering an already-3-item list to .php could easily leave zero
       // candidates even when a correct .php match existed just outside the
-      // original top 3.
+      // original top 3. (A 2026-07-23 attempt to widen this further to 12/5
+      // alongside the seed count was reverted - see loop.ts's seedReadFiles
+      // comment for why.)
       const matches = await findSemanticMatchesAcrossPaths(roots.map((root) => root.absolutePath), queryEmbedding, 8);
       const scored = matches.filter((match) => match.score >= SEMANTIC_SEED_MIN_SCORE);
       const preferredExtension = preferredSeedExtension(query);

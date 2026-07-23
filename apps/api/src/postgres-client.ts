@@ -329,6 +329,25 @@ export async function initializePostgresSchema(): Promise<void> {
   // project_paths on every semantic-search query.
   await runSql(`alter table code_embeddings add column if not exists role text not null default 'unknown'`);
 
+  // pgvector migration (2026-07-23, team-mode latency fix): the jsonb
+  // column above was "fine at this scale" per its own original comment, an
+  // assumption disproven live - a real project had 7995 rows, and every
+  // semantic-search query pulled ALL of them over the wire just to rank in
+  // JS (5.5s of pure data transfer per query, confirmed live, on top of an
+  // already-flaky embeddings provider). embedding_vec is additive - the old
+  // jsonb column stays as the durable source of new writes until the read
+  // path is fully cut over, so this migration can't lose data even if the
+  // vector extension were ever unavailable on a given deployment.
+  // 4096 dims (qwen3-embedding-8b) exceeds pgvector's 2000-dim ivfflat/hnsw
+  // index limit, so this intentionally has NO index - even a sequential
+  // scan of a few thousand rows computed natively in C (pgvector's <=>)
+  // is drastically faster than transferring+JSON-parsing the same rows into
+  // Node and computing cosine similarity in JS, per the comment this
+  // replaces on findSemanticMatches/findSemanticMatchesAcrossPaths.
+  await runSql(`create extension if not exists vector`);
+  await runSql(`alter table code_embeddings add column if not exists embedding_vec vector(4096)`);
+  await runSql(`update code_embeddings set embedding_vec = (embedding::text)::vector(4096) where embedding_vec is null`);
+
   // developer_runs — телеметрия Developer pipeline с первого дня
   // (docs/architecture/011-developer-pipeline.md, раздел 7): без этих данных
   // ни один будущий вопрос тюнинга (нужен ли отдельный Reviewer-vendor, где

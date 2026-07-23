@@ -1,12 +1,6 @@
 import { stableId, type PathRole } from "@client/shared";
 import { runSql } from "./postgres-client.js";
 
-interface CodeEmbeddingRow {
-  file_path: string;
-  content_hash: string;
-  embedding: number[];
-}
-
 export interface CodeEmbeddingMatch {
   filePath: string;
   score: number;
@@ -16,27 +10,6 @@ export interface CodeEmbeddingMatch {
 export interface CrossPathCodeEmbeddingMatch extends CodeEmbeddingMatch {
   projectRootPath: string;
   role: PathRole;
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  const length = Math.min(a.length, b.length);
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-
-  for (let i = 0; i < length; i += 1) {
-    const valueA = a[i] ?? 0;
-    const valueB = b[i] ?? 0;
-    dot += valueA * valueB;
-    normA += valueA * valueA;
-    normB += valueB * valueB;
-  }
-
-  if (normA === 0 || normB === 0) {
-    return 0;
-  }
-
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 export interface CodeEmbeddingIndexState {
@@ -79,17 +52,24 @@ export interface UpsertCodeEmbeddingInput {
 export async function upsertCodeEmbedding(input: UpsertCodeEmbeddingInput): Promise<void> {
   try {
     const id = stableId(["code-embedding", input.projectRootPath, input.filePath]);
+    // embedding_vec (2026-07-23, pgvector migration): written alongside the
+    // legacy jsonb column, not instead of it - embedding stays the durable
+    // source of truth, embedding_vec is what findSemanticMatches* actually
+    // reads now. Written from the same JSON text form the jsonb column uses,
+    // so both columns are always in sync from one input.
+    const embeddingJson = JSON.stringify(input.embedding);
     await runSql(
       `
-        insert into code_embeddings (id, project_root_path, file_path, content_hash, embedding, role, updated_at)
-        values ($1, $2, $3, $4, $5::jsonb, $6, $7)
+        insert into code_embeddings (id, project_root_path, file_path, content_hash, embedding, embedding_vec, role, updated_at)
+        values ($1, $2, $3, $4, $5::jsonb, $5::vector, $6, $7)
         on conflict (id) do update set
           content_hash = excluded.content_hash,
           embedding = excluded.embedding,
+          embedding_vec = excluded.embedding_vec,
           role = excluded.role,
           updated_at = excluded.updated_at
       `,
-      [id, input.projectRootPath, input.filePath, input.contentHash, JSON.stringify(input.embedding), input.role, new Date().toISOString()],
+      [id, input.projectRootPath, input.filePath, input.contentHash, embeddingJson, input.role, new Date().toISOString()],
     );
   } catch (error) {
     console.warn("[code-embeddings] upsertCodeEmbedding failed:", error);
@@ -109,10 +89,16 @@ export async function pruneCodeEmbeddings(projectRootPath: string, keepFilePaths
 }
 
 /**
- * Brute-force cosine similarity over every stored vector for one project.
- * Fine at this scale (hundreds to a few thousand files per project, not the
- * terabytes ElasticSearch/OpenSearch would be justified for - see
- * project-state.md's docs-research entry on why that was rejected).
+ * Ranking pushed down to Postgres via pgvector's native `<=>` (cosine
+ * distance) operator + ORDER BY/LIMIT (2026-07-23 - the previous approach
+ * fetched EVERY row for the project over the wire and ranked in JS; confirmed
+ * live on a real project with 7995 rows: 5.5s of pure data transfer per call,
+ * on every single semantic-search/seed lookup. No index on embedding_vec -
+ * qwen3-embedding-8b's 4096 dims exceeds pgvector's 2000-dim ivfflat/hnsw
+ * limit - but a native sequential scan over a few thousand rows in C is still
+ * drastically faster than transferring+parsing the same rows into Node.
+ * `1 - distance` converts cosine DISTANCE back to the similarity SCORE the
+ * rest of this codebase already expects (higher = more similar).
  */
 export async function findSemanticMatches(
   projectRootPath: string,
@@ -120,15 +106,18 @@ export async function findSemanticMatches(
   topK = 8,
 ): Promise<CodeEmbeddingMatch[]> {
   try {
-    const rows = await runSql<CodeEmbeddingRow>(
-      `select file_path, content_hash, embedding from code_embeddings where project_root_path = $1`,
-      [projectRootPath],
+    const rows = await runSql<{ file_path: string; score: number }>(
+      `
+        select file_path, 1 - (embedding_vec <=> $2::vector) as score
+        from code_embeddings
+        where project_root_path = $1 and embedding_vec is not null
+        order by embedding_vec <=> $2::vector
+        limit $3
+      `,
+      [projectRootPath, JSON.stringify(queryEmbedding), topK],
     );
 
-    return rows
-      .map((row) => ({ filePath: row.file_path, score: cosineSimilarity(queryEmbedding, row.embedding) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+    return rows.map((row) => ({ filePath: row.file_path, score: row.score }));
   } catch (error) {
     console.warn("[code-embeddings] findSemanticMatches failed, degrading to no matches:", error);
     return [];
@@ -142,7 +131,8 @@ export async function findSemanticMatches(
  * calls). Returns which repo + role each match belongs to so the caller can
  * build a label-prefixed virtual path (packages/agentic-research's
  * WorkspaceRoot convention) instead of a bare relative path that would be
- * ambiguous once two repos share directory names like "src".
+ * ambiguous once two repos share directory names like "src". Same pgvector
+ * pushdown as findSemanticMatches - see its comment for why.
  */
 export async function findSemanticMatchesAcrossPaths(
   projectRootPaths: string[],
@@ -154,20 +144,23 @@ export async function findSemanticMatchesAcrossPaths(
   }
 
   try {
-    const rows = await runSql<CodeEmbeddingRow & { project_root_path: string; role: PathRole }>(
-      `select project_root_path, file_path, content_hash, embedding, role from code_embeddings where project_root_path = any($1::text[])`,
-      [projectRootPaths],
+    const rows = await runSql<{ project_root_path: string; file_path: string; role: PathRole; score: number }>(
+      `
+        select project_root_path, file_path, role, 1 - (embedding_vec <=> $2::vector) as score
+        from code_embeddings
+        where project_root_path = any($1::text[]) and embedding_vec is not null
+        order by embedding_vec <=> $2::vector
+        limit $3
+      `,
+      [projectRootPaths, JSON.stringify(queryEmbedding), topK],
     );
 
-    return rows
-      .map((row) => ({
-        filePath: row.file_path,
-        score: cosineSimilarity(queryEmbedding, row.embedding),
-        projectRootPath: row.project_root_path,
-        role: row.role,
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+    return rows.map((row) => ({
+      filePath: row.file_path,
+      score: row.score,
+      projectRootPath: row.project_root_path,
+      role: row.role,
+    }));
   } catch (error) {
     console.warn("[code-embeddings] findSemanticMatchesAcrossPaths failed, degrading to no matches:", error);
     return [];

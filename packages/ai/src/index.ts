@@ -1410,10 +1410,22 @@ export async function embedTexts(input: EmbedTextsInput): Promise<number[][]> {
   }
 
   const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/embeddings`;
+  // Short timeout, single attempt (2026-07-23, team-mode latency fix): every
+  // caller of embedTexts already treats it as best-effort (semantic search/
+  // seed pre-read both degrade to "skip this optimization" on failure, never
+  // block the actual answer on it) - but it shared the 25s/2-attempt budget
+  // meant for answer-critical chat completions. Confirmed live: this
+  // specific embeddings model is flaky enough that failed attempts routinely
+  // burned the full 25s (one traced case took 247s - the abort itself was
+  // delayed by unrelated event-loop contention, not just the timeout value),
+  // and a 2nd attempt on an already-struggling endpoint rarely helped. Since
+  // successful calls here are consistently under 3s, 6s is generous
+  // headroom, not a hair-trigger - failing fast means the loop proceeds
+  // without the optimization sooner instead of stalling on it.
   const response = await performProviderRequest(endpoint, input.providerApiKey, {
     model: input.embeddingModel,
     input: input.texts,
-  });
+  }, { timeoutMs: 6_000, maxAttempts: 1 });
 
   const payload = (await response.json()) as { data?: Array<{ embedding?: number[]; index?: number }> };
   const rows = [...(payload.data ?? [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
@@ -4079,12 +4091,19 @@ export function buildQuestionShapeHint(shape: QuestionShape): string {
   }
 }
 
-async function performProviderRequest(endpoint: string, apiKey: string, body: Record<string, unknown>): Promise<Response> {
+async function performProviderRequest(
+  endpoint: string,
+  apiKey: string,
+  body: Record<string, unknown>,
+  overrides?: { timeoutMs?: number; maxAttempts?: number },
+): Promise<Response> {
   let lastError: unknown = null;
+  const timeoutMs = overrides?.timeoutMs ?? PROVIDER_REQUEST_TIMEOUT_MS;
+  const maxAttempts = overrides?.maxAttempts ?? PROVIDER_MAX_ATTEMPTS;
 
-  for (let attempt = 1; attempt <= PROVIDER_MAX_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), PROVIDER_REQUEST_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const response = await fetch(endpoint, {
@@ -4102,7 +4121,7 @@ async function performProviderRequest(endpoint: string, apiKey: string, body: Re
         return response;
       }
 
-      if (!shouldRetryResponse(response.status) || attempt === PROVIDER_MAX_ATTEMPTS) {
+      if (!shouldRetryResponse(response.status) || attempt === maxAttempts) {
         clearTimeout(timeoutId);
         const bodyText = await response.text().catch(() => "");
         throw new Error(`Provider request failed with ${response.status}${bodyText ? `: ${bodyText.slice(0, 300)}` : ""}`);
@@ -4119,7 +4138,7 @@ async function performProviderRequest(endpoint: string, apiKey: string, body: Re
       const isAbortError = error instanceof DOMException && error.name === "AbortError";
       const shouldRetry = isAbortError || isTransientError(error);
 
-      if (!shouldRetry || attempt === PROVIDER_MAX_ATTEMPTS) {
+      if (!shouldRetry || attempt === maxAttempts) {
         throw error;
       }
 

@@ -27,7 +27,13 @@ services:
       retries: 30
 
   postgres:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 (2026-07-23, team-mode latency fix): plain
+    # postgres:16-alpine had no vector extension at all - code_embeddings
+    # stored vectors as jsonb and every semantic-search query fetched the
+    # ENTIRE project's embeddings (confirmed live: 7995 rows for one real
+    # project) over the wire just to rank them in JS. Same Postgres 16 base,
+    # same data/volume - this only adds the extension.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-client}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clientmeta}
