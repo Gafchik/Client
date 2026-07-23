@@ -282,7 +282,7 @@ export interface AgenticRunResult {
 }
 
 interface ParsedAction {
-  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "find_references" | "db_query" | "final_answer";
+  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "find_references" | "db_query" | "request_verification" | "final_answer";
   arg: string;
 }
 
@@ -295,7 +295,7 @@ interface ParsedAction {
 // hypothetical) - the downstream answer-synthesis prompt (packages/ai) also
 // demands Russian, but this is a deliberate second safety net, not
 // redundant.
-function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean): string {
+function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasEscalationModel: boolean): string {
   return [
     "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
     "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
@@ -318,6 +318,12 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
       ? [
         "ACTION: db_query(a single SELECT/WITH/EXPLAIN/SHOW statement)",
         "db_query runs read-only against the project's REAL database (resolved from its own .env/docker-compose). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements. Use it when a question is really about DATA, not code: what a config/setting is actually set to for a real record, whether a described bug's symptom is visible in the actual stored row (e.g. \"field X did not save\" - check what actually got persisted, not just what the code SHOULD do), what real example values/relationships a table holds instead of guessing from a model's field list alone.",
+      ]
+      : []),
+    ...(hasEscalationModel
+      ? [
+        "ACTION: request_verification(a specific, concrete reason: which exact claim/file you are unsure about and why - not a vague \"just to be safe\")",
+        "request_verification hands the rest of this investigation to a stronger model, before you commit to a final_answer - use it when you notice a genuine reason to distrust your own read of the evidence: two files disagree, a business term could plausibly map to more than one similarly-named mechanism (e.g. \"relation\" vs \"Relationship\"), or you are about to answer confidently from only one weak match. Do not use it just because the question is broad - only when you have a CONCRETE, nameable doubt. This does not replace final_answer or skip review - a critic still checks your answer either way - it only changes which model does the remaining thinking. You will not always have this option; if it is not offered, keep investigating and answering yourself.",
       ]
       : []),
     "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic)",
@@ -514,7 +520,7 @@ export async function buildSeedGrepObservation(projectRoots: WorkspaceRoot[], ta
 // parens, e.g. grep regex groups), stopping once MAX_ACTIONS_PER_TURN is
 // reached or no further match/close-paren is found.
 function parseActions(content: string): ParsedAction[] {
-  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|find_references|db_query|final_answer)\s*\(/g;
+  const actionPattern = /ACTION:\s*(list_dir|grep_content|read_file|semantic_search|find_references|db_query|request_verification|final_answer)\s*\(/g;
   const actions: ParsedAction[] = [];
   let searchFrom = 0;
 
@@ -681,7 +687,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
   const messages: ChatMessage[] = [
-    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery)) },
+    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.researcherEscalationModel)) },
     { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnTopicHint}${priorTurnHint}${observerHintBlock}${attachmentHintBlock}${questionShapeBlock}` },
   ];
 
@@ -1064,6 +1070,25 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
         observation = options.dbQuery
           ? await options.dbQuery(action.arg)
           : "(db_query is not available - no resolvable database connection for this project)";
+      } else if (action.tool === "request_verification") {
+        // Phase 3 (2026-07-23, per the latency/quality plan): the Critic is
+        // still ALWAYS run on every final_answer regardless (see
+        // evaluateProposedAnswer) - this is additive agency on TOP of that
+        // floor, not a replacement for it. It only changes which model does
+        // the remaining thinking, and only ever moves in the same direction
+        // the existing reactive (post-rejection) escalation already does -
+        // it just lets the researcher ask for it proactively, with a
+        // concrete stated reason, instead of only after a critic rejection.
+        if (!options.researcherEscalationModel) {
+          observation = "No escalation model is configured for this run - continue investigating and answering with what you have.";
+        } else if (hasEscalated) {
+          observation = `Already escalated to ${activeResearcherModel} earlier this run - continue with it, no further switch happens.`;
+        } else {
+          activeResearcherModel = options.researcherEscalationModel;
+          hasEscalated = true;
+          actionsLog.push(`[turn ${turn}] model-requested escalation to ${activeResearcherModel}: ${action.arg}`);
+          observation = `Escalated to ${activeResearcherModel} for the rest of this investigation, because: ${action.arg}. Continue investigating with this in mind - a critic will still check your final answer either way.`;
+        }
       } else {
         const parentDir = dirnameOf(action.arg);
 
