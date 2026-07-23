@@ -22,14 +22,22 @@ import type {
   TeamRecord,
 } from "@client/shared";
 
-/** A screenshot pasted into the composer, from paste to upload completion (2026-07-19, картинки-в-чате feature). */
+/**
+ * A screenshot pasted into the composer, from paste to upload completion
+ * (2026-07-19, картинки-в-чате feature). Upload/vision-analysis is deferred
+ * until Send is actually pressed (2026-07-23 fix - was firing on paste,
+ * before the user committed to sending the message at all) - `file` holds
+ * the raw blob so submitPipelineRun can upload it at that point.
+ */
 interface PendingAttachment {
   /** Client-generated, stable for the lifetime of this pending item - the server id (below) only exists once the upload responds. */
   localId: string;
   id: string | null;
   mimeType: string;
-  /** Object URL for an instant thumbnail while the upload/analysis is still in flight. */
+  /** Object URL for an instant thumbnail, available immediately on paste. */
   previewUrl: string;
+  /** Raw pasted image, kept until Send triggers the actual upload. */
+  file: File;
   uploading: boolean;
   error: string | null;
   structuredContext: AttachmentStructuredContext | null;
@@ -3992,7 +4000,13 @@ export function App() {
   // хватало бы. Пользователь видит статус "Анализирую…" на превью, пока идёт.
   const ATTACHMENT_UPLOAD_TIMEOUT_MS = 45000;
 
-  async function handleImagePaste(blob: File) {
+  // Paste only stages the image locally (instant thumbnail, no network
+  // call) - actual upload+vision-analysis happens at Send time, see
+  // uploadPendingAttachment/submitPipelineRun. Before this fix the upload
+  // fired immediately on paste, so an image the user pasted and then never
+  // sent (or removed) had already been vision-analyzed and left as an
+  // orphaned chat_attachments row - staging locally avoids that entirely.
+  function handleImagePaste(blob: File) {
     if (!projectPath.trim()) {
       setError("Сначала выбери проект - потом можно вставлять скриншоты.");
       return;
@@ -4003,36 +4017,44 @@ export function App() {
 
     setPendingAttachments((current) => [
       ...current,
-      { localId, id: null, mimeType: blob.type, previewUrl, uploading: true, error: null, structuredContext: null },
+      { localId, id: null, mimeType: blob.type, previewUrl, file: blob, uploading: false, error: null, structuredContext: null },
     ]);
+  }
+
+  async function uploadPendingAttachment(
+    attachment: PendingAttachment,
+  ): Promise<{ id: string; structuredContext: AttachmentStructuredContext } | null> {
+    setPendingAttachments((current) =>
+      current.map((item) => (item.localId === attachment.localId ? { ...item, uploading: true, error: null } : item)),
+    );
 
     try {
-      const imageDataBase64 = await blobToBase64(blob);
+      const imageDataBase64 = await blobToBase64(attachment.file);
       const response = await fetchJsonWithTimeout<{ id: string; structuredContext: AttachmentStructuredContext }>(
         `${API_BASE_URL}/api/attachments`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ projectRootPath: projectPath, mimeType: blob.type, imageDataBase64 }),
+          body: JSON.stringify({ projectRootPath: projectPath, mimeType: attachment.mimeType, imageDataBase64 }),
         },
         ATTACHMENT_UPLOAD_TIMEOUT_MS,
       );
 
       setPendingAttachments((current) =>
-        current.map((attachment) =>
-          attachment.localId === localId
-            ? { ...attachment, id: response.id, uploading: false, structuredContext: response.structuredContext }
-            : attachment,
+        current.map((item) =>
+          item.localId === attachment.localId
+            ? { ...item, id: response.id, uploading: false, structuredContext: response.structuredContext }
+            : item,
         ),
       );
+
+      return response;
     } catch (uploadError) {
+      const message = uploadError instanceof Error ? uploadError.message : "Не удалось загрузить изображение.";
       setPendingAttachments((current) =>
-        current.map((attachment) =>
-          attachment.localId === localId
-            ? { ...attachment, uploading: false, error: uploadError instanceof Error ? uploadError.message : "Не удалось загрузить изображение." }
-            : attachment,
-        ),
+        current.map((item) => (item.localId === attachment.localId ? { ...item, uploading: false, error: message } : item)),
       );
+      return null;
     }
   }
 
@@ -4051,7 +4073,7 @@ export function App() {
       const blob = item.getAsFile();
 
       if (blob) {
-        void handleImagePaste(blob);
+        handleImagePaste(blob);
       }
     }
   }
@@ -4064,6 +4086,23 @@ export function App() {
 
     setRunning(true);
     setError(null);
+
+    // Upload+vision-analyze pasted screenshots only now, at the moment Send
+    // was actually pressed (2026-07-23 fix - used to fire on paste, before
+    // the user committed to sending at all). attachmentsSnapshot/uploadResults
+    // are paired by index, not re-read from `pendingAttachments` state after
+    // the awaits below (setState updates from uploadPendingAttachment are
+    // async and would not be visible in this closure yet).
+    const attachmentsSnapshot = pendingAttachments;
+    const uploadResults = await Promise.all(
+      attachmentsSnapshot.map((attachment) => uploadPendingAttachment(attachment)),
+    );
+
+    if (uploadResults.some((uploaded) => uploaded === null)) {
+      setRunning(false);
+      setError("Не удалось загрузить один или несколько скриншотов - попробуй ещё раз или убери их из сообщения.");
+      return;
+    }
 
     // Уточнение реализовано как склейка строки на клиенте перед pipeline run
     // (продолжающим тот же conversationId). Обязательно требует уже принятого
@@ -4080,19 +4119,19 @@ export function App() {
     const composedTask = isFollowUpClarification
       ? `${selectedTask}\n\nУточнение пользователя: ${task.trim()}`
       : task.trim();
-    // Только уже успешно загруженные (id != null) - вложение, всё ещё
-    // анализирующееся в момент отправки, в эту реплику просто не попадёт
-    // (см. disabled на кнопке отправки: пока идёт загрузка, отправка заблокирована).
-    const attachmentIds = pendingAttachments
-      .filter((attachment): attachment is PendingAttachment & { id: string } => attachment.id !== null)
-      .map((attachment) => attachment.id);
-    // Снимок для "живого" пузыря сообщения, пока идёт run (см. sentAttachments) -
-    // берём только те, что реально успели проанализироваться (structuredContext
-    // не null); ещё-загружающиеся сюда и так не попали бы (см. attachmentIds выше).
-    const attachmentsToSend: ConversationAttachment[] = pendingAttachments
-      .filter((attachment): attachment is PendingAttachment & { id: string; structuredContext: AttachmentStructuredContext } =>
-        attachment.id !== null && attachment.structuredContext !== null)
-      .map((attachment) => ({ id: attachment.id, turnIndex: -1, mimeType: attachment.mimeType, structuredContext: attachment.structuredContext }));
+    // Past the guard above, every entry is non-null - safe to treat as such.
+    const uploaded = uploadResults as Array<{ id: string; structuredContext: AttachmentStructuredContext }>;
+    const attachmentIds = uploaded.map((result) => result.id);
+    // Снимок для "живого" пузыря сообщения, пока идёт run (см. sentAttachments).
+    // `uploaded` and `attachmentsSnapshot` are the same length by construction
+    // (uploaded = the Promise.all results for exactly attachmentsSnapshot,
+    // in order) - the `!` below reflects that guarantee, not a real risk.
+    const attachmentsToSend: ConversationAttachment[] = attachmentsSnapshot.map((attachment, index) => ({
+      id: uploaded[index]!.id,
+      turnIndex: -1,
+      mimeType: attachment.mimeType,
+      structuredContext: uploaded[index]!.structuredContext,
+    }));
 
     try {
       const accepted = await fetchJsonWithTimeout<PipelineRunStatus & { kind?: string }>(`${API_BASE_URL}/api/pipeline/run`, {
@@ -4146,6 +4185,18 @@ export function App() {
         setSelectedTask(composedTask);
         setClarificationRound((round) => (isFollowUpClarification ? round + 1 : 0));
         updateActiveRunId(accepted.runId);
+        // Bug fix (2026-07-23): used to only be set once the FIRST ANSWER
+        // completed (pollPipelineStatus's completion handler, below), not
+        // from the moment the user's message was actually sent. The server
+        // already decides conversationId synchronously at accept time (a
+        // fresh chat's conversationId is just its first run's own runId -
+        // see apps/api/src/app.ts's POST /api/pipeline/run) - accepted.conversationId
+        // is already final here, no reason to wait for completion. Setting
+        // it this early also makes the "restore last chat" localStorage
+        // mechanism (the effect keyed on conversationId below) persist this
+        // chat right away, instead of losing it if the tab closes/reloads
+        // while the first answer is still running.
+        setConversationId(accepted.conversationId);
         setResult(null);
         setInspectorOpen(false);
         setTask("");
@@ -5420,7 +5471,7 @@ export function App() {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
 
-                      if (!running && selectedProjectId && task.trim() && !pendingAttachments.some((attachment) => attachment.uploading)) {
+                      if (!running && selectedProjectId && task.trim()) {
                         void submitPipelineRun(false);
                       }
                     }
@@ -5440,15 +5491,15 @@ export function App() {
                   <button
                     type="submit"
                     className="primary-button"
-                    disabled={running || loading || !selectedProjectId || pendingAttachments.some((attachment) => attachment.uploading)}
+                    disabled={running || loading || !selectedProjectId}
                   >
                     {running
-                      ? "Собираю ответ…"
-                      : pendingAttachments.some((attachment) => attachment.uploading)
+                      ? pendingAttachments.some((attachment) => attachment.uploading)
                         ? "Анализирую скриншот…"
-                        : !selectedProjectId
-                          ? "Сначала выбери проект"
-                          : "Получить ответ по проекту"}
+                        : "Собираю ответ…"
+                      : !selectedProjectId
+                        ? "Сначала выбери проект"
+                        : "Получить ответ по проекту"}
                   </button>
                 </div>
               </div>
