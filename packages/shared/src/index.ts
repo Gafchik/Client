@@ -1238,6 +1238,21 @@ export function stableId(parts: Array<string | number>): string {
   return createHash("sha1").update(parts.join("::")).digest("hex");
 }
 
+// Bug fix (2026-07-23, model bake-off): every provider call across the
+// codebase hardcoded a literal temperature (0, 0.1, 0.2) - fine for the
+// OpenAI-style models this was originally built against, but Anthropic's API
+// rejects any temperature other than 1 unless extended thinking is enabled
+// ("The `temperature` parameter may only be set to 1 when extended thinking
+// is enabled"). Confirmed live: this made every anthropic/* researcher call
+// fail its very first turn with a 400, which the loop's error handling then
+// silently turned into a generic "not sure" answer - looking exactly like
+// the model itself failed to investigate, when the model was never actually
+// able to try. Call this at every request-body construction site instead of
+// writing temperature literals directly.
+export function resolveProviderTemperature(model: string, baseTemperature: number): number {
+  return model.startsWith("anthropic/") ? 1 : baseTemperature;
+}
+
 export function contentHash(value: string): string {
   return createHash("sha1").update(value).digest("hex");
 }

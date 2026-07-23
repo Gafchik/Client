@@ -20,6 +20,7 @@ import {
   type GraphState,
   type ImpactReport,
   type ResearchReport,
+  resolveProviderTemperature,
   type ValidatedAnswerPacket,
   type ValidationPacket,
   type ValidationRecommendedAction,
@@ -351,7 +352,7 @@ export async function expandTaskSearchKeywords(input: ExpandTaskSearchKeywordsIn
     // ответа на случай code-fence/лишнего текста вокруг).
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0.1,
+      temperature: resolveProviderTemperature(input.providerModel, 0.1),
       messages: [
         {
           role: "system",
@@ -479,7 +480,7 @@ export async function classifyProjectScopeDirective(input: {
     const rootsDescription = input.roots.map((root) => `"${root.label}" (role: ${root.role})`).join(", ");
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -577,7 +578,7 @@ export async function classifyApprovalResponse(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -639,7 +640,7 @@ export async function classifyTestsOffer(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -724,7 +725,7 @@ export async function classifyPostCompletionCommand(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -782,7 +783,7 @@ export async function classifyAutoMergeIntent(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -846,7 +847,7 @@ export async function classifyChatIntent(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -929,7 +930,7 @@ export async function planDevelopSubtasks(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0.1,
+      temperature: resolveProviderTemperature(input.providerModel, 0.1),
       messages: [
         {
           role: "system",
@@ -1013,7 +1014,7 @@ export async function extractDomainGlossaryTerms(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -1115,7 +1116,7 @@ export async function analyzeAttachmentImage(input: VisionAnalysisInput): Promis
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.visionModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.visionModel, 0),
       messages: [
         {
           role: "system",
@@ -1172,7 +1173,7 @@ async function extractAttachmentStructuredContext(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -1286,7 +1287,7 @@ export async function extractCodePatternFacts(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -1363,7 +1364,7 @@ export async function classifyFactConflict(input: {
     const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
     const response = await performProviderRequest(endpoint, input.providerApiKey, {
       model: input.providerModel,
-      temperature: 0,
+      temperature: resolveProviderTemperature(input.providerModel, 0),
       messages: [
         {
           role: "system",
@@ -1602,7 +1603,7 @@ async function synthesizeValidationWithProvider(input: ValidateEvidenceInput): P
   // ответа на случай code-fence/лишнего текста вокруг), как в keyword-expansion.
   const response = await performProviderRequest(endpoint, input.providerApiKey, {
     model: input.providerModel,
-    temperature: 0.1,
+    temperature: resolveProviderTemperature(input.providerModel, 0.1),
     messages: [
       {
         role: "system",
@@ -2937,7 +2938,7 @@ async function synthesizeAnswerWithProvider(
   const prompt = buildAnswerPrompt(input, fallback, brief);
   const response = await performProviderRequest(endpoint, input.providerApiKey, {
     model: input.providerModel,
-    temperature: 0.2,
+    temperature: resolveProviderTemperature(input.providerModel, 0.2),
     messages: [
       {
         role: "system",

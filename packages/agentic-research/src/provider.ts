@@ -1,3 +1,5 @@
+import { resolveProviderTemperature } from "@client/shared";
+
 // Extracted verbatim from loop.ts (2026-07-17, Developer pipeline) so the
 // develop-loop can reuse the exact same provider-call/retry/backoff behavior
 // the research loop has already proven live, instead of duplicating it.
@@ -86,7 +88,7 @@ async function performCall(
       signal: controller.signal,
       body: JSON.stringify({
         model,
-        temperature: 0.1,
+        temperature: resolveProviderTemperature(model, 0.1),
         max_tokens: maxCompletionTokens ?? MAX_COMPLETION_TOKENS,
         messages,
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
