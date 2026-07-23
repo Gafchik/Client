@@ -63,6 +63,17 @@ interface BuildAnswerInput {
    * ожидаемому UX "ответь как живой разработчик, а не как отчёт".
    */
   compactPrompt?: boolean;
+  /**
+   * Накопленная за прошлые прогоны память о проекте (business-graph
+   * "gotchas" + подтверждённые facts) - раньше эта подсказка попадала
+   * только в промпт agentic Researcher'а team-mode (buildObserverHintSuffix
+   * в pipeline-runner.ts), поэтому вопросы, шедшие по chat-fast-path/deep-
+   * research-path без команды, никогда её не видели. Теперь передаётся
+   * сюда для ЛЮБОГО lane, чтобы синтез ответа тоже мог опереться на уже
+   * известные подводные камни, а не полагаться только на evidence этого
+   * конкретного запуска.
+   */
+  knownGotchasHint?: string;
   usage?: ProviderUsageAccumulator;
 }
 
@@ -3756,8 +3767,13 @@ function buildAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPackage, bri
       ]
     : [];
 
+  const gotchasSection = input.knownGotchasHint
+    ? ["=== 0.5 KNOWN PROJECT GOTCHAS (from prior research, verify before relying on) ===", input.knownGotchasHint, ""]
+    : [];
+
   return [
     ...transcriptSection,
+    ...gotchasSection,
     "=== USER REQUEST ===",
     input.task,
     "",
@@ -3884,8 +3900,13 @@ function buildCompactAnswerPrompt(input: BuildAnswerInput, fallback: AnswerPacka
     ? prioritizedEvidence.map((item) => `- ${item.filePath ? `\`${item.filePath}\`` : item.label}: ${item.reason}`).join("\n")
     : "(no strong evidence)";
 
+  const gotchasSection = input.knownGotchasHint
+    ? ["Known project gotchas from prior research (verify before relying on):", input.knownGotchasHint, ""]
+    : [];
+
   return [
     ...transcriptSection,
+    ...gotchasSection,
     "User request:",
     input.task,
     "",

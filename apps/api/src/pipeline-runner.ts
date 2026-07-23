@@ -701,11 +701,112 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   // алгоритма. Kill-switch по конструкции: без выбранной команды пайплайн
   // работает ровно как раньше.
   const configuredTeam = isQuestionRun ? await getSelectedTeam() : null;
-  const shouldPreferSimpleQuestionPath =
+  // Real risk signal from git history (2026-07-16, architecture review
+  // finding) - one git log call for the whole repo's recent history, not
+  // per-file; degrades to an empty map (no risk signal, not a crash) for a
+  // non-git project or a slow/failing git command. Hoisted here (2026-07-23)
+  // so the SAME churn data feeds both the team-mode escalation decision
+  // below and the final impact stage further down - avoids a second git
+  // call and keeps the escalation gate's risk signal consistent with the
+  // one actually shown to the user.
+  const fileChurn = repository.isGitRepository ? await computeFileChurnSignals(projectRootPath) : undefined;
+  // Gotcha-memory gap fix (2026-07-23, per live-testing plan): business-graph
+  // "gotchas" + confirmed facts/glossary were only ever built into a hint
+  // for the team-mode Researcher's OWN prompt (see effectiveProjectRoots/
+  // observerHintResult below) - any question that stayed on chat-fast-path
+  // or deep-research-path (no team, or team not escalated into) never saw
+  // this accumulated project memory at all. Computed here, unscoped by any
+  // path-directive (that refinement stays team-mode-only), so the final
+  // answer-synthesis call below gets it regardless of which lane ran.
+  const questionProjectRoots: WorkspaceRoot[] = projectPaths?.length
+    ? projectPaths.map((pathRecord) => ({
+        label: pathRecord.name,
+        absolutePath: normalizePath(path.resolve(pathRecord.rootPath)),
+        role: pathRecord.role,
+      }))
+    : [{ label: "root", absolutePath: projectRootPath, role: "unknown" }];
+  const answerGotchasHint = isQuestionRun
+    ? [
+        (await buildObserverHintSuffix(questionProjectRoots, task)).text,
+        buildKnownFactsHint(questionProjectRoots, await queryFactsAcrossPaths(questionProjectRoots.map((root) => root.absolutePath))),
+        buildGlossaryHint(await queryGlossaryAcrossPaths(questionProjectRoots.map((root) => root.absolutePath))),
+      ].filter(Boolean).join("\n\n")
+    : "";
+  // Latency root-cause fix (2026-07-23, per live-testing plan): team-mode
+  // used to fire whenever a team was configured at all (minus a narrow
+  // locate/compare shape whitelist) - an analytical "how does X work"
+  // question cost 89K tokens/7 calls this way, purely because its shape
+  // didn't match the whitelist, not because deterministic research was
+  // actually insufficient. Now EVERY question-run always computes the
+  // cheap deterministic research first (no LLM calls, packages/research)
+  // as a probe, and escalates into the expensive agentic Researcher+Critic
+  // loop only when that probe's own signals say so - the exact same
+  // confidence/evidence/ambiguity/high-risk-change gate shouldUseChatFastPath
+  // already uses below for the no-team case, just applied one level earlier.
+  const researchInputForRun = {
+    runId,
+    task,
+    workspace,
+    index,
+    graph,
+    repository,
+    backgroundState,
+    knownFacts,
+    ...(priorConversationMemoryTurn
+      ? {
+          priorTurn: {
+            task: priorConversationMemoryTurn.task,
+            summary: priorConversationMemoryTurn.summary,
+            dominantModule: priorConversationMemoryTurn.dominantModule,
+            evidence: priorConversationMemoryTurn.evidence,
+            moduleIntents: priorConversationMemoryTurn.moduleIntents,
+            intentClass: priorConversationMemoryTurn.intentClass,
+            strategyKey: priorConversationMemoryTurn.strategyKey,
+            queryProfileKey: priorConversationMemoryTurn.queryProfileKey,
+          },
+        }
+      : priorConversationTurn
+      ? {
+          priorTurn: {
+            task: priorConversationTurn.research.task,
+            summary: priorConversationTurn.research.summary,
+            dominantModule: priorConversationTurn.research.dominantModule,
+            evidence: priorConversationTurn.research.evidence,
+            moduleIntents: priorConversationTurn.research.moduleIntents,
+            intentClass: priorConversationTurn.research.intentClass,
+            strategyKey: priorConversationTurn.research.strategyKey,
+            queryProfileKey: priorConversationTurn.research.queryProfileKey,
+          },
+        }
+      : {}),
+  };
+  const primaryResearch = runResearch(researchInputForRun);
+  const keywordExpansion = await maybeExpandResearchWithTranslatedKeywords(researchInputForRun, primaryResearch, {
+    isQuestionRun,
+    providerBaseUrl,
+    providerModel,
+    providerApiKey,
+    usage: otherUsage,
+  });
+  const deterministicResearch = keywordExpansion.research;
+  const probeDiagnostics = [
+    ...workspace.diagnostics,
+    ...index.diagnostics,
+    ...repository.diagnostics,
+    ...backgroundState.diagnostics,
+  ];
+  const probeImpact = analyzeImpact({
+    runId,
+    graph,
+    research: deterministicResearch,
+    ...(fileChurn ? { fileChurn } : {}),
+  });
+  const shouldEscalateToTeamMode =
     isQuestionRun
-    && (questionShape === "locate" || questionShape === "compare");
-  const selectedTeam = shouldPreferSimpleQuestionPath ? null : configuredTeam;
-  let initialResearch: PipelineRunResult["research"];
+    && Boolean(configuredTeam)
+    && !shouldUseChatFastPath({ task, research: deterministicResearch, impact: probeImpact, diagnostics: probeDiagnostics });
+  const selectedTeam = shouldEscalateToTeamMode ? configuredTeam : null;
+  let initialResearch: PipelineRunResult["research"] = deterministicResearch;
   let teamValidation: ValidationResult | null = null;
 
   if (selectedTeam) {
@@ -964,52 +1065,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       });
     }
   } else {
-    const researchInputForRun = {
-      runId,
-      task,
-      workspace,
-      index,
-      graph,
-      repository,
-      backgroundState,
-      knownFacts,
-      ...(priorConversationMemoryTurn
-        ? {
-            priorTurn: {
-              task: priorConversationMemoryTurn.task,
-              summary: priorConversationMemoryTurn.summary,
-              dominantModule: priorConversationMemoryTurn.dominantModule,
-              evidence: priorConversationMemoryTurn.evidence,
-              moduleIntents: priorConversationMemoryTurn.moduleIntents,
-              intentClass: priorConversationMemoryTurn.intentClass,
-              strategyKey: priorConversationMemoryTurn.strategyKey,
-              queryProfileKey: priorConversationMemoryTurn.queryProfileKey,
-            },
-          }
-        : priorConversationTurn
-        ? {
-            priorTurn: {
-              task: priorConversationTurn.research.task,
-              summary: priorConversationTurn.research.summary,
-              dominantModule: priorConversationTurn.research.dominantModule,
-              evidence: priorConversationTurn.research.evidence,
-              moduleIntents: priorConversationTurn.research.moduleIntents,
-              intentClass: priorConversationTurn.research.intentClass,
-              strategyKey: priorConversationTurn.research.strategyKey,
-              queryProfileKey: priorConversationTurn.research.queryProfileKey,
-            },
-          }
-        : {}),
-    };
-    const primaryResearch = runResearch(researchInputForRun);
-    const keywordExpansion = await maybeExpandResearchWithTranslatedKeywords(researchInputForRun, primaryResearch, {
-      isQuestionRun,
-      providerBaseUrl,
-      providerModel,
-      providerApiKey,
-      usage: otherUsage,
-    });
-    initialResearch = keywordExpansion.research;
+    // Deterministic research (probed above to decide escalation) is already
+    // the final answer for this run - no team was configured, or the probe
+    // looked solid enough that the expensive agentic pass isn't warranted.
     completeStage(
       runId,
       "research",
@@ -1056,11 +1114,9 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   }
 
   const impactStartedAt = startStage(runId, "impact");
-  // Real risk signal from git history (2026-07-16, architecture review
-  // finding) - one git log call for the whole repo's recent history, not
-  // per-file; degrades to an empty map (no risk signal, not a crash) for a
-  // non-git project or a slow/failing git command.
-  const fileChurn = repository.isGitRepository ? await computeFileChurnSignals(projectRootPath) : undefined;
+  // fileChurn already computed above (hoisted, shared with the escalation
+  // probe) - recomputed here only conceptually; reused as-is since research
+  // may have changed (agentic path) but recent-churn risk signal hasn't.
   const initialImpact = analyzeImpact({
     runId,
     graph,
@@ -1173,7 +1229,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const focusedResearchResults = validationLoop.focusedResearchResults;
   const validatedAnswerPacket = validationLoop.validatedAnswerPacket;
   const shouldUseLightweightExecutionArtifacts =
-    isQuestionRun && (questionRuntimeMode === "chat-fast-path" || shouldPreferSimpleQuestionPath);
+    isQuestionRun && questionRuntimeMode === "chat-fast-path";
   let plan: PipelineRunResult["plan"];
   let executionPreview: PipelineRunResult["executionPreview"];
   let executionRuntime: PipelineRunResult["executionRuntime"];
@@ -1271,6 +1327,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     validatedAnswerPacket,
     ...(conversationTranscript.length > 0 ? { conversationTranscript } : {}),
     ...(questionRuntimeMode === "chat-fast-path" ? { compactPrompt: true } : {}),
+    ...(answerGotchasHint ? { knownGotchasHint: answerGotchasHint } : {}),
     usage: otherUsage,
   });
   completeStage(runId, "answer", answerStartedAt, `Подготовлен финальный ответ: режим ${answer.answerMode}, confidence ${answer.confidence}%.`);

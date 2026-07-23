@@ -2,7 +2,7 @@ import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, loadBestBa
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type BackgroundProjectState } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
-import { enqueuePipelineRun, findPipelineRunByRepositoryHead } from "./pipeline-runner.js";
+import { enqueuePipelineRun, findPipelineRunByRepositoryHead, hasAnyActiveQuestionRun } from "./pipeline-runner.js";
 import { getCurrentProvider } from "./provider-store.js";
 import { listProjects } from "./project-store.js";
 
@@ -153,6 +153,16 @@ async function maybeEnqueueAutoBackgroundSync(
   }
 
   if (backgroundState.hasLocalChanges) {
+    return;
+  }
+
+  // Provider-capacity contention fix (2026-07-23, per live-testing plan):
+  // this poll fires every 15s regardless of whether a real user question is
+  // in flight, competing for the same provider rate limits - observer-monitor.ts
+  // already guards its own crawl the same way, this was just the one caller
+  // of hasAnyActiveQuestionRun that didn't. Nothing is lost by deferring: the
+  // next poll tick (or the throttle window) retries once the user's run ends.
+  if (hasAnyActiveQuestionRun()) {
     return;
   }
 
