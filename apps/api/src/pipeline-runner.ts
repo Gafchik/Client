@@ -3412,16 +3412,28 @@ function buildGraphInvalidationPlan(
             0,
             previousGraph.nodes.filter((node) => !node.filePath || !changedPaths.includes(normalizePath(node.filePath))).length,
           ),
-          reusedEdgeCount: Math.max(
-            0,
-            previousGraph.edges.filter((edge) => {
-              const sourceNode = previousGraph.nodes.find((node) => node.id === edge.sourceId);
-              const targetNode = previousGraph.nodes.find((node) => node.id === edge.targetId);
-              const sourceChanged = sourceNode?.filePath ? changedPaths.includes(normalizePath(sourceNode.filePath)) : false;
-              const targetChanged = targetNode?.filePath ? changedPaths.includes(normalizePath(targetNode.filePath)) : false;
-              return !sourceChanged && !targetChanged;
-            }).length,
-          ),
+          // Perf bug fix (2026-07-23, found live - a real project with a
+          // sizeable cached graph made this run's "index" stage APPEAR stuck
+          // for ~85s, blocking the whole event loop the entire time since
+          // this is synchronous): `.find()` on the full nodes array per edge
+          // is O(edges * nodes) - on a graph with thousands of nodes/edges
+          // this is easily tens of millions of comparisons for a value
+          // (reusedEdgeCount) that's purely informational/diagnostic. A
+          // one-time id->node map turns the whole pass into O(edges + nodes).
+          reusedEdgeCount: (() => {
+            const nodeById = new Map(previousGraph.nodes.map((node) => [node.id, node]));
+
+            return Math.max(
+              0,
+              previousGraph.edges.filter((edge) => {
+                const sourceNode = nodeById.get(edge.sourceId);
+                const targetNode = nodeById.get(edge.targetId);
+                const sourceChanged = sourceNode?.filePath ? changedPaths.includes(normalizePath(sourceNode.filePath)) : false;
+                const targetChanged = targetNode?.filePath ? changedPaths.includes(normalizePath(targetNode.filePath)) : false;
+                return !sourceChanged && !targetChanged;
+              }).length,
+            );
+          })(),
         }
       : {}),
     reason:
