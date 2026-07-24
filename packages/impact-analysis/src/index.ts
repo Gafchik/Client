@@ -103,22 +103,21 @@ export function analyzeImpact(input: ImpactInput): ImpactReport {
       expandFileImpact(input.graph, node.id, affectedFiles, affectedModules);
     }
 
+    // Perf fix (2026-07-25): getIncomingNeighbors used to be called twice
+    // here (once gated on isCodeNode, once unconditionally right after) with
+    // identical arguments - same graph, same nodeId - just to feed two
+    // separate loop bodies. Computed once and reused below; the isCodeNode
+    // branch's own bookkeeping (affectedSymbols/affectedModules for `node`
+    // itself, not its neighbors) is unaffected.
     if (isCodeNode(node.kind)) {
       affectedSymbols.add(node.label);
       if (node.filePath) {
         affectedModules.add(deriveStructuralModuleLabel(node.filePath));
       }
-
-      for (const neighbor of getIncomingNeighbors(input.graph, nodeId)) {
-        if (neighbor.kind === "file" && neighbor.filePath) {
-          affectedFiles.add(neighbor.filePath);
-          affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));
-          expandFileImpact(input.graph, neighbor.id, affectedFiles, affectedModules);
-        }
-      }
     }
 
-    for (const neighbor of getIncomingNeighbors(input.graph, nodeId)) {
+    const incomingNeighbors = getIncomingNeighbors(input.graph, nodeId);
+    for (const neighbor of incomingNeighbors) {
       if (neighbor.kind === "file" && neighbor.filePath) {
         affectedFiles.add(neighbor.filePath);
         affectedModules.add(deriveStructuralModuleLabel(neighbor.filePath));

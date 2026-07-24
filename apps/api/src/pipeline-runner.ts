@@ -725,13 +725,26 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
         role: pathRecord.role,
       }))
     : [{ label: "root", absolutePath: projectRootPath, role: "unknown" }];
+  const answerObserverHintResult = isQuestionRun
+    ? await buildObserverHintSuffix(questionProjectRoots, task)
+    : { text: "", entries: [] };
   const answerGotchasHint = isQuestionRun
     ? [
-        (await buildObserverHintSuffix(questionProjectRoots, task)).text,
+        answerObserverHintResult.text,
         buildKnownFactsHint(questionProjectRoots, await queryFactsAcrossPaths(questionProjectRoots.map((root) => root.absolutePath))),
         buildGlossaryHint(await queryGlossaryAcrossPaths(questionProjectRoots.map((root) => root.absolutePath))),
       ].filter(Boolean).join("\n\n")
     : "";
+  // 2026-07-24: same entries as answerGotchasHint above, but structured
+  // (unitPath/confidence) so the validator can treat a matching, critic-
+  // approved crawl as real evidence instead of only ever seeing it as prose
+  // in the Researcher/answer-synthesis prompt (see buildValidationPacket's
+  // businessGraphSignals in packages/ai).
+  const answerBusinessGraphSignals = answerObserverHintResult.entries.map((entry) => ({
+    unitPath: entry.unitPath,
+    text: entry.text,
+    confidence: entry.confidence,
+  }));
   // Latency root-cause fix (2026-07-23, per live-testing plan): team-mode
   // used to fire whenever a team was configured at all (minus a narrow
   // locate/compare shape whitelist) - an analytical "how does X work"
@@ -788,7 +801,52 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     providerApiKey,
     usage: otherUsage,
   });
-  const deterministicResearch = keywordExpansion.research;
+  // Memory-first (2026-07-24, user's explicit request: "как живой человек -
+  // сначала помню где что лежит, потом убеждаюсь что в коде не изменилось").
+  // A non-stale, critic-approved Observer crawl of a unit this question is
+  // about is real evidence, not just a Researcher-prompt hint - inject it
+  // into the deterministic probe BEFORE the team-mode escalation gate below
+  // runs, so a question memory already covers well doesn't pay for a live
+  // agentic crawl (or a long deep-research-path validation loop) just
+  // because the deterministic keyword/domain-profile scorer's OWN evidence
+  // looked thin on its own. Confidence>=65 mirrors this codebase's own
+  // "trustworthy origin" threshold (facts.ts's isTrustworthyOrigin); staleness
+  // ("не изменилось") is already enforced upstream - buildObserverHintSuffix
+  // only ever returns entries where !entry.isStale (current file hashes still
+  // match the crawl). If the code moved on since the last crawl, the entry
+  // simply isn't offered here, and this run falls through to the unmodified
+  // research path exactly as before.
+  const trustworthyBusinessGraphSignals = answerBusinessGraphSignals.filter((signal) => signal.confidence >= 65);
+  const deterministicResearch: PipelineRunResult["research"] = trustworthyBusinessGraphSignals.length
+    ? {
+        ...keywordExpansion.research,
+        evidence: [
+          ...trustworthyBusinessGraphSignals.map((signal) => ({
+            id: stableId(["business-graph-evidence", runId, signal.unitPath]),
+            label: signal.unitPath,
+            // filePath set to the unit path itself (not a single file) so this
+            // still counts as a real, countable anchor in shouldUseChatFastPath's
+            // unique-evidence-file diversity ratio below - a filePath-less entry
+            // would only inflate the denominator (evidence.length) without ever
+            // counting toward uniqueEvidenceFiles, silently making that check
+            // stricter for questions memory actually covers well.
+            filePath: signal.unitPath,
+            score: Math.round(signal.confidence / 5),
+            reason: signal.text,
+            origin: "business-graph" as const,
+          })),
+          ...keywordExpansion.research.evidence,
+        ],
+        // shouldUseChatFastPath gates on research.confidence < 72 BEFORE it
+        // ever looks at evidence - a well-covered question whose deterministic
+        // keyword scorer happened to land under that bar would still get
+        // force-escalated even with strong corroborating memory now sitting
+        // in its evidence array. Only ever raises confidence (never lowers
+        // what deterministic scoring already found), capped at 90 so memory
+        // alone can't manufacture "existence"-question-style overconfidence.
+        confidence: Math.max(keywordExpansion.research.confidence, Math.min(90, Math.max(...trustworthyBusinessGraphSignals.map((signal) => signal.confidence)))),
+      }
+    : keywordExpansion.research;
   const probeDiagnostics = [
     ...workspace.diagnostics,
     ...index.diagnostics,
@@ -1198,6 +1256,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     ],
     runtimeMode: questionRuntimeMode,
     ...(teamValidation ? { precomputedTeamValidation: teamValidation } : {}),
+    businessGraphSignals: answerBusinessGraphSignals,
     usage: otherUsage,
   });
   completeStage(
@@ -2512,6 +2571,7 @@ export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: stri
         projectRootPath: entry.projectRootPath,
         unitPath: entry.unitPath,
         text: entryText(entry),
+        confidence: entry.confidence,
       })),
     };
   } catch {
@@ -2583,6 +2643,7 @@ async function runValidationLoop(input: {
   diagnostics: string[];
   runtimeMode: QuestionRuntimeMode;
   precomputedTeamValidation?: ValidationResult;
+  businessGraphSignals?: Array<{ unitPath: string; text: string; confidence: number }> | undefined;
   usage?: ProviderUsageAccumulator;
 }): Promise<{
   research: PipelineRunResult["research"];
@@ -2614,6 +2675,7 @@ async function runValidationLoop(input: {
       iteration: 0,
       priorActions: [],
       remainingIterationBudget: 0,
+      businessGraphSignals: input.businessGraphSignals,
     });
     updateStageLabel(input.runId, "validation", "Команда уже проверила ответ критиком — пропускаю отдельный validation loop...");
     const teamValidation = input.precomputedTeamValidation;
@@ -2622,6 +2684,7 @@ async function runValidationLoop(input: {
       questionType: teamPacket.questionType,
       validation: teamValidation,
       research: input.research,
+      businessGraphSignals: input.businessGraphSignals,
     });
 
     return {
@@ -2650,6 +2713,7 @@ async function runValidationLoop(input: {
       iteration: 0,
       priorActions: [],
       remainingIterationBudget: 0,
+      businessGraphSignals: input.businessGraphSignals,
     });
     updateStageLabel(input.runId, "validation", "Сигнал сильный — пропускаю глубокую проверку и собираю быстрый ответ...");
     const fastValidation = await validateEvidence({
@@ -2664,6 +2728,7 @@ async function runValidationLoop(input: {
       questionType: fastPacket.questionType,
       validation: fastValidation,
       research: input.research,
+      businessGraphSignals: input.businessGraphSignals,
     });
 
     return {
@@ -2698,6 +2763,7 @@ async function runValidationLoop(input: {
     iteration: 0,
     priorActions,
     remainingIterationBudget: MAX_VALIDATION_REFINEMENT_ITERATIONS,
+    businessGraphSignals: input.businessGraphSignals,
   });
   updateStageLabel(input.runId, "validation", "Проверяю, отвечает ли найденное на вопрос...");
   const shouldBypassProviderOnInitialValidation = shouldUseFastValidationPath(currentPacket, currentResearch);
@@ -2748,6 +2814,7 @@ async function runValidationLoop(input: {
       request,
     });
     focusedResearchResults.push(refinement);
+    await yieldToEventLoop();
 
     currentResearch = mergeResearchWithFocusedResult(currentResearch, refinement);
     currentImpact = analyzeImpact({
@@ -2755,6 +2822,7 @@ async function runValidationLoop(input: {
       graph: input.graph,
       research: currentResearch,
     });
+    await yieldToEventLoop();
     currentContext = buildContextPackage({
       runId: input.runId,
       task: input.task,
@@ -2776,6 +2844,7 @@ async function runValidationLoop(input: {
       iteration,
       priorActions,
       remainingIterationBudget: Math.max(0, MAX_VALIDATION_REFINEMENT_ITERATIONS - iteration),
+      businessGraphSignals: input.businessGraphSignals,
     });
     currentValidation = await validateEvidence({
       packet: currentPacket,
@@ -2802,6 +2871,7 @@ async function runValidationLoop(input: {
     questionType: currentPacket.questionType,
     validation: currentValidation,
     research: currentResearch,
+    businessGraphSignals: input.businessGraphSignals,
   });
 
   return {

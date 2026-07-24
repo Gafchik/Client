@@ -19,6 +19,70 @@ interface BuildGraphOptions {
   invalidatedPaths?: string[];
 }
 
+// Perf fix (2026-07-25): almost every accessor below used to do a fresh
+// linear .filter()/.find() scan over graph.edges (and graph.nodes for
+// getNodeById) on EVERY call - fine for a small graph, but on a real project
+// (confirmed live: 58,089 nodes / 251,954 edges) a single analyzeImpact()
+// call fans out to ~10 starting points, each pulling file dependencies/
+// dependents that themselves scan per OWNED SYMBOL - hundreds of millions of
+// primitive ops in one call, repeated on every validation refinement
+// iteration (up to 3x) with no yieldToEventLoop() in between. Measured live:
+// a single question-run's "impact" stage alone took 2m20s, and the server's
+// event loop was blocked long enough that an unrelated 244-byte status
+// request took 67-87s to respond. Same anti-pattern already fixed once in
+// apps/api/pipeline-runner.ts's buildGraphInvalidationPlan - this is the
+// same fix (precompute a lookup structure once instead of rescanning),
+// applied where it turned out to matter most.
+// Cached per GraphState object identity (WeakMap, not a graph field) so nothing
+// is added to the type, nothing gets serialized/persisted, and every
+// accessor below stays byte-for-byte behavior-compatible with callers - only
+// the complexity changes. The SAME GraphState instance is reused across all
+// starting points and all refinement iterations within one pipeline run, so
+// the O(E) index build happens at most once per run, not once per call.
+interface GraphAdjacencyIndex {
+  nodeById: Map<string, GraphNode>;
+  incomingByTarget: Map<string, GraphEdge[]>;
+  outgoingBySource: Map<string, GraphEdge[]>;
+}
+
+const graphAdjacencyIndexCache = new WeakMap<GraphState, GraphAdjacencyIndex>();
+
+function getAdjacencyIndex(graph: GraphState): GraphAdjacencyIndex {
+  const cached = graphAdjacencyIndexCache.get(graph);
+
+  if (cached) {
+    return cached;
+  }
+
+  const nodeById = new Map<string, GraphNode>();
+  for (const node of graph.nodes) {
+    nodeById.set(node.id, node);
+  }
+
+  const incomingByTarget = new Map<string, GraphEdge[]>();
+  const outgoingBySource = new Map<string, GraphEdge[]>();
+
+  for (const edge of graph.edges) {
+    const incoming = incomingByTarget.get(edge.targetId);
+    if (incoming) {
+      incoming.push(edge);
+    } else {
+      incomingByTarget.set(edge.targetId, [edge]);
+    }
+
+    const outgoing = outgoingBySource.get(edge.sourceId);
+    if (outgoing) {
+      outgoing.push(edge);
+    } else {
+      outgoingBySource.set(edge.sourceId, [edge]);
+    }
+  }
+
+  const index: GraphAdjacencyIndex = { nodeById, incomingByTarget, outgoingBySource };
+  graphAdjacencyIndexCache.set(graph, index);
+  return index;
+}
+
 export function buildGraph(
   workspace: WorkspaceSnapshot,
   index: IndexResult,
@@ -254,23 +318,25 @@ export function buildGraph(
 }
 
 export function getIncomingNeighbors(graph: GraphState, nodeId: string): GraphNode[] {
-  const sourceIds = graph.edges.filter((edge) => edge.targetId === nodeId).map((edge) => edge.sourceId);
-  const sourceSet = new Set(sourceIds);
-  return graph.nodes.filter((node) => sourceSet.has(node.id));
+  const index = getAdjacencyIndex(graph);
+  const edges = index.incomingByTarget.get(nodeId) ?? [];
+  const sourceSet = new Set(edges.map((edge) => edge.sourceId));
+  return Array.from(sourceSet, (id) => index.nodeById.get(id)).filter((node): node is GraphNode => Boolean(node));
 }
 
 export function getOutgoingNeighbors(graph: GraphState, nodeId: string): GraphNode[] {
-  const targetIds = graph.edges.filter((edge) => edge.sourceId === nodeId).map((edge) => edge.targetId);
-  const targetSet = new Set(targetIds);
-  return graph.nodes.filter((node) => targetSet.has(node.id));
+  const index = getAdjacencyIndex(graph);
+  const edges = index.outgoingBySource.get(nodeId) ?? [];
+  const targetSet = new Set(edges.map((edge) => edge.targetId));
+  return Array.from(targetSet, (id) => index.nodeById.get(id)).filter((node): node is GraphNode => Boolean(node));
 }
 
 export function getIncomingEdges(graph: GraphState, nodeId: string): GraphEdge[] {
-  return graph.edges.filter((edge) => edge.targetId === nodeId);
+  return getAdjacencyIndex(graph).incomingByTarget.get(nodeId) ?? [];
 }
 
 export function getOutgoingEdges(graph: GraphState, nodeId: string): GraphEdge[] {
-  return graph.edges.filter((edge) => edge.sourceId === nodeId);
+  return getAdjacencyIndex(graph).outgoingBySource.get(nodeId) ?? [];
 }
 
 export function getNeighborsByEdgeType(
@@ -279,11 +345,11 @@ export function getNeighborsByEdgeType(
   edgeType: GraphRelationType,
   direction: "incoming" | "outgoing",
 ): GraphNode[] {
-  const matchingEdges = graph.edges.filter((edge) =>
-    direction === "incoming" ? edge.type === edgeType && edge.targetId === nodeId : edge.type === edgeType && edge.sourceId === nodeId,
-  );
+  const index = getAdjacencyIndex(graph);
+  const candidateEdges = direction === "incoming" ? index.incomingByTarget.get(nodeId) : index.outgoingBySource.get(nodeId);
+  const matchingEdges = (candidateEdges ?? []).filter((edge) => edge.type === edgeType);
   const ids = new Set(matchingEdges.map((edge) => (direction === "incoming" ? edge.sourceId : edge.targetId)));
-  return graph.nodes.filter((node) => ids.has(node.id));
+  return Array.from(ids, (id) => index.nodeById.get(id)).filter((node): node is GraphNode => Boolean(node));
 }
 
 export function getNodesByKind(graph: GraphState, kind: GraphNodeKind): GraphNode[] {
@@ -291,7 +357,7 @@ export function getNodesByKind(graph: GraphState, kind: GraphNodeKind): GraphNod
 }
 
 export function getNodeById(graph: GraphState, nodeId: string): GraphNode | undefined {
-  return graph.nodes.find((node) => node.id === nodeId);
+  return getAdjacencyIndex(graph).nodeById.get(nodeId);
 }
 
 export function getEdgesByType(graph: GraphState, edgeType: GraphRelationType): GraphEdge[] {
@@ -305,13 +371,12 @@ export function getModuleSubgraph(graph: GraphState, moduleLabel: string): Graph
     return [];
   }
 
+  const index = getAdjacencyIndex(graph);
   const directIds = new Set<string>([moduleNode.id]);
 
-  for (const edge of graph.edges) {
-    if (edge.sourceId === moduleNode.id || edge.targetId === moduleNode.id) {
-      directIds.add(edge.sourceId);
-      directIds.add(edge.targetId);
-    }
+  for (const edge of [...(index.incomingByTarget.get(moduleNode.id) ?? []), ...(index.outgoingBySource.get(moduleNode.id) ?? [])]) {
+    directIds.add(edge.sourceId);
+    directIds.add(edge.targetId);
   }
 
   return graph.nodes.filter((node) => directIds.has(node.id));
@@ -324,7 +389,8 @@ export function getModuleRelations(graph: GraphState, moduleLabel: string): Grap
     return [];
   }
 
-  return graph.edges.filter((edge) => edge.sourceId === moduleNode.id || edge.targetId === moduleNode.id);
+  const index = getAdjacencyIndex(graph);
+  return [...(index.incomingByTarget.get(moduleNode.id) ?? []), ...(index.outgoingBySource.get(moduleNode.id) ?? [])];
 }
 
 export function getModuleRelationSummary(
@@ -337,8 +403,9 @@ export function getModuleRelationSummary(
     return [];
   }
 
-  return graph.edges
-    .filter((edge) => edge.type === "DEPENDS_ON" && (edge.sourceId === moduleNode.id || edge.targetId === moduleNode.id))
+  const index = getAdjacencyIndex(graph);
+  return [...(index.incomingByTarget.get(moduleNode.id) ?? []), ...(index.outgoingBySource.get(moduleNode.id) ?? [])]
+    .filter((edge) => edge.type === "DEPENDS_ON")
     .map((edge) => {
       const direction = edge.sourceId === moduleNode.id ? "outgoing" : "incoming";
       const targetId = direction === "outgoing" ? edge.targetId : edge.sourceId;
@@ -396,22 +463,25 @@ export function getStructuralNeighbors(
 ): GraphNode[] {
   const allowed = new Set(relationTypes);
   const neighborIds = new Set<string>();
+  const index = getAdjacencyIndex(graph);
 
-  for (const edge of graph.edges) {
-    if (!allowed.has(edge.type)) {
-      continue;
-    }
-
-    if ((direction === "incoming" || direction === "both") && edge.targetId === nodeId) {
-      neighborIds.add(edge.sourceId);
-    }
-
-    if ((direction === "outgoing" || direction === "both") && edge.sourceId === nodeId) {
-      neighborIds.add(edge.targetId);
+  if (direction === "incoming" || direction === "both") {
+    for (const edge of index.incomingByTarget.get(nodeId) ?? []) {
+      if (allowed.has(edge.type)) {
+        neighborIds.add(edge.sourceId);
+      }
     }
   }
 
-  return graph.nodes.filter((node) => neighborIds.has(node.id));
+  if (direction === "outgoing" || direction === "both") {
+    for (const edge of index.outgoingBySource.get(nodeId) ?? []) {
+      if (allowed.has(edge.type)) {
+        neighborIds.add(edge.targetId);
+      }
+    }
+  }
+
+  return Array.from(neighborIds, (id) => index.nodeById.get(id)).filter((node): node is GraphNode => Boolean(node));
 }
 
 export function traverseGraph(
@@ -423,6 +493,7 @@ export function traverseGraph(
   const allowed = new Set(relationTypes);
   const visited = new Set<string>(startingNodeIds);
   const queue = startingNodeIds.map((nodeId) => ({ nodeId, depth: 0 }));
+  const index = getAdjacencyIndex(graph);
 
   while (queue.length > 0) {
     const current = queue.shift();
@@ -431,7 +502,12 @@ export function traverseGraph(
       continue;
     }
 
-    for (const edge of graph.edges) {
+    const adjacentEdges = [
+      ...(index.incomingByTarget.get(current.nodeId) ?? []),
+      ...(index.outgoingBySource.get(current.nodeId) ?? []),
+    ];
+
+    for (const edge of adjacentEdges) {
       if (!allowed.has(edge.type)) {
         continue;
       }
@@ -470,66 +546,64 @@ export function getFileOwnedSymbols(graph: GraphState, fileId: string): GraphNod
   return getNeighborsByEdgeType(graph, fileId, "DECLARES", "outgoing");
 }
 
+const FILE_DEPENDENCY_EDGE_TYPES = new Set(["IMPORTS", "REFERENCES", "CALLS", "USES", "READS", "WRITES", "CREATES"]);
+
 export function getFileDependencies(graph: GraphState, fileId: string): GraphNode[] {
   const ownedSymbols = getFileOwnedSymbols(graph, fileId);
   const dependencyIds = new Set<string>();
+  const index = getAdjacencyIndex(graph);
+  const fileFilePath = index.nodeById.get(fileId)?.filePath;
 
   for (const symbol of ownedSymbols) {
     for (const dependency of getSymbolDependencies(graph, symbol.id)) {
-      if (dependency.filePath && dependency.filePath !== getNodeById(graph, fileId)?.filePath) {
+      if (dependency.filePath && dependency.filePath !== fileFilePath) {
         dependencyIds.add(dependency.id);
       }
     }
   }
 
-  for (const edge of graph.edges) {
-    if (edge.sourceId !== fileId) {
+  for (const edge of index.outgoingBySource.get(fileId) ?? []) {
+    if (!FILE_DEPENDENCY_EDGE_TYPES.has(edge.type)) {
       continue;
     }
 
-    if (!["IMPORTS", "REFERENCES", "CALLS", "USES", "READS", "WRITES", "CREATES"].includes(edge.type)) {
-      continue;
-    }
+    const targetNode = index.nodeById.get(edge.targetId);
 
-    const targetNode = getNodeById(graph, edge.targetId);
-
-    if (targetNode?.filePath && targetNode.filePath !== getNodeById(graph, fileId)?.filePath) {
+    if (targetNode?.filePath && targetNode.filePath !== fileFilePath) {
       dependencyIds.add(targetNode.id);
     }
   }
 
-  return graph.nodes.filter((node) => dependencyIds.has(node.id));
+  return Array.from(dependencyIds, (id) => index.nodeById.get(id)).filter((node): node is GraphNode => Boolean(node));
 }
 
 export function getFileDependents(graph: GraphState, fileId: string): GraphNode[] {
   const ownedSymbols = getFileOwnedSymbols(graph, fileId);
   const dependentIds = new Set<string>();
+  const index = getAdjacencyIndex(graph);
+  const fileFilePath = index.nodeById.get(fileId)?.filePath;
 
   for (const symbol of ownedSymbols) {
     for (const dependent of getSymbolDependents(graph, symbol.id)) {
-      if (dependent.filePath && dependent.filePath !== getNodeById(graph, fileId)?.filePath) {
+      if (dependent.filePath && dependent.filePath !== fileFilePath) {
         dependentIds.add(dependent.id);
       }
     }
   }
 
-  for (const edge of graph.edges) {
-    if (edge.targetId !== fileId) {
+  for (const edge of index.incomingByTarget.get(fileId) ?? []) {
+    if (!FILE_DEPENDENCY_EDGE_TYPES.has(edge.type)) {
       continue;
     }
 
-    if (!["IMPORTS", "REFERENCES", "CALLS", "USES", "READS", "WRITES", "CREATES"].includes(edge.type)) {
-      continue;
-    }
+    const sourceNode = index.nodeById.get(edge.sourceId);
 
-    const sourceNode = getNodeById(graph, edge.sourceId);
-
-    if (sourceNode?.filePath && sourceNode.filePath !== getNodeById(graph, fileId)?.filePath) {
+    if (sourceNode?.filePath && sourceNode.filePath !== fileFilePath) {
       dependentIds.add(sourceNode.id);
     }
   }
 
-  return graph.nodes.filter((node) => dependentIds.has(node.id));
+  return Array.from(dependentIds, (id) => index.nodeById.get(id)).filter((node): node is GraphNode => Boolean(node));
 }
 
 export function getSymbolDependencies(graph: GraphState, symbolId: string): GraphNode[] {

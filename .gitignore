@@ -18,3 +18,4 @@ test_img/
 
 *.log
 dump_*.sql
+*.tsbuildinfo

@@ -334,7 +334,11 @@ export interface ScoredReference {
   // applyPriorTurnEvidence в packages/research) — в отличие от "recalled" это
   // не долговременный факт о проекте, а evidence, которое было релевантно
   // именно предыдущему вопросу в этом же треде.
-  origin: "baseline" | "overlay" | "structural" | "recalled" | "conversation";
+  // "business-graph" - corroborated by a non-stale, critic-approved Observer
+  // crawl of the same unit (see packages/knowledge's BusinessGraphEntry) -
+  // distinct from "recalled" (Fact Store) because it's a whole-unit
+  // narrative summary, not a single verified statement.
+  origin: "baseline" | "overlay" | "structural" | "recalled" | "conversation" | "business-graph";
   originDetails?: string;
   reinforcedByFactIds?: string[];
 }
@@ -722,6 +726,14 @@ export interface ValidationPacket {
     hasLocalChanges: boolean;
     changedFileCount: number;
   };
+  // 2026-07-24: business_graph_entries that corroborate THIS run's evidence
+  // (matched by unit path / structural anchor overlap, already filtered to
+  // non-stale + critic-approved by the caller). Previously the validator
+  // never saw gotcha/Observer memory at all - a correct answer backed by
+  // solid project memory could still get scored "insufficient-evidence"
+  // because the deterministic/LLM validator only ever looked at this run's
+  // own symbol-graph evidence.
+  businessGraphSignals: Array<{ unitPath: string; text: string; confidence: number }>;
   priorActions: ValidationRecommendedAction[];
   remainingIterationBudget: number;
 }

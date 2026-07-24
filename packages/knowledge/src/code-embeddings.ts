@@ -58,10 +58,18 @@ export async function upsertCodeEmbedding(input: UpsertCodeEmbeddingInput): Prom
     // reads now. Written from the same JSON text form the jsonb column uses,
     // so both columns are always in sync from one input.
     const embeddingJson = JSON.stringify(input.embedding);
+    // 2026-07-24: reusing $5 for both ::jsonb and ::vector casts fails with
+    // "cannot cast type jsonb to vector" (pg 42846) - node-postgres binds a
+    // parameter's type from its first cast, so the second cast tries to
+    // convert the already-jsonb-typed value straight to vector, which
+    // Postgres does not support. A literal-string repro of the same SQL
+    // works fine (no bound-parameter typing involved), which is why this
+    // silently passed a raw-SQL sanity check. Passing the JSON text as two
+    // separate parameters avoids the conflict entirely.
     await runSql(
       `
         insert into code_embeddings (id, project_root_path, file_path, content_hash, embedding, embedding_vec, role, updated_at)
-        values ($1, $2, $3, $4, $5::jsonb, $5::vector, $6, $7)
+        values ($1, $2, $3, $4, $5::jsonb, $8::vector, $6, $7)
         on conflict (id) do update set
           content_hash = excluded.content_hash,
           embedding = excluded.embedding,
@@ -69,7 +77,7 @@ export async function upsertCodeEmbedding(input: UpsertCodeEmbeddingInput): Prom
           role = excluded.role,
           updated_at = excluded.updated_at
       `,
-      [id, input.projectRootPath, input.filePath, input.contentHash, embeddingJson, input.role, new Date().toISOString()],
+      [id, input.projectRootPath, input.filePath, input.contentHash, embeddingJson, input.role, new Date().toISOString(), embeddingJson],
     );
   } catch (error) {
     console.warn("[code-embeddings] upsertCodeEmbedding failed:", error);

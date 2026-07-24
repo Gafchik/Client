@@ -64,6 +64,8 @@ export interface ObserverEntryRef {
   unitPath: string;
   /** Full text (summary + mechanisms + gotchas) the researcher was actually shown for this entry - what the Critic compares the final answer against. */
   text: string;
+  /** BusinessGraphEntry.confidence at crawl time (2026-07-24) - lets downstream consumers (e.g. the validator's evidence scoring) gate on "was this crawl genuinely critic-approved" without a second DB round-trip. */
+  confidence: number;
 }
 
 export interface AgenticRunOptions {

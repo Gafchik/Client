@@ -78,6 +78,13 @@ interface BuildAnswerInput {
   usage?: ProviderUsageAccumulator;
 }
 
+/** Minimal shape needed from an ObserverEntryRef (packages/agentic-research) - kept local instead of importing that package, to avoid a new cross-package dependency for what's just three fields. */
+interface BusinessGraphSignalInput {
+  unitPath: string;
+  text: string;
+  confidence: number;
+}
+
 interface BuildValidationPacketInput {
   runId: string;
   task: string;
@@ -90,6 +97,8 @@ interface BuildValidationPacketInput {
   iteration: number;
   priorActions: ValidationRecommendedAction[];
   remainingIterationBudget: number;
+  /** Business-graph entries already surfaced to the Researcher/answer stage this run (buildObserverHintSuffix) - passed through so the validator can also count them as evidence instead of only ever seeing this run's own symbol-graph evidence. */
+  businessGraphSignals?: BusinessGraphSignalInput[] | undefined;
 }
 
 interface ValidateEvidenceInput {
@@ -105,6 +114,7 @@ interface BuildValidatedAnswerPacketInput {
   questionType: string;
   validation: ValidationResult;
   research: ResearchReport;
+  businessGraphSignals?: BusinessGraphSignalInput[] | undefined;
 }
 
 interface ProviderChatResponse {
@@ -250,6 +260,22 @@ export function buildValidationPacket(input: BuildValidationPacketInput): Valida
     ]),
   ).slice(0, 8);
 
+  // Only count a business-graph entry as evidence if it actually corroborates
+  // something THIS run already found (unit path overlaps a real evidence
+  // file/anchor) and the crawl was genuinely critic-approved (>=65 mirrors
+  // this codebase's own "trustworthy origin" threshold, see facts.ts's
+  // isTrustworthyOrigin) - otherwise a stale or low-confidence Observer guess
+  // could inflate readiness for evidence that isn't really there.
+  const evidencePaths = input.research.evidence.map((item) => item.filePath?.toLowerCase() ?? "").filter(Boolean);
+  const anchorTexts = structuralAnchors.map((anchor) => anchor.toLowerCase());
+  const businessGraphSignals = (input.businessGraphSignals ?? []).filter((signal) => {
+    if (signal.confidence < 65) {
+      return false;
+    }
+    const unitTokens = signal.unitPath.toLowerCase().split(/[\\/]/).filter(Boolean);
+    return unitTokens.some((token) => evidencePaths.some((path) => path.includes(token)) || anchorTexts.some((anchor) => anchor.includes(token)));
+  });
+
   return {
     packetId: stableId(["validation-packet", input.runId, input.iteration]),
     runId: input.runId,
@@ -288,6 +314,7 @@ export function buildValidationPacket(input: BuildValidationPacketInput): Valida
           },
         }
       : {}),
+    businessGraphSignals,
     priorActions: input.priorActions,
     remainingIterationBudget: input.remainingIterationBudget,
   };
@@ -1451,14 +1478,21 @@ export function buildValidatedAnswerPacket(input: BuildValidatedAnswerPacketInpu
         .map((gap) => gap.label),
       ...input.validation.missingConfirmations.slice(0, 2),
     ].slice(0, 4),
-    validatedEvidence: applyPrimaryEvidenceOrder(input.research.evidence, input.validation.primaryEvidenceLabel)
-      .slice(0, 6)
-      .map((item) => ({
-        label: item.label,
-        ...(item.filePath ? { filePath: item.filePath } : {}),
-        reason: item.reason,
-        origin: item.origin,
+    validatedEvidence: [
+      ...applyPrimaryEvidenceOrder(input.research.evidence, input.validation.primaryEvidenceLabel)
+        .slice(0, 6)
+        .map((item) => ({
+          label: item.label,
+          ...(item.filePath ? { filePath: item.filePath } : {}),
+          reason: item.reason,
+          origin: item.origin,
+        })),
+      ...(input.businessGraphSignals ?? []).slice(0, 2).map((signal) => ({
+        label: signal.unitPath,
+        reason: signal.text,
+        origin: "business-graph" as const,
       })),
+    ],
     validatorRationale: input.validation.rationale,
   };
 }
@@ -2283,6 +2317,12 @@ function computeEvidenceQualityScore(packet: ValidationPacket): number {
     packet.questionType === "existence" && highScoreEvidence >= 2 && fileAnchors >= 2
       ? 8
       : 0;
+  // Corroborating, critic-approved project memory is real evidence too - a
+  // question this run's own symbol-graph evidence covers thinly can still be
+  // well-grounded if a fresh Observer crawl of the same unit backs it up.
+  // Capped so this can nudge readiness across a threshold but never carry a
+  // run on memory alone.
+  const businessGraphBoost = Math.min(packet.businessGraphSignals.length, 3) * 7;
 
   return (
     highScoreEvidence * 8
@@ -2292,6 +2332,7 @@ function computeEvidenceQualityScore(packet: ValidationPacket): number {
     + flowQuestionBoost
     + locationQuestionBoost
     + existenceQuestionBoost
+    + businessGraphBoost
   );
 }
 
@@ -2384,8 +2425,12 @@ function buildValidationGaps(
 ): ValidationResult["gaps"] {
   const gaps: ValidationResult["gaps"] = [];
   const normalizedTask = packet.task.toLowerCase();
+  // A corroborating, critic-approved Observer crawl of the same unit already
+  // answers "is there a real anchor/entry point here" - don't flag a gap the
+  // project's own memory already closes.
+  const hasBusinessGraphCoverage = packet.businessGraphSignals.length > 0;
 
-  if (packet.evidenceHighlights.length < 2) {
+  if (packet.evidenceHighlights.length < 2 && !hasBusinessGraphCoverage) {
     gaps.push({
       id: stableId(["validation-gap", packet.runId, packet.iteration, "evidence-count"]),
       label: "Недостаточно сильных evidence anchors.",
@@ -2412,7 +2457,7 @@ function buildValidationGaps(
     });
   }
 
-  if (packet.questionType === "flow" && packet.graphCoverage.entryPointCount === 0) {
+  if (packet.questionType === "flow" && packet.graphCoverage.entryPointCount === 0 && !hasBusinessGraphCoverage) {
     gaps.push({
       id: stableId(["validation-gap", packet.runId, packet.iteration, "entrypoint"]),
       label: "Не найдены явные entry points для flow-вопроса.",
@@ -2445,16 +2490,17 @@ function buildValidationGaps(
 function buildMissingConfirmations(packet: ValidationPacket): string[] {
   const confirmations: string[] = [];
   const normalizedTask = packet.task.toLowerCase();
+  const hasBusinessGraphCoverage = packet.businessGraphSignals.length > 0;
 
-  if (packet.questionType === "configuration" && normalizedTask.includes("locale")) {
+  if (packet.questionType === "configuration" && normalizedTask.includes("locale") && !hasBusinessGraphCoverage) {
     confirmations.push("Не хватает явного подтверждения runtime locale chain через middleware/config.");
   }
 
-  if (packet.questionType === "existence" && normalizedTask.includes("oauth")) {
+  if (packet.questionType === "existence" && normalizedTask.includes("oauth") && !hasBusinessGraphCoverage) {
     confirmations.push("Не хватает прямого подтверждения route/controller/provider chain для OAuth.");
   }
 
-  if (packet.questionType === "flow" && packet.graphCoverage.entryPointCount === 0) {
+  if (packet.questionType === "flow" && packet.graphCoverage.entryPointCount === 0 && !hasBusinessGraphCoverage) {
     confirmations.push("Не хватает подтверждённого entry point для начала flow.");
   }
 
@@ -2684,6 +2730,7 @@ function buildValidationPrompt(packet: ValidationPacket): string {
     `Structural anchors: ${packet.structuralAnchors.join(" | ") || "(none)"}`,
     `Evidence: ${packet.evidenceHighlights.map((item) => `${item.label} :: ${item.reason} :: ${item.filePath ?? "?"} :: ${item.origin}`).join(" | ") || "(none)"}`,
     `Graph coverage: nodes=${packet.graphCoverage.nodeCount}, edges=${packet.graphCoverage.edgeCount}, anchors=${packet.graphCoverage.relevantAnchorCount}, entryPoints=${packet.graphCoverage.entryPointCount}`,
+    `Business-graph signals (prior, critic-approved Observer crawls corroborating this unit - treat as real evidence, not a mere hint): ${packet.businessGraphSignals.map((s) => `${s.unitPath} (confidence ${s.confidence}) :: ${s.text}`).join(" | ") || "(none)"}`,
     `Diagnostics: ${packet.diagnostics.join(" | ") || "(none)"}`,
     packet.backgroundState
       ? `Background: freshness=${packet.backgroundState.freshness}, baselineSource=${packet.backgroundState.baselineSource}, localChanges=${packet.backgroundState.hasLocalChanges}, changedFiles=${packet.backgroundState.changedFileCount}`
