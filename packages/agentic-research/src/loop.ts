@@ -589,9 +589,28 @@ function parseActions(content: string): ParsedAction[] {
     searchFrom = closeParenIndex + 1;
   }
 
-  // Whether final_answer came first, last, or mixed in - it wins alone.
+  // Bug fix (2026-07-24, live incident): used to let final_answer "win
+  // alone" regardless of position - fine when it's the model's only move
+  // this turn, but the loop's own scan above stops right after the first
+  // final_answer it sees, so a NON-zero index means other real ACTION calls
+  // came first in this SAME response. Confirmed live with claude-sonnet-4.6:
+  // it would emit real ACTION lines, then - without waiting for the actual
+  // OBSERVATION (which does not exist yet at generation time) - continue in
+  // the same completion with fabricated "results" and a final_answer built
+  // on them. Trusting that final_answer discarded the genuine earlier
+  // actions and fed the model's own hallucination back as if it were a real
+  // answer, which is exactly what caused a 25-turn stuck loop that never
+  // read more than one real file. If final_answer isn't the very first
+  // action, treat it as unearned: drop it and execute only the genuine
+  // actions that preceded it, so the model gets REAL observations before
+  // it's allowed to conclude.
   const finalAnswerIndex = actions.findIndex((action) => action.tool === "final_answer");
-  return finalAnswerIndex === -1 ? actions : [actions[finalAnswerIndex] as ParsedAction];
+
+  if (finalAnswerIndex === -1) {
+    return actions;
+  }
+
+  return finalAnswerIndex === 0 ? [actions[0] as ParsedAction] : actions.slice(0, finalAnswerIndex);
 }
 
 async function callCritic(input: {
