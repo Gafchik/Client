@@ -438,6 +438,16 @@ export const REVIEWER_SYSTEM_PROMPT = [
   // a general expectation of what code like this usually needs. If you are
   // not certain the diff you can actually see supports the finding, do not
   // write it.",
+  // 2026-07-25: the Developer already sees this same project memory
+  // (confirmed facts + Observer-crawl gotchas) while writing the diff -
+  // previously the Reviewer never did, so it had no way to catch a diff
+  // that quietly breaks a known project-specific invariant (e.g. "cases
+  // auto-link by SSN+name+DOB, don't drop that check without updating the
+  // callers that rely on it"). Placed last in priority: it is a LEAD from a
+  // prior scan, not verified ground truth like the diff/journal/impact data
+  // above - only escalate it to a BLOCKER if you can point at the actual
+  // diff text that contradicts it, never on the hint's wording alone.
+  "(8) If project memory (confirmed facts / Observer gotchas) is given below, check whether the diff appears to violate a specific stated invariant or gotcha from it - but treat that memory as a lead to verify against the actual diff, not a confirmed fact on its own; only raise it as a BLOCKER if the diff itself visibly contradicts it.",
   "Reply STRICTLY in this format: either the single word \"APPROVED\", or \"NEEDS_CHANGES:\" followed by a numbered list of findings IN RUSSIAN, one finding per number, each starting with either \"BLOCKER:\" or \"NOTE:\".",
 ].join("\n");
 
@@ -876,6 +886,18 @@ async function callReviewer(input: {
   diffUnchangedSinceLastReview?: boolean;
   /** Deterministic pattern-scan findings (see security-scan.ts) - evidence handed to the Reviewer, not an auto-block; the Reviewer still judges each as real or a false positive. */
   securityFindings?: string[];
+  /**
+   * Confirmed facts/glossary + Observer gotchas for the touched project(s) -
+   * the SAME memory channel the Developer already sees (DevelopRunOptions.
+   * knownFactsHint/observerHint), previously never threaded through to the
+   * Reviewer at all (2026-07-25 fix). Without this the safety-net role had
+   * no way to know "this silently auto-links cases by SSN+name+DOB" or
+   * similar project-specific gotchas, and could approve a diff that quietly
+   * breaks one - only the Developer, who isn't the one deciding pass/fail,
+   * ever had this context.
+   */
+  knownFactsHint?: string;
+  observerHint?: string;
 }): Promise<{ round: DevelopReviewRound | null; promptTokens: number; completionTokens: number; unavailableReason?: string }> {
   const boundedDiff = input.diff.length > MAX_REVIEW_DIFF_CHARS
     ? `${input.diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n... (diff truncated at ${MAX_REVIEW_DIFF_CHARS} chars - flag this if the visible part alone cannot justify approval)`
@@ -948,6 +970,15 @@ async function callReviewer(input: {
               ...input.securityFindings,
             ]
           : []),
+        // The Developer already saw this same project memory while writing
+        // the diff below - giving it to you too closes the gap where the
+        // only role that can actually catch a violation of a known project
+        // gotcha (silent side effects, non-obvious invariants) never knew
+        // the gotcha existed. Same caveat as it carries for the Developer:
+        // a lead from a prior scan, not a confirmed fact - verify against
+        // the actual diff, don't block on the hint's wording alone.
+        ...(input.observerHint ? ["", input.observerHint] : []),
+        ...(input.knownFactsHint ? ["", input.knownFactsHint] : []),
         "",
         "Unified diff of the change:",
         boundedDiff,
@@ -1321,6 +1352,8 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ...(reviews.length > 0 ? { priorRound: reviews[reviews.length - 1] } : {}),
       ...(reviews.length > 0 && summary ? { authorDisputeSummary: summary } : {}),
       ...(options.computeFindingSimilarity ? { computeFindingSimilarity: options.computeFindingSimilarity } : {}),
+      ...(options.knownFactsHint ? { knownFactsHint: options.knownFactsHint } : {}),
+      ...(options.observerHint ? { observerHint: options.observerHint } : {}),
       diffUnchangedSinceLastReview,
     });
     lastReviewedDiff = latestDiff;
