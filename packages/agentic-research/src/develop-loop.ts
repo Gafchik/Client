@@ -31,7 +31,16 @@ import {
 // edit_file recovery, concrete block example) came FIRST and is what makes
 // raising this defensible today, not a substitute for it.
 const DEFAULT_DEVELOP_CEILING_TURNS = 90;
-const DEVELOP_TOKEN_SAFETY_LIMIT = 950_000;
+// Raised 950K -> 1.6M (2026-07-26, live evidence): two separate real tasks
+// (a 9-file consent flow, a 7-file bill-status invariant) both hit this
+// ceiling before ever reaching task_complete - NOT because the work itself
+// was too large, but because HISTORY_COMPACT_TRIGGER_MESSAGES (50) never
+// fired before the abort (a 20-22 turn run stays under 50 messages). Lowered
+// that trigger too (see below) so compaction now actually engages on
+// exactly this class of task; this higher ceiling is the remaining margin
+// for genuinely large changes even with compaction active, not a
+// replacement for fixing the trigger.
+const DEVELOP_TOKEN_SAFETY_LIMIT = 1_600_000;
 // Live evidence (iteration 4, 2026-07-18): 14 FORMAT_ERROR incidents, almost
 // all on real ~500-600 line Vue SFCs (SshTab.vue, AddEditServerDialog.vue) -
 // logs showed the SEARCH block parsed fine but the REPLACE/CONTENT block's
@@ -372,8 +381,30 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
     "",
     "How to work:",
     "1. STUDY BEFORE WRITING, ACTIVELY, NOT JUST BY LUCK OF GREP. Before implementing anything, explicitly look for whether this project ALREADY has a mechanism for this kind of thing" + (hasSemanticSearch ? " - semantic_search is often the right tool for this (it finds by MEANING: e.g. search \"default records created for a new X\" or \"clone template data for new entity\", not just the task's literal words)" : "") + ". Find 2-3 places where this project already does something similar and read them - then write YOUR change in the same style, same naming, same patterns, same error handling, REUSING an existing mechanism (a shared method/hook/utility) instead of writing a new parallel one when one already exists. Code that reinvents what the codebase already has is wrong even when it runs - it is technical debt from the moment it is written.",
+    // Live evidence (2026-07-25): a task that gates an EXISTING user-facing
+    // flow (adding a consent step before an existing "add device" action)
+    // got implemented by reading generically-similar files (a couple of
+    // unrelated consent/agreement models) but NEVER the actual flow being
+    // gated (the add-device controller/routes) - the resulting code was
+    // syntactically fine but structurally disconnected from the real
+    // integration point, exactly what a senior developer who actually
+    // traced the flow first would not produce. Instruction 1 above (find
+    // SIMILAR code) is not the same check as this one (find the EXACT
+    // mechanism this task touches) - both are required, they answer
+    // different questions.
+    "1b. If the task modifies, gates, or inserts a step into an EXISTING user-facing flow (a button, an endpoint, a process the task describes as already happening) - find and read THAT EXACT flow end-to-end (the real route/controller/handler involved, not just something thematically similar) before deciding your approach. \"I found a similar-sounding model\" is not the same as \"I traced the actual code path this task changes\" - do the second one specifically, every time the task references existing behavior.",
+    // Live evidence (2026-07-25, same task): the codebase already had a
+    // container for exactly this domain (Sms/) - the model had ALREADY READ
+    // its controller and routes this same run - and still created a brand
+    // new sibling container instead of extending it, with no stated reason
+    // either way. This is a structural decision, not a style preference:
+    // instruction 2's find_references check only fires for changing
+    // EXISTING signatures/behavior, never for "should this new code live in
+    // an existing module" - nothing else in this prompt ever asked that
+    // question explicitly, so it silently never got asked.
+    "1c. Before creating a new top-level module/container/directory, list_dir the parent directory it would live in and check whether an existing sibling already owns this domain (by name or by content you already read). If one does, extend it by default - creating a new one next to an obviously-related existing one needs a stated reason in your plan (step 3 below), not just being possible. Reusing an existing container's structure (even if it means the new code is not perfectly separated) beats a cleaner-looking new module that fragments one feature area across two places.",
     `2. BEFORE CHANGING WHAT ALREADY EXISTS - never break an existing caller. Before you edit the BODY or SIGNATURE of a function/method that other code might call, or before you rename/remove/move anything existing,${hasFindReferences ? " use find_references(name) to see its real callers/dependents" : " grep_content for its name to see where else it is used"} and make sure your change keeps them working (or update them too, if that is genuinely required and still in scope). State in your task_complete summary which existing callers you checked for anything you changed rather than purely added - \"I did not check\" is an honest thing to write if true, but silently not checking is not.`,
-    "3. STATE A SHORT PLAN before your first write_file/edit_file (a few sentences in your own reasoning text, not a separate tool call): which files need to change and why, which existing pattern from step 1 you are reusing (if any), and explicitly - does this task need a DATABASE MIGRATION/schema change? A feature that adds or reads a new field/column/table needs a real migration in this same task, not just application code that silently assumes the column exists - code referencing a column with no migration creating it is broken, not done. If there is a real, non-obvious choice between two reasonable ways to implement this (not a trivial choice with one obvious answer), name it and say which you picked and why - the safer/more consistent one wins over the cleverer one. Getting this right BEFORE writing code prevents discovering a missing piece late, when budget is tight.",
+    "3. STATE A SHORT PLAN before your first write_file/edit_file (a few sentences in your own reasoning text, not a separate tool call): which files need to change and why, which existing pattern from step 1 you are reusing (if any), which existing flow you traced end-to-end per 1b (if the task touches one), and which existing container/module you are extending per 1c (or, if you are creating a new one, the specific reason an existing sibling was not the right fit - not just \"this feels cleaner\"). Also state explicitly - does this task need a DATABASE MIGRATION/schema change? A feature that adds or reads a new field/column/table needs a real migration in this same task, not just application code that silently assumes the column exists - code referencing a column with no migration creating it is broken, not done. If there is a real, non-obvious choice between two reasonable ways to implement this (not a trivial choice with one obvious answer), name it and say which you picked and why - the safer/more consistent one wins over the cleverer one. Getting this right BEFORE writing code prevents discovering a missing piece late, when budget is tight.",
     "4. Read a file (read_file) before editing it - edit_file requires an exact match of existing content, guessing will just bounce.",
     "5. IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet, list_dir it first - a neighboring file may be the real place to change.",
     "6. Keep the change minimal and coherent: implement what the task asks, do not refactor unrelated code, do not add features nobody asked for. Do not add error handling, validation, or defensive checks for scenarios that cannot happen given how this code is actually called - trust the surrounding code's own guarantees the same way it already does. Do not introduce a new abstraction (helper/base class/interface/config flag) for something that only has one or two call sites today - three similar lines beats a premature abstraction. If you must touch a file whose connection to the task is not obvious, say why in your summary.",
@@ -1192,7 +1223,15 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   // needs an old file's current content just re-reads it (same recovery
   // path the stuck-detector already relies on).
   const seedMessageCount = messages.length;
-  const HISTORY_COMPACT_TRIGGER_MESSAGES = 50;
+  // Lowered 50 -> 24 (2026-07-26, live evidence): each turn adds ~2 messages,
+  // so 50 meant compaction never engaged before turn ~25 - both real runs
+  // that hit DEVELOP_TOKEN_SAFETY_LIMIT aborted at turn 20-22, UNDER that
+  // threshold, meaning compaction had literally never fired for either of
+  // them. 24 engages around turn ~12, while HISTORY_KEEP_RECENT_MESSAGES
+  // (~12 turns of raw context) still comfortably covers the "just re-read
+  // this file, remember what I was just doing" continuity window the
+  // stuck-detector and edit_file's own recovery path already rely on.
+  const HISTORY_COMPACT_TRIGGER_MESSAGES = 24;
   const HISTORY_KEEP_RECENT_MESSAGES = 24;
   let historyCompactionMessageIndex = -1;
 
