@@ -37,17 +37,19 @@ interface ObserverRunner {
   /** Set once a full pass finds nothing stale; cleared the moment HEAD moves. */
   resting: boolean;
   /**
-   * Per-unit backoff state (2026-07-19 full-project review fix): a unit that
-   * hits max_turns/error/an empty-content final_answer used to be treated
-   * identically to a real success - no idle sleep, and since unit selection
-   * always picks the FIRST non-fresh unit in worklist order, the exact same
-   * hard-to-crawl unit got re-selected and re-crawled (a fresh 40-turn LLM
-   * run) on literally the next loop iteration, forever - permanently
-   * starving every other unit in the worklist while burning budget. Tracked
-   * per runner (per project), not globally, and cleared the moment a unit
-   * genuinely completes with real content.
+   * Units that failed (or didn't converge) to a real final_answer during
+   * THIS pass through the worklist - never persisted to business_graph_entries
+   * at all (2026-07-25: a failed crawl used to be written as an empty/
+   * placeholder row just so isStale would force a retry later, cluttering
+   * the table with rows carrying no real content). In-memory only, per
+   * runner (per project), cleared once every stale unit has been attempted
+   * (a fresh pass) - this is what prevents the SAME hard-to-crawl unit from
+   * being re-selected on literally the next loop iteration forever
+   * (2026-07-19's original starvation bug), without needing any DB state or
+   * timestamp-based backoff: a failure just moves this unit to the back of
+   * the current pass instead of hogging every cycle.
    */
-  retryState: Map<string, { failureCount: number; nextRetryAt: number }>;
+  attemptedThisPass: Set<string>;
   /**
    * Resolves once THIS runner's own loop has actually stopped iterating -
    * not merely when stopRequested was set (2026-07-19 fix). A stop can take
@@ -64,13 +66,6 @@ interface ObserverRunner {
    */
   loopExited: Promise<void>;
 }
-
-// Backoff for a unit that failed/didn't complete (2026-07-19 fix) - doubles
-// per consecutive failure, capped at RESTING_RECHECK_MS so a permanently
-// broken unit still gets rechecked eventually (e.g. after a fix lands)
-// without hammering it every idle tick in the meantime.
-const UNIT_RETRY_BASE_MS = 30_000;
-const UNIT_RETRY_MAX_MS = RESTING_RECHECK_MS;
 
 async function getCurrentHead(projectRootPath: string): Promise<string | null> {
   try {
@@ -102,7 +97,7 @@ export function startObserver(projectRootPath: string): void {
     activity: null,
     lastCheckedHead: null,
     resting: false,
-    retryState: new Map(),
+    attemptedThisPass: new Set(),
     loopExited: Promise.resolve(),
   };
   runners.set(projectRootPath, runner);
@@ -313,22 +308,29 @@ async function crawlOneStaleUnit(
     const everCrawledUnitPaths = new Set(entries.map((entry) => entry.unitPath));
     const staleUnits = units.filter((unit) => !freshUnitPaths.has(unit));
     const prioritizedStaleUnits = prioritizeStaleUnits(staleUnits, everCrawledUnitPaths, churnByFile);
-    const now = Date.now();
-    // Skips a unit still in backoff (see ObserverRunner.retryState) and
-    // falls through to the next stale one instead - a hard-to-crawl unit no
-    // longer blocks the rest of the worklist just by sitting first in order.
-    const nextUnit = prioritizedStaleUnits.find((unit) => (runner.retryState.get(unit)?.nextRetryAt ?? 0) <= now);
 
     if (staleUnits.length === 0) {
       // Genuinely nothing left to do - a real "fully studied" rest.
+      runner.attemptedThisPass.clear();
       runner.resting = true;
       return false;
     }
 
+    // Skips a unit already attempted (and failed) THIS pass and falls
+    // through to the next stale one instead - a hard-to-crawl unit no
+    // longer blocks the rest of the worklist just by sitting first in
+    // priority order every single iteration.
+    let nextUnit = prioritizedStaleUnits.find((unit) => !runner.attemptedThisPass.has(unit));
+
     if (!nextUnit) {
-      // Everything still stale is in backoff right now - NOT the same as
-      // fully studied, just waiting out a cooldown; do not report false
-      // completion (2026-07-19 fix).
+      // Every stale unit has been tried at least once this pass (and none
+      // of them succeeded, or they would have left the stale set) - start a
+      // fresh pass rather than reporting false completion.
+      runner.attemptedThisPass.clear();
+      nextUnit = prioritizedStaleUnits[0];
+    }
+
+    if (!nextUnit) {
       runner.resting = false;
       return false;
     }
@@ -359,31 +361,37 @@ async function crawlOneStaleUnit(
       return false;
     }
 
-    // Real evidence: 24/25 units of a live test project ended up "fresh"
-    // forever with a literal error message as their featureSummary, because
-    // this used to hash whatever files got touched before a crawl failed
-    // (e.g. read one file, then hit a 429) regardless of outcome - a file's
-    // content hash doesn't change just because the crawl that read it later
-    // failed, so isStale (empty-hashes-only) never re-triggered and the
-    // failure was permanently mistaken for a completed, trustworthy result.
-    // Only a genuine final_answer counts as "learned this unit" - anything
-    // else stores empty hashes so it stays stale and gets retried next pass.
-    const sourceFileHashes = result.raw.stopped === "final_answer"
-      ? await hashFiles(projectRootPath, result.touchedFiles)
-      : {};
+    // 2026-07-25: a crawl that didn't reach a genuine final_answer is no
+    // longer persisted AT ALL - it used to be written as an empty/
+    // placeholder row (featureSummary like "Обход не завершился выводом")
+    // purely so isStale would force a retry later, but that meant ~16% of a
+    // real project's business_graph_entries carried zero usable content.
+    // Not writing anything keeps the unit looking "never crawled" (see
+    // everCrawledUnitPaths above), which already puts it back at the front
+    // of the NEXT full pass's priority order on its own - attemptedThisPass
+    // is the only thing needed to stop it from being retried within the
+    // SAME pass (see the starvation bug this replaces, still documented on
+    // ObserverRunner.attemptedThisPass above).
+    if (result.raw.stopped !== "final_answer") {
+      runner.attemptedThisPass.add(nextUnit);
+      return false;
+    }
+
+    const sourceFileHashes = await hashFiles(projectRootPath, result.touchedFiles);
+
+    if (Object.keys(sourceFileHashes).length === 0) {
+      // A "final_answer" that touched zero files is just as unusable as an
+      // outright failure - same treatment, no row written.
+      runner.attemptedThisPass.add(nextUnit);
+      return false;
+    }
+
     // Snapshot of every file under the unit right now, not just the ones the
     // LLM touched (2026-07-19, full-project review) - lets a later read
     // notice a brand new file added after this crawl, which sourceFileHashes
-    // alone can't (see graph-entries.ts's mapRow). Only meaningful paired
-    // with a genuine success - [] on failure is fine since empty
-    // sourceFileHashes already forces isStale regardless.
-    const knownFilePaths = result.raw.stopped === "final_answer"
-      ? await listUnitFilePaths(projectRootPath, nextUnit)
-      : [];
+    // alone can't (see graph-entries.ts's mapRow).
+    const knownFilePaths = await listUnitFilePaths(projectRootPath, nextUnit);
 
-    // Written either way (cheap diagnostic breadcrumb, and isStale is always
-    // true when sourceFileHashes is empty, so a failed attempt self-heals on
-    // the next pass rather than looking like a trusted, empty result).
     await upsertBusinessGraphEntry({
       projectRootPath,
       unitPath: nextUnit,
@@ -395,31 +403,7 @@ async function crawlOneStaleUnit(
       confidence: result.confidence,
     });
 
-    const genuinelySucceeded = result.raw.stopped === "final_answer" && Object.keys(sourceFileHashes).length > 0;
-
-    if (genuinelySucceeded) {
-      runner.retryState.delete(nextUnit);
-      return true;
-    }
-
-    // Bug fix (2026-07-19, full-project review): max_turns used to be
-    // indistinguishable from a real success here (this function used to
-    // just return `stopped !== "error"`, which is true for max_turns) - a
-    // unit that genuinely cannot be crawled within CRAWL_MAX_TURNS got
-    // re-selected and re-crawled (a fresh 40-turn LLM run) on literally the
-    // next loop iteration, forever, since unit selection always picks the
-    // first stale unit in order - permanently starving every other unit in
-    // the worklist. Same fate for a "final_answer" with zero touched files
-    // (sourceFileHashes empty -> immediately stale again, see
-    // graph-entries.ts's isStale). Exponential, capped backoff instead -
-    // this unit stops hogging every cycle but still gets retried
-    // eventually, and prioritizedStaleUnits.find() above now falls through
-    // to the NEXT stale unit in the meantime instead of blocking on this one.
-    const previous = runner.retryState.get(nextUnit);
-    const failureCount = (previous?.failureCount ?? 0) + 1;
-    const delayMs = Math.min(UNIT_RETRY_BASE_MS * 2 ** (failureCount - 1), UNIT_RETRY_MAX_MS);
-    runner.retryState.set(nextUnit, { failureCount, nextRetryAt: Date.now() + delayMs });
-    return false;
+    return true;
   } catch (error) {
     console.warn(`[observer-monitor] crawl of ${projectRootPath} failed:`, error);
     return false;
