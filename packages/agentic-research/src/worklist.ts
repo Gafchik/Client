@@ -15,15 +15,71 @@ async function safeReaddir(absDir: string): Promise<Dirent[]> {
   }
 }
 
-// Finds "the level where the project actually branches into many features,"
-// generically - not by assuming any particular convention (e.g. Laravel's
-// app/src/Containers/<name>, which would just be hardcoding one project's
-// layout again). A directory with exactly one subdirectory is treated as a
-// pass-through wrapper (app -> src -> Containers) and skipped through until
-// reaching either a genuine fan-out (2+ siblings) or a dead end.
+// A directory whose subtree fits comfortably in one crawlUnit() pass is
+// left alone even if it still branches internally - Containers/CaseData
+// (Models/Actions/DTO/Builders/UI/... - one cohesive feature) should stay
+// ONE unit, not fragment into "CaseData/Models", "CaseData/Actions", etc,
+// each too small on its own to summarize meaningfully. Only genuinely large
+// aggregates (e.g. Containers/ itself, holding ~100 sibling feature
+// modules) are worth splitting further. 150 is a rough "one Laravel
+// container module's worth of files" - crawlUnit doesn't read every file
+// anyway (see its maxTurns), this just bounds how coarse a single summary
+// is asked to be.
+const UNIT_SIZE_FANOUT_THRESHOLD_FILES = 150;
+
+async function countFilesUpTo(absDir: string, limit: number, depth = 0): Promise<number> {
+  if (depth > 8) {
+    return 0;
+  }
+
+  const entries = await safeReaddir(absDir);
+  let count = 0;
+
+  for (const entry of entries) {
+    if (count >= limit) {
+      break;
+    }
+
+    if (entry.isDirectory()) {
+      if (IGNORED_DIRS.has(entry.name) || entry.name.startsWith(".")) {
+        continue;
+      }
+
+      count += await countFilesUpTo(path.join(absDir, entry.name), limit - count, depth + 1);
+    } else if (entry.isFile()) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+// Finds "the level(s) where the project actually branches into many
+// features," generically - not by assuming any particular convention (e.g.
+// Laravel's app/src/Containers/<name>, which would just be hardcoding one
+// project's layout again). A directory with exactly one subdirectory is
+// treated as a pass-through wrapper (app -> src -> Containers) and skipped
+// through; a genuine fan-out (2+ siblings) that's still too big to crawl as
+// one unit recurses into EACH branch too, so a returned unit is only ever a
+// true leaf - either a dead end, a single-child chain that dead-ends, or a
+// branch small enough to summarize as one cohesive feature.
+//
+// Bug fix (2026-07-25, live granularity complaint): this used to stop at
+// the FIRST fan-out it found and return those directories as final units,
+// without ever checking whether one of THEM was itself a further fan-out
+// point. On a real Laravel/Apiato project this meant app -> {View, src}
+// (app's own fan-out) was treated as final, and src's own ~100
+// Containers/<Module> children - the actual feature-sized units this whole
+// function exists to find - were folded into one "app/src" blob instead of
+// ~100 separate units. An unconditionally recursive first attempt at this
+// fix overcorrected the other way (fragmented Containers/CaseData itself
+// into CaseData/Models, CaseData/Actions, etc) - the size check above is
+// what keeps recursion from going past the actual feature-module level.
 async function followToFanOut(absDir: string, depth = 0): Promise<string[]> {
   if (depth > 6) {
-    return [];
+    // Hit the depth cap mid-chain - treat where we stopped as a leaf unit
+    // rather than silently dropping this branch's coverage entirely.
+    return [absDir];
   }
 
   const subDirs = (await safeReaddir(absDir)).filter(isRelevantDir);
@@ -32,11 +88,21 @@ async function followToFanOut(absDir: string, depth = 0): Promise<string[]> {
     return [];
   }
 
-  if (subDirs.length > 1) {
-    return subDirs.map((entry) => path.join(absDir, entry.name));
+  if (subDirs.length === 1) {
+    return followToFanOut(path.join(absDir, subDirs[0]!.name), depth + 1);
   }
 
-  return followToFanOut(path.join(absDir, subDirs[0]!.name), depth + 1);
+  const fileCount = await countFilesUpTo(absDir, UNIT_SIZE_FANOUT_THRESHOLD_FILES + 1);
+
+  if (fileCount <= UNIT_SIZE_FANOUT_THRESHOLD_FILES) {
+    return [absDir];
+  }
+
+  const expanded = await Promise.all(
+    subDirs.map((entry) => followToFanOut(path.join(absDir, entry.name), depth + 1)),
+  );
+
+  return expanded.flatMap((result, index) => (result.length > 0 ? result : [path.join(absDir, subDirs[index]!.name)]));
 }
 
 /**
@@ -47,7 +113,11 @@ async function followToFanOut(absDir: string, depth = 0): Promise<string[]> {
  * domain-profile lookup (the exact anti-pattern this whole feature exists to
  * escape).
  */
-export async function listWorkUnits(projectRootPath: string, maxUnits = 200): Promise<string[]> {
+// Raised 200 -> 500 (2026-07-25) alongside the recursive fan-out fix above -
+// a real Laravel/Apiato project's Containers/<Module> layer alone can be
+// ~100 units, and that's now found instead of folded into one blob, so the
+// old cap could silently truncate coverage of legitimately large projects.
+export async function listWorkUnits(projectRootPath: string, maxUnits = 500): Promise<string[]> {
   const rootDirs = (await safeReaddir(projectRootPath)).filter(isRelevantDir);
   const units: string[] = [];
 
