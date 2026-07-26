@@ -1,4 +1,4 @@
-import { callModel, type ChatMessage } from "./provider.js";
+import { callModel, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
 import { buildSeedGrepObservation } from "./loop.js";
 import { formatSecurityFindingsForReviewer, scanDiffForSecurityFindings } from "./security-scan.js";
 import {
@@ -312,16 +312,18 @@ function isSmallScopedTask(task: string): boolean {
 function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean): string {
   return [
     "You are an experienced senior fullstack developer implementing a code change in a project you are seeing for the first time. You work in an isolated git worktree - your edits cannot damage the user's checkout, and everything you change will be reviewed as a diff.",
-    "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
-    "ACTION: list_dir(relative/path)",
-    "ACTION: grep_content(string or regex to search file contents for)",
-    "ACTION: read_file(relative/path/to/file.php)",
-    ...(hasSemanticSearch
-      ? ["ACTION: semantic_search(a plain-language description of what you are looking for) - finds files by MEANING, use it when the business term from the task does not match any file/directory name or grep hit."]
-      : []),
-    ...(hasFindReferences
-      ? ["ACTION: find_references(ClassOrFunctionOrFileName) - REAL structural callers/dependents from the persisted code graph; use before changing a shared function's signature/behavior to see who depends on it."]
-      : []),
+    // Native tool-calling (2026-07-26): the tool list/schema is declared via
+    // the API's own `tools` parameter, not prose here - every model behind
+    // this gateway (confirmed live: gpt-5.4, claude-opus-4.6, grok-4.1-fast,
+    // deepseek-v3.2) gets JSON-schema-validated tool calls, so there is no
+    // text markup format left to describe or get wrong. This replaces the
+    // old "ACTION: name(args)" + "<<<SEARCH/<<<REPLACE" prompt-imitation
+    // protocol, which live testing showed breaking down in model-specific
+    // ways (grok-4.1-fast stuck 30 turns failing to close a SEARCH block;
+    // deepseek-v3.2 emitting garbled output when switching from reading to
+    // writing) - a side-by-side test of gpt-5.4/claude-opus-4.6 via native
+    // tool_calls on the same real task produced zero format errors.
+    "Use the provided tools to explore and edit the project. You may call several tools in one turn when they are genuinely independent (e.g. reading a few related files at once).",
     ...(hasDbQuery
       ? [
           // Live evidence motivating this tool (2026-07-18, explicit
@@ -331,53 +333,19 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
           // translate to this project's ORM/query-builder convention
           // (checking for an existing scope/relation to reuse along the
           // way, same as instruction 1 below).
-          "ACTION: db_query(a single SELECT/WITH/EXPLAIN/SHOW statement) - runs read-only against the project's REAL database (resolved from its own .env/docker-compose, not the worktree). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements, this is for INSPECTION not mutation. Use it to: see real example rows instead of guessing from a model's field list; when debugging \"X did not save correctly\", check what actually got persisted before guessing where the bug is; when building a non-trivial query (filters/joins/aggregation), get the raw SQL right against real data FIRST, then translate it into this project's ORM/query-builder style (checking for an already-existing scope/relation to reuse, per instruction 1). All actual schema/data changes still go through run_command's normal DB-safety gate (migrations, seeders) - db_query itself can never write anything.",
+          "db_query runs read-only against the project's REAL database (resolved from its own .env/docker-compose, not the worktree). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements, this is for INSPECTION not mutation. Use it to: see real example rows instead of guessing from a model's field list; when debugging \"X did not save correctly\", check what actually got persisted before guessing where the bug is; when building a non-trivial query (filters/joins/aggregation), get the raw SQL right against real data FIRST, then translate it into this project's ORM/query-builder style (checking for an already-existing scope/relation to reuse, per instruction 1). All actual schema/data changes still go through run_command's normal DB-safety gate (migrations, seeders) - db_query itself can never write anything.",
         ]
       : []),
-    "ACTION: run_command(shell command) - runs in the project root (180s timeout). Use it to run the project's OWN checks: tests, linter, build, php -l, etc. Also use it to boot local infrastructure this task needs (e.g. docker compose up -d for a database) - check for a docker-compose file / README / .env.example as part of your normal exploration if the task needs a working DB.",
+    "run_command runs in the project root (180s timeout). Use it to run the project's OWN checks: tests, linter, build, php -l, etc. Also use it to boot local infrastructure this task needs (e.g. docker compose up -d for a database) - check for a docker-compose file / README / .env.example as part of your normal exploration if the task needs a working DB.",
     ...(isMultiRoot
       ? [
-          "For run_command in this multi-part project, prefix with the part label: ACTION: run_command(api: php artisan test) - the label goes INSIDE the parentheses, as the first part of the command argument. It is NOT a separate action type: never write \"ACTION: api: php artisan test\" (missing the run_command(...) wrapper entirely) - that is not a recognized action and will be silently ignored, wasting the whole turn.",
+          "For run_command in this multi-part project, prefix the command itself with the part label, e.g. \"api: php artisan test\" - the label is part of the command string, not a separate argument.",
         ]
       : []),
     "DB SAFETY: a command that changes persisted schema or data in a way git cannot undo (running a migration, db:seed, migrate:rollback, DROP/ALTER/TRUNCATE, etc.) will NOT execute when you call run_command - it instead PAUSES this run for a human to approve, and resumes afterward WITH THE REAL OUTPUT of what you ran, so you can act on it. This is expected, not an error - if the task genuinely needs a migration, issue it via run_command like any other command and wait; do not try to work around it (no manually editing files inside a database, no alternate commands to sneak past it). A command with --pretend or --dry-run (e.g. php artisan migrate --pretend) runs immediately WITHOUT pausing - nothing actually changes, so it is a good first move to preview a migration before running it for real. If you only need to VERIFY something against the database without permanently changing data (e.g. checking a query/insert behaves correctly), wrap it in an explicit transaction that you roll back yourself using the project's own DB tooling (e.g. for Laravel: php artisan tinker --execute=\"DB::beginTransaction(); ...; DB::rollBack();\", or raw SQL: START TRANSACTION; ...; ROLLBACK;) - that is a normal run_command too, not a paused one, since nothing is actually left changed.",
-    "ACTION: write_file(relative/path/to/file.ext) - creates or fully overwrites a file. The content comes in a block IMMEDIATELY after the ACTION line:",
-    "<<<CONTENT",
-    "...entire file content...",
-    "CONTENT>>>",
-    "ACTION: edit_file(relative/path/to/file.ext) - targeted edit of an existing file. Two blocks IMMEDIATELY after the ACTION line:",
-    "<<<SEARCH",
-    "...exact existing lines (must match the file EXACTLY and occur exactly once)...",
-    "SEARCH>>>",
-    "<<<REPLACE",
-    "...replacement lines...",
-    "REPLACE>>>",
-    // Live evidence (2026-07-18): different models varied sharply in how
-    // often they generated MALFORMED blocks (missing/mismatched markers) -
-    // one model repeatedly opened "<<<SEARCH" but never closed it with
-    // "SEARCH>>>" on its own line. The prose description + placeholder
-    // above was not enough for every model to reliably imitate; a complete,
-    // concrete worked example (real code, not "...lines...") gives every
-    // model something to pattern-match exactly, character for character.
-    "Concrete worked example of a complete, correctly-formed edit_file call - copy this EXACT structure, only the content differs:",
-    "ACTION: edit_file(app/Models/User.php)",
-    "<<<SEARCH",
-    "    protected $fillable = [",
-    "        'name',",
-    "        'email',",
-    "    ];",
-    "SEARCH>>>",
-    "<<<REPLACE",
-    "    protected $fillable = [",
-    "        'name',",
-    "        'email',",
-    "        'phone',",
-    "    ];",
-    "REPLACE>>>",
-    "Notice: each marker (\"<<<SEARCH\", \"SEARCH>>>\", \"<<<REPLACE\", \"REPLACE>>>\") is ALONE on its own line, with nothing else on that line - not indented, not combined with code, not followed by extra text. Every SEARCH block you open MUST be closed with \"SEARCH>>>\" before \"<<<REPLACE\" begins - never skip the closing marker.",
-    "PREFER edit_file over write_file for existing files: read_file output can be truncated, and rewriting a file from a truncated read destroys the part you never saw. edit_file is immune to that - it only touches the block you matched.",
-    "ACTION: ask_user(one clarifying question IN RUSSIAN) - use ONLY if the task is genuinely ambiguous in a way that materially changes what to implement (different behavior, different data model - not naming/details you can decide yourself). It ends the run and asks the human. Ask at the START, before writing code - never after you have already implemented one interpretation.",
-    "ACTION: task_complete(final summary IN RUSSIAN) - call exactly once, when the change is done and verified as well as this project allows. The summary must state: what was changed and why, what was verified (which commands, what they showed), honestly what was NOT verified and why (e.g. the project has no test suite), and - only if genuinely non-empty, do not pad this - remaining risk (something you are not fully certain about, an edge case you could not check) and anything worth a human manually checking before this ships. No meta commentary.",
+    "PREFER edit_file over write_file for existing files: read_file output can be truncated, and rewriting a file from a truncated read destroys the part you never saw. edit_file only touches the exact snippet you matched, so it is immune to that - its `search` argument must match the file's CURRENT content exactly and occur exactly once.",
+    "ask_user - a clarifying question IN RUSSIAN - use ONLY if the task is genuinely ambiguous in a way that materially changes what to implement (different behavior, different data model - not naming/details you can decide yourself). It ends the run and asks the human. Ask at the START, before writing code - never after you have already implemented one interpretation.",
+    "task_complete - call exactly once, when the change is done and verified as well as this project allows. The summary (IN RUSSIAN) must state: what was changed and why, what was verified (which commands, what they showed), honestly what was NOT verified and why (e.g. the project has no test suite), and - only if genuinely non-empty, do not pad this - remaining risk (something you are not fully certain about, an edge case you could not check) and anything worth a human manually checking before this ships. No meta commentary.",
     "",
     "How to work:",
     "1. STUDY BEFORE WRITING, ACTIVELY, NOT JUST BY LUCK OF GREP. Before implementing anything, explicitly look for whether this project ALREADY has a mechanism for this kind of thing" + (hasSemanticSearch ? " - semantic_search is often the right tool for this (it finds by MEANING: e.g. search \"default records created for a new X\" or \"clone template data for new entity\", not just the task's literal words)" : "") + ". Find 2-3 places where this project already does something similar and read them - then write YOUR change in the same style, same naming, same patterns, same error handling, REUSING an existing mechanism (a shared method/hook/utility) instead of writing a new parallel one when one already exists. Code that reinvents what the codebase already has is wrong even when it runs - it is technical debt from the moment it is written.",
@@ -420,10 +388,111 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
     "8. VERIFY YOUR OWN WORK, but do not write persisted test files unless the task explicitly asked for tests: for a BUG FIX, reproduce the wrong behavior first (an ad hoc run_command - a one-off script, a REPL/tinker call, a manual reproduction), then fix, then show the SAME ad hoc check now passing - before/after with throwaway commands, not a new test file added to the repo. Adding actual test files/test infrastructure is out of scope unless the task says so - that is a separate step the user decides on later.",
     "9. Do not invent APIs, columns, or config keys you have not seen in this codebase. Check first.",
     "10. Default to no comments in code you write. Add one only when it captures a non-obvious WHY (a hidden constraint, a workaround, something that would genuinely surprise the next reader) - never comments that restate what well-named code already says.",
-    `You may batch up to ${MAX_ACTIONS_PER_TURN} ACTION lines per turn (they execute in order, results come back together). Any ACTION beyond the ${MAX_ACTIONS_PER_TURN}th is NOT executed - if you need more, split them across turns and wait for the results. Exceptions: task_complete and ask_user must be called ALONE.`,
-    "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
+    `You may call several tools in one turn when they are genuinely independent (results come back together, same order) - up to about ${MAX_ACTIONS_PER_TURN} is a reasonable batch. task_complete and ask_user must be called ALONE, not alongside other tool calls.`,
+    "You may briefly (1-2 sentences) say what you are doing and why before calling tools.",
     "If the reviewer later returns findings: fix the ones that are real. If a finding is factually wrong, do NOT change code to appease it - explain why in your next task_complete summary under a line starting with \"Оспорено:\".",
   ].join("\n");
+}
+
+// Native tool-calling schema (2026-07-26) - see provider.ts's ToolDefinition
+// comment for why one shape works across every model behind this gateway.
+// Mirrors DevelopTool 1:1; keep both in sync if a tool is added/removed.
+function buildDevelopTools(hasSemanticSearch: boolean, hasFindReferences: boolean, hasDbQuery: boolean): ToolDefinition[] {
+  const tools: ToolDefinition[] = [
+    { type: "function", function: { name: "list_dir", description: "List a directory's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
+    { type: "function", function: { name: "grep_content", description: "Search file contents for a literal string or regex.", parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] } } },
+    { type: "function", function: { name: "read_file", description: "Read a file's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
+  ];
+
+  if (hasSemanticSearch) {
+    tools.push({ type: "function", function: { name: "semantic_search", description: "Find files by MEANING rather than literal words - use when the business term from the task does not match any file/directory name or grep hit (e.g. \"default records created for a new X\", \"clone template data for new entity\").", parameters: { type: "object", properties: { query: { type: "string", description: "Plain-language description of what you are looking for." } }, required: ["query"] } } });
+  }
+
+  if (hasFindReferences) {
+    tools.push({ type: "function", function: { name: "find_references", description: "REAL structural callers/dependents of a class or function, from the project's persisted code graph. Use before changing a shared function's signature/behavior to see who depends on it.", parameters: { type: "object", properties: { name: { type: "string", description: "Class, function, or file name." } }, required: ["name"] } } });
+  }
+
+  if (hasDbQuery) {
+    tools.push({ type: "function", function: { name: "db_query", description: "Run a single read-only SELECT/WITH/EXPLAIN/SHOW statement against the project's real database. Never INSERT/UPDATE/DELETE/DDL.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } });
+  }
+
+  tools.push(
+    { type: "function", function: { name: "run_command", description: "Run a shell command in the project root (180s timeout) - tests, linters, builds, syntax checks, booting local infra.", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } } },
+    { type: "function", function: { name: "write_file", description: "Create a new file or fully overwrite an existing one.", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] } } },
+    {
+      type: "function",
+      function: {
+        name: "edit_file",
+        description: "Targeted edit of an existing file: replace an exact existing snippet with new content. `search` must match the file's CURRENT content exactly and occur exactly once - read the file first.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            search: { type: "string", description: "Exact existing snippet to find (must match exactly, exactly once)." },
+            replace: { type: "string", description: "Replacement content." },
+          },
+          required: ["path", "search", "replace"],
+        },
+      },
+    },
+    { type: "function", function: { name: "ask_user", description: "Ask the human ONE clarifying question (in Russian) - only when the task is genuinely ambiguous in a way that changes what to implement. Ends the run.", parameters: { type: "object", properties: { question: { type: "string" } }, required: ["question"] } } },
+    { type: "function", function: { name: "task_complete", description: "Call exactly once, alone, when the change is done and verified. Summary in Russian: what changed and why, what was verified, what was not and why, remaining risk if any.", parameters: { type: "object", properties: { summary: { type: "string" } }, required: ["summary"] } } },
+  );
+
+  return tools;
+}
+
+// Adapts a native ToolCall into the SAME ParsedDevelopAction shape the
+// (proven, battle-tested) per-action execution logic below already expects -
+// this is the one seam between "how did we learn what the model wants to
+// do" (now JSON-schema-validated tool_calls) and "what do we actually do
+// about it" (unchanged). A malformed call (bad JSON, missing required field)
+// becomes a formatError, handled by the existing bounce-back path exactly
+// like a malformed ACTION used to be - except this should now be rare to
+// nonexistent, since the API itself validates the call before we ever see it.
+function toolCallToAction(toolCall: ToolCall): ParsedDevelopAction {
+  const tool = toolCall.function.name as DevelopTool;
+  let args: Record<string, unknown> = {};
+
+  try {
+    args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+  } catch {
+    return { tool, arg: "", formatError: `Could not parse tool call arguments as JSON: ${(toolCall.function.arguments ?? "").slice(0, 200)}` };
+  }
+
+  const str = (key: string): string => (typeof args[key] === "string" ? (args[key] as string) : "");
+
+  switch (tool) {
+    case "list_dir":
+    case "read_file":
+      return { tool, arg: str("path") };
+    case "grep_content":
+      return { tool, arg: str("pattern") };
+    case "semantic_search":
+      return { tool, arg: str("query") };
+    case "find_references":
+      return { tool, arg: str("name") };
+    case "db_query":
+      return { tool, arg: str("query") };
+    case "run_command":
+      return { tool, arg: str("command") };
+    case "write_file":
+      if (typeof args.content !== "string") {
+        return { tool, arg: str("path"), formatError: "write_file call is missing the required \"content\" field." };
+      }
+      return { tool, arg: str("path"), content: args.content };
+    case "edit_file":
+      if (typeof args.search !== "string" || typeof args.replace !== "string") {
+        return { tool, arg: str("path"), formatError: "edit_file call is missing the required \"search\" and/or \"replace\" field." };
+      }
+      return { tool, arg: str("path"), search: args.search, replace: args.replace };
+    case "ask_user":
+      return { tool, arg: str("question") };
+    case "task_complete":
+      return { tool, arg: str("summary") };
+    default:
+      return { tool, arg: "", formatError: `Unknown tool: ${String(tool)}` };
+  }
 }
 
 export const REVIEWER_SYSTEM_PROMPT = [
@@ -1132,6 +1201,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ]),
     ]
     : [];
+  const developTools = buildDevelopTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery));
   const messages: ChatMessage[] = [
     { role: "system", content: buildDevelopSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery)) },
     {
@@ -1234,6 +1304,15 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   const HISTORY_COMPACT_TRIGGER_MESSAGES = 24;
   const HISTORY_KEEP_RECENT_MESSAGES = 24;
   let historyCompactionMessageIndex = -1;
+  // Native tool-calling (2026-07-26): a turn is now 1 assistant message + N
+  // tool-role responses (N varies with how many tools the model batched),
+  // not a fixed 2 messages like the old text protocol - message-COUNT-based
+  // compaction could otherwise cut between an assistant message's tool_calls
+  // and one of its own tool responses, which every provider rejects as a
+  // malformed sequence. Tracks the message index right after each turn
+  // FULLY completes (all its tool responses pushed), so compaction only
+  // ever cuts at a turn boundary, never mid-turn.
+  const turnBoundaries: number[] = [];
 
   let totalPromptTokens = 0;
   let totalCompletionTokens = 0;
@@ -1451,7 +1530,16 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       return;
     }
 
-    const keepFromIndex = messages.length - HISTORY_KEEP_RECENT_MESSAGES;
+    const target = messages.length - HISTORY_KEEP_RECENT_MESSAGES;
+    // Snap to the latest FULLY COMPLETED turn at or before the target,
+    // instead of a raw message-count cut - see turnBoundaries' comment.
+    let keepFromIndex = seedMessageCount;
+
+    for (const boundary of turnBoundaries) {
+      if (boundary <= target && boundary > keepFromIndex) {
+        keepFromIndex = boundary;
+      }
+    }
 
     if (keepFromIndex <= seedMessageCount) {
       return;
@@ -1462,12 +1550,27 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ...actionsLog,
     ].join("\n");
 
+    const beforeLength = messages.length;
+
     if (historyCompactionMessageIndex === -1) {
       messages.splice(seedMessageCount, keepFromIndex - seedMessageCount, { role: "user", content: summaryContent });
       historyCompactionMessageIndex = seedMessageCount;
     } else {
       messages[historyCompactionMessageIndex] = { role: "user", content: summaryContent };
       messages.splice(historyCompactionMessageIndex + 1, keepFromIndex - (historyCompactionMessageIndex + 1));
+    }
+
+    // Turns folded into the summary no longer have a meaningful boundary;
+    // turns still present in raw form shift by however much the splice
+    // just changed the array's length.
+    const shift = messages.length - beforeLength;
+
+    for (let i = turnBoundaries.length - 1; i >= 0; i -= 1) {
+      if ((turnBoundaries[i] as number) <= keepFromIndex) {
+        turnBoundaries.splice(i, 1);
+      } else {
+        turnBoundaries[i] = (turnBoundaries[i] as number) + shift;
+      }
     }
   }
 
@@ -1481,11 +1584,13 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
 
     options.onProgress?.({ turn, filesChanged: editedFiles.size, phase });
 
-    let content: string;
+    let content: string | null;
+    let toolCalls: ToolCall[];
 
     try {
-      const result = await callModel(options.providerBaseUrl, options.providerApiKey, options.developerModel, messages);
+      const result = await callModel(options.providerBaseUrl, options.providerApiKey, options.developerModel, messages, undefined, undefined, developTools);
       content = result.content;
+      toolCalls = result.toolCalls ?? [];
       totalPromptTokens += result.usage?.prompt_tokens ?? 0;
       totalCompletionTokens += result.usage?.completion_tokens ?? 0;
     } catch (error) {
@@ -1497,25 +1602,26 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       return finalize({ turnsUsed: turn, stopped: "max_turns" });
     }
 
-    messages.push({ role: "assistant", content });
-    const { actions, droppedActionCount } = parseDevelopActions(content);
+    messages.push({ role: "assistant", content: content || null, tool_calls: toolCalls.length ? toolCalls : undefined });
+    const actions = toolCalls.map(toolCallToAction);
 
     if (actions.length === 0) {
       noActionStreak += 1;
-      actionsLog.push(`[turn ${turn}] NO ACTION PARSED. raw content: ${content.slice(0, 200)}`);
+      actionsLog.push(`[turn ${turn}] NO TOOL CALL. raw content: ${(content ?? "").slice(0, 200)}`);
 
       if (noActionStreak >= 3) {
-        // Three protocol-free replies in a row - the model is not going to
+        // Three tool-free replies in a row - the model is not going to
         // recover; treat the last one as its de-facto summary and let the
         // normal completion path (diff collection + review) judge the work.
-        const verdict = await evaluateTaskComplete(content.trim(), turn);
+        const verdict = await evaluateTaskComplete((content ?? "").trim(), turn);
         return verdict === "continue-loop" ? finalize({ turnsUsed: turn, stopped: "max_turns" }) : verdict;
       }
 
       messages.push({
         role: "user",
-        content: "No ACTION line was parsed from your reply. Use the exact protocol: ACTION: tool(argument) - with write_file/edit_file blocks where required. If you are done, use ACTION: task_complete(summary in Russian).",
+        content: "No tool call was made in your reply. Call one of the available tools, or task_complete(summary in Russian) if you are done.",
       });
+      turnBoundaries.push(messages.length);
       continue;
     }
 
@@ -1533,15 +1639,16 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       const verdict = await evaluateTaskComplete(first.arg, turn);
 
       if (verdict === "continue-loop") {
+        turnBoundaries.push(messages.length);
         continue;
       }
 
       return verdict;
     }
 
-    const observationBlocks: string[] = [];
-
-    for (const action of actions) {
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      const action = actions[actionIndex] as ParsedDevelopAction;
+      const toolCallId = (toolCalls[actionIndex] as ToolCall).id;
       let observation: string;
       let skipTruncation = false;
 
@@ -1575,8 +1682,11 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
         // approval (not the model re-issuing it) and resumes with the real
         // result in priorSensitiveActions - see DevelopRunOptions.
         if (isSensitiveDbCommand(action.arg)) {
-          const reasonMatch = /^([\s\S]*?)(?:\n?ACTION:)/.exec(content);
-          const reason = (reasonMatch?.[1] ?? "").trim().slice(0, 300) || "Developer wants to run this as part of the task.";
+          // Native tool-calling (2026-07-26): the model's accompanying text
+          // is already separate from the tool call itself, so it can be
+          // used directly - no more regex-extracting "everything before the
+          // first ACTION: line" out of one combined text blob.
+          const reason = (content ?? "").trim().slice(0, 300) || "Developer wants to run this as part of the task.";
           const pendingApproval: DevelopSensitiveAction = { command: action.arg, reason, status: "pending" };
           actionsLog.push(`[turn ${turn}] run_command(${action.arg}) -> HALTED for human approval (sensitive DB command).`);
           return finalize({
@@ -1629,7 +1739,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
               // or not it "chooses" to re-read.
               editFailuresByFile.delete(normalized);
               const freshContent = await readFile(options.projectRoots, action.arg, DEVELOP_READ_FILE_CHARS);
-              observation = `${observation}\n\nSTOP GUESSING: ${failures} attempts against this exact file in a row have all failed to match. Here is its CURRENT actual content (fetched for you automatically) - your next SEARCH block must match this exactly:\n${freshContent}`;
+              observation = `${observation}\n\nSTOP GUESSING: ${failures} attempts against this exact file in a row have all failed to match. Here is its CURRENT actual content (fetched for you automatically) - your next edit_file call's "search" argument must match this exactly:\n${freshContent}`;
               skipTruncation = true;
             } else {
               editFailuresByFile.set(normalized, failures);
@@ -1653,14 +1763,14 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       }
 
       // Diagnostic detail (2026-07-18): previously every outcome logged
-      // identically ("tool(arg) -> N lines"), making a malformed-block
+      // identically ("tool(arg) -> N lines"), making a malformed-call
       // formatError indistinguishable from a real editFile/writeFile
       // failure or a successful call - live evidence: a run made ~14
       // consecutive write_file/edit_file "attempts" against one file with
       // ZERO actual changes landing, and there was no way to tell from the
-      // log alone whether the model kept sending broken <<<CONTENT/SEARCH
-      // blocks or kept guessing wrong content. A short outcome tag costs
-      // nothing and turns that guesswork into a fact next time.
+      // log alone whether the model kept sending broken arguments or kept
+      // guessing wrong content. A short outcome tag costs nothing and turns
+      // that guesswork into a fact next time.
       const outcomeTag = action.formatError
         ? "FORMAT_ERROR"
         : observation.startsWith("OK")
@@ -1680,18 +1790,16 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
         ? `${observation.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`
         : observation;
 
-      observationBlocks.push(`ACTION ${action.tool}(${action.arg}):\n${boundedObservation}`);
+      // Native tool-calling (2026-07-26): one `role: "tool"` response per
+      // tool_call, matched by id - replaces the old single combined
+      // "OBSERVATION:" user message built from concatenated text blocks.
+      // Every tool_call requested this turn gets answered here (no
+      // per-turn drop-and-warn anymore) - the API itself requires a
+      // matching tool response for each one before the next assistant turn.
+      messages.push({ role: "tool", tool_call_id: toolCallId, name: action.tool, content: boundedObservation });
     }
 
-    if (droppedActionCount > 0) {
-      actionsLog.push(`[turn ${turn}] ${droppedActionCount} action(s) beyond the per-turn cap were NOT executed.`);
-      observationBlocks.push(
-        `IMPORTANT: ${droppedActionCount} further ACTION line(s) in your reply were NOT executed - the per-turn limit is ${MAX_ACTIONS_PER_TURN} actions. Their effects did NOT happen (no edits applied, no commands run). Re-issue them now, before anything else.`,
-      );
-    }
-
-    const observationHeader = observationBlocks.length > 1 ? `OBSERVATIONS (${observationBlocks.length}):\n` : "OBSERVATION:\n";
-    messages.push({ role: "user", content: observationHeader + observationBlocks.join("\n\n---\n\n") });
+    turnBoundaries.push(messages.length);
 
     // General "no progress" detector (2026-07-18) - ported from the research
     // loop's proven mechanism (see STUCK_TURNS_THRESHOLD). editedFiles counts

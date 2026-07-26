@@ -1,5 +1,5 @@
 import { expandRussianTechTransliteration, tokenize } from "@client/shared";
-import { callModel, type ChatMessage, type ProviderUsage } from "./provider.js";
+import { callModel, type ChatMessage, type ProviderUsage, type ToolCall, type ToolDefinition } from "./provider.js";
 import { dirnameOf, grepContent, listDir, normalizeDirKey, readFile, toWorkspaceRelativePath, type WorkspaceRoot } from "./tools.js";
 
 // Provider call/retry/backoff mechanics (performCall/callModel and their
@@ -306,35 +306,31 @@ interface ParsedAction {
 function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasEscalationModel: boolean): string {
   return [
     "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
-    "You have tools. Write each action on its own line in this exact form (no markdown wrapping):",
-    "ACTION: list_dir(relative/path)",
-    "ACTION: grep_content(string or regex to search file contents for)",
-    "ACTION: read_file(relative/path/to/file.php)",
+    // Native tool-calling (2026-07-26): see provider.ts's ToolDefinition
+    // comment - the tool schema is declared via the API's own `tools`
+    // parameter, not prose here. This also structurally closes a bug found
+    // live with claude-sonnet-4.6 (2026-07-24): the old text protocol let a
+    // model emit real ACTION lines, then - without waiting for the actual
+    // observation - keep generating in the SAME completion with a
+    // fabricated "result" and a final_answer built on it. A native tool
+    // call cannot be followed by more text in the same turn the way free
+    // text could; the model must actually get the real tool result back
+    // before its next turn, so this class of hallucination is no longer
+    // representable, not just discouraged by an after-the-fact filter.
+    "Use the provided tools to investigate. You may call several in one turn when they are genuinely independent (e.g. reading a few related files at once).",
     ...(hasSemanticSearch
-      ? [
-        "ACTION: semantic_search(a plain-language description of what you are looking for)",
-        "semantic_search finds files by MEANING, not literal text - use it when the business term from the question (e.g. \"relation cases\", \"profile access\") does not obviously match any file/directory name or grep hit, instead of guessing blindly.",
-      ]
+      ? ["semantic_search finds files by MEANING, not literal text - use it when the business term from the question (e.g. \"relation cases\", \"profile access\") does not obviously match any file/directory name or grep hit, instead of guessing blindly."]
       : []),
     ...(hasFindReferences
-      ? [
-        "ACTION: find_references(ClassOrFunctionOrFileName)",
-        "find_references looks up REAL structural callers/dependents of a class, function, or file from the persisted code graph - use it instead of grep_content when you need \"who actually calls/uses this\", because grep only matches the literal name as text and misses calls through a renamed variable, an interface, or other indirection. It may come back empty for a name the graph does not have a resolved node for (e.g. purely dynamic dispatch) - that is an honest limit of static analysis, not a sign nothing calls it; fall back to grep_content in that case.",
-      ]
+      ? ["find_references looks up REAL structural callers/dependents of a class, function, or file from the persisted code graph - use it instead of grep_content when you need \"who actually calls/uses this\", because grep only matches the literal name as text and misses calls through a renamed variable, an interface, or other indirection. It may come back empty for a name the graph does not have a resolved node for (e.g. purely dynamic dispatch) - that is an honest limit of static analysis, not a sign nothing calls it; fall back to grep_content in that case."]
       : []),
     ...(hasDbQuery
-      ? [
-        "ACTION: db_query(a single SELECT/WITH/EXPLAIN/SHOW statement)",
-        "db_query runs read-only against the project's REAL database (resolved from its own .env/docker-compose). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements. Use it when a question is really about DATA, not code: what a config/setting is actually set to for a real record, whether a described bug's symptom is visible in the actual stored row (e.g. \"field X did not save\" - check what actually got persisted, not just what the code SHOULD do), what real example values/relationships a table holds instead of guessing from a model's field list alone.",
-      ]
+      ? ["db_query runs read-only against the project's REAL database (resolved from its own .env/docker-compose). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements. Use it when a question is really about DATA, not code: what a config/setting is actually set to for a real record, whether a described bug's symptom is visible in the actual stored row (e.g. \"field X did not save\" - check what actually got persisted, not just what the code SHOULD do), what real example values/relationships a table holds instead of guessing from a model's field list alone."]
       : []),
     ...(hasEscalationModel
-      ? [
-        "ACTION: request_verification(a specific, concrete reason: which exact claim/file you are unsure about and why - not a vague \"just to be safe\")",
-        "request_verification hands the rest of this investigation to a stronger model, before you commit to a final_answer - use it when you notice a genuine reason to distrust your own read of the evidence: two files disagree, a business term could plausibly map to more than one similarly-named mechanism (e.g. \"relation\" vs \"Relationship\"), or you are about to answer confidently from only one weak match. Do not use it just because the question is broad - only when you have a CONCRETE, nameable doubt. This does not replace final_answer or skip review - a critic still checks your answer either way - it only changes which model does the remaining thinking. You will not always have this option; if it is not offered, keep investigating and answering yourself.",
-      ]
+      ? ["request_verification hands the rest of this investigation to a stronger model, before you commit to a final_answer - use it when you notice a genuine reason to distrust your own read of the evidence: two files disagree, a business term could plausibly map to more than one similarly-named mechanism (e.g. \"relation\" vs \"Relationship\"), or you are about to answer confidently from only one weak match. Do not use it just because the question is broad - only when you have a CONCRETE, nameable doubt. This does not replace final_answer or skip review - a critic still checks your answer either way - it only changes which model does the remaining thinking. You will not always have this option; if it is not offered, keep investigating and answering yourself."]
       : []),
-    "ACTION: final_answer(your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic)",
+    "final_answer - your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic. Call it ALONE, not alongside other tool calls.",
     ...(isMultiRoot
       ? [
         "IMPORTANT: this project has MULTIPLE physical repos (parts), listed in \"Project parts\" above with their role (e.g. backend, frontend-web, frontend-desktop, cli) and shown by list_dir(\".\"). Every path you write starts with the part's name, e.g. \"web/src/boot/axios.js\" or \"api/routes/api.php\" - the part name is not a regular directory, it is which repo you are in.",
@@ -342,8 +338,8 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
         "USE THE FRONTEND AS A BUSINESS GLOSSARY: a frontend part's i18n/locale files and UI component labels are written in the user's own business language, not engineering names - e.g. an i18n file may map an English key like `cancelSubscription` to the exact literal phrase the user typed. If a business term from the question has no obvious match by its literal wording, grep for the exact phrase itself (do not only translate/rephrase it) - a hit in an i18n/locale file often reveals the real technical name to then search for, and the UI component that uses that translation key leads you to which backend endpoint it calls.",
       ]
       : []),
-    `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Write several ACTION lines in a row in one response (up to ${MAX_ACTIONS_PER_TURN} per turn), they execute in order and the results come back together in one batch. One ACTION per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: if you call it, call ONLY it, with no other ACTION in the same response (look at the results first, then answer).`,
-    "Before an ACTION you may briefly (1-2 sentences) write what you are doing and why.",
+    `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Call several tools in one turn (up to about ${MAX_ACTIONS_PER_TURN}), they execute in order and the results come back together in one batch. One tool call per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: call it ALONE, with no other tool call in the same turn (look at the results first, then answer).`,
+    "You may briefly (1-2 sentences) say what you are doing and why before calling tools.",
     "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
     "IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet in this conversation, list_dir that directory first. A neighboring file with a similar name might be the one that actually answers the question - blindly guessing a filename skips that discovery.",
     "You have time to think it through properly. Do not rush to final_answer before checking all realistic places, including neighboring files with related meaning (e.g. there may be more than one Service nearby - check the whole directory).",
@@ -369,6 +365,85 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
     "If a file you opened imports, requires, or calls a function whose ACTUAL behavior matters for answering the question - especially one invoked with a flag/option argument, since that is exactly what usually changes what a function does - open that function's own definition before answering, do not infer its behavior from its name or from how the caller uses it. A reference to something is not evidence of what it does.",
     "When ready, call final_answer exactly once. Do not invent facts you have not seen in the observations. If you did not check something, say so plainly instead of asserting it with confidence.",
   ].join("\n");
+}
+
+// Native tool-calling schema (2026-07-26) - see provider.ts's ToolDefinition
+// comment for why one shape works across every model behind this gateway.
+// Mirrors ParsedAction["tool"] 1:1; keep both in sync if a tool is added/removed.
+function buildResearchTools(hasSemanticSearch: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasEscalationModel: boolean): ToolDefinition[] {
+  const tools: ToolDefinition[] = [
+    { type: "function", function: { name: "list_dir", description: "List a directory's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
+    { type: "function", function: { name: "grep_content", description: "Search file contents for a literal string or regex.", parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] } } },
+    { type: "function", function: { name: "read_file", description: "Read a file's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
+  ];
+
+  if (hasSemanticSearch) {
+    tools.push({ type: "function", function: { name: "semantic_search", description: "Find files by MEANING rather than literal words - use when the business term from the question does not obviously match any file/directory name or grep hit.", parameters: { type: "object", properties: { query: { type: "string", description: "Plain-language description of what you are looking for." } }, required: ["query"] } } });
+  }
+
+  if (hasFindReferences) {
+    tools.push({ type: "function", function: { name: "find_references", description: "REAL structural callers/dependents of a class, function, or file, from the project's persisted code graph - use instead of grep_content for \"who actually calls/uses this\".", parameters: { type: "object", properties: { name: { type: "string", description: "Class, function, or file name." } }, required: ["name"] } } });
+  }
+
+  if (hasDbQuery) {
+    tools.push({ type: "function", function: { name: "db_query", description: "Run a single read-only SELECT/WITH/EXPLAIN/SHOW statement against the project's real database. Never INSERT/UPDATE/DELETE/DDL.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } });
+  }
+
+  if (hasEscalationModel) {
+    tools.push({ type: "function", function: { name: "request_verification", description: "Hand the rest of this investigation to a stronger model, before committing to final_answer - use only when you have a CONCRETE, nameable doubt (conflicting files, an ambiguous name match, an about-to-guess moment), not just because the question is broad.", parameters: { type: "object", properties: { reason: { type: "string", description: "Specific claim/file you are unsure about and why." } }, required: ["reason"] } } });
+  }
+
+  tools.push({
+    type: "function",
+    function: {
+      name: "final_answer",
+      description: "Your final answer, IN RUSSIAN. Call exactly once, alone (never alongside other tool calls). Content must be ONLY the answer itself - no meta commentary.",
+      parameters: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+    },
+  });
+
+  return tools;
+}
+
+// Adapts a native ToolCall into the SAME ParsedAction shape the (proven)
+// per-action dispatch logic below already expects - see develop-loop.ts's
+// toolCallToAction for the identical rationale. A malformed call (bad JSON,
+// missing required field) surfaces as an "Error: ..." arg string instead of
+// a formatError field (ParsedAction has no such field - this loop's dispatch
+// switch below just needs SOME string arg to fall through to its existing
+// "else" file-read branch or tool-specific handling; an error-shaped arg
+// naturally produces an error-shaped observation the model can react to).
+function toolCallToAction(toolCall: ToolCall): ParsedAction {
+  const tool = toolCall.function.name as ParsedAction["tool"];
+  let args: Record<string, unknown> = {};
+
+  try {
+    args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+  } catch {
+    return { tool, arg: `[invalid arguments JSON: ${(toolCall.function.arguments ?? "").slice(0, 200)}]` };
+  }
+
+  const str = (key: string): string => (typeof args[key] === "string" ? (args[key] as string) : "");
+
+  switch (tool) {
+    case "list_dir":
+    case "read_file":
+      return { tool, arg: str("path") };
+    case "grep_content":
+      return { tool, arg: str("pattern") };
+    case "semantic_search":
+      return { tool, arg: str("query") };
+    case "find_references":
+      return { tool, arg: str("name") };
+    case "db_query":
+      return { tool, arg: str("query") };
+    case "request_verification":
+      return { tool, arg: str("reason") };
+    case "final_answer":
+      return { tool, arg: str("answer") };
+    default:
+      return { tool, arg: "" };
+  }
 }
 
 const CRITIC_SYSTEM_PROMPT = [
@@ -713,6 +788,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   const projectLine = isMultiRoot
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
+  const researchTools = buildResearchTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.researcherEscalationModel));
   const messages: ChatMessage[] = [
     { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.researcherEscalationModel)) },
     { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnTopicHint}${priorTurnHint}${observerHintBlock}${attachmentHintBlock}${questionShapeBlock}` },
@@ -984,8 +1060,9 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
 
     options.onProgress?.({ turn, filesRead: touchedFiles.size + seedReadFiles.size });
 
-    let content: string;
+    let content: string | null;
     let usage: ProviderUsage | null;
+    let toolCalls: ToolCall[];
 
     try {
       const result = await callModel(
@@ -994,9 +1071,12 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
         activeResearcherModel,
         messages,
         RESEARCHER_REASONING_EFFORT,
+        undefined,
+        researchTools,
       );
       content = result.content;
       usage = result.usage;
+      toolCalls = result.toolCalls ?? [];
     } catch (error) {
       return finalize({
         turnsUsed: turn,
@@ -1022,52 +1102,34 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       return finalize({ turnsUsed: turn, stopped: "max_turns" });
     }
 
-    const actions = parseActions(content);
+    messages.push({ role: "assistant", content: content || null, tool_calls: toolCalls.length ? toolCalls : undefined });
 
-    if (actions.length === 0) {
-      actionsLog.push(`[turn ${turn}] NO ACTION PARSED (treated as implicit final answer). raw content: ${content.slice(0, 300)}`);
-      messages.push({ role: "assistant", content });
+    if (toolCalls.length === 0) {
+      // Native tool-calling (2026-07-26): with a real tools API, a reply
+      // with no tool call is genuinely free-form prose, never a mis-parsed
+      // "ACTION: final_answer(" attempt (that whole failure class - a stray
+      // unbalanced paren breaking the old regex scanner - cannot happen
+      // when the API itself validates the call). Treat the text directly
+      // as the candidate answer, no prefix-stripping needed.
+      actionsLog.push(`[turn ${turn}] NO TOOL CALL (treated as implicit final answer). raw content: ${(content ?? "").slice(0, 300)}`);
 
-      // The model may have genuinely tried ACTION: final_answer(...), but
-      // parseActions's balanced-paren scanner never found a matching close
-      // (a stray unbalanced paren anywhere in a long markdown answer is
-      // enough) and correctly returned null - verified live: this leaked the
-      // literal "ACTION: final_answer(" protocol prefix into a stored
-      // Observer business-graph hint, which then got shown to the user
-      // verbatim as if it were a clean answer. Strip that prefix (and a
-      // trailing lone close-paren, if the model's text happened to end with
-      // one) before treating the rest as the candidate - otherwise this is
-      // genuinely free-form prose with no ACTION attempt, left as-is.
-      const finalAnswerPrefixPattern = /ACTION:\s*final_answer\s*\(/;
-      const prefixMatch = finalAnswerPrefixPattern.exec(content);
-      const rawCandidate = prefixMatch
-        ? content.slice(prefixMatch.index + prefixMatch[0].length).replace(/\)\s*$/, "")
-        : content;
-
-      const verdict = await evaluateProposedAnswer(rawCandidate.trim(), turn);
+      const verdict = await evaluateProposedAnswer((content ?? "").trim(), turn);
 
       if (verdict === "continue-loop") {
         continue;
       }
 
-      // Bug fix (2026-07-15): this used to force stopped:"parse_error" here
-      // regardless of the critic's verdict, discarding a genuinely good,
-      // critic-approved answer just because the model skipped the
-      // ACTION: final_answer(...) wrapper. Downstream (toValidationResult)
-      // reads stopped === "final_answer" to decide whether an answer exists
-      // at all - the override silently turned confirmed-good answers into
-      // "insufficient-evidence", which skipped the LLM answer-polish pass
-      // entirely and surfaced the raw, duplicated deterministic-fallback
-      // template to the user instead. `verdict` already carries the correct
-      // "final_answer" stopped value from evaluateProposedAnswer - trust it,
-      // exactly like the explicit ACTION: final_answer(...) branch below does.
       return verdict;
     }
 
-    messages.push({ role: "assistant", content });
+    const actions = toolCalls.map(toolCallToAction);
 
     if (actions[0]?.tool === "final_answer") {
-      // parseActions guarantees final_answer is alone when present.
+      // Native tool-calling cannot fabricate a fake observation and keep
+      // reasoning past it in the same turn (see buildSystemPrompt's
+      // comment) - but a model could still batch final_answer alongside
+      // other calls, so keep the same "first wins, alone" discipline as
+      // the old protocol.
       actionsLog.push(`[turn ${turn}] final_answer (proposed)`);
       const verdict = await evaluateProposedAnswer(actions[0].arg, turn);
 
@@ -1082,9 +1144,9 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     // same batch (e.g. read_file right after list_dir on its parent) must see
     // seenDirs/touchedFiles updates from earlier ones in this same turn, the
     // same ordering guarantee a single action always had.
-    const observationBlocks: string[] = [];
-
-    for (const action of actions) {
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      const action = actions[actionIndex] as ParsedAction;
+      const toolCallId = (toolCalls[actionIndex] as ToolCall).id;
       let observation: string;
 
       if (action.tool === "list_dir") {
@@ -1156,11 +1218,11 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
         ? `${observation.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`
         : observation;
 
-      observationBlocks.push(`ACTION ${action.tool}(${action.arg}):\n${boundedObservation}`);
+      // Native tool-calling (2026-07-26): one `role: "tool"` response per
+      // tool_call, matched by id - replaces the old single combined
+      // "OBSERVATION:" user message built from concatenated text blocks.
+      messages.push({ role: "tool", tool_call_id: toolCallId, name: action.tool, content: boundedObservation });
     }
-
-    const observationHeader = observationBlocks.length > 1 ? `OBSERVATIONS (${observationBlocks.length}):\n` : "OBSERVATION:\n";
-    messages.push({ role: "user", content: observationHeader + observationBlocks.join("\n\n---\n\n") });
 
     const currentSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size;
 
@@ -1183,7 +1245,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       stuckNudgeSent = true;
       messages.push({
         role: "user",
-        content: `${STUCK_TURNS_THRESHOLD} turns in a row now with no new directory/file/search term - it looks like you are stuck, not genuinely researching further. Give a final answer right now via ACTION: final_answer(...), based on what you have actually found, and honestly state what is missing - that is better than continuing to wander in circles.`,
+        content: `${STUCK_TURNS_THRESHOLD} turns in a row now with no new directory/file/search term - it looks like you are stuck, not genuinely researching further. Call final_answer right now, based on what you have actually found, and honestly state what is missing - that is better than continuing to wander in circles.`,
       });
     }
   }

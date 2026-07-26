@@ -39,9 +39,57 @@ export interface ProviderUsage {
   completion_tokens?: number;
 }
 
+// Native tool-calling (2026-07-26): confirmed live that rout.my (the
+// provider gateway) already normalizes EVERY model - openai/gpt-5.4,
+// anthropic/claude-opus-4.6, x-ai/grok-4.1-fast, deepseek/deepseek-v3.2, all
+// tested directly - into the same OpenAI-style `tools`/`tool_calls` shape
+// regardless of the underlying provider's own native format. No per-model
+// adapter is needed; one shape works everywhere. This replaces the
+// text-based "ACTION: name(args)" prompt protocol both agentic loops
+// (loop.ts, develop-loop.ts) used to rely on, which live testing showed
+// breaking down in two DIFFERENT model-specific ways once model choice
+// moved beyond the couple of models the protocol was originally tuned
+// against: grok-4.1-fast got stuck in a 30-turn loop failing to reproduce
+// the exact <<<SEARCH/<<<REPLACE marker syntax, and deepseek-v3.2 started
+// emitting garbled/malformed output specifically when transitioning from
+// investigation to writing after a long run. A side-by-side test of the
+// SAME task via native tool_calls (JSON-schema-validated by the API itself,
+// no prompt-format-imitation possible) produced ZERO format errors on both
+// gpt-5.4 and claude-opus-4.6.
+export interface ToolCallFunction {
+  name: string;
+  arguments: string;
+}
+
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: ToolCallFunction;
+}
+
+export interface ToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
+  role: "system" | "user" | "assistant" | "tool";
+  // Optional (not just "") because a native tool-calling turn's assistant
+  // message often has NO text content at all, only tool_calls - some
+  // providers return null there, and sending "" back on the next turn where
+  // a provider expects null/absent is itself a source of subtle protocol
+  // mismatches worth avoiding.
+  content?: string | null;
+  /** Present on an assistant message that requested one or more tool calls instead of (or alongside) text. */
+  tool_calls?: ToolCall[] | undefined;
+  /** Required on a `role: "tool"` message - which tool_call this result answers. */
+  tool_call_id?: string | undefined;
+  /** Conventionally the tool name, mirrored back on a `role: "tool"` message - not required by every provider but harmless to include. */
+  name?: string | undefined;
 }
 
 export function getStatusCode(error: unknown): number | null {
@@ -73,7 +121,8 @@ async function performCall(
   messages: ChatMessage[],
   reasoningEffort?: string,
   maxCompletionTokens?: number,
-): Promise<{ content: string; usage: ProviderUsage | null }> {
+  tools?: ToolDefinition[],
+): Promise<{ content: string; toolCalls: ToolCall[] | null; usage: ProviderUsage | null }> {
   const endpoint = `${providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), PROVIDER_REQUEST_TIMEOUT_MS);
@@ -92,6 +141,7 @@ async function performCall(
         max_tokens: maxCompletionTokens ?? MAX_COMPLETION_TOKENS,
         messages,
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+        ...(tools?.length ? { tools, tool_choice: "auto" } : {}),
       }),
     });
 
@@ -101,7 +151,7 @@ async function performCall(
     }
 
     const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
+      choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> | null; tool_calls?: ToolCall[] } }>;
       usage?: ProviderUsage;
     };
     const rawContent = payload.choices?.[0]?.message?.content;
@@ -110,8 +160,9 @@ async function performCall(
       : Array.isArray(rawContent)
         ? rawContent.map((part) => part.text ?? "").join("")
         : "";
+    const toolCalls = payload.choices?.[0]?.message?.tool_calls ?? null;
 
-    return { content, usage: payload.usage ?? null };
+    return { content, toolCalls, usage: payload.usage ?? null };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -124,12 +175,13 @@ export async function callModel(
   messages: ChatMessage[],
   reasoningEffort?: string,
   maxCompletionTokens?: number,
-): Promise<{ content: string; usage: ProviderUsage | null }> {
+  tools?: ToolDefinition[],
+): Promise<{ content: string; toolCalls: ToolCall[] | null; usage: ProviderUsage | null }> {
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= RATE_LIMIT_MAX_ATTEMPTS; attempt += 1) {
     try {
-      return await performCall(providerBaseUrl, providerApiKey, model, messages, reasoningEffort, maxCompletionTokens);
+      return await performCall(providerBaseUrl, providerApiKey, model, messages, reasoningEffort, maxCompletionTokens, tools);
     } catch (error) {
       lastError = error;
 
