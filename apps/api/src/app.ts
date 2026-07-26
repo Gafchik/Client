@@ -1122,6 +1122,17 @@ export function createApp() {
               : `${priorDevelop.task}\n\nПользователь ОТКЛОНИЛ выполнение команды "${resolvedAction.command}". Продолжи задачу БЕЗ неё — либо предложи альтернативный путь, либо честно опиши в итоговом summary, что это заблокировано и требует ручного вмешательства.`;
             const status = startDevelopRun({
               ...developInputBase,
+              // Model-capture bug (2026-07-26, live incident): a continuation
+              // must keep the EXACT model the original run started with, not
+              // whatever teams.developer_model/reviewer_model currently reads
+              // in the DB - the team's model can legitimately change while an
+              // approval/clarification round-trip is in flight (e.g. testing
+              // a new roster), and developInputBase above always re-reads the
+              // CURRENT value. priorDevelop already stores what the run
+              // actually used (DevelopRunStatusRecord.developerModel/
+              // reviewerModel), so it overrides developInputBase here.
+              developerModel: priorDevelop.developerModel,
+              reviewerModel: priorDevelop.reviewerModel,
               task: composedTask,
               continueFrom: {
                 worktrees: priorDevelop.worktrees,
@@ -1146,6 +1157,9 @@ export function createApp() {
             ].join("\n");
             const status = startDevelopRun({
               ...developInputBase,
+              // See model-capture bug note above.
+              developerModel: priorDevelop.developerModel,
+              reviewerModel: priorDevelop.reviewerModel,
               task: composedTask,
               continueFrom: {
                 worktrees: priorDevelop.worktrees,
@@ -1222,6 +1236,9 @@ export function createApp() {
               ].join("\n");
               const status = startDevelopRun({
                 ...developInputBase,
+                // See model-capture bug note above.
+                developerModel: priorDevelop.developerModel,
+                reviewerModel: priorDevelop.reviewerModel,
                 task: testsTask,
                 continueFrom: {
                   worktrees: priorDevelop.worktrees,
@@ -1346,12 +1363,19 @@ export function createApp() {
               : Boolean(priorDevelop?.autoMergeOnCompletion);
 
             const shouldContinueExistingWorktree = Boolean(priorDevelop?.worktrees.length);
+            const isContinuation = (intent === "develop-correction" || shouldContinueExistingWorktree) && priorDevelop;
             const status = startDevelopRun({
               ...developInputBase,
+              // See model-capture bug note above (only applies when this is
+              // actually a continuation - a fresh task with no worktree to
+              // continue must still pick up whatever the team is set to now).
+              ...(isContinuation
+                ? { developerModel: priorDevelop.developerModel, reviewerModel: priorDevelop.reviewerModel }
+                : {}),
               task: composedTask,
               ...(chain ? chain : {}),
               ...(autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
-              ...((intent === "develop-correction" || shouldContinueExistingWorktree) && priorDevelop
+              ...(isContinuation
                 ? {
                     continueFrom: {
                       worktrees: priorDevelop.worktrees,
@@ -1497,10 +1521,34 @@ export function createApp() {
       return reply.code(409).send({ message: "Не выбрана Team — Developer использует researcher-модель команды, Reviewer — critic-модель." });
     }
 
+    // Scope directive (2026-07-26, live finding): this direct endpoint used
+    // to always hand startDevelopRun EVERY registered root of the project,
+    // unlike the chat path (question-run above, ~:1064) which classifies
+    // "делай только бек"/"backend-проект"-style task text and restricts to
+    // the matching root(s) first. A multi-root project's semantic_search
+    // pools embeddings across ALL roots it is given - live trace showed a
+    // backend-only task's semantic_search returning ONLY frontend .js
+    // matches because the sibling frontend/billing roots were included
+    // unfiltered, and the model never tried the tool again for the rest of
+    // that 39-turn run. Same classifier, same gate, so any direct caller of
+    // this endpoint (not just chat) gets the same protection.
+    const scopeDirective = projectRecord && projectRecord.paths.length > 1
+      ? await classifyProjectScopeDirective({
+          task,
+          providerBaseUrl,
+          providerModel: selectedTeam.criticModel,
+          providerApiKey,
+          roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
+        })
+      : { restricted: false, allowedLabels: [] as string[] };
+    const effectiveProjectPaths = scopeDirective.restricted
+      ? projectRecord?.paths.filter((pathRecord) => scopeDirective.allowedLabels.includes(pathRecord.name))
+      : projectRecord?.paths;
+
     const status = startDevelopRun({
       task,
       projectPath: normalizePath(path.resolve(projectPath)),
-      ...(projectRecord?.paths.length ? { projectPaths: projectRecord.paths } : {}),
+      ...(effectiveProjectPaths?.length ? { projectPaths: effectiveProjectPaths } : {}),
       providerBaseUrl,
       providerApiKey,
       developerModel: selectedTeam.developerModel,

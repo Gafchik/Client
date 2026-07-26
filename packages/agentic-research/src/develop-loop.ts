@@ -1,13 +1,16 @@
+import { appendFileSync } from "node:fs";
 import { callModel, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
 import { buildSeedGrepObservation } from "./loop.js";
 import { formatSecurityFindingsForReviewer, scanDiffForSecurityFindings } from "./security-scan.js";
 import {
   dirnameOf,
   editFile,
+  formatReadFileSlice,
   grepContent,
   listDir,
   normalizeDirKey,
   readFile,
+  readFileRaw,
   runShellCommand,
   toWorkspaceRelativePath,
   writeFile,
@@ -96,6 +99,23 @@ const EDIT_FAILURE_STUCK_THRESHOLD = 3;
 // more than pure exploration does.
 const STUCK_TURNS_THRESHOLD = 10;
 const STUCK_TURNS_HARD_ABORT = STUCK_TURNS_THRESHOLD + 5;
+
+// Explore-vs-write forcing gate (2026-07-26, live investigation): three
+// separate soft-nudge attempts (two system-prompt wordings pushing
+// find_references/semantic_search, then a `note` tool for durable
+// findings) all measured ZERO effect on grok-4.5/deepseek-v4-pro, which
+// burned their ENTIRE token budget on read-only exploration and never
+// called write_file/edit_file once. Root cause: both models' `content`
+// field was EMPTY on every single turn across every trace captured - they
+// never verbalize reasoning at all, so any instruction relying on the
+// model "noticing" something about its own behavior is a no-op for them,
+// no matter how it is worded. zeroMutationBounceSent below already proves
+// the fix that DOES work for this class of model: a forced message the
+// model must react to, not a suggestion it can silently ignore - but it is
+// reactive (only fires if the model itself calls task_complete). This
+// ratio is the PROACTIVE version of the same idea, checked every turn
+// regardless of what the model does.
+const EXPLORATION_BUDGET_BOUNCE_RATIO = 0.6;
 
 // DB safety (2026-07-18, explicit product-owner requirement): a command
 // that mutates persisted schema/data in a way git cannot roll back. Kept
@@ -278,6 +298,7 @@ type DevelopTool =
   | "run_command"
   | "write_file"
   | "edit_file"
+  | "note"
   | "ask_user"
   | "task_complete";
 
@@ -289,6 +310,8 @@ export interface ParsedDevelopAction {
   /** edit_file's <<<SEARCH / <<<REPLACE blocks. */
   search?: string;
   replace?: string;
+  /** read_file's optional continuation offset (see tools.ts readFile's pagination comment). */
+  offset?: number | undefined;
   /** Set when the ACTION line was found but its required block(s) were malformed - executor bounces this back verbatim. */
   formatError?: string;
 }
@@ -344,6 +367,7 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
       : []),
     "DB SAFETY: a command that changes persisted schema or data in a way git cannot undo (running a migration, db:seed, migrate:rollback, DROP/ALTER/TRUNCATE, etc.) will NOT execute when you call run_command - it instead PAUSES this run for a human to approve, and resumes afterward WITH THE REAL OUTPUT of what you ran, so you can act on it. This is expected, not an error - if the task genuinely needs a migration, issue it via run_command like any other command and wait; do not try to work around it (no manually editing files inside a database, no alternate commands to sneak past it). A command with --pretend or --dry-run (e.g. php artisan migrate --pretend) runs immediately WITHOUT pausing - nothing actually changes, so it is a good first move to preview a migration before running it for real. If you only need to VERIFY something against the database without permanently changing data (e.g. checking a query/insert behaves correctly), wrap it in an explicit transaction that you roll back yourself using the project's own DB tooling (e.g. for Laravel: php artisan tinker --execute=\"DB::beginTransaction(); ...; DB::rollBack();\", or raw SQL: START TRANSACTION; ...; ROLLBACK;) - that is a normal run_command too, not a paused one, since nothing is actually left changed.",
     "PREFER edit_file over write_file for existing files: read_file output can be truncated, and rewriting a file from a truncated read destroys the part you never saw. edit_file only touches the exact snippet you matched, so it is immune to that - its `search` argument must match the file's CURRENT content exactly and occur exactly once.",
+    "note - call this as soon as you understand something you will need later: what a specific method/class does and where it lives, a schema/column detail, a naming convention, which existing mechanism you decided to reuse. This is cheaper and more durable than re-reading the same file again later - a long run's older raw reads eventually get summarized away, but notes do not. Bad note: a copy of file content. Good note: \"insurance_response_count (Bill.php ~1647) counts billHistories() rows where type in Payment/Verification/Delay/Denial/Appeal - first-of-type logic still needs adding there\".",
     "ask_user - a clarifying question IN RUSSIAN - use ONLY if the task is genuinely ambiguous in a way that materially changes what to implement (different behavior, different data model - not naming/details you can decide yourself). It ends the run and asks the human. Ask at the START, before writing code - never after you have already implemented one interpretation.",
     "task_complete - call exactly once, when the change is done and verified as well as this project allows. The summary (IN RUSSIAN) must state: what was changed and why, what was verified (which commands, what they showed), honestly what was NOT verified and why (e.g. the project has no test suite), and - only if genuinely non-empty, do not pad this - remaining risk (something you are not fully certain about, an edge case you could not check) and anything worth a human manually checking before this ships. No meta commentary.",
     "",
@@ -360,6 +384,10 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
     // SIMILAR code) is not the same check as this one (find the EXACT
     // mechanism this task touches) - both are required, they answer
     // different questions.
+    // Wording-nudge experiment (2026-07-26, both variants measured ~zero
+    // effect on grok-4.5/deepseek-v4-pro's convergence - see task #111
+    // notes): reverted pending a debug-log-based investigation of what the
+    // model is actually doing turn by turn before trying a code-level fix.
     "1b. If the task modifies, gates, or inserts a step into an EXISTING user-facing flow (a button, an endpoint, a process the task describes as already happening) - find and read THAT EXACT flow end-to-end (the real route/controller/handler involved, not just something thematically similar) before deciding your approach. \"I found a similar-sounding model\" is not the same as \"I traced the actual code path this task changes\" - do the second one specifically, every time the task references existing behavior.",
     // Live evidence (2026-07-25, same task): the codebase already had a
     // container for exactly this domain (Sms/) - the model had ALREADY READ
@@ -401,7 +429,7 @@ function buildDevelopTools(hasSemanticSearch: boolean, hasFindReferences: boolea
   const tools: ToolDefinition[] = [
     { type: "function", function: { name: "list_dir", description: "List a directory's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
     { type: "function", function: { name: "grep_content", description: "Search file contents for a literal string or regex.", parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] } } },
-    { type: "function", function: { name: "read_file", description: "Read a file's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
+    { type: "function", function: { name: "read_file", description: "Read a file's contents. Long files are truncated - the truncation message tells you the exact `offset` to pass in a follow-up call to continue reading from where it stopped, so you can reach the rest of a large file without guessing at line ranges.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." }, offset: { type: "number", description: "Character offset to continue from - omit for the start of the file. Use the offset value the previous truncated read told you to use." } }, required: ["path"] } } },
   ];
 
   if (hasSemanticSearch) {
@@ -435,6 +463,15 @@ function buildDevelopTools(hasSemanticSearch: boolean, hasFindReferences: boolea
         },
       },
     },
+    // Durable notes (2026-07-26, live investigation): context compaction
+    // periodically wipes the raw content you have read - a live trace
+    // showed a model re-reading the exact same file every ~6 turns because
+    // whatever it learned from it earlier had already scrolled out of
+    // context. Use `note` to save a SHORT, concrete fact you want to keep
+    // for the rest of THIS run regardless of compaction - "what/where", not
+    // a file dump. Notes are cheap and survive compaction verbatim; re-reading
+    // a whole file you have already understood is the expensive alternative.
+    { type: "function", function: { name: "note", description: "Save a short, durable fact about this project for the rest of the run (survives context compaction, unlike raw file reads) - e.g. what a specific method does and where, a schema detail, a convention you found. NOT a place for file dumps or your plan - one or two sentences of the actual finding.", parameters: { type: "object", properties: { fact: { type: "string" } }, required: ["fact"] } } },
     { type: "function", function: { name: "ask_user", description: "Ask the human ONE clarifying question (in Russian) - only when the task is genuinely ambiguous in a way that changes what to implement. Ends the run.", parameters: { type: "object", properties: { question: { type: "string" } }, required: ["question"] } } },
     { type: "function", function: { name: "task_complete", description: "Call exactly once, alone, when the change is done and verified. Summary in Russian: what changed and why, what was verified, what was not and why, remaining risk if any.", parameters: { type: "object", properties: { summary: { type: "string" } }, required: ["summary"] } } },
   );
@@ -464,8 +501,9 @@ function toolCallToAction(toolCall: ToolCall): ParsedDevelopAction {
 
   switch (tool) {
     case "list_dir":
-    case "read_file":
       return { tool, arg: str("path") };
+    case "read_file":
+      return { tool, arg: str("path"), offset: typeof args.offset === "number" ? args.offset : undefined };
     case "grep_content":
       return { tool, arg: str("pattern") };
     case "semantic_search":
@@ -486,6 +524,8 @@ function toolCallToAction(toolCall: ToolCall): ParsedDevelopAction {
         return { tool, arg: str("path"), formatError: "edit_file call is missing the required \"search\" and/or \"replace\" field." };
       }
       return { tool, arg: str("path"), search: args.search, replace: args.replace };
+    case "note":
+      return { tool, arg: str("fact") };
     case "ask_user":
       return { tool, arg: str("question") };
     case "task_complete":
@@ -1169,6 +1209,28 @@ async function callReviewer(input: {
   }
 }
 
+// Debug tracer (2026-07-26, live investigation: "надо видеть до чего доходит
+// модель, увидеть каждый шаг" - actionsLog is a one-line-per-action summary
+// that is ALSO fed back into the model's own context on compaction, so it
+// cannot carry full reasoning text/observations without inflating every
+// future turn's prompt. This is a separate, human-only side channel: full
+// untruncated model reasoning + full tool args/observations, written to a
+// file, never read back by the loop itself. Opt-in via env var so normal
+// runs pay zero cost.
+const developDebugLogPath = process.env.DEVELOP_DEBUG_LOG;
+
+function writeDevelopDebugLog(text: string): void {
+  if (!developDebugLogPath) {
+    return;
+  }
+
+  try {
+    appendFileSync(developDebugLogPath, `${text}\n\n`);
+  } catch {
+    // Debug-only channel - never let a logging failure affect the actual run.
+  }
+}
+
 export async function runDevelopmentTask(options: DevelopRunOptions): Promise<DevelopRunResult> {
   const maxTurns = options.maxTurns ?? DEFAULT_DEVELOP_CEILING_TURNS;
   const isMultiRoot = options.projectRoots.length > 1;
@@ -1201,7 +1263,20 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ]),
     ]
     : [];
-  const developTools = buildDevelopTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery));
+  let developTools = buildDevelopTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery));
+  // Write-only mode (2026-07-26, live investigation): the forced bounce
+  // message alone (EXPLORATION_BUDGET_BOUNCE_RATIO) measured ZERO effect on
+  // grok-4.5 - it kept issuing run_command exploration calls right past the
+  // directive, exactly as before. A request the model can silently ignore
+  // is not a deterministic gate; this is the actual enforcement - once the
+  // bounce fires, exploration tools are removed from what the model CAN
+  // call at all, not just asked not to call. read_file stays (edit_file's
+  // touchedFiles gate below requires it - a file only ever seen via
+  // run_command's cat/sed does not count as "read" for that gate, so
+  // removing read_file here would leave the model unable to satisfy it for
+  // anything it only shell-explored).
+  const WRITE_MODE_TOOL_NAMES = new Set(["read_file", "write_file", "edit_file", "note", "ask_user", "task_complete"]);
+  const writeOnlyDevelopTools = developTools.filter((tool) => WRITE_MODE_TOOL_NAMES.has(tool.function.name));
   const messages: ChatMessage[] = [
     { role: "system", content: buildDevelopSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery)) },
     {
@@ -1279,6 +1354,21 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
     messages.push({ role: "user", content: options.knownFactsHint });
   }
 
+  // Durable notes (2026-07-26, live investigation - see the `note` tool's
+  // description above for the finding this responds to). This slot sits
+  // BEFORE seedMessageCount is captured below, so compactHistoryIfNeeded's
+  // splice range (which always starts at seedMessageCount) can never touch
+  // it - it is rewritten in place on every `note` call instead, the same
+  // "single persistent slot" mechanic historyCompactionMessageIndex already
+  // uses for the compaction summary itself.
+  const durableNotes: string[] = [];
+  const durableNotesMessageIndex = messages.length;
+  const renderDurableNotes = (): string =>
+    durableNotes.length === 0
+      ? "Заметки (note), сохранённые за этот прогон: пока нет."
+      : ["Заметки (note), сохранённые за этот прогон (переживают сжатие истории):", ...durableNotes.map((note, index) => `${index + 1}. ${note}`)].join("\n");
+  messages.push({ role: "user", content: renderDurableNotes() });
+
   // Context compaction (iteration 5 evidence, 2026-07-18): raw message
   // history was found to be the REAL driver behind DEVELOP_TOKEN_SAFETY_LIMIT
   // aborts, not completion truncation - a real run hit 974K prompt tokens by
@@ -1320,8 +1410,28 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   const touchedFiles = new Set<string>([...seedReadFiles]);
   const editedFiles = new Set<string>();
   const editFailuresByFile = new Map<string, number>();
+  // File-content cache (2026-07-26) - keyed by workspace-relative path, only
+  // for the structured read_file tool (run_command's cat/sed is unstructured
+  // shell text, too fragile to safely intercept by parsing arbitrary
+  // commands). Invalidated below whenever write_file/edit_file successfully
+  // changes a path, so a cache hit is never stale. Stores the FULL raw
+  // content (not a pre-truncated view) so a later call with a DIFFERENT
+  // offset (see readFileRaw/formatReadFileSlice pagination above) is
+  // served correctly from the same cache entry instead of always
+  // re-serving whatever was truncated on the first call.
+  const readFileCache = new Map<string, string>();
   const seenDirs = new Set<string>([normalizeDirKey("."), ...[...seedReadFiles].map((filePath) => dirnameOf(filePath))]);
   const grepTermsSeen = new Set<string>();
+  // Bug fix (2026-07-26, live incident): grok-4.5 investigated almost
+  // entirely through run_command (cat/rg/sed), a valid and often more
+  // efficient exploration style this loop has always allowed - but the
+  // stuck-detector's "surface size" only ever credited list_dir/grep_content/
+  // read_file/edit_file, so 19 turns of genuine, ever-different investigation
+  // (new files/patterns every single command) still triggered a false
+  // "no new ground" SAFETY ABORT. Tracks distinct run_command strings the
+  // same way grepTermsSeen tracks distinct grep patterns - a model that
+  // issues the SAME command repeatedly still correctly reads as stuck.
+  const runCommandsSeen = new Set<string>();
   const verificationLog: DevelopVerificationEntry[] = [];
   const reviews: DevelopReviewRound[] = [];
   const sensitiveActions: DevelopSensitiveAction[] = [...(options.priorSensitiveActions ?? [])];
@@ -1340,10 +1450,11 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   let phase: "developing" | "reviewing" | "fixing" = "developing";
   let zeroMutationBounceSent = false;
   let zeroVerificationBounceSent = false;
+  let explorationBudgetBounceSent = false;
   let noActionStreak = 0;
   let stuckTurns = 0;
   let stuckNudgeSent = false;
-  let lastSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size + editedFiles.size;
+  let lastSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size + editedFiles.size + runCommandsSeen.size;
 
   const finalize = async (
     overrides: Partial<DevelopRunResult> & Pick<DevelopRunResult, "turnsUsed" | "stopped">,
@@ -1605,6 +1716,12 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
     messages.push({ role: "assistant", content: content || null, tool_calls: toolCalls.length ? toolCalls : undefined });
     const actions = toolCalls.map(toolCallToAction);
 
+    writeDevelopDebugLog(
+      `===== turn ${turn} (developerModel=${options.developerModel}) =====\n` +
+      `REASONING:\n${(content ?? "(empty)").trim()}\n` +
+      `TOOL_CALLS:\n${actions.map((a, i) => `  [${i}] ${a.tool}(${a.arg.length > 500 ? `${a.arg.slice(0, 500)}...` : a.arg})`).join("\n") || "  (none)"}`,
+    );
+
     if (actions.length === 0) {
       noActionStreak += 1;
       actionsLog.push(`[turn ${turn}] NO TOOL CALL. raw content: ${(content ?? "").slice(0, 200)}`);
@@ -1697,6 +1814,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
           });
         }
 
+        runCommandsSeen.add(action.arg);
         const result = await runShellCommand(options.projectRoots, action.arg);
         verificationLog.push({ ...result, turn });
         observation = `exit code ${result.exitCode} (${Math.round(result.durationMs / 1000)}s)\n${result.output || "(no output)"}`;
@@ -1704,7 +1822,9 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
         observation = await writeFile(options.projectRoots, action.arg, action.content ?? "");
 
         if (observation.startsWith("OK")) {
-          editedFiles.add(toWorkspaceRelativePath(options.projectRoots, action.arg));
+          const normalizedWritePath = toWorkspaceRelativePath(options.projectRoots, action.arg);
+          editedFiles.add(normalizedWritePath);
+          readFileCache.delete(normalizedWritePath);
         }
       } else if (action.tool === "edit_file") {
         const normalized = toWorkspaceRelativePath(options.projectRoots, action.arg);
@@ -1720,6 +1840,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
           if (observation.startsWith("OK")) {
             editedFiles.add(normalized);
             editFailuresByFile.delete(normalized);
+            readFileCache.delete(normalized);
           } else {
             const failures = (editFailuresByFile.get(normalized) ?? 0) + 1;
 
@@ -1746,6 +1867,10 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
             }
           }
         }
+      } else if (action.tool === "note") {
+        durableNotes.push(action.arg);
+        messages[durableNotesMessageIndex] = { role: "user", content: renderDurableNotes() };
+        observation = "Noted.";
       } else {
         const parentDir = dirnameOf(action.arg);
 
@@ -1754,10 +1879,31 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
           seenDirs.add(normalizeDirKey(parentDir));
           observation = `You asked to read a file in the "${parentDir}" directory, which you have not listed yet - here is its content (a neighboring file with a similar name might be the real place to change); read the file you need as your next action:\n${dirListing}`;
         } else {
-          observation = await readFile(options.projectRoots, action.arg, DEVELOP_READ_FILE_CHARS);
+          const normalizedReadPath = toWorkspaceRelativePath(options.projectRoots, action.arg);
+          const requestedOffset = action.offset ?? 0;
+          const cachedFullContent = readFileCache.get(normalizedReadPath);
 
-          if (!observation.startsWith("Error")) {
-            touchedFiles.add(toWorkspaceRelativePath(options.projectRoots, action.arg));
+          if (cachedFullContent !== undefined) {
+            // File-content cache (2026-07-26, live investigation, combined
+            // with durable notes/pagination above): serves the requested
+            // OFFSET's view from the same cached full content, not just a
+            // replay of whatever was truncated on the first read - a repeat
+            // read_file(path) with no new offset gets an explicit "already
+            // read" note so the model notices it is asking for the same
+            // thing again instead of continuing past the truncation point.
+            const slice = formatReadFileSlice(cachedFullContent, DEVELOP_READ_FILE_CHARS, requestedOffset);
+            observation = requestedOffset === 0 ? `(already read earlier this run - same content, not re-fetched from disk)\n${slice}` : slice;
+            touchedFiles.add(normalizedReadPath);
+          } else {
+            const raw = await readFileRaw(options.projectRoots, action.arg);
+
+            if ("error" in raw) {
+              observation = raw.error;
+            } else {
+              touchedFiles.add(normalizedReadPath);
+              readFileCache.set(normalizedReadPath, raw.content);
+              observation = formatReadFileSlice(raw.content, DEVELOP_READ_FILE_CHARS, requestedOffset);
+            }
           }
         }
       }
@@ -1785,6 +1931,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       // cost real diagnosis time).
       const logSnippet = outcomeTag === "FORMAT_ERROR" ? ` — ${observation.slice(0, 220).replace(/\n/g, " ")}` : "";
       actionsLog.push(`[turn ${turn}] ${action.tool}(${action.arg}) -> ${observation.split("\n").length} lines${outcomeTag ? ` [${outcomeTag}]` : ""}${logSnippet}`);
+      writeDevelopDebugLog(`--- turn ${turn} OBSERVATION for ${action.tool}(${action.arg.length > 200 ? `${action.arg.slice(0, 200)}...` : action.arg}) ---\n${observation}`);
 
       const boundedObservation = observation.length > MAX_OBSERVATION_CHARS && action.tool !== "read_file" && !skipTruncation
         ? `${observation.slice(0, MAX_OBSERVATION_CHARS)}\n... (truncated)`
@@ -1805,7 +1952,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
     // loop's proven mechanism (see STUCK_TURNS_THRESHOLD). editedFiles counts
     // toward progress here (unlike research, which has no write concept) -
     // making real edits is progress even without new exploration.
-    const currentSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size + editedFiles.size;
+    const currentSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size + editedFiles.size + runCommandsSeen.size;
 
     if (currentSurfaceSize === lastSurfaceSize) {
       stuckTurns += 1;
@@ -1825,6 +1972,21 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       messages.push({
         role: "user",
         content: `${STUCK_TURNS_THRESHOLD} turns in a row now with no new directory/file/search term/edit - it looks like you are stuck (re-reading the same ground) rather than making progress. If you have enough to act, do so now (write_file/edit_file); if you are blocked, call task_complete now describing exactly what is done and what is not, honestly - that is better than continuing to wander in circles.`,
+      });
+    }
+
+    // See EXPLORATION_BUDGET_BOUNCE_RATIO's comment above - proactive,
+    // forced version of zeroMutationBounceSent's check, firing regardless
+    // of whether the model ever calls task_complete on its own.
+    const budgetUsedRatio = Math.max(turn / maxTurns, (totalPromptTokens + totalCompletionTokens) / DEVELOP_TOKEN_SAFETY_LIMIT);
+
+    if (editedFiles.size === 0 && !explorationBudgetBounceSent && budgetUsedRatio >= EXPLORATION_BUDGET_BOUNCE_RATIO) {
+      explorationBudgetBounceSent = true;
+      developTools = writeOnlyDevelopTools;
+      actionsLog.push(`[turn ${turn}] exploration-budget bounce: ${Math.round(budgetUsedRatio * 100)}% of budget used, zero files changed. Exploration tools disabled for the rest of this run.`);
+      messages.push({
+        role: "user",
+        content: `You have used over ${Math.round(EXPLORATION_BUDGET_BOUNCE_RATIO * 100)}% of your available turn/token budget for this task and have not changed a single file yet. Exploration tools (list_dir/grep_content/semantic_search/find_references/db_query/run_command) are now DISABLED for the rest of this run - only read_file, write_file, edit_file, note, ask_user, and task_complete remain available. Commit to an approach based on what you already know: read_file anything you still need the exact current content of, then write it. If something genuinely blocks you, call task_complete now and explain exactly what is blocking you.`,
       });
     }
   }

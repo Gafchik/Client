@@ -211,27 +211,55 @@ export async function grepContent(roots: WorkspaceRoot[], pattern: string): Prom
   }
 }
 
-export async function readFile(roots: WorkspaceRoot[], relPath: string, maxChars: number = MAX_READ_FILE_CHARS): Promise<string> {
+// Pagination (2026-07-26, live investigation): readFile used to always
+// return chars [0, maxChars) with no way to reach the rest of a longer
+// file - a real 65KB/2086-line model class exceeded MAX_READ_FILE_CHARS by
+// ~3x, and the methods multiple models needed (deep in the file) were
+// structurally unreachable through this tool. Every affected model fell
+// back to run_command's sed -n 'X,Yp' as the only way to see past the
+// cutoff - not a style preference, a workaround for a missing feature.
+// `offset` (default 0) lets a caller continue past a previous truncation;
+// the truncation message now states the next offset to pass so a model
+// (or a human caller) can actually get there.
+//
+// Split into readFileRaw (disk read, no truncation) + formatReadFileSlice
+// (pure formatting) so a caller that wants to cache a file's FULL content
+// once (develop-loop.ts's readFileCache) can still format a DIFFERENT
+// offset's view from the same cached content on a later call, instead of
+// caching one already-truncated string that can only ever answer offset 0.
+export async function readFileRaw(roots: WorkspaceRoot[], relPath: string): Promise<{ content: string } | { error: string }> {
   const resolved = resolvePath(roots, relPath);
 
   if (resolved === "top-level" || !resolved) {
-    return `Error: "${relPath}" is not a file inside any known root. Top-level parts of this project are: ${describeRoots(roots)}.`;
+    return { error: `Error: "${relPath}" is not a file inside any known root. Top-level parts of this project are: ${describeRoots(roots)}.` };
   }
 
   const target = resolveWithinRoot(resolved.root, resolved.rest);
 
   if (!target) {
-    return "Error: path is outside the project root.";
+    return { error: "Error: path is outside the project root." };
   }
 
   try {
-    const content = await fs.readFile(target, "utf8");
-    return content.length > maxChars
-      ? `${content.slice(0, maxChars)}\n... (truncated, ${content.length} chars total)`
-      : content;
+    return { content: await fs.readFile(target, "utf8") };
   } catch (error) {
-    return `Error reading file: ${error instanceof Error ? error.message : String(error)}`;
+    return { error: `Error reading file: ${error instanceof Error ? error.message : String(error)}` };
   }
+}
+
+export function formatReadFileSlice(content: string, maxChars: number, offset = 0): string {
+  const slice = content.slice(offset, offset + maxChars);
+
+  if (offset + maxChars < content.length) {
+    return `${slice}\n... (truncated: showing chars ${offset}-${offset + slice.length} of ${content.length} total - call read_file again with offset=${offset + maxChars} to continue reading from here)`;
+  }
+
+  return offset > 0 ? `${slice}\n... (end of file, ${content.length} chars total)` : slice;
+}
+
+export async function readFile(roots: WorkspaceRoot[], relPath: string, maxChars: number = MAX_READ_FILE_CHARS, offset = 0): Promise<string> {
+  const result = await readFileRaw(roots, relPath);
+  return "error" in result ? result.error : formatReadFileSlice(result.content, maxChars, offset);
 }
 
 // ---------------------------------------------------------------------------
