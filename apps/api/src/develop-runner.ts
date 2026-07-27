@@ -638,7 +638,22 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
   // but would have discarded real in-progress edits for needs-approval.
   const isPausedForHuman = result.stopped === "needs-clarification" || result.stopped === "needs-approval";
 
-  if (!result.diff.trim() && !isPausedForHuman) {
+  // Bug fix (2026-07-27, live incident): the SAME class of bug the comment
+  // above already describes, in a case it did not cover - a CONTINUATION
+  // round (input.continueFrom set) that legitimately makes no further
+  // edits this round (e.g. correctly disputing a stale reviewer finding,
+  // nothing left to change) still has an empty diff, but the conversation
+  // is NOT over - a later message in the same conversation may still need
+  // to continue in this worktree. Wiping the branch+worktree here silently
+  // discarded every prior round's accumulated changes (migrations,
+  // middleware, model edits) the moment one correction round happened to
+  // touch nothing - the NEXT continuation then had no worktree to resume,
+  // silently fell back to a fresh checkout, and produced a diff totally
+  // disconnected from the actual feature. Only a genuinely FRESH task
+  // (no continueFrom) with an empty diff is truly "nothing to merge, would
+  // just be litter" - a continuation's empty diff just means this round
+  // added nothing, not that everything before it should be discarded.
+  if (!result.diff.trim() && !isPausedForHuman && !input.continueFrom) {
     // Nothing to merge - the branch and worktree would just be litter.
     await Promise.all(worktrees.map((worktree) => removeTaskWorktree(worktree, { deleteBranch: true }).catch(() => {})));
     record.worktrees = [];
