@@ -1,4 +1,8 @@
 import { appendFileSync } from "node:fs";
+import { unlink, writeFile as writeTempFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
+import { randomUUID } from "node:crypto";
 import { callModel, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
 import { buildSeedGrepObservation } from "./loop.js";
 import { formatSecurityFindingsForReviewer, scanDiffForSecurityFindings } from "./security-scan.js";
@@ -79,6 +83,11 @@ const MAX_REVIEW_DIFF_CHARS = 60_000;
 // (docs/architecture/011-developer-pipeline.md: bounded retry is what keeps
 // the Developer<->Reviewer loop from burning budget on noise findings).
 const MAX_REVIEW_ROUNDS = 2;
+// Reviewer verification budget (2026-07-27) - bounded so a Reviewer that
+// gets absorbed in checking one claim cannot turn into a second full
+// exploration loop; this is meant for a handful of targeted runtime checks
+// right before the verdict, not open-ended investigation.
+const REVIEWER_MAX_VERIFY_TURNS = 4;
 // Live evidence (2026-07-18): against a real 392-line file (magendamd
 // CreateClinicAction.php - the earlier develop-loop tests only ever hit
 // small synthetic files, which never surfaced this), a run made 13
@@ -1001,6 +1010,65 @@ function extractSummaryChunks(summary: string): string[] {
   return chunks.filter((chunk) => chunk.length >= 15);
 }
 
+// Reviewer DB verification (2026-07-27, explicit product-owner request:
+// give the Reviewer the same real-behavior-checking ability the Developer
+// already has via run_command's transaction-wrapped tinker convention -
+// "как это может Клод делать: select, запускать тинкер в транзакции и
+// откатывать, чтобы это было безопасно"). Unlike the Developer's version
+// (which trusts the model to write its own DB::beginTransaction()/
+// rollBack() correctly), this wraps the model's PHP snippet in a
+// transaction+rollback THAT WE CONSTRUCT, not the model - safety enforced
+// by code, matching this codebase's standing "never rely on model
+// compliance" convention. Live evidence motivating this: a real MD-261
+// round only caught its two worst bugs (deleting ALL tokens instead of
+// one; a string/int comparison that always failed) once the Developer was
+// explicitly told to verify behaviorally instead of trusting php -l alone
+// - the Reviewer, which never runs anything, could not have caught either
+// one from the diff text alone.
+//
+// The temp script is written OUTSIDE the git worktree (a real OS temp
+// path, never under projectRoots) specifically so it can never show up as
+// an untracked file in the NEXT round's diff - collectWorktreeChanges/git
+// status would otherwise pick up stray litter here, corrupting the
+// diffUnchangedSinceLastReview byte-comparison this file already relies on.
+async function verifyInTransactionTinker(projectRoots: WorkspaceRoot[], phpCode: string): Promise<string> {
+  const isMultiRoot = projectRoots.length > 1;
+  const tempPath = joinPath(tmpdir(), `client-reviewer-verify-${randomUUID()}.php`);
+  const wrapped = [
+    "<?php",
+    "",
+    "use Illuminate\\Support\\Facades\\DB;",
+    "",
+    "DB::beginTransaction();",
+    "",
+    "try {",
+    phpCode,
+    "} catch (\\Throwable $e) {",
+    "    echo 'VERIFY ERROR: ' . $e->getMessage() . PHP_EOL;",
+    "} finally {",
+    "    DB::rollBack();",
+    "}",
+    "",
+  ].join("\n");
+
+  try {
+    await writeTempFile(tempPath, wrapped, "utf8");
+  } catch (error) {
+    return `Error writing temp verification script: ${error instanceof Error ? error.message : String(error)}`;
+  }
+
+  try {
+    const primaryLabel = (projectRoots[0] as WorkspaceRoot).label;
+    const tinkerCommand = `php artisan tinker --execute="require '${tempPath}';"`;
+    const result = await runShellCommand(projectRoots, isMultiRoot ? `${primaryLabel}: ${tinkerCommand}` : tinkerCommand);
+    return `exit code ${result.exitCode} (${Math.round(result.durationMs / 1000)}s)\n${result.output || "(no output)"}`;
+  } finally {
+    await unlink(tempPath).catch(() => {
+      // Best-effort cleanup of a real-OS-temp-dir file - never worth failing the verification over.
+    });
+  }
+}
+
 async function callReviewer(input: {
   reviewerModel: string;
   providerBaseUrl: string;
@@ -1038,10 +1106,15 @@ async function callReviewer(input: {
    */
   knownFactsHint?: string;
   observerHint?: string;
+  /** Read-only SELECT/WITH/EXPLAIN/SHOW against the project's real DB - same tool the Developer already has. */
+  dbQuery?: (query: string) => Promise<string>;
+  /** Runs a PHP snippet against the real project inside a transaction WE wrap and roll back - see verifyInTransactionTinker above. */
+  projectRoots?: WorkspaceRoot[];
 }): Promise<{ round: DevelopReviewRound | null; promptTokens: number; completionTokens: number; unavailableReason?: string }> {
   const boundedDiff = input.diff.length > MAX_REVIEW_DIFF_CHARS
     ? `${input.diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n... (diff truncated at ${MAX_REVIEW_DIFF_CHARS} chars - flag this if the visible part alone cannot justify approval)`
     : input.diff;
+  const canVerifyBehavior = Boolean(input.dbQuery || input.projectRoots?.length);
   const messages: ChatMessage[] = [
     { role: "system", content: REVIEWER_SYSTEM_PROMPT },
     {
@@ -1119,6 +1192,17 @@ async function callReviewer(input: {
         // the actual diff, don't block on the hint's wording alone.
         ...(input.observerHint ? ["", input.observerHint] : []),
         ...(input.knownFactsHint ? ["", input.knownFactsHint] : []),
+        // Reviewer DB verification (2026-07-27): a static read of the diff
+        // cannot catch a comparison that is always false at runtime (a
+        // string/int mismatch) or a query that deletes more than it should
+        // - both real bugs a live MD-261 round only caught once the
+        // Developer was forced to actually RUN the code, not just read it.
+        ...(canVerifyBehavior
+          ? [
+              "",
+              `You may call ${input.dbQuery ? "db_query (read-only SELECT/WITH/EXPLAIN/SHOW)" : ""}${input.dbQuery && input.projectRoots?.length ? " and " : ""}${input.projectRoots?.length ? "verify_in_transaction (a PHP snippet run against this project - automatically wrapped in a transaction that is ALWAYS rolled back afterward, so nothing you run here is ever persisted)" : ""} BEFORE giving your final verdict, when a finding you are about to make is actually a claim about RUNTIME BEHAVIOR (does this comparison actually match; does this query affect the row(s) it should; does this field actually get persisted) rather than something you can settle by reading the diff text alone. Do not use these for things the diff already answers on its own - only for genuine behavioral uncertainty. You have a limited number of these calls before you must give your final verdict - use them deliberately, not to re-explore the whole codebase.`,
+            ]
+          : []),
         "",
         "Unified diff of the change:",
         boundedDiff,
@@ -1126,10 +1210,83 @@ async function callReviewer(input: {
     },
   ];
 
+  const reviewerTools: ToolDefinition[] = [];
+
+  if (input.dbQuery) {
+    reviewerTools.push({ type: "function", function: { name: "db_query", description: "Run a single read-only SELECT/WITH/EXPLAIN/SHOW statement against the project's real database. Never INSERT/UPDATE/DELETE/DDL.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } });
+  }
+
+  if (input.projectRoots?.length) {
+    reviewerTools.push({ type: "function", function: { name: "verify_in_transaction", description: "Run a PHP snippet against this project to verify a specific runtime behavior claim (e.g. does this comparison actually match, does this method return what the diff assumes). Automatically wrapped in a DB transaction that is ALWAYS rolled back after - nothing you run here is ever persisted, regardless of what the snippet does. The snippet runs inside a try/catch already, no need to add your own.", parameters: { type: "object", properties: { php_code: { type: "string", description: "PHP statements to run (no <?php tag, no surrounding try/catch/transaction - already provided)." } }, required: ["php_code"] } } });
+  }
+
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+
   try {
-    const { content, usage } = await callModel(input.providerBaseUrl, input.providerApiKey, input.reviewerModel, messages);
+    let content = "";
+
+    for (let verifyTurn = 1; verifyTurn <= REVIEWER_MAX_VERIFY_TURNS; verifyTurn += 1) {
+      const result = await callModel(input.providerBaseUrl, input.providerApiKey, input.reviewerModel, messages, undefined, undefined, reviewerTools.length ? reviewerTools : undefined);
+      totalPromptTokens += result.usage?.prompt_tokens ?? 0;
+      totalCompletionTokens += result.usage?.completion_tokens ?? 0;
+      const toolCalls = result.toolCalls ?? [];
+
+      if (toolCalls.length === 0) {
+        content = result.content;
+        break;
+      }
+
+      messages.push({ role: "assistant", content: result.content || null, tool_calls: toolCalls });
+
+      for (const toolCall of toolCalls) {
+        let args: Record<string, unknown> = {};
+
+        try {
+          args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+        } catch {
+          // Malformed args - bounce back an error observation, same as the Developer loop does.
+        }
+
+        let observation: string;
+
+        if (toolCall.function.name === "db_query" && input.dbQuery) {
+          observation = await input.dbQuery(typeof args.query === "string" ? args.query : "");
+        } else if (toolCall.function.name === "verify_in_transaction" && input.projectRoots?.length) {
+          observation = await verifyInTransactionTinker(input.projectRoots, typeof args.php_code === "string" ? args.php_code : "");
+        } else {
+          observation = `Error: unknown or unavailable tool "${toolCall.function.name}".`;
+        }
+
+        messages.push({ role: "tool", tool_call_id: toolCall.id, name: toolCall.function.name, content: observation });
+      }
+
+      if (verifyTurn === REVIEWER_MAX_VERIFY_TURNS) {
+        // Ran out of verification turns without a final answer - force one
+        // last text-only call (no tools) so a verdict still comes back
+        // instead of silently returning an empty content string.
+        const final = await callModel(input.providerBaseUrl, input.providerApiKey, input.reviewerModel, messages);
+        totalPromptTokens += final.usage?.prompt_tokens ?? 0;
+        totalCompletionTokens += final.usage?.completion_tokens ?? 0;
+        content = final.content;
+      }
+    }
+
     const trimmed = content.trim();
-    const approved = /^APPROVED\b/i.test(trimmed);
+    // Bug fix (2026-07-27, live evidence from the tool-calling verification
+    // flow above): the reviewer is instructed to reply STRICTLY with just
+    // "APPROVED" or "NEEDS_CHANGES: ...", but once it has turns to reason
+    // through tool results before answering, it started reasoning out loud
+    // FIRST and putting the verdict word at the END instead - a real round
+    // ended with a paragraph of analysis concluding "...APPROVED" on its own
+    // last line. The old start-anchored check missed this entirely, and the
+    // NEEDS_CHANGES fallback path below then treated the ENTIRE reasoning
+    // text as a single "finding", flipping a genuine approval into a false
+    // NEEDS_CHANGES. Checking the last non-empty line closes this without
+    // loosening the check elsewhere (a mid-paragraph mention of the word
+    // "approved" still will not match either anchor).
+    const lastNonEmptyLine = trimmed.split("\n").map((line) => line.trim()).filter(Boolean).pop() ?? "";
+    const approved = /^APPROVED\b/i.test(trimmed) || /^APPROVED$/i.test(lastNonEmptyLine);
     const rawFindings = approved
       ? []
       : trimmed
@@ -1193,8 +1350,8 @@ async function callReviewer(input: {
         findings: approved ? [] : (repeatedAdjusted.blockers.length > 0 ? repeatedAdjusted.blockers : filteredFindings.length > 0 ? [] : [trimmed]),
         raw: trimmed,
       },
-      promptTokens: usage?.prompt_tokens ?? 0,
-      completionTokens: usage?.completion_tokens ?? 0,
+      promptTokens: totalPromptTokens,
+      completionTokens: totalCompletionTokens,
     };
   } catch (error) {
     // Reviewer being unavailable must not deadlock the run - the diff is
@@ -1202,8 +1359,8 @@ async function callReviewer(input: {
     // hand in v1 anyway).
     return {
       round: null,
-      promptTokens: 0,
-      completionTokens: 0,
+      promptTokens: totalPromptTokens,
+      completionTokens: totalCompletionTokens,
       unavailableReason: error instanceof Error ? error.message : String(error),
     };
   }
@@ -1583,6 +1740,8 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ...(options.computeFindingSimilarity ? { computeFindingSimilarity: options.computeFindingSimilarity } : {}),
       ...(options.knownFactsHint ? { knownFactsHint: options.knownFactsHint } : {}),
       ...(options.observerHint ? { observerHint: options.observerHint } : {}),
+      ...(options.dbQuery ? { dbQuery: options.dbQuery } : {}),
+      projectRoots: options.projectRoots,
       diffUnchangedSinceLastReview,
     });
     lastReviewedDiff = latestDiff;

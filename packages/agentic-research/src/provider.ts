@@ -13,7 +13,18 @@ import { resolveProviderTemperature } from "@client/shared";
 // data" (a verdict about the model's research, when it was actually a
 // one-off infra timeout). Raised for headroom and aborts are now retried
 // like any other transient failure instead of killing the run outright.
-const PROVIDER_REQUEST_TIMEOUT_MS = 45_000;
+// Raised 45s -> 90s (2026-07-27, live investigation): callModel already
+// retries an AbortError up to PROVIDER_MAX_ATTEMPTS times (see
+// isRetryableError below), but several real Developer-pipeline runs still
+// terminated with "This operation was aborted" as their FINAL error -
+// meaning all 3 attempts failed identically. The develop-loop's contexts
+// (large tool schemas, long history, big multi-file observations) can
+// legitimately take longer to generate a response than the research loop
+// this timeout was originally tuned for - if generation genuinely needs
+// more than 45s, retrying the same 45s window 3 times just re-fails the
+// same way. This does not touch the retry COUNT, only the window each
+// attempt gets.
+const PROVIDER_REQUEST_TIMEOUT_MS = 90_000;
 const PROVIDER_MAX_ATTEMPTS = 3;
 const PROVIDER_BASE_BACKOFF_MS = 1_200;
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
