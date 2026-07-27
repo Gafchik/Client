@@ -906,6 +906,13 @@ export async function classifyChatIntent(input: {
     const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
 
     if (!jsonMatch) {
+      // Debug (2026-07-27, live investigation): classifyChatIntent was
+      // silently defaulting to "question" 9 times in a row on a real
+      // continuation message with no visible cause - this and the catch
+      // block below are the ONLY two ways that happens, and neither logged
+      // anything, so there was no way to tell "the classifier genuinely
+      // said question" from "the call itself failed/returned garbage".
+      console.error("[classifyChatIntent] no JSON found in model reply, defaulting to question. raw content:", content);
       return "question";
     }
 
@@ -921,7 +928,8 @@ export async function classifyChatIntent(input: {
     }
 
     return "question";
-  } catch {
+  } catch (error) {
+    console.error("[classifyChatIntent] call failed, defaulting to question:", error instanceof Error ? error.message : String(error));
     return "question";
   }
 }
