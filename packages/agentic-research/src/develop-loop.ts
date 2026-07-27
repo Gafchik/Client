@@ -1061,7 +1061,22 @@ async function verifyInTransactionTinker(projectRoots: WorkspaceRoot[], phpCode:
     const primaryLabel = (projectRoots[0] as WorkspaceRoot).label;
     const tinkerCommand = `php artisan tinker --execute="require '${tempPath}';"`;
     const result = await runShellCommand(projectRoots, isMultiRoot ? `${primaryLabel}: ${tinkerCommand}` : tinkerCommand);
-    return `exit code ${result.exitCode} (${Math.round(result.durationMs / 1000)}s)\n${result.output || "(no output)"}`;
+    // Noise filter (2026-07-27, live evidence): a real project's vendor/
+    // dependencies (here: defstudio/telegraph, guzzlehttp, symfony) log
+    // PHP 8.4 "implicitly nullable parameter" deprecation warnings on
+    // EVERY bootstrap, dozens of lines that have nothing to do with
+    // whatever the reviewer is actually checking. Left unfiltered, this
+    // buried the real output/error so badly that the reviewer's own
+    // response got spent re-reading/discussing the noise and was cut off
+    // by the completion-token limit before ever reaching a verdict - twice
+    // in the same live run. Only strips known-noisy deprecation lines,
+    // never touches the actual echo'd output or a real fatal/PDO error.
+    const filteredOutput = (result.output || "(no output)")
+      .split("\n")
+      .filter((line) => !/^(PHP )?Deprecated:/.test(line.trim()))
+      .join("\n")
+      .trim();
+    return `exit code ${result.exitCode} (${Math.round(result.durationMs / 1000)}s)\n${filteredOutput || "(no output after filtering deprecation noise)"}`;
   } finally {
     await unlink(tempPath).catch(() => {
       // Best-effort cleanup of a real-OS-temp-dir file - never worth failing the verification over.
@@ -1232,6 +1247,12 @@ async function callReviewer(input: {
       totalCompletionTokens += result.usage?.completion_tokens ?? 0;
       const toolCalls = result.toolCalls ?? [];
 
+      writeDevelopDebugLog(
+        `===== REVIEWER verify-turn ${verifyTurn} (reviewerModel=${input.reviewerModel}) =====\n` +
+        `REASONING:\n${(result.content ?? "(empty)").trim()}\n` +
+        `TOOL_CALLS:\n${toolCalls.map((tc, i) => `  [${i}] ${tc.function.name}(${tc.function.arguments.length > 500 ? `${tc.function.arguments.slice(0, 500)}...` : tc.function.arguments})`).join("\n") || "  (none - final answer)"}`,
+      );
+
       if (toolCalls.length === 0) {
         content = result.content;
         break;
@@ -1258,6 +1279,7 @@ async function callReviewer(input: {
           observation = `Error: unknown or unavailable tool "${toolCall.function.name}".`;
         }
 
+        writeDevelopDebugLog(`--- REVIEWER verify-turn ${verifyTurn} OBSERVATION for ${toolCall.function.name} ---\n${observation}`);
         messages.push({ role: "tool", tool_call_id: toolCall.id, name: toolCall.function.name, content: observation });
       }
 
