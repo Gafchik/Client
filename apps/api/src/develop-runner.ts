@@ -283,11 +283,24 @@ export function findLatestDevelopRunForConversation(conversationId: string): Dev
 // separate worktree, two runs against the SAME project would write the same
 // real files concurrently. Rather than reject a second request outright,
 // queue it - a per-project-root promise chain, same pattern a single mutex
-// would use, keyed by the SAME sorted-root-paths key a multi-root project's
-// identity is already keyed by elsewhere in this file (promoteDevelopmentPatternFacts,
-// resolveOriginalRoots). Only one develop run per project root is ever
-// actually EXECUTING at a time; anything after it just waits its turn.
-const activeProjectQueue = new Map<string, Promise<void>>();
+// would use.
+//
+// Bug fix (2026-07-29, live incident): this used to be keyed by the joined,
+// SORTED SET of a run's own root paths (e.g. "backend|billing|frontend") -
+// two real runs against the SAME magendamd project ran fully concurrently
+// anyway, because a scope-directive classifier (see startDevelopRun below)
+// restricted one of them to just ["backend"] while the other kept all
+// three roots, producing two DIFFERENT keys for projects that plainly
+// overlap. Caught live: both wrote to the real magendamd_backend checkout
+// at the same time - no data was actually lost that time (their edits
+// happened not to collide), but the failure mode is real file corruption,
+// not a near-miss to shrug off. Now keyed per INDIVIDUAL root path instead
+// of the joined set - a new run waits on every root it touches that
+// ANY currently active run also touches, transitively (if run B shares a
+// root with running A, and run C later shares a different root with B,
+// C correctly waits for B, which already waited for A) - not just on an
+// exact match of the whole set.
+const activeRootQueues = new Map<string, Promise<void>>();
 
 function resolveOriginalRoots(input: StartDevelopRunInput): WorkspaceRoot[] {
   return input.projectPaths?.length
@@ -297,10 +310,6 @@ function resolveOriginalRoots(input: StartDevelopRunInput): WorkspaceRoot[] {
         role: pathRecord.role,
       }))
     : [{ label: "root", absolutePath: normalizePath(path.resolve(input.projectPath)), role: "unknown" }];
-}
-
-function resolveProjectQueueKey(originalRoots: WorkspaceRoot[]): string {
-  return originalRoots.map((root) => root.absolutePath).sort().join("|");
 }
 
 export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRecord {
@@ -332,8 +341,12 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
   });
 
   const originalRoots = resolveOriginalRoots(input);
-  const queueKey = resolveProjectQueueKey(originalRoots);
-  const previousTail = activeProjectQueue.get(queueKey) ?? Promise.resolve();
+  // Wait for every CURRENTLY ACTIVE run that shares ANY of this run's roots
+  // - not just an exact-set match (see activeRootQueues' own comment above).
+  const overlappingTails = originalRoots
+    .map((root) => activeRootQueues.get(root.absolutePath))
+    .filter((tail): tail is Promise<void> => Boolean(tail));
+  const previousTail = overlappingTails.length ? Promise.all(overlappingTails).then(() => {}) : Promise.resolve();
   record.progress = { turn: 0, filesChanged: 0, phase: "queued" };
 
   const currentTail = previousTail.then(() => {
@@ -344,7 +357,13 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
   // Swallow so one failed run never poisons the queue for the NEXT task on
   // this project - each run's own success/failure is already recorded on
   // its own `record`, this chain only exists to serialize execution order.
-  activeProjectQueue.set(queueKey, currentTail.catch(() => {}));
+  const settledTail = currentTail.catch(() => {});
+
+  // Registered against EVERY root this run touches, so a LATER run sharing
+  // any one of them (even a different subset) correctly waits for this one.
+  for (const root of originalRoots) {
+    activeRootQueues.set(root.absolutePath, settledTail);
+  }
 
   void currentTail
     .then(() => maybeAdvanceChain(record, input))

@@ -4,6 +4,7 @@ import { crawlUnit, listUnitFilePaths, listWorkUnits } from "@client/agentic-res
 import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
 import { computeFileChurnSignals, type FileChurnSignal } from "@client/repository-git";
 import type { ObserverActivityInfo, ObserverProgressInfo } from "@client/shared";
+import { buildDbQueryTool } from "./db-query-tool.js";
 import { getCurrentProvider } from "./provider-store.js";
 import { getSelectedTeam } from "./team-store.js";
 
@@ -223,6 +224,7 @@ async function runnerLoop(runner: ObserverRunner): Promise<void> {
       criticModel: selectedTeam.criticModel,
       providerBaseUrl: provider.baseUrl,
       providerApiKey: provider.apiKey,
+      ...(selectedTeam.researcherEscalationModel ? { researcherEscalationModel: selectedTeam.researcherEscalationModel } : {}),
     });
     lastFullCheckAt = Date.now();
     runner.lastCheckedHead = await getCurrentHead(runner.projectRootPath);
@@ -288,9 +290,19 @@ function prioritizeStaleUnits(
 
 async function crawlOneStaleUnit(
   runner: ObserverRunner,
-  models: { observerModel: string; criticModel: string; providerBaseUrl: string; providerApiKey: string },
+  models: { observerModel: string; criticModel: string; providerBaseUrl: string; providerApiKey: string; researcherEscalationModel?: string },
 ): Promise<boolean> {
   const projectRootPath = runner.projectRootPath;
+  // Same hypothesis-nudge/deterministic-escalation mechanisms as the live
+  // Researcher (2026-07-28, product-owner request) - Observer shares the
+  // exact same runAgenticLoop under the hood but never had db_query or an
+  // escalation model wired in, so neither mechanism could ever fire for it.
+  // Given Observer's whole job is writing the facts/gotchas that later feed
+  // the Researcher's own hint, a wrong guess here compounds across every
+  // future question that reads it - resolved fresh per crawl, same "degrade
+  // to unavailable rather than block" convention as pipeline-runner.ts's own
+  // dbQueryTool.
+  const dbQuery = await buildDbQueryTool([projectRootPath]).catch(() => null);
 
   try {
     const [units, entries, churnByFile] = await Promise.all([
@@ -344,6 +356,8 @@ async function crawlOneStaleUnit(
       providerBaseUrl: models.providerBaseUrl,
       providerApiKey: models.providerApiKey,
       maxTurns: CRAWL_MAX_TURNS,
+      ...(dbQuery ? { dbQuery } : {}),
+      ...(models.researcherEscalationModel ? { researcherEscalationModel: models.researcherEscalationModel } : {}),
       // Checked every turn, not just before starting - an explicit user
       // stop yields within one turn instead of running to completion
       // regardless. No longer also yields to an active question-run (see

@@ -357,6 +357,13 @@ export interface AgenticRunResult {
   escalatedResearcherPromptTokens?: number;
   escalatedResearcherCompletionTokens?: number;
   escalatedResearcherCallCount?: number;
+  /**
+   * Whether the hypothesis-first nudge (HYPOTHESIS_NUDGE_FILE_THRESHOLD)
+   * fired this run - telemetry for the 2026-07-28 experiment, so its actual
+   * effect on real traffic can be measured over time instead of only via
+   * manual test batches (see packages/knowledge's knowledge_catalog columns).
+   */
+  hypothesisNudgeFired?: boolean;
 }
 
 interface ParsedAction {
@@ -1043,6 +1050,21 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   let stuckTurns = 0;
   let stuckNudgeSent = false;
   let lastSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size;
+  // Hypothesis-first nudge (2026-07-28, product-owner request, live magendamd
+  // evidence): two live runs on the same wide "how does this status work
+  // across 5 near-identical note tables" question both burned 20-31 files
+  // read-first, hoping to synthesize an answer from static code alone,
+  // without ever once checking real data - on a codebase this owner
+  // describes as genuinely messy/inconsistent across copy-pasted similar
+  // entities, that is exactly backwards from how a human works the same
+  // problem (form a theory, check ONE real record, let the data settle
+  // ambiguities code alone can't). Soft nudge only (same pattern as the
+  // stuck-nudge above), not a tool lockout - not every question is
+  // DB-verifiable, and this project explicitly avoids turn-pressure that
+  // forces conclusions before the model actually knows enough.
+  const HYPOTHESIS_NUDGE_FILE_THRESHOLD = 6;
+  let hypothesisNudgeSent = false;
+  let dbQueryAttempted = false;
 
   const finalize = (
     overrides: Partial<AgenticRunResult> & Pick<AgenticRunResult, "turnsUsed" | "stopped">,
@@ -1073,6 +1095,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       researcherCompletionTokens,
       criticPromptTokens,
       criticCompletionTokens,
+      hypothesisNudgeFired: hypothesisNudgeSent,
       ...(hasEscalated
         ? {
             escalatedResearcherModel: activeResearcherModel,
@@ -1288,6 +1311,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
           ? await options.findReferences(action.arg)
           : "(find_references is not available for this project)";
       } else if (action.tool === "db_query") {
+        dbQueryAttempted = true;
         observation = options.dbQuery
           ? await options.dbQuery(action.arg)
           : "(db_query is not available - no resolvable database connection for this project)";
@@ -1399,6 +1423,15 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       messages.push({
         role: "user",
         content: `${STUCK_TURNS_THRESHOLD} turns in a row now with no new directory/file/search term - it looks like you are stuck, not genuinely researching further. Call final_answer right now, based on what you have actually found, and honestly state what is missing - that is better than continuing to wander in circles.`,
+      });
+    }
+
+    if (!hypothesisNudgeSent && options.dbQuery && !dbQueryAttempted && touchedFiles.size >= HYPOTHESIS_NUDGE_FILE_THRESHOLD) {
+      hypothesisNudgeSent = true;
+      actionsLog.push(`[turn ${turn}] hypothesis nudge: ${touchedFiles.size} files read, db_query never tried.`);
+      messages.push({
+        role: "user",
+        content: `You have read ${touchedFiles.size} files without ever checking real data (db_query). Before reading more code: state your current working hypothesis in one sentence, then try ONE db_query call that would confirm or kill it against real rows/values - a real record settles an ambiguity between competing readings of the code far faster than more files will, especially on a codebase with duplicated/inconsistent logic across similar entities. If this specific question genuinely has nothing a database could confirm (pure code-structure/architecture question), say so briefly and continue as before - this is a nudge to consider the option, not a requirement to use it.`,
       });
     }
   }

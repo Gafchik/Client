@@ -1751,6 +1751,17 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   let stuckTurns = 0;
   let stuckNudgeSent = false;
   let lastSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size + editedFiles.size + runCommandsSeen.size;
+  // Hypothesis-first nudge (2026-07-29, ported from loop.ts's Researcher
+  // experiment - live A/B there showed 3/3 successes after the nudge vs 0/1
+  // without it, on a genuinely messy/duplicated-logic project). Here the
+  // stakes are higher than a wrong ANSWER: editing based on a misread of
+  // current behavior produces a wrong CODE CHANGE, caught (if at all) only a
+  // full review round later. Fires once, before the FIRST edit - not before
+  // reading in general, since exploring further before writing is fine, but
+  // committing to an edit on an unverified assumption is the actual risk.
+  const HYPOTHESIS_NUDGE_FILE_THRESHOLD = 6;
+  let hypothesisNudgeSent = false;
+  let dbQueryAttempted = false;
 
   const finalize = async (
     overrides: Partial<DevelopRunResult> & Pick<DevelopRunResult, "turnsUsed" | "stopped">,
@@ -2099,6 +2110,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
           ? await options.findReferences(action.arg)
           : "(find_references is not available for this project)";
       } else if (action.tool === "db_query") {
+        dbQueryAttempted = true;
         observation = options.dbQuery
           ? await options.dbQuery(action.arg)
           : "(db_query is not available - no resolvable database connection for this project)";
@@ -2301,6 +2313,15 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       messages.push({
         role: "user",
         content: `${STUCK_TURNS_THRESHOLD} turns in a row now with no new directory/file/search term/edit - it looks like you are stuck (re-reading the same ground) rather than making progress. If you have enough to act, do so now (write_file/edit_file); if you are blocked, call task_complete now describing exactly what is done and what is not, honestly - that is better than continuing to wander in circles.`,
+      });
+    }
+
+    if (!hypothesisNudgeSent && options.dbQuery && !dbQueryAttempted && editedFiles.size === 0 && touchedFiles.size >= HYPOTHESIS_NUDGE_FILE_THRESHOLD) {
+      hypothesisNudgeSent = true;
+      actionsLog.push(`[turn ${turn}] hypothesis nudge: ${touchedFiles.size} files read, no edit yet, db_query never tried.`);
+      messages.push({
+        role: "user",
+        content: `You have read ${touchedFiles.size} files without making an edit yet, and without ever checking real data (db_query). Before writing your first edit: state your current working hypothesis about the actual current behavior in one sentence, then try ONE db_query call that would confirm or kill it against real rows/values - especially on a codebase with duplicated/inconsistent logic across similar entities, a wrong assumption about current behavior produces a wrong edit, not just a wrong answer. If this specific task genuinely has nothing a database could confirm (pure refactor/structural change), say so briefly and continue as before - this is a nudge to consider the option, not a requirement.`,
       });
     }
 

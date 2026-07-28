@@ -142,6 +142,16 @@ export async function initializePostgresSchema(): Promise<void> {
   // fingerprint'ов (уже имевшихся в каталоге). Существующие строки backfill'ятся
   // разовым SQL (см. project-state.md), новые пишутся при сохранении.
   await runSql(`alter table knowledge_catalog add column if not exists file_count integer not null default 0`);
+  // Agentic-loop telemetry (2026-07-28, product-owner request): raw signals
+  // from the hypothesis-nudge/deterministic-escalation experiment
+  // (packages/agentic-research's loop.ts), so their real effect on live
+  // traffic can be measured over time via a plain SQL query instead of only
+  // via manual test batches - same "ALTER COLUMN IF NOT EXISTS, no separate
+  // migration runner" idiom as every other knowledge_catalog column above.
+  await runSql(`alter table knowledge_catalog add column if not exists hypothesis_nudge_fired boolean not null default false`);
+  await runSql(`alter table knowledge_catalog add column if not exists escalated boolean not null default false`);
+  await runSql(`alter table knowledge_catalog add column if not exists escalated_call_count integer not null default 0`);
+  await runSql(`alter table knowledge_catalog add column if not exists critic_verdict text not null default ''`);
 
   await runSql(`
     create table if not exists project_facts (

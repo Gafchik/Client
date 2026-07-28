@@ -128,6 +128,20 @@ interface SaveKnowledgeInput {
   validatedAnswerPacket?: ValidatedAnswerPacket;
   answer: AnswerPackage;
   usage?: ProviderUsageSummary;
+  /**
+   * Agentic-loop telemetry (2026-07-28, product-owner request): raw signals
+   * from THIS run's own agentic loop (packages/agentic-research's loop.ts),
+   * so whether the hypothesis-nudge/escalation mechanisms actually help can
+   * be measured over real traffic instead of only via manual test batches.
+   * Undefined for a non-agentic (deterministic-only) run - not every
+   * question-run goes through the agentic Researcher.
+   */
+  agenticTelemetry?: {
+    hypothesisNudgeFired: boolean;
+    escalated: boolean;
+    escalatedCallCount: number;
+    criticVerdict: string;
+  };
 }
 
 function buildConversationMemoryTurn(input: SaveKnowledgeInput, savedAt: string): ConversationMemoryTurn {
@@ -385,8 +399,8 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
     await runSqlInTx(
       `
         insert into knowledge_catalog
-          (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index, prompt_tokens, completion_tokens, total_tokens, provider_call_count, file_count)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+          (run_id, project_root_path, task, saved_at, storage_path, summary, mode, repository_id, branch, head_commit, head_fingerprint, conversation_id, turn_index, prompt_tokens, completion_tokens, total_tokens, provider_call_count, file_count, hypothesis_nudge_fired, escalated, escalated_call_count, critic_verdict)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         on conflict (run_id) do update set
           project_root_path = $2,
           task = $3,
@@ -404,7 +418,11 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
           completion_tokens = $15,
           total_tokens = $16,
           provider_call_count = $17,
-          file_count = $18
+          file_count = $18,
+          hypothesis_nudge_fired = $19,
+          escalated = $20,
+          escalated_call_count = $21,
+          critic_verdict = $22
       `,
       [
         input.runId,
@@ -425,6 +443,10 @@ export async function saveKnowledgeArtifacts(input: SaveKnowledgeInput): Promise
         input.usage?.totalTokens ?? 0,
         input.usage?.callCount ?? 0,
         input.index.manifest.fileCount,
+        input.agenticTelemetry?.hypothesisNudgeFired ?? false,
+        input.agenticTelemetry?.escalated ?? false,
+        input.agenticTelemetry?.escalatedCallCount ?? 0,
+        input.agenticTelemetry?.criticVerdict ?? "",
       ],
     );
   });

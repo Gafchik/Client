@@ -40,6 +40,10 @@ export interface CrawlUnitInput {
   providerApiKey: string;
   maxTurns?: number;
   shouldAbort?: () => boolean;
+  /** See AgenticRunOptions.dbQuery (2026-07-28) - Observer shares the same runAgenticLoop as the live Researcher but never had this wired in until now. */
+  dbQuery?: (query: string) => Promise<string>;
+  /** See AgenticRunOptions.researcherEscalationModel (2026-07-28) - same reasoning as dbQuery above. */
+  researcherEscalationModel?: string;
 }
 
 export interface CrawlUnitResult {
@@ -90,6 +94,8 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
     providerApiKey: input.providerApiKey,
     ...(input.maxTurns ? { maxTurns: input.maxTurns } : {}),
     ...(input.shouldAbort ? { shouldAbort: input.shouldAbort } : {}),
+    ...(input.dbQuery ? { dbQuery: input.dbQuery } : {}),
+    ...(input.researcherEscalationModel ? { researcherEscalationModel: input.researcherEscalationModel } : {}),
   });
 
   const confidence = raw.stopped !== "final_answer"

@@ -867,6 +867,11 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
   const selectedTeam = shouldEscalateToTeamMode ? configuredTeam : null;
   let initialResearch: PipelineRunResult["research"] = deterministicResearch;
   let teamValidation: ValidationResult | null = null;
+  // Agentic-loop telemetry (2026-07-28) - hoisted the same way as
+  // initialResearch/teamValidation above, since saveKnowledgeArtifacts is
+  // called much later, well outside this if-block's own scope. Stays null
+  // for a non-agentic (deterministic-only) run.
+  let agenticTelemetry: { hypothesisNudgeFired: boolean; escalated: boolean; escalatedCallCount: number; criticVerdict: string } | null = null;
 
   if (selectedTeam) {
     updateStageLabel(runId, "research", `Команда «${selectedTeam.name}»: Researcher исследует проект инструментами...`);
@@ -1018,6 +1023,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     });
     initialResearch = agenticResult.research;
     teamValidation = agenticResult.validation;
+    agenticTelemetry = {
+      hypothesisNudgeFired: agenticResult.raw.hypothesisNudgeFired ?? false,
+      escalated: Boolean(agenticResult.raw.escalatedResearcherModel),
+      escalatedCallCount: agenticResult.raw.escalatedResearcherCallCount ?? 0,
+      criticVerdict: agenticResult.raw.criticVerdict,
+    };
     // Opportunistic Observer correction (2026-07-19, architecture review
     // "safety fuse" request): the Critic (never the researcher's own
     // self-assertion, see callCritic's gating) found a transcript-backed
@@ -1463,6 +1474,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     validatedAnswerPacket,
     answer,
     usage: buildUsageSummary(researcherUsage, criticUsage, otherUsage, selectedTeam?.researcherModel ?? "", selectedTeam?.criticModel ?? "", escalatedResearcherUsage, escalatedResearcherModelUsed),
+    ...(agenticTelemetry ? { agenticTelemetry } : {}),
   });
   completeStage(runId, "knowledge", knowledgeStartedAt, `Артефакты сохранены в центральное knowledge-хранилище: ${knowledge.artifactCount} групп.`);
 
