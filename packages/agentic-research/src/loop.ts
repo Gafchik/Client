@@ -41,6 +41,26 @@ const RUN_TOKEN_SAFETY_LIMIT = 1_200_000;
 // Matches tools.ts's MAX_READ_FILE_CHARS (7000) - raising the read cap alone
 // without this would just move the same truncation from readFile to here.
 const MAX_OBSERVATION_CHARS = 7000;
+// Deterministic proactive escalation (2026-07-28, product-owner request,
+// replacing reliance on the model's own self-assessment via
+// request_verification): live A/B on a real wide question (magendamd,
+// "how does the Document Due status transition work") - deepseek-v4-pro read
+// 31 files over 31 turns and STILL never once attempted final_answer before
+// hitting the token ceiling; the SAME question, same evidence available,
+// solved by openai/gpt-5.4 in 18 turns with a critic-APPROVED answer. The
+// base model was not stuck (still finding new files) and never called
+// request_verification itself either - its own prompt deliberately requires
+// a CONCRETE, nameable doubt to invoke that, not "I've been at this a
+// while", so a genuinely slow-to-converge model can wander past this exact
+// failure mode without ever raising its hand. This is the deterministic
+// floor under that: if the model has not attempted a SINGLE final_answer by
+// this turn (regardless of how much exploring it has done), and an
+// escalation model is configured and not yet in use, escalate automatically
+// - no self-assessment required. Additive to request_verification/the
+// critic-rejection escalation (loop.ts's existing hasEscalated logic), not a
+// replacement - whichever fires first wins, the other becomes a no-op via
+// the same hasEscalated guard.
+const PROACTIVE_ESCALATION_TURN_THRESHOLD = 20;
 // Live evidence (2026-07-28): a genuinely productive run (still finding new
 // files every turn, not stuck) hit RUN_TOKEN_SAFETY_LIMIT at turn 15/23 files
 // read, without ever reaching final_answer - because every `role: "tool"`
@@ -1073,8 +1093,14 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   // if the model insists a second time, the critic (whose prompt now also
   // covers this case) makes the call.
   let zeroReadBounceSent = false;
+  // Deterministic escalation trigger (2026-07-28, product-owner request,
+  // replacing reliance on the model's own self-assessment): tracks whether
+  // the model has EVER attempted to conclude, regardless of outcome. Fed
+  // into the proactive-escalation check further down.
+  let finalAnswerAttempts = 0;
 
   async function evaluateProposedAnswer(candidate: string, turn: number): Promise<AgenticRunResult | "continue-loop"> {
+    finalAnswerAttempts += 1;
     // seedReadFiles count as real reads (their full content was in context).
     if (touchedFiles.size === 0 && seedReadFiles.size === 0 && !zeroReadBounceSent && turn < maxTurns - 5) {
       zeroReadBounceSent = true;
@@ -1147,6 +1173,16 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     }
 
     options.onProgress?.({ turn, filesRead: touchedFiles.size + seedReadFiles.size });
+
+    if (!hasEscalated && options.researcherEscalationModel && finalAnswerAttempts === 0 && turn >= PROACTIVE_ESCALATION_TURN_THRESHOLD) {
+      activeResearcherModel = options.researcherEscalationModel;
+      hasEscalated = true;
+      actionsLog.push(`[turn ${turn}] PROACTIVE ESCALATION to ${activeResearcherModel}: ${turn} turns without ever attempting final_answer.`);
+      messages.push({
+        role: "user",
+        content: `You have spent ${turn} turns investigating without ever proposing a final answer. The rest of this investigation now runs on a stronger model - no action needed from you, just continue (or answer now if you already have enough).`,
+      });
+    }
 
     let content: string | null;
     let usage: ProviderUsage | null;

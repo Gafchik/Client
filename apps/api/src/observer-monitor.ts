@@ -4,7 +4,6 @@ import { crawlUnit, listUnitFilePaths, listWorkUnits } from "@client/agentic-res
 import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
 import { computeFileChurnSignals, type FileChurnSignal } from "@client/repository-git";
 import type { ObserverActivityInfo, ObserverProgressInfo } from "@client/shared";
-import { hasAnyActiveQuestionRun } from "./pipeline-runner.js";
 import { getCurrentProvider } from "./provider-store.js";
 import { getSelectedTeam } from "./team-store.js";
 
@@ -177,16 +176,15 @@ async function runnerLoop(runner: ObserverRunner): Promise<void> {
   let lastFullCheckAt = 0;
 
   while (!runner.stopRequested) {
-    // A background crawl shares the same provider/API key as live
-    // interactive requests - live testing showed message-sending degrading
-    // exactly when a crawl was in flight. Wait out any active question-run
-    // rather than starting a new unit while one is in progress; shouldAbort
-    // (passed to crawlUnit below) covers one starting mid-crawl.
-    if (hasAnyActiveQuestionRun()) {
-      await sleep(IDLE_RECHECK_MS);
-      continue;
-    }
-
+    // Deliberately does NOT yield to an active question-run (2026-07-28,
+    // explicit product-owner decision, reversing the 2026-07-19 behavior):
+    // that auto-pause existed because a background crawl shares the same
+    // provider/API key as live interactive requests and could degrade a
+    // real user's chat request mid-conversation. Reversed after a real cost
+    // check showed plenty of daily token headroom at current model
+    // multipliers - an Observer runner now starts/stops ONLY via explicit
+    // startObserver/stopObserver (frontend control), never auto-paused by
+    // chat activity.
     // Resolved fresh every loop iteration, never cached - an operator can
     // change the selected team/provider while a runner is active.
     const selectedTeam = await getSelectedTeam();
@@ -347,9 +345,11 @@ async function crawlOneStaleUnit(
       providerApiKey: models.providerApiKey,
       maxTurns: CRAWL_MAX_TURNS,
       // Checked every turn, not just before starting - an explicit user
-      // stop (or a question-run that started mid-crawl) yields within one
-      // turn instead of running to completion regardless.
-      shouldAbort: () => runner.stopRequested || hasAnyActiveQuestionRun(),
+      // stop yields within one turn instead of running to completion
+      // regardless. No longer also yields to an active question-run (see
+      // runnerLoop's own comment above) - only frontend start/stop controls
+      // this now.
+      shouldAbort: () => runner.stopRequested,
     }).finally(() => {
       runner.activity = null;
     });
