@@ -51,6 +51,23 @@ const DEFAULT_OBSERVER_MODEL = "nvidia/nemotron-3-ultra";
 // §12.1). Это ДЕФОЛТ для команд, где роль не задана явно — сама модель
 // живёт в Postgres и меняется с фронта, как и остальные роли.
 const DEFAULT_REVIEWER_MODEL = "moonshotai/kimi-k2.7-code";
+// Tester default (2026-07-28, live 5-candidate casting on a real bug -
+// Document Due/EHR-approve scoping + a second real bug found via HTTP
+// reproduction): deepseek-v4-pro was the clear standout - independently
+// re-derived the correct root cause every run, found a genuine non-obvious
+// counter-mismatch and explained it from code, and reliably found+reverted
+// its own test mutations without being told to twice. It was NOT the
+// cheapest candidate by tokenMultiplier (grok-4.1-fast at 0.7x is) - the
+// casting lesson worth keeping is that turns-to-a-real-report matters as
+// much as per-token price for a role whose whole job is multi-turn
+// convergence: grok never once completed a token/create call correctly
+// across 4 separate runs (a stable, model-level gap, not fixable by
+// prompting) and kimi/glm/gpt-5 repeatedly burned their entire turn budget
+// without ever calling task_complete before this session's test_plan+bounce
+// mechanism (tester-loop.ts) was added. A model that never converges is not
+// cheap just because its tokens are - it is the most expensive outcome
+// there is.
+const DEFAULT_TESTER_MODEL = "deepseek/deepseek-v4-pro";
 
 export async function initializeTeamStore(): Promise<void> {
   // Таблица создаётся централизованно в initializePostgresSchema() (postgres-client.ts).
@@ -199,10 +216,11 @@ function mapTeamRow(row: TeamRow): TeamRecord {
     // видит, какая модель реально пойдёт в работу.
     developerModel: row.developer_model || row.researcher_model,
     reviewerModel: row.reviewer_model || DEFAULT_REVIEWER_MODEL,
-    // Tester (2026-07-27): falls back to the effective reviewerModel above
-    // (not row.reviewer_model directly) so a team with NEITHER set still
-    // gets a real model, not an empty string.
-    testerModel: row.tester_model || row.reviewer_model || DEFAULT_REVIEWER_MODEL,
+    // Tester: own dedicated default now (2026-07-28, see DEFAULT_TESTER_MODEL's
+    // comment) rather than piggybacking on reviewerModel - the two roles
+    // turned out to have different casting winners once actually measured
+    // live, not just similar-sounding job descriptions.
+    testerModel: row.tester_model || DEFAULT_TESTER_MODEL,
     ...(row.researcher_escalation_model ? { researcherEscalationModel: row.researcher_escalation_model } : {}),
     ...(row.vision_model ? { visionModel: row.vision_model } : {}),
     isSelected: Boolean(row.is_selected),

@@ -225,30 +225,55 @@ async function indexOneProject(rootPath: string, role: PathRole, provider: Resol
     batches.push(candidates.slice(i, i + EMBEDDING_BATCH_SIZE));
   }
 
-  // Batches run concurrently (independent embedding calls) - during the
-  // initial catch-up pass on a large project this is the difference between
-  // minutes and hours to a usable index.
-  await Promise.all(
-    batches.map(async (batch) => {
-      try {
-        const vectors = await embedTexts({
-          providerBaseUrl: provider.baseUrl,
-          providerApiKey: provider.apiKey,
-          embeddingModel: EMBEDDING_MODEL,
-          texts: batch.map((item) => item.content),
-        });
+  // Batches run concurrently, but bounded (2026-07-28, live evidence - was
+  // unbounded Promise.all before): a 300-files/tick, 20-per-batch catch-up
+  // pass fires up to 15 embedTexts calls at once, PER PROJECT, and this tick
+  // already runs every tracked project's own batches concurrently too (see
+  // tick()'s allPaths.map). Real log evidence from an active session: 3522
+  // "batch embed failed... AbortError" warnings total, 2464 of them on the
+  // single largest project (magendamd_backend, ~8300 files - exactly the one
+  // that needs many full 15-batch ticks to catch up) - consistent with this
+  // loop hammering embedTexts's own 6s/1-attempt budget (packages/ai's
+  // embedTexts) harder than the endpoint can actually serve, not just that
+  // endpoint's already-documented baseline flakiness. Coverage still
+  // eventually completes either way (failed batches retry next tick via the
+  // content-hash check above) so this was never a correctness bug, only
+  // wasted requests/latency against a shared, already-flaky gateway. A small
+  // concurrency cap keeps the "minutes not hours" win from the comment this
+  // replaces while giving each in-flight request a real chance to finish
+  // inside its timeout instead of queueing behind a dozen siblings.
+  const EMBEDDING_BATCH_CONCURRENCY = 4;
+  let nextBatchIndex = 0;
 
-        await Promise.all(
-          batch.map((item, index) => {
-            const embedding = vectors[index];
-            return embedding
-              ? upsertCodeEmbedding({ projectRootPath: rootPath, filePath: item.relPath, contentHash: item.hash, embedding, role })
-              : Promise.resolve();
-          }),
-        );
-      } catch (error) {
-        console.warn(`[embedding-indexer] batch embed failed for ${rootPath}:`, error);
-      }
-    }),
-  );
+  async function runBatch(batch: (typeof candidates)): Promise<void> {
+    try {
+      const vectors = await embedTexts({
+        providerBaseUrl: provider.baseUrl,
+        providerApiKey: provider.apiKey,
+        embeddingModel: EMBEDDING_MODEL,
+        texts: batch.map((item) => item.content),
+      });
+
+      await Promise.all(
+        batch.map((item, index) => {
+          const embedding = vectors[index];
+          return embedding
+            ? upsertCodeEmbedding({ projectRootPath: rootPath, filePath: item.relPath, contentHash: item.hash, embedding, role })
+            : Promise.resolve();
+        }),
+      );
+    } catch (error) {
+      console.warn(`[embedding-indexer] batch embed failed for ${rootPath}:`, error);
+    }
+  }
+
+  async function worker(): Promise<void> {
+    while (nextBatchIndex < batches.length) {
+      const batch = batches[nextBatchIndex] as (typeof candidates);
+      nextBatchIndex += 1;
+      await runBatch(batch);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(EMBEDDING_BATCH_CONCURRENCY, batches.length) }, () => worker()));
 }

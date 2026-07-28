@@ -1,7 +1,7 @@
 import { runTesterTask, type TesterRunResult, type WorkspaceRoot } from "@client/agentic-research";
 import { queryFactsAcrossPaths, queryGlossaryAcrossPaths } from "@client/knowledge";
 import { normalizePath, stableId, type ProjectPathRecord } from "@client/shared";
-import { buildDbQueryTool } from "./db-query-tool.js";
+import { buildDbQueryTool, checkDockerComposeHealth } from "./db-query-tool.js";
 import { buildHttpRequestTool } from "./dev-server-tool.js";
 import { buildGlossaryHint, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool } from "./pipeline-runner.js";
 
@@ -132,8 +132,16 @@ async function executeTesterRun(record: TesterRunStatusRecord, input: StartTeste
 
   try {
     const originalPaths = originalRoots.map((root) => root.absolutePath);
-    const [facts, glossary] = await Promise.all([queryFactsAcrossPaths(originalPaths), queryGlossaryAcrossPaths(originalPaths)]);
-    knownFactsHint = [buildKnownFactsHint(originalRoots, facts), buildGlossaryHint(glossary)].filter(Boolean).join("\n\n");
+    const [facts, glossary, environmentHealthNotes] = await Promise.all([
+      queryFactsAcrossPaths(originalPaths),
+      queryGlossaryAcrossPaths(originalPaths),
+      // Read-only "are this project's own docker services actually up"
+      // check (2026-07-28) - same rationale as develop-runner.ts: know
+      // upfront rather than have the Tester burn turns on db_query/
+      // http_request calls that fail for a reason unrelated to the task.
+      Promise.all(originalPaths.map((rootPath) => checkDockerComposeHealth(rootPath))),
+    ]);
+    knownFactsHint = [buildKnownFactsHint(originalRoots, facts), buildGlossaryHint(glossary), ...environmentHealthNotes.filter((note): note is string => Boolean(note))].filter(Boolean).join("\n\n");
   } catch {
     // no memory, still a valid run
   }

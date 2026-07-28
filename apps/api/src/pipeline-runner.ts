@@ -56,6 +56,7 @@ import {
 } from "@client/shared";
 import { openWorkspace, openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { grepContent, runAgenticResearch, type ObserverEntryRef, type WorkspaceRoot } from "@client/agentic-research";
+import { buildReadOtherBranchTool } from "./branch-inspect-tool.js";
 import { buildDbQueryTool } from "./db-query-tool.js";
 import { saveGraphSnapshot } from "./graph-store.js";
 import { getRedisClient } from "./redis-client.js";
@@ -993,6 +994,10 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
       // never queryable by the Researcher itself - see buildGraphNavigationTool.
       findReferences: buildGraphNavigationTool(graph),
       ...(dbQueryTool ? { dbQuery: dbQueryTool } : {}),
+      // "Compare with another branch, no checkout" (2026-07-28, explicit
+      // product-owner directive) - same tool the Developer loop already has
+      // (develop-runner.ts), now also reachable from a plain chat question.
+      readOtherBranch: buildReadOtherBranchTool(effectiveProjectRoots),
       // Speed pass (2026-07-16, по одобренному плану): контент топ-файлов
       // семантического индекса кладётся в контекст ДО первого хода (см.
       // AgenticRunOptions.semanticSeedFiles) - главный рычаг задержки на

@@ -37,7 +37,7 @@ import {
 // optimization pass (semanticSeedFiles, stuck detector, deterministic
 // edit_file recovery, concrete block example) came FIRST and is what makes
 // raising this defensible today, not a substitute for it.
-const DEFAULT_DEVELOP_CEILING_TURNS = 90;
+const DEFAULT_DEVELOP_CEILING_TURNS = 150;
 // Raised 950K -> 1.6M (2026-07-26, live evidence): two separate real tasks
 // (a 9-file consent flow, a 7-file bill-status invariant) both hit this
 // ceiling before ever reaching task_complete - NOT because the work itself
@@ -47,7 +47,19 @@ const DEFAULT_DEVELOP_CEILING_TURNS = 90;
 // exactly this class of task; this higher ceiling is the remaining margin
 // for genuinely large changes even with compaction active, not a
 // replacement for fixing the trigger.
-const DEVELOP_TOKEN_SAFETY_LIMIT = 1_600_000;
+//
+// Raised again 1.6M -> 3M, turns 90 -> 150 (2026-07-28, explicit product-
+// owner decision, "чисто ради прикола"): a real cost check first - Developer
+// (grok-4.1-fast, 0.7x) plus the forced Reviewer pass (kimi-k2.7-code, 1.65x,
+// capped at MAX_REVIEW_ROUNDS=2 calls, historically a small slice of a big
+// run's total tokens) blends to roughly 0.75x even at a full-ceiling run,
+// and the account's daily allowance is 51M tokens/day - a full-ceiling run at
+// the OLD 1.6M limit was already under 2.5% of that per task. Doubling-ish
+// the ceiling still leaves single-task cost in the low single-digit percent
+// range. Turn ceiling raised proportionally for the same reason as
+// loop.ts's RUN_TOKEN_SAFETY_LIMIT bump - a token-only raise just moves the
+// bottleneck to turns instead.
+const DEVELOP_TOKEN_SAFETY_LIMIT = 3_000_000;
 // Live evidence (iteration 4, 2026-07-18): 14 FORMAT_ERROR incidents, almost
 // all on real ~500-600 line Vue SFCs (SshTab.vue, AddEditServerDialog.vue) -
 // logs showed the SEARCH block parsed fine but the REPLACE/CONTENT block's
@@ -154,6 +166,39 @@ function isSensitiveDbCommand(command: string): boolean {
   return SENSITIVE_DB_COMMAND_PATTERN.test(command) && !DRY_RUN_FLAG_PATTERN.test(command);
 }
 
+// Same halt-for-approval treatment as the DB gate above (2026-07-28,
+// updated same day worktree isolation was dropped - see createTaskSession's
+// docstring): the Developer now runs directly in the user's REAL checkout,
+// not a disposable copy, so a package-manager command that INSTALLS/UPDATES/
+// REMOVES dependencies changes real, currently-working versions the user
+// depends on - often many packages at once, not something that should ever
+// happen silently, same bar as a DB migration. Commands that only READ
+// dependency state (list, why, outdated, audit) are exempt - only the
+// mutating verbs are gated.
+const DEPENDENCY_MUTATION_COMMAND_PATTERN = /\b(composer\s+(install|update|require|remove|reinstall)|npm\s+(install|ci|uninstall|update)|yarn\s+(install|add|remove|upgrade)|pnpm\s+(install|add|remove|update|up))\b/i;
+
+function isDependencyMutationCommand(command: string): boolean {
+  return DEPENDENCY_MUTATION_COMMAND_PATTERN.test(command);
+}
+
+// Docker container lifecycle gate (2026-07-28, explicit product-owner
+// directive the same day worktree isolation was dropped: "никакая миграция
+// или пересборка контейнера не должна пройти мимо тебя"). Live-confirmed
+// risk this exact session: a plain `docker compose up -d` on a stack whose
+// image tag floats (no patch pin) recreated a container on a newer, already-
+// locally-cached image that silently dropped a required MySQL auth plugin,
+// breaking database access for hours - nobody asked for an upgrade, the
+// image had just drifted since the last time that container was created.
+// `up`/`restart`/`build`/`pull`/`down` (compose or bare docker) can all
+// recreate or replace a running container, so all of them pause for human
+// approval, same as a DB migration - read-only inspection (ps/logs) is
+// unaffected.
+const SENSITIVE_DOCKER_COMMAND_PATTERN = /\bdocker(?:-compose|\s+compose)\s+(up|build|pull|restart|down)\b|\bdocker\s+(restart|stop|start|kill|rm)\b/i;
+
+function isSensitiveDockerCommand(command: string): boolean {
+  return SENSITIVE_DOCKER_COMMAND_PATTERN.test(command);
+}
+
 export interface DevelopVerificationEntry extends ShellCommandResult {
   turn: number;
 }
@@ -253,6 +298,18 @@ export interface DevelopRunOptions {
    * same "honest degradation" convention as findReferences/computeImpactPreview.
    */
   dbQuery?: (query: string) => Promise<string>;
+  /**
+   * Read another branch/commit/tag WITHOUT checking it out (2026-07-28,
+   * explicit product-owner request, made specifically relevant by dropping
+   * worktree isolation the same day - see createTaskSession's docstring in
+   * packages/repository-git: the Developer now works directly in the
+   * user's REAL checkout, so an actual `git checkout other-branch` would
+   * swap the real working tree out from under the task. Undefined only if
+   * the root somehow isn't a git repo (shouldn't happen - createTaskSession
+   * already requires one), same honest-degradation convention as the rest
+   * of this options interface.
+   */
+  readOtherBranch?: (input: { root?: string; ref: string; path: string; mode?: "content" | "list" | "diff" }) => Promise<string>;
 }
 
 /**
@@ -304,6 +361,7 @@ type DevelopTool =
   | "semantic_search"
   | "find_references"
   | "db_query"
+  | "read_other_branch"
   | "run_command"
   | "write_file"
   | "edit_file"
@@ -341,9 +399,14 @@ function isSmallScopedTask(task: string): boolean {
   return narrowCue && !broadImplementationCue;
 }
 
-function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean): string {
+function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasReadOtherBranch: boolean): string {
   return [
-    "You are an experienced senior fullstack developer implementing a code change in a project you are seeing for the first time. You work in an isolated git worktree - your edits cannot damage the user's checkout, and everything you change will be reviewed as a diff.",
+    // Updated 2026-07-28 (worktree isolation dropped, see createTaskSession):
+    // this used to say "you work in an isolated git worktree - your edits
+    // cannot damage the user's checkout" - that claim became FALSE the
+    // moment this run stopped happening in a disposable copy. Do not
+    // reintroduce it even if it reads more reassuring; it is not true.
+    "You are an experienced senior fullstack developer implementing a code change in a project you are seeing for the first time. You are working DIRECTLY in the user's real checkout (not an isolated copy) - only one task runs against a given project at a time, and everything you change will be reviewed as a diff before anything is committed (nothing here ever commits or pushes on its own).",
     // Native tool-calling (2026-07-26): the tool list/schema is declared via
     // the API's own `tools` parameter, not prose here - every model behind
     // this gateway (confirmed live: gpt-5.4, claude-opus-4.6, grok-4.1-fast,
@@ -368,13 +431,20 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
           "db_query runs read-only against the project's REAL database (resolved from its own .env/docker-compose, not the worktree). READ-ONLY ONLY, enforced in code regardless of what you send - no INSERT/UPDATE/DELETE/DDL, no multiple statements, this is for INSPECTION not mutation. Use it to: see real example rows instead of guessing from a model's field list; when debugging \"X did not save correctly\", check what actually got persisted before guessing where the bug is; when building a non-trivial query (filters/joins/aggregation), get the raw SQL right against real data FIRST, then translate it into this project's ORM/query-builder style (checking for an already-existing scope/relation to reuse, per instruction 1). All actual schema/data changes still go through run_command's normal DB-safety gate (migrations, seeders) - db_query itself can never write anything.",
         ]
       : []),
-    "run_command runs in the project root (180s timeout). Use it to run the project's OWN checks: tests, linter, build, php -l, etc. Also use it to boot local infrastructure this task needs (e.g. docker compose up -d for a database) - check for a docker-compose file / README / .env.example as part of your normal exploration if the task needs a working DB.",
+    "run_command runs in the project root (180s timeout). Use it to run the project's OWN checks: tests, linter, build, php -l, etc. If the task needs infrastructure that looks stopped (check via `docker compose ps`, read-only), you may try booting it (e.g. docker compose up -d) - see DOCKER SAFETY below for what happens next.",
     ...(isMultiRoot
       ? [
           "For run_command in this multi-part project, prefix the command itself with the part label, e.g. \"api: php artisan test\" - the label is part of the command string, not a separate argument.",
         ]
       : []),
     "DB SAFETY: a command that changes persisted schema or data in a way git cannot undo (running a migration, db:seed, migrate:rollback, DROP/ALTER/TRUNCATE, etc.) will NOT execute when you call run_command - it instead PAUSES this run for a human to approve, and resumes afterward WITH THE REAL OUTPUT of what you ran, so you can act on it. This is expected, not an error - if the task genuinely needs a migration, issue it via run_command like any other command and wait; do not try to work around it (no manually editing files inside a database, no alternate commands to sneak past it). A command with --pretend or --dry-run (e.g. php artisan migrate --pretend) runs immediately WITHOUT pausing - nothing actually changes, so it is a good first move to preview a migration before running it for real. If you only need to VERIFY something against the database without permanently changing data (e.g. checking a query/insert behaves correctly), wrap it in an explicit transaction that you roll back yourself using the project's own DB tooling (e.g. for Laravel: php artisan tinker --execute=\"DB::beginTransaction(); ...; DB::rollBack();\", or raw SQL: START TRANSACTION; ...; ROLLBACK;) - that is a normal run_command too, not a paused one, since nothing is actually left changed.",
+    "DEPENDENCY SAFETY: you are working in the REAL project checkout, not a disposable copy - a command that installs/updates/removes dependencies (composer install/update/require/remove, npm install/ci/uninstall/update, yarn/pnpm equivalents) will NOT execute when you call run_command, it PAUSES for human approval first, same behavior as DB SAFETY above. Read-only dependency inspection (composer show, npm ls, npm outdated, etc.) is unaffected.",
+    "DOCKER SAFETY: same PAUSE-for-approval behavior for any command that could recreate or rebuild a running container (docker/docker-compose compose up/build/pull/restart/down, docker restart/stop/start/kill/rm) - a container recreate can silently pick up a different image than the one currently running. Read-only inspection (docker compose ps/logs) is unaffected.",
+    ...(hasReadOtherBranch
+      ? [
+          "read_other_branch reads a file's content, lists a directory, or diffs against ANOTHER branch/tag/commit - WITHOUT checking it out (you never leave the branch you are already on, nothing on disk changes). Use it whenever the task asks you to compare with or look at another branch (\"как это было на master\", \"сравни с prod\") - do NOT use run_command's `git checkout` for this (blocked anyway) and do not guess from memory what another branch contains.",
+        ]
+      : []),
     "PREFER edit_file over write_file for existing files: read_file output can be truncated, and rewriting a file from a truncated read destroys the part you never saw. edit_file only touches the exact snippet you matched, so it is immune to that - its `search` argument must match the file's CURRENT content exactly and occur exactly once.",
     "note - call this as soon as you understand something you will need later: what a specific method/class does and where it lives, a schema/column detail, a naming convention, which existing mechanism you decided to reuse. This is cheaper and more durable than re-reading the same file again later - a long run's older raw reads eventually get summarized away, but notes do not. Bad note: a copy of file content. Good note: \"insurance_response_count (Bill.php ~1647) counts billHistories() rows where type in Payment/Verification/Delay/Denial/Appeal - first-of-type logic still needs adding there\".",
     "ask_user - a clarifying question IN RUSSIAN - use ONLY if the task is genuinely ambiguous in a way that materially changes what to implement (different behavior, different data model - not naming/details you can decide yourself). It ends the run and asks the human. Ask at the START, before writing code - never after you have already implemented one interpretation.",
@@ -410,6 +480,7 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
     "1c. Before creating a new top-level module/container/directory, list_dir the parent directory it would live in and check whether an existing sibling already owns this domain (by name or by content you already read). If one does, extend it by default - creating a new one next to an obviously-related existing one needs a stated reason in your plan (step 3 below), not just being possible. Reusing an existing container's structure (even if it means the new code is not perfectly separated) beats a cleaner-looking new module that fragments one feature area across two places.",
     `2. BEFORE CHANGING WHAT ALREADY EXISTS - never break an existing caller. Before you edit the BODY or SIGNATURE of a function/method that other code might call, or before you rename/remove/move anything existing,${hasFindReferences ? " use find_references(name) to see its real callers/dependents" : " grep_content for its name to see where else it is used"} and make sure your change keeps them working (or update them too, if that is genuinely required and still in scope). State in your task_complete summary which existing callers you checked for anything you changed rather than purely added - \"I did not check\" is an honest thing to write if true, but silently not checking is not.`,
     "3. STATE A SHORT PLAN before your first write_file/edit_file (a few sentences in your own reasoning text, not a separate tool call): which files need to change and why, which existing pattern from step 1 you are reusing (if any), which existing flow you traced end-to-end per 1b (if the task touches one), and which existing container/module you are extending per 1c (or, if you are creating a new one, the specific reason an existing sibling was not the right fit - not just \"this feels cleaner\"). Also state explicitly - does this task need a DATABASE MIGRATION/schema change? A feature that adds or reads a new field/column/table needs a real migration in this same task, not just application code that silently assumes the column exists - code referencing a column with no migration creating it is broken, not done. If there is a real, non-obvious choice between two reasonable ways to implement this (not a trivial choice with one obvious answer), name it and say which you picked and why - the safer/more consistent one wins over the cleverer one. Getting this right BEFORE writing code prevents discovering a missing piece late, when budget is tight.",
+    "3b. A new migration column is not done until the ORM model actually exposes it: a recurring, repeatedly-observed mistake across many real runs is adding a column via migration but forgetting to add it to the model's mass-assignment/serialization arrays (Laravel: $fillable/$casts/$hidden; other ORMs: their equivalent). If your plan involves a migration, immediately also check and update the model that owns that table - do this as ONE step, not an afterthought you might skip.",
     "4. Read a file (read_file) before editing it - edit_file requires an exact match of existing content, guessing will just bounce.",
     "5. IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet, list_dir it first - a neighboring file may be the real place to change.",
     "6. Keep the change minimal and coherent: implement what the task asks, do not refactor unrelated code, do not add features nobody asked for. Do not add error handling, validation, or defensive checks for scenarios that cannot happen given how this code is actually called - trust the surrounding code's own guarantees the same way it already does. Do not introduce a new abstraction (helper/base class/interface/config flag) for something that only has one or two call sites today - three similar lines beats a premature abstraction. If you must touch a file whose connection to the task is not obvious, say why in your summary.",
@@ -434,7 +505,7 @@ function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boole
 // Native tool-calling schema (2026-07-26) - see provider.ts's ToolDefinition
 // comment for why one shape works across every model behind this gateway.
 // Mirrors DevelopTool 1:1; keep both in sync if a tool is added/removed.
-function buildDevelopTools(hasSemanticSearch: boolean, hasFindReferences: boolean, hasDbQuery: boolean): ToolDefinition[] {
+function buildDevelopTools(hasSemanticSearch: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasReadOtherBranch: boolean, isMultiRoot: boolean): ToolDefinition[] {
   const tools: ToolDefinition[] = [
     { type: "function", function: { name: "list_dir", description: "List a directory's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
     { type: "function", function: { name: "grep_content", description: "Search file contents for a literal string or regex.", parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] } } },
@@ -451,6 +522,26 @@ function buildDevelopTools(hasSemanticSearch: boolean, hasFindReferences: boolea
 
   if (hasDbQuery) {
     tools.push({ type: "function", function: { name: "db_query", description: "Run a single read-only SELECT/WITH/EXPLAIN/SHOW statement against the project's real database. Never INSERT/UPDATE/DELETE/DDL.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } });
+  }
+
+  if (hasReadOtherBranch) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "read_other_branch",
+        description: "Read a file's content, list a directory, or diff against ANOTHER branch/tag/commit - WITHOUT checking it out (you keep working in the current checkout the whole time, nothing on disk changes). Use this when the task asks you to compare with or look at another branch (e.g. \"как это было на master\", \"сравни с prod\", \"what does main have here\").",
+        parameters: {
+          type: "object",
+          properties: {
+            ...(isMultiRoot ? { root: { type: "string", description: "Which physical repo (this project has more than one) - use the same label run_command uses." } } : {}),
+            ref: { type: "string", description: "Branch/tag/commit to read from, e.g. \"main\", \"origin/master\", a commit hash." },
+            path: { type: "string", description: "File or directory path, relative to that root." },
+            mode: { type: "string", enum: ["content", "list", "diff"], description: "\"content\" (default) = this file's full text at that ref. \"list\" = this directory's entries at that ref. \"diff\" = diff between your CURRENT working tree and that ref, scoped to this path." },
+          },
+          required: ["ref", "path"],
+        },
+      },
+    });
   }
 
   tools.push(
@@ -521,6 +612,22 @@ function toolCallToAction(toolCall: ToolCall): ParsedDevelopAction {
       return { tool, arg: str("name") };
     case "db_query":
       return { tool, arg: str("query") };
+    case "read_other_branch": {
+      if (typeof args.ref !== "string" || typeof args.path !== "string") {
+        return { tool, arg: "", formatError: "read_other_branch call is missing the required \"ref\" and/or \"path\" field." };
+      }
+      // Packed as JSON in `arg`, same convention tester-loop.ts's http_request
+      // uses for a multi-field tool - the dispatch below parses it back out.
+      return {
+        tool,
+        arg: JSON.stringify({
+          ref: args.ref,
+          path: args.path,
+          ...(typeof args.root === "string" ? { root: args.root } : {}),
+          ...(typeof args.mode === "string" ? { mode: args.mode } : {}),
+        }),
+      };
+    }
     case "run_command":
       return { tool, arg: str("command") };
     case "write_file":
@@ -548,7 +655,7 @@ export const REVIEWER_SYSTEM_PROMPT = [
   "You are an independent senior code reviewer (a different model from the author). You are given: the original task, the full unified diff of the change, and the verification journal (commands the author ran, with exit codes).",
   "Form your OWN opinion of how this task should be solved in this codebase, then judge the diff against it. You were deliberately NOT given the author's notes or plan - review the result, not the intention.",
   "Review ONLY the changed files visible in the diff and their direct, explicitly-provided structural impact. Do not turn this into a broader audit of neighboring modules, hypothetical files, or unrelated architecture cleanup.",
-  "Look for, in order of importance: (1) the diff not actually doing what the task asks, or doing it partially; (2) correctness bugs and behavior broken for existing callers visible from the diff context - if a \"Structural impact\" block is given below, it lists REAL, deterministically-found dependents of the changed files (not a claim, actual graph data); check whether the diff's behavior change is compatible with each one, this is your strongest source for this finding, stronger than what you can infer from the diff alone; (3) changes with no plausible relation to the task (each must be justified or flagged); (4) a verification command the author actually RAN that FAILED (non-zero exit / visible error in its output) and the diff does not address it - flag it; (5) clear inconsistency with the surrounding code's own style visible in the diff context; (6) duplication and single-responsibility drift VISIBLE IN THE DIFF CONTEXT ITSELF - only flag this if you can point at a SPECIFIC existing function/method shown in the diff's surrounding context that the new code re-implements instead of reusing or extending, or a single new function/method that does two or more clearly unrelated things. Do not lecture about SOLID/DRY/design patterns in the abstract and do not suggest introducing a new abstraction (factory/strategy/interface/base class) unless the diff's own surrounding context already uses that abstraction elsewhere for the same kind of thing - proposing patterns the codebase does not already use is over-engineering, not a real finding; (7) a NEW PERSISTED FIELD WITH NO MIGRATION - if the diff adds a field/column to something that looks like it is meant to be saved to a database (added to a model's fillable/casts array, an ORM entity/@Column decorator, a serializer, a repository insert/update call) but the diff contains NO migration/schema file creating that column anywhere, flag it explicitly as broken - this code will fail at runtime against a real database, not just be incomplete (live evidence: this exact gap shipped a 'tags' field with zero migration).",
+  "Look for, in order of importance: (1) the diff not actually doing what the task asks, or doing it partially; (2) correctness bugs and behavior broken for existing callers visible from the diff context - if a \"Structural impact\" block is given below, it lists REAL, deterministically-found dependents of the changed files (not a claim, actual graph data); check whether the diff's behavior change is compatible with each one, this is your strongest source for this finding, stronger than what you can infer from the diff alone; (3) changes with no plausible relation to the task (each must be justified or flagged); (4) a verification command the author actually RAN that FAILED (non-zero exit / visible error in its output) and the diff does not address it - flag it; (5) clear inconsistency with the surrounding code's own style visible in the diff context; (6) duplication and single-responsibility drift VISIBLE IN THE DIFF CONTEXT ITSELF - only flag this if you can point at a SPECIFIC existing function/method shown in the diff's surrounding context that the new code re-implements instead of reusing or extending, or a single new function/method that does two or more clearly unrelated things. Do not lecture about SOLID/DRY/design patterns in the abstract and do not suggest introducing a new abstraction (factory/strategy/interface/base class) unless the diff's own surrounding context already uses that abstraction elsewhere for the same kind of thing - proposing patterns the codebase does not already use is over-engineering, not a real finding; (7) a NEW PERSISTED FIELD WITH NO MIGRATION - if the diff adds a field/column to something that looks like it is meant to be saved to a database (added to a model's fillable/casts array, an ORM entity/@Column decorator, a serializer, a repository insert/update call) but the diff contains NO migration/schema file creating that column anywhere, flag it explicitly as broken - this code will fail at runtime against a real database, not just be incomplete (live evidence: this exact gap shipped a 'tags' field with zero migration); (7b) the MIRROR of (7), also live-observed repeatedly - a diff that ADDS A MIGRATION for a new column but never touches the model that owns that table (no fillable/casts/hidden update) - the column will exist in the database but be silently unreadable/unwritable through the ORM, an equally broken half-finished state.",
   // Tests-as-separate-step (2026-07-18, docs/architecture/011 §4.12, explicit
   // product-owner directive): this project's own primary test target (and
   // the owner's own work projects) are NOT test-covered by convention -
@@ -1031,7 +1138,7 @@ function extractSummaryChunks(summary: string): string[] {
 // an untracked file in the NEXT round's diff - collectWorktreeChanges/git
 // status would otherwise pick up stray litter here, corrupting the
 // diffUnchangedSinceLastReview byte-comparison this file already relies on.
-async function verifyInTransactionTinker(projectRoots: WorkspaceRoot[], phpCode: string): Promise<string> {
+async function verifyInTransactionTinker(projectRoots: WorkspaceRoot[], phpCode: string, dbEnvOverrides?: Record<string, string>): Promise<string> {
   const isMultiRoot = projectRoots.length > 1;
   const tempPath = joinPath(tmpdir(), `client-reviewer-verify-${randomUUID()}.php`);
   const wrapped = [
@@ -1060,7 +1167,7 @@ async function verifyInTransactionTinker(projectRoots: WorkspaceRoot[], phpCode:
   try {
     const primaryLabel = (projectRoots[0] as WorkspaceRoot).label;
     const tinkerCommand = `php artisan tinker --execute="require '${tempPath}';"`;
-    const result = await runShellCommand(projectRoots, isMultiRoot ? `${primaryLabel}: ${tinkerCommand}` : tinkerCommand);
+    const result = await runShellCommand(projectRoots, isMultiRoot ? `${primaryLabel}: ${tinkerCommand}` : tinkerCommand, dbEnvOverrides);
     // Noise filter (2026-07-27, live evidence): a real project's vendor/
     // dependencies (here: defstudio/telegraph, guzzlehttp, symfony) log
     // PHP 8.4 "implicitly nullable parameter" deprecation warnings on
@@ -1125,6 +1232,16 @@ async function callReviewer(input: {
   dbQuery?: (query: string) => Promise<string>;
   /** Runs a PHP snippet against the real project inside a transaction WE wrap and roll back - see verifyInTransactionTinker above. */
   projectRoots?: WorkspaceRoot[];
+  /**
+   * DB connection env vars resolved from the ORIGINAL project root (2026-07-28)
+   * - a worktree has no .env of its own (gitignored, unlike vendor/ it is
+   * deliberately NOT symlinked there - see repository-git's
+   * linkGitignoredDependencyDirs docstring for why), so verify_in_transaction
+   * would otherwise fail with "Database hosts array is empty" even once
+   * vendor/autoload.php is reachable. Passed as process env only, never
+   * written to disk in the worktree.
+   */
+  dbEnvOverrides?: Record<string, string>;
 }): Promise<{ round: DevelopReviewRound | null; promptTokens: number; completionTokens: number; unavailableReason?: string }> {
   const boundedDiff = input.diff.length > MAX_REVIEW_DIFF_CHARS
     ? `${input.diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n... (diff truncated at ${MAX_REVIEW_DIFF_CHARS} chars - flag this if the visible part alone cannot justify approval)`
@@ -1442,7 +1559,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ]),
     ]
     : [];
-  let developTools = buildDevelopTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery));
+  let developTools = buildDevelopTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.readOtherBranch), isMultiRoot);
   // Write-only mode (2026-07-26, live investigation): the forced bounce
   // message alone (EXPLORATION_BUDGET_BOUNCE_RATIO) measured ZERO effect on
   // grok-4.5 - it kept issuing run_command exploration calls right past the
@@ -1457,7 +1574,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   const WRITE_MODE_TOOL_NAMES = new Set(["read_file", "write_file", "edit_file", "note", "ask_user", "task_complete"]);
   const writeOnlyDevelopTools = developTools.filter((tool) => WRITE_MODE_TOOL_NAMES.has(tool.function.name));
   const messages: ChatMessage[] = [
-    { role: "system", content: buildDevelopSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery)) },
+    { role: "system", content: buildDevelopSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.readOtherBranch)) },
     {
       role: "user",
       content: [
@@ -1681,6 +1798,21 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   };
 
   async function evaluateTaskComplete(summary: string, turn: number): Promise<DevelopRunResult | "continue-loop"> {
+    // Same live bug found in the Tester loop (2026-07-28): a model can call
+    // task_complete with an empty or near-empty summary string, and every
+    // check below only looks at editedFiles/verificationLog/diff - none of
+    // them would have caught this, so the run would report success with no
+    // actual explanation of what happened. One bounce, same pattern as the
+    // gates below.
+    if (summary.trim().length < 20 && turn < maxTurns - 2) {
+      actionsLog.push(`[turn ${turn}] task_complete bounced: summary was empty or too short (${summary.length} chars).`);
+      messages.push({
+        role: "user",
+        content: "task_complete's summary was empty or far too short to be a real report. Call task_complete again with an actual summary: what changed and why, what was verified, what was not and why, remaining risk if any.",
+      });
+      return "continue-loop";
+    }
+
     if (editedFiles.size === 0 && !zeroMutationBounceSent && turn < maxTurns - 5) {
       zeroMutationBounceSent = true;
       actionsLog.push(`[turn ${turn}] task_complete bounced: zero files changed.`);
@@ -1970,6 +2102,17 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
         observation = options.dbQuery
           ? await options.dbQuery(action.arg)
           : "(db_query is not available - no resolvable database connection for this project)";
+      } else if (action.tool === "read_other_branch") {
+        if (!options.readOtherBranch) {
+          observation = "(read_other_branch is not available for this project)";
+        } else {
+          try {
+            const parsed = JSON.parse(action.arg) as { root?: string; ref: string; path: string; mode?: "content" | "list" | "diff" };
+            observation = await options.readOtherBranch(parsed);
+          } catch (error) {
+            observation = `Error: read_other_branch failed - ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
       } else if (action.tool === "run_command") {
         // DB safety (2026-07-18): a command that mutates persisted
         // schema/data (migrations, seeds, destructive DDL) halts the WHOLE
@@ -1979,14 +2122,19 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
         // (develop-runner.ts) executes the EXACT command shown here on
         // approval (not the model re-issuing it) and resumes with the real
         // result in priorSensitiveActions - see DevelopRunOptions.
-        if (isSensitiveDbCommand(action.arg)) {
+        if (isSensitiveDbCommand(action.arg) || isDependencyMutationCommand(action.arg) || isSensitiveDockerCommand(action.arg)) {
           // Native tool-calling (2026-07-26): the model's accompanying text
           // is already separate from the tool call itself, so it can be
           // used directly - no more regex-extracting "everything before the
           // first ACTION: line" out of one combined text blob.
+          const gateReason = isSensitiveDbCommand(action.arg)
+            ? "sensitive DB command"
+            : isSensitiveDockerCommand(action.arg)
+              ? "docker command that could recreate/rebuild a container"
+              : "dependency-mutating command (changes real, currently-working package versions)";
           const reason = (content ?? "").trim().slice(0, 300) || "Developer wants to run this as part of the task.";
           const pendingApproval: DevelopSensitiveAction = { command: action.arg, reason, status: "pending" };
-          actionsLog.push(`[turn ${turn}] run_command(${action.arg}) -> HALTED for human approval (sensitive DB command).`);
+          actionsLog.push(`[turn ${turn}] run_command(${action.arg}) -> HALTED for human approval (${gateReason}).`);
           return finalize({
             turnsUsed: turn,
             stopped: "needs-approval",

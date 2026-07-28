@@ -4,9 +4,10 @@ import { runDevelopmentTask, runShellCommand, type DevelopRunResult, type Develo
 import { classifyFactConflict, embedTexts, extractCodePatternFacts } from "@client/ai";
 import { getFileDependents } from "@client/graph";
 import { loadChatAttachmentsByIds, promoteFactsFromDevelopment, queryFactsAcrossPaths, queryGlossaryAcrossPaths } from "@client/knowledge";
-import { applyWorktreeDiffToRoot, collectWorktreeChanges, createTaskWorktree, removeTaskWorktree, type TaskWorktree } from "@client/repository-git";
+import { collectWorktreeChanges, createTaskSession, type TaskWorktree } from "@client/repository-git";
 import { normalizePath, stableId, type GraphState, type ProjectPathRecord } from "@client/shared";
-import { buildDbQueryTool } from "./db-query-tool.js";
+import { buildReadOtherBranchTool } from "./branch-inspect-tool.js";
+import { buildDbQueryTool, checkDockerComposeHealth } from "./db-query-tool.js";
 import { loadGraphSnapshot, refreshGraphForChangedFiles } from "./graph-store.js";
 import { buildAttachmentContextHint, buildGlossaryHint, buildGraphNavigationTool, buildKnownFactsHint, buildObserverHintSuffix, buildSemanticSearchTool, buildSemanticSeedLookup } from "./pipeline-runner.js";
 import { runSql } from "./postgres-client.js";
@@ -277,6 +278,31 @@ export function findLatestDevelopRunForConversation(conversationId: string): Dev
   return latest;
 }
 
+// Serialization (2026-07-28, explicit product-owner decision alongside
+// dropping worktree isolation - see createTaskSession's docstring): with no
+// separate worktree, two runs against the SAME project would write the same
+// real files concurrently. Rather than reject a second request outright,
+// queue it - a per-project-root promise chain, same pattern a single mutex
+// would use, keyed by the SAME sorted-root-paths key a multi-root project's
+// identity is already keyed by elsewhere in this file (promoteDevelopmentPatternFacts,
+// resolveOriginalRoots). Only one develop run per project root is ever
+// actually EXECUTING at a time; anything after it just waits its turn.
+const activeProjectQueue = new Map<string, Promise<void>>();
+
+function resolveOriginalRoots(input: StartDevelopRunInput): WorkspaceRoot[] {
+  return input.projectPaths?.length
+    ? input.projectPaths.map((pathRecord) => ({
+        label: pathRecord.name,
+        absolutePath: normalizePath(path.resolve(pathRecord.rootPath)),
+        role: pathRecord.role,
+      }))
+    : [{ label: "root", absolutePath: normalizePath(path.resolve(input.projectPath)), role: "unknown" }];
+}
+
+function resolveProjectQueueKey(originalRoots: WorkspaceRoot[]): string {
+  return originalRoots.map((root) => root.absolutePath).sort().join("|");
+}
+
 export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRecord {
   const startedAt = new Date().toISOString();
   const runId = stableId(["develop-run", input.projectPath, input.task, Date.now()]);
@@ -305,7 +331,22 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
     // stance every other Postgres consumer in this app takes.
   });
 
-  void executeDevelopRun(record, input)
+  const originalRoots = resolveOriginalRoots(input);
+  const queueKey = resolveProjectQueueKey(originalRoots);
+  const previousTail = activeProjectQueue.get(queueKey) ?? Promise.resolve();
+  record.progress = { turn: 0, filesChanged: 0, phase: "queued" };
+
+  const currentTail = previousTail.then(() => {
+    record.progress = { turn: 0, filesChanged: 0, phase: "starting" };
+    record.updatedAt = new Date().toISOString();
+    return executeDevelopRun(record, input, originalRoots);
+  });
+  // Swallow so one failed run never poisons the queue for the NEXT task on
+  // this project - each run's own success/failure is already recorded on
+  // its own `record`, this chain only exists to serialize execution order.
+  activeProjectQueue.set(queueKey, currentTail.catch(() => {}));
+
+  void currentTail
     .then(() => maybeAdvanceChain(record, input))
     .catch((error) => {
       record.status = "failed";
@@ -350,32 +391,15 @@ async function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDev
   }
 
   // "И сразу занеси это в ветку" said in the ORIGINAL task message
-  // (2026-07-18, see classifyAutoMergeIntent) - only once the whole
-  // task/chain has reached a genuinely clean approval, same bar as the
-  // tests-offer above. Deliberately not fired on a needs-changes/paused
-  // result - an unreviewed diff should never land in the user's real
-  // checkout without them at least seeing why it wasn't approved.
+  // (2026-07-18, see classifyAutoMergeIntent) - made MOOT 2026-07-28 by
+  // dropping worktree isolation (see createTaskSession's docstring):
+  // whatever the Developer wrote is already sitting in the real checkout as
+  // uncommitted changes, there is nothing left to bring in. Only surfaces a
+  // confirming note now, matching what mergeDevelopRunToRealCheckout itself
+  // degraded to - no longer calls it (nothing for it to actually do).
   if (wholeTaskDone && record.autoMergeOnCompletion && record.worktrees.length > 0) {
-    try {
-      const outcomes = await mergeDevelopRunToRealCheckout(record.worktrees);
-      record.autoMergeOutcome = outcomes;
-      const allApplied = outcomes.every((outcome) => outcome.applied);
-      const lines = outcomes.map((outcome) =>
-        outcome.applied
-          ? `✓ ${outcome.label}: занесено (${outcome.changedFiles.length} файл(ов)) — незакоммичено, смотри diff в IDE.`
-          : `✗ ${outcome.label}: не удалось занести — ${outcome.error ?? "неизвестная ошибка"}.`,
-      );
-      result.summary = [
-        result.summary ?? "",
-        "",
-        allApplied ? "Занёс в текущую ветку, как просил:" : "Занёс частично — есть проблемы:",
-        ...lines,
-      ].join("\n");
-    } catch (error) {
-      // Best-effort - the run itself already succeeded and is fully usable
-      // via the worktree/manual merge button either way.
-      result.summary = `${result.summary ?? ""}\n\nНе удалось автоматически занести в ветку: ${error instanceof Error ? error.message : String(error)}. Worktree на месте — попробуй кнопкой или напиши "занеси в ветку".`;
-    }
+    record.autoMergeOutcome = record.worktrees.map((worktree) => ({ label: worktree.label, applied: true, changedFiles: result.changedFiles }));
+    result.summary = [result.summary ?? "", "", "Правки уже в проекте, как просил — отдельно заносить некуда, worktree больше нет (пишу прямо в реальный чекаут)."].join("\n");
   }
 
   if (!input.chainRemaining?.length) {
@@ -415,21 +439,15 @@ async function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDev
   record.chainNextRunId = nextRecord.runId;
 }
 
-async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDevelopRunInput): Promise<void> {
-  const originalRoots: WorkspaceRoot[] = input.projectPaths?.length
-    ? input.projectPaths.map((pathRecord) => ({
-        label: pathRecord.name,
-        absolutePath: normalizePath(path.resolve(pathRecord.rootPath)),
-        role: pathRecord.role,
-      }))
-    : [{ label: "root", absolutePath: normalizePath(path.resolve(input.projectPath)), role: "unknown" }];
-
-  // Worktree per physical repo - all-or-nothing: a task that can only be
-  // isolated in HALF the project must not run at all (the un-isolated half
-  // would be mutated in the user's own checkout). A correction run re-enters
-  // the previous run's worktrees instead (they still hold the delivered
-  // changes the user is giving feedback on).
-  const reusedWorktrees = input.continueFrom?.worktrees.length === originalRoots.length
+async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDevelopRunInput, originalRoots: WorkspaceRoot[]): Promise<void> {
+  // No worktree isolation (2026-07-28, see createTaskSession's docstring) -
+  // a correction run reuses the previous run's session info as-is (same
+  // startCommit, so the diff still shows everything since the task began,
+  // across however many correction rounds); a fresh run opens a new session
+  // pointed at the SAME real directory. Either way "worktreePath" below
+  // equals the real project root - callers that resolve tools from it
+  // (dbQuery, run_command's cwd, etc.) get the real thing, not a copy.
+  const reusedSession = input.continueFrom?.worktrees.length === originalRoots.length
     ? input.continueFrom.worktrees.map((info): TaskWorktree => ({
         rootPath: info.rootPath,
         worktreePath: info.worktreePath,
@@ -437,16 +455,11 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
         startCommit: info.startCommit,
       }))
     : null;
-  const worktrees: TaskWorktree[] = reusedWorktrees ?? [];
+  const worktrees: TaskWorktree[] = reusedSession ?? [];
 
-  if (!reusedWorktrees) {
-    try {
-      for (const root of originalRoots) {
-        worktrees.push(await createTaskWorktree(root.absolutePath, record.runId.slice(0, 12), root.label));
-      }
-    } catch (error) {
-      await Promise.all(worktrees.map((worktree) => removeTaskWorktree(worktree, { deleteBranch: true }).catch(() => {})));
-      throw error;
+  if (!reusedSession) {
+    for (const root of originalRoots) {
+      worktrees.push(await createTaskSession(root.absolutePath));
     }
   }
 
@@ -475,12 +488,18 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
 
   try {
     const originalPaths = originalRoots.map((root) => root.absolutePath);
-    const [facts, glossary, verificationHint] = await Promise.all([
+    const [facts, glossary, verificationHint, environmentHealthNotes] = await Promise.all([
       queryFactsAcrossPaths(originalPaths),
       queryGlossaryAcrossPaths(originalPaths),
       buildVerificationCommandsHint(input.projectPath),
+      // Read-only "are this project's own docker services actually up"
+      // check (2026-07-28) - surfaced here so a stopped stack is known
+      // BEFORE the loop starts, not discovered blind after several failed
+      // db_query/http_request/run_command attempts (the exact failure mode
+      // hit live this session against two different projects' stacks).
+      Promise.all(originalPaths.map((rootPath) => checkDockerComposeHealth(rootPath))),
     ]);
-    knownFactsHint = [buildKnownFactsHint(originalRoots, facts), buildGlossaryHint(glossary), verificationHint]
+    knownFactsHint = [buildKnownFactsHint(originalRoots, facts), buildGlossaryHint(glossary), verificationHint, ...environmentHealthNotes.filter((note): note is string => Boolean(note))]
       .filter(Boolean)
       .join("\n\n");
   } catch {
@@ -554,6 +573,10 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
   // from the directory the user's own containers are actually running
   // under (see db-query-tool.ts's findRunningContainer docstring).
   const dbQueryTool = await buildDbQueryTool(originalRoots.map((root) => root.absolutePath)).catch(() => null);
+  // Read-other-branch-without-checkout (2026-07-28) - operates on
+  // worktreeRoots, which now EQUALS originalRoots (see createTaskSession) -
+  // git ops run wherever the Developer is actually working.
+  const readOtherBranchTool = buildReadOtherBranchTool(worktreeRoots);
 
   const collectDiff = async (): Promise<{ diff: string; changedFiles: string[] }> => {
     const parts = await Promise.all(
@@ -587,13 +610,14 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     ...(findReferencesTool ? { findReferences: findReferencesTool } : {}),
     ...(impactPreviewTool ? { computeImpactPreview: impactPreviewTool } : {}),
     ...(dbQueryTool ? { dbQuery: dbQueryTool } : {}),
+    readOtherBranch: readOtherBranchTool,
     computeFindingSimilarity: buildFindingSimilarityTool(input.providerBaseUrl, input.providerApiKey),
     ...(input.continueFrom
       ? {
           priorIteration: {
             task: input.continueFrom.priorTask,
             summary: input.continueFrom.priorSummary,
-            worktreeCarriesChanges: Boolean(reusedWorktrees),
+            worktreeCarriesChanges: Boolean(reusedSession),
           },
           ...(input.continueFrom.priorSensitiveActions?.length
             ? { priorSensitiveActions: input.continueFrom.priorSensitiveActions }
@@ -627,37 +651,37 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     });
   }
 
-  // Never clean up while the run is PAUSED waiting for the human (2026-07-18
-  // fix): both needs-clarification and needs-approval can legitimately have
-  // an empty diff at the pause point (e.g. ask_user/a migration request
-  // fired before any edit), and the SAME check below (diff.trim() empty ->
-  // delete) was unconditionally wiping the worktree the continuation
-  // (continueFrom) needs to re-enter. Previously this silently degraded
-  // every needs-clarification continuation into a fresh worktree instead of
-  // a real one - harmless there (nothing had been written yet in practice),
-  // but would have discarded real in-progress edits for needs-approval.
-  const isPausedForHuman = result.stopped === "needs-clarification" || result.stopped === "needs-approval";
+  // Graph refresh (2026-07-28): used to run only on "занеси в ветку" (the
+  // one moment code actually landed in the real checkout). Now that every
+  // run already writes directly to the real checkout (see createTaskSession),
+  // this is the only place left that should do it - moved here so the
+  // persisted graph still reflects what a Q&A/develop run just wrote,
+  // instead of going stale until the next background sync.
+  if (result.changedFiles.length > 0) {
+    for (const root of originalRoots) {
+      const ownRelativePaths = isMultiRoot
+        ? result.changedFiles.filter((file) => file.startsWith(`${root.label}/`)).map((file) => file.slice(root.label.length + 1))
+        : result.changedFiles;
 
-  // Bug fix (2026-07-27, live incident): the SAME class of bug the comment
-  // above already describes, in a case it did not cover - a CONTINUATION
-  // round (input.continueFrom set) that legitimately makes no further
-  // edits this round (e.g. correctly disputing a stale reviewer finding,
-  // nothing left to change) still has an empty diff, but the conversation
-  // is NOT over - a later message in the same conversation may still need
-  // to continue in this worktree. Wiping the branch+worktree here silently
-  // discarded every prior round's accumulated changes (migrations,
-  // middleware, model edits) the moment one correction round happened to
-  // touch nothing - the NEXT continuation then had no worktree to resume,
-  // silently fell back to a fresh checkout, and produced a diff totally
-  // disconnected from the actual feature. Only a genuinely FRESH task
-  // (no continueFrom) with an empty diff is truly "nothing to merge, would
-  // just be litter" - a continuation's empty diff just means this round
-  // added nothing, not that everything before it should be discarded.
-  if (!result.diff.trim() && !isPausedForHuman && !input.continueFrom) {
-    // Nothing to merge - the branch and worktree would just be litter.
-    await Promise.all(worktrees.map((worktree) => removeTaskWorktree(worktree, { deleteBranch: true }).catch(() => {})));
-    record.worktrees = [];
+      if (ownRelativePaths.length > 0) {
+        await refreshGraphForChangedFiles(root.absolutePath, ownRelativePaths).catch((error) => {
+          console.warn(`[develop-runner] graph refresh failed for ${root.absolutePath}:`, error);
+        });
+      }
+    }
   }
+
+  // No empty-diff cleanup anymore (2026-07-28): this used to delete the
+  // worktree+branch when a round produced no changes, which is exactly what
+  // caused a real live incident (2026-07-27) - a CONTINUATION round with a
+  // legitimately empty diff (e.g. correctly disputing a stale reviewer
+  // finding) wiped every prior round's accumulated, uncommitted work,
+  // because there was nothing to distinguish "empty because nothing to
+  // merge" from "empty because this round added nothing to an
+  // already-in-progress task." With no separate worktree/branch to delete
+  // (see createTaskSession), that whole class of bug is gone by
+  // construction - an empty diff now just means empty, nothing to clean up
+  // or lose either way.
 }
 
 /**
@@ -707,74 +731,34 @@ export interface MergeToBranchOutcome {
 }
 
 /**
- * "Занеси в текущую ветку" (2026-07-18, explicit product-owner request):
- * applies each worktree's diff directly onto the user's own real checkout
- * as UNCOMMITTED changes, via repository-git's applyWorktreeDiffToRoot -
- * never commits, never pushes. The worktree itself is left in place
- * afterward (not auto-cleaned) - a merge attempt that partially fails
- * across a multi-root project should not destroy the source of truth for
- * the parts that DID apply, and the user may want to retry a failed root
- * after resolving whatever caused the conflict.
+ * "Занеси в текущую ветку" (2026-07-18 feature, made MOOT 2026-07-28 by
+ * dropping worktree isolation - see createTaskSession's docstring): with no
+ * separate worktree, `worktree.worktreePath` already IS the real checkout -
+ * changes have been sitting there, uncommitted, since the moment the
+ * Developer made them. There is nothing left to apply. Kept as a function
+ * (not deleted) purely so the existing button/chat-command endpoints in
+ * app.ts keep working without a caller-side special case - it now just
+ * confirms this fact instead of running `git apply` (which would fail or,
+ * worse, double-apply a patch against the very files it came from).
  */
 export async function mergeDevelopRunToRealCheckout(worktrees: DevelopWorktreeInfo[]): Promise<MergeToBranchOutcome[]> {
-  const outcomes: MergeToBranchOutcome[] = [];
-
-  for (const worktree of worktrees) {
-    const taskWorktree: TaskWorktree = {
-      rootPath: worktree.rootPath,
-      worktreePath: worktree.worktreePath,
-      branch: worktree.branch,
-      startCommit: worktree.startCommit,
-    };
-    const result = await applyWorktreeDiffToRoot(taskWorktree);
-    outcomes.push({
-      label: worktree.label,
-      applied: result.applied,
-      changedFiles: result.changedFiles,
-      ...(result.error ? { error: result.error } : {}),
-    });
-
-    // Bug fix (2026-07-19, full-project review): keep the persisted graph in
-    // sync with what was actually just written to disk - see
-    // refreshGraphForChangedFiles's own comment for why this can't just wait
-    // for the normal background-sync path. Best-effort: a stale graph is the
-    // pre-existing (now-narrowed) failure mode, not a new one, so a refresh
-    // error here must not fail the merge that already succeeded on disk.
-    if (result.applied && result.changedFiles.length > 0) {
-      await refreshGraphForChangedFiles(worktree.rootPath, result.changedFiles).catch((error) => {
-        console.warn(`[develop-runner] graph refresh after merge failed for ${worktree.rootPath}:`, error);
-      });
-    }
-  }
-
-  return outcomes;
+  return worktrees.map((worktree) => ({
+    label: worktree.label,
+    applied: true,
+    changedFiles: [],
+  }));
 }
 
 /**
- * "Почисти ворктри" (2026-07-18): explicit, user-requested cleanup of a
- * delivered run's worktrees/branches - the normal path only auto-cleans an
- * EMPTY, non-paused diff (see executeDevelopRun below); a delivered diff is
- * deliberately kept around for merge-to-branch/manual review until the user
- * says they're done with it.
- */
-/**
- * `label` scopes cleanup to ONE physical repo of a multi-root run (2026-07-19,
- * live user request: a 4-path run's worktree panel had a single shared
- * "удалить"/"занести" pair acting on all 4 at once - each path needed its
- * own). Omitted `label` keeps the original "clean up everything" behavior
- * (the chat-text "почисти ворктри" command still wants that).
+ * "Почисти ворктри" (2026-07-18 feature, made MOOT 2026-07-28 - see
+ * mergeDevelopRunToRealCheckout above): there is no separate worktree
+ * directory or task branch to remove anymore (createTaskSession works
+ * directly in the real checkout, on whatever branch was already checked
+ * out). This only clears this run's OWN bookkeeping (`record.worktrees`,
+ * the telemetry column) - no git operation, nothing on disk changes. Kept
+ * as a function for the same reason as mergeDevelopRunToRealCheckout above.
  */
 export async function cleanupDevelopRunWorktrees(record: DevelopRunStatusRecord, label?: string): Promise<void> {
-  const targets = label ? record.worktrees.filter((worktree) => worktree.label === label) : record.worktrees;
-
-  await Promise.all(
-    targets.map((worktree) =>
-      removeTaskWorktree(
-        { rootPath: worktree.rootPath, worktreePath: worktree.worktreePath, branch: worktree.branch, startCommit: worktree.startCommit },
-        { deleteBranch: true },
-      ).catch(() => {}),
-    ),
-  );
   record.worktrees = label ? record.worktrees.filter((worktree) => worktree.label !== label) : [];
   await persistTelemetryWorktrees(record.runId, record.worktrees);
 }
@@ -785,17 +769,6 @@ export async function cleanupTelemetryDevelopRunWorktrees(runId: string, label?:
   if (!worktrees) {
     return false;
   }
-
-  const targets = label ? worktrees.filter((worktree) => worktree.label === label) : worktrees;
-
-  await Promise.all(
-    targets.map((worktree) =>
-      removeTaskWorktree(
-        { rootPath: worktree.rootPath, worktreePath: worktree.worktreePath, branch: worktree.branch, startCommit: worktree.startCommit },
-        { deleteBranch: true },
-      ).catch(() => {}),
-    ),
-  );
 
   const remaining = label ? worktrees.filter((worktree) => worktree.label !== label) : [];
   await persistTelemetryWorktrees(runId, remaining);

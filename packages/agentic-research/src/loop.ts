@@ -11,7 +11,7 @@ import { dirnameOf, grepContent, listDir, normalizeDirKey, readFile, toWorkspace
 // know enough - worse than an incomplete answer a chat follow-up can finish).
 // SAFETY_CEILING_TURNS/RUN_TOKEN_SAFETY_LIMIT exist only to stop a genuinely
 // runaway loop, not to shape when the model decides it's done.
-const DEFAULT_SAFETY_CEILING_TURNS = 40;
+const DEFAULT_SAFETY_CEILING_TURNS = 90;
 // Live evidence (2026-07-15): two different strong models, asked a genuinely
 // wide multi-file business question (CaseData's relation-case flow, 8-10
 // legitimately relevant files), both got cut off by this exact ceiling while
@@ -21,10 +21,46 @@ const DEFAULT_SAFETY_CEILING_TURNS = 40;
 // on hard questions (the thing this project explicitly does not want) while
 // contributing nothing on easy ones, which already converge naturally well
 // under the old ceiling (42K-84K tokens observed on the slay-api questions).
-const RUN_TOKEN_SAFETY_LIMIT = 450_000;
+//
+// Raised again 450K -> 1.2M, turns 40 -> 90 (2026-07-28, explicit product-
+// owner decision after a real cost check): even with tool-output compaction
+// (see COMPACT_TOOL_OUTPUT_AFTER_TURNS above), a genuinely wide analytical
+// question on magendamd still hit 450K without ever reaching final_answer -
+// 3 separate live attempts, all "insufficient-data-answer" at ~450-490K
+// tokens. Checked actual account economics before raising this blind: at
+// current team model multipliers (deepseek-v4-pro/grok-4.1-fast 0.7x,
+// gemini-3.1-flash-lite 0.5x, gpt-5.4 escalation 2x - but escalation is rare,
+// most tokens run at the cheap models), even a full-ceiling run billed at a
+// pessimistic all-escalated blend comes to under 3% of the account's daily
+// token allowance (51M/day) - there was no real cost reason to keep this
+// this tight. Turn ceiling raised proportionally (bumping only the token
+// limit would just move the bottleneck to turns instead of fixing it -
+// ~26-32K tokens/turn observed means 40 turns was already binding well
+// before 1.2M tokens would be reached).
+const RUN_TOKEN_SAFETY_LIMIT = 1_200_000;
 // Matches tools.ts's MAX_READ_FILE_CHARS (7000) - raising the read cap alone
 // without this would just move the same truncation from readFile to here.
 const MAX_OBSERVATION_CHARS = 7000;
+// Live evidence (2026-07-28): a genuinely productive run (still finding new
+// files every turn, not stuck) hit RUN_TOKEN_SAFETY_LIMIT at turn 15/23 files
+// read, without ever reaching final_answer - because every `role: "tool"`
+// message's full content (up to MAX_OBSERVATION_CHARS each) stays in
+// `messages` forever and gets resent on every subsequent model call. A tool
+// result already did its job the turn it arrived - the model's own reasoning
+// in later assistant messages is what actually carries forward what it
+// learned. Once a tool message is this many turns old, its content is
+// replaced with a short stub (re-callable any time); the message itself
+// stays in place so tool_call_id pairing for providers that require it is
+// never broken.
+//
+// Live A/B on the same real question (2026-07-28): 5 gave 17 files/17 turns
+// before hitting RUN_TOKEN_SAFETY_LIMIT; tightening to 2 was tried and made
+// things WORSE (15 files/20 turns, same ceiling) - the model needs to
+// re-list/re-verify things it can no longer see, so a too-short window trades
+// per-turn cost for MORE turns, a net wash or worse. 5 was the best of the
+// values actually tested here - do not re-tighten this without a fresh
+// live A/B, "shorter must be cheaper" already turned out false once.
+const COMPACT_TOOL_OUTPUT_AFTER_TURNS = 5;
 // Bug fix (2026-07-19, live incident): actionsLog used to record ONLY a
 // line count per action ("grep_content(doskey) -> 3 lines") - this is the
 // ENTIRE transcript the Critic sees (callCritic's `transcript` is
@@ -230,6 +266,20 @@ export interface AgenticRunOptions {
    */
   dbQuery?: (query: string) => Promise<string>;
   /**
+   * Read a file/directory/diff from ANOTHER branch/tag/commit WITHOUT
+   * checking it out (2026-07-28, explicit product-owner directive: "Claude
+   * Code can look at another branch without checkout - our project should
+   * be able to do that too, on request, if the chat asks to compare
+   * something"). Already existed for the Developer loop (develop-loop.ts,
+   * where a real checkout must never move mid-task) but was never wired
+   * into this Researcher loop, so a plain chat question like "как это было
+   * на master" had no way to answer without either guessing from memory or
+   * someone manually running git commands outside the product. Injected the
+   * same way as dbQuery/findReferences (this package stays free of the
+   * git-plumbing dependency - see packages/repository-git's readOtherBranch).
+   */
+  readOtherBranch?: (input: { root?: string; ref: string; path: string; mode?: "content" | "list" | "diff" }) => Promise<string>;
+  /**
    * Pre-formatted block of previously CONFIRMED project facts (fact store,
    * packages/knowledge) relevant to this task - "verify, then rely" seeds.
    * Team-mode never saw the fact store before 2026-07-16 (only the legacy
@@ -290,7 +340,7 @@ export interface AgenticRunResult {
 }
 
 interface ParsedAction {
-  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "find_references" | "db_query" | "request_verification" | "final_answer";
+  tool: "list_dir" | "grep_content" | "read_file" | "semantic_search" | "find_references" | "db_query" | "request_verification" | "read_other_branch" | "final_answer";
   arg: string;
 }
 
@@ -303,7 +353,7 @@ interface ParsedAction {
 // hypothetical) - the downstream answer-synthesis prompt (packages/ai) also
 // demands Russian, but this is a deliberate second safety net, not
 // redundant.
-function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasEscalationModel: boolean): string {
+function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasEscalationModel: boolean, hasReadOtherBranch: boolean): string {
   return [
     "You are an experienced senior fullstack developer investigating an unfamiliar codebase to honestly answer an engineering question.",
     // Native tool-calling (2026-07-26): see provider.ts's ToolDefinition
@@ -330,6 +380,9 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
     ...(hasEscalationModel
       ? ["request_verification hands the rest of this investigation to a stronger model, before you commit to a final_answer - use it when you notice a genuine reason to distrust your own read of the evidence: two files disagree, a business term could plausibly map to more than one similarly-named mechanism (e.g. \"relation\" vs \"Relationship\"), or you are about to answer confidently from only one weak match. Do not use it just because the question is broad - only when you have a CONCRETE, nameable doubt. This does not replace final_answer or skip review - a critic still checks your answer either way - it only changes which model does the remaining thinking. You will not always have this option; if it is not offered, keep investigating and answering yourself."]
       : []),
+    ...(hasReadOtherBranch
+      ? ["read_other_branch reads a file's content, lists a directory, or diffs against ANOTHER branch/tag/commit - WITHOUT checking it out (you never leave the branch you are already on, nothing on disk changes). Use it whenever the question asks you to compare with or look at another branch (\"как это было на master\", \"сравни с prod\", \"what changed since v2\") - never guess from memory what another branch contains."]
+      : []),
     "final_answer - your final answer IN RUSSIAN, naming specific files if you found them, or an honest admission that you did not; the content must be ONLY the answer itself - no meta commentary like 'revised version of the answer' or notes addressed to the critic. Call it ALONE, not alongside other tool calls.",
     ...(isMultiRoot
       ? [
@@ -339,6 +392,7 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
       ]
       : []),
     `IMPORTANT for speed: if you already see several places worth checking (several files to read, several directories to look at, several terms to grep) - do not spread this across separate turns one at a time. Call several tools in one turn (up to about ${MAX_ACTIONS_PER_TURN}), they execute in order and the results come back together in one batch. One tool call per turn is NOT more careful, it is just slower: every extra turn is a whole separate model call that re-sends the entire history again. The one exception is final_answer: call it ALONE, with no other tool call in the same turn (look at the results first, then answer).`,
+    `A tool result's raw content is cleared from view a few turns after it arrived (replaced with a short note saying so) - this is just to keep the conversation from growing forever, not a sign anything went wrong. If you actually need to look at a file/grep/listing again later, just call the same tool again - it is cheap.`,
     "You may briefly (1-2 sentences) say what you are doing and why before calling tools.",
     "Start with list_dir(\".\") if you do not know the structure. Look for literal, semantically close directory/file names - not only in Russian, but also their English translations.",
     "IMPORTANT: before reading a specific file in a directory you have not listed (list_dir) yet in this conversation, list_dir that directory first. A neighboring file with a similar name might be the one that actually answers the question - blindly guessing a filename skips that discovery.",
@@ -370,7 +424,7 @@ function buildSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, has
 // Native tool-calling schema (2026-07-26) - see provider.ts's ToolDefinition
 // comment for why one shape works across every model behind this gateway.
 // Mirrors ParsedAction["tool"] 1:1; keep both in sync if a tool is added/removed.
-function buildResearchTools(hasSemanticSearch: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasEscalationModel: boolean): ToolDefinition[] {
+function buildResearchTools(hasSemanticSearch: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasEscalationModel: boolean, hasReadOtherBranch: boolean, isMultiRoot: boolean): ToolDefinition[] {
   const tools: ToolDefinition[] = [
     { type: "function", function: { name: "list_dir", description: "List a directory's contents.", parameters: { type: "object", properties: { path: { type: "string", description: "Relative path from the project root." } }, required: ["path"] } } },
     { type: "function", function: { name: "grep_content", description: "Search file contents for a literal string or regex.", parameters: { type: "object", properties: { pattern: { type: "string" } }, required: ["pattern"] } } },
@@ -391,6 +445,26 @@ function buildResearchTools(hasSemanticSearch: boolean, hasFindReferences: boole
 
   if (hasEscalationModel) {
     tools.push({ type: "function", function: { name: "request_verification", description: "Hand the rest of this investigation to a stronger model, before committing to final_answer - use only when you have a CONCRETE, nameable doubt (conflicting files, an ambiguous name match, an about-to-guess moment), not just because the question is broad.", parameters: { type: "object", properties: { reason: { type: "string", description: "Specific claim/file you are unsure about and why." } }, required: ["reason"] } } });
+  }
+
+  if (hasReadOtherBranch) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "read_other_branch",
+        description: "Read a file's content, list a directory, or diff against ANOTHER branch/tag/commit - WITHOUT checking it out (you keep working on the current branch the whole time, nothing on disk changes). Use this when the question asks to compare with or look at another branch (e.g. \"как это было на master\", \"сравни с prod\", \"what does main have here that this branch doesn't\").",
+        parameters: {
+          type: "object",
+          properties: {
+            ...(isMultiRoot ? { root: { type: "string", description: "Which physical repo (this project has more than one) - use the same label shown in \"Project parts\"." } } : {}),
+            ref: { type: "string", description: "Branch/tag/commit to read from, e.g. \"main\", \"origin/master\", a commit hash." },
+            path: { type: "string", description: "File or directory path, relative to that root." },
+            mode: { type: "string", enum: ["content", "list", "diff"], description: "\"content\" (default) = this file's full text at that ref. \"list\" = this directory's entries at that ref. \"diff\" = diff between the CURRENT branch and that ref, scoped to this path." },
+          },
+          required: ["ref", "path"],
+        },
+      },
+    });
   }
 
   tools.push({
@@ -439,6 +513,19 @@ function toolCallToAction(toolCall: ToolCall): ParsedAction {
       return { tool, arg: str("query") };
     case "request_verification":
       return { tool, arg: str("reason") };
+    case "read_other_branch":
+      // Packed as JSON in `arg`, same convention develop-loop.ts's
+      // read_other_branch and tester-loop.ts's http_request use for a
+      // multi-field tool - the dispatch below parses it back out.
+      return {
+        tool,
+        arg: JSON.stringify({
+          ref: str("ref"),
+          path: str("path"),
+          ...(typeof args.root === "string" ? { root: args.root } : {}),
+          ...(typeof args.mode === "string" ? { mode: args.mode } : {}),
+        }),
+      };
     case "final_answer":
       return { tool, arg: str("answer") };
     default:
@@ -788,9 +875,9 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
   const projectLine = isMultiRoot
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
-  const researchTools = buildResearchTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.researcherEscalationModel));
+  const researchTools = buildResearchTools(Boolean(options.semanticSearch), Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.researcherEscalationModel), Boolean(options.readOtherBranch), isMultiRoot);
   const messages: ChatMessage[] = [
-    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.researcherEscalationModel)) },
+    { role: "system", content: buildSystemPrompt(Boolean(options.semanticSearch), isMultiRoot, Boolean(options.findReferences), Boolean(options.dbQuery), Boolean(options.researcherEscalationModel), Boolean(options.readOtherBranch)) },
     { role: "user", content: `${projectLine}\nQuestion: ${options.task}${priorTurnTopicHint}${priorTurnHint}${observerHintBlock}${attachmentHintBlock}${questionShapeBlock}` },
   ];
 
@@ -919,6 +1006,7 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
     ...[...seedReadFiles].map((filePath) => dirnameOf(filePath)),
   ]);
   const grepTermsSeen = new Set<string>();
+  const toolMessageAges: Array<{ message: ChatMessage; turn: number; compacted: boolean }> = [];
   let criticRounds = 0;
   let criticVerdict: AgenticRunResult["criticVerdict"] = "not-run";
   // Live evidence (2026-07-15): a run burned 48 calls / ~300K tokens (hit the
@@ -1186,6 +1274,27 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
           actionsLog.push(`[turn ${turn}] model-requested escalation to ${activeResearcherModel}: ${action.arg}`);
           observation = `Escalated to ${activeResearcherModel} for the rest of this investigation, because: ${action.arg}. Continue investigating with this in mind - a critic will still check your final answer either way.`;
         }
+      } else if (action.tool === "read_other_branch") {
+        if (!options.readOtherBranch) {
+          observation = "(read_other_branch is not available for this project)";
+        } else {
+          try {
+            const parsed = JSON.parse(action.arg) as { ref?: string; path?: string; root?: string; mode?: "content" | "list" | "diff" };
+
+            if (!parsed.ref || !parsed.path) {
+              observation = "Error: read_other_branch call is missing the required \"ref\" and/or \"path\" field.";
+            } else {
+              observation = await options.readOtherBranch({
+                ref: parsed.ref,
+                path: parsed.path,
+                ...(parsed.root ? { root: parsed.root } : {}),
+                ...(parsed.mode ? { mode: parsed.mode } : {}),
+              });
+            }
+          } catch (error) {
+            observation = `Error: read_other_branch failed - ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
       } else {
         const parentDir = dirnameOf(action.arg);
 
@@ -1222,6 +1331,14 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       // tool_call, matched by id - replaces the old single combined
       // "OBSERVATION:" user message built from concatenated text blocks.
       messages.push({ role: "tool", tool_call_id: toolCallId, name: action.tool, content: boundedObservation });
+      toolMessageAges.push({ message: messages[messages.length - 1] as ChatMessage, turn, compacted: false });
+    }
+
+    for (const entry of toolMessageAges) {
+      if (!entry.compacted && turn - entry.turn >= COMPACT_TOOL_OUTPUT_AFTER_TURNS) {
+        entry.message.content = `[${entry.message.name} output from turn ${entry.turn} cleared to save context - it was read successfully; call ${entry.message.name} again if you need this content]`;
+        entry.compacted = true;
+      }
     }
 
     const currentSurfaceSize = touchedFiles.size + seenDirs.size + grepTermsSeen.size;

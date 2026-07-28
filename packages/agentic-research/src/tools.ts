@@ -598,7 +598,7 @@ const MAX_COMMAND_OUTPUT_CHARS = 12_000;
 // docs/architecture/011-developer-pipeline.md.
 const FORBIDDEN_COMMAND_PATTERN = /\bgit\s+(push|commit|merge|rebase|reset|checkout|switch|remote|worktree|filter-branch|reflog|update-ref|symbolic-ref|branch\s+(-[dDmMfF]|--delete|--force|--move)|tag\s+(-f|--force))\b|\bnpm\s+publish\b|\bsudo\b|\brm\s+(-[a-z]*\s+)*[/~]|\bmkfs\b|\bshutdown\b|\breboot\b/i;
 
-export async function runShellCommand(roots: WorkspaceRoot[], rawArg: string): Promise<ShellCommandResult> {
+export async function runShellCommand(roots: WorkspaceRoot[], rawArg: string, extraEnv?: Record<string, string>): Promise<ShellCommandResult> {
   let command = rawArg.trim();
   let cwdRoot = roots[0] as WorkspaceRoot;
 
@@ -636,6 +636,7 @@ export async function runShellCommand(roots: WorkspaceRoot[], rawArg: string): P
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
       timeout: RUN_COMMAND_TIMEOUT_MS,
+      ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
     });
     const output = `${stdout}${stderr ? `\n${stderr}` : ""}`.trim();
     return {

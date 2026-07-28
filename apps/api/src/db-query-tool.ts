@@ -149,6 +149,53 @@ export async function findComposeFile(rootPath: string): Promise<string | null> 
 }
 
 /**
+ * Read-only environment health-check (2026-07-28, explicit product-owner
+ * request) - surfaces "these services are down" to a Developer/Reviewer/
+ * Tester run's INITIAL context, before it starts working, instead of the
+ * model discovering it blind over many turns of failed db_query/http_request
+ * calls (the exact failure mode hit live this session, twice, against two
+ * different projects). Deliberately never starts anything itself - see
+ * feedback memory on casual docker restarts: a floating image tag made a
+ * routine "just bring it back up" recreate the container on a newer,
+ * incompatible image and silently break auth for hours. This function only
+ * reports state; starting stopped services is always a human or Developer
+ * (run_command, its own decision) call, never automatic.
+ */
+export async function checkDockerComposeHealth(rootPath: string): Promise<string | null> {
+  const composeFile = await findComposeFile(rootPath);
+
+  if (!composeFile) {
+    return null;
+  }
+
+  const result = await execCommand("docker", ["compose", "ps", "-a", "--format", "json"], DOCKER_DISCOVERY_TIMEOUT_MS, undefined, rootPath);
+
+  if (!result.ok || !result.stdout.trim()) {
+    return null; // docker itself unavailable, or nothing declared yet - not this check's job to diagnose docker, degrade silently
+  }
+
+  const downServices: string[] = [];
+
+  for (const line of result.stdout.split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    try {
+      const entry = JSON.parse(line) as { Service?: string; State?: string };
+
+      if (entry.Service && entry.State && entry.State !== "running") {
+        downServices.push(`${entry.Service} (${entry.State})`);
+      }
+    } catch {
+      continue; // one unparseable line (docker compose version quirk) shouldn't sink the whole check
+    }
+  }
+
+  return downServices.length > 0 ? `docker compose services NOT running in this project: ${downServices.join(", ")}. If the task needs them, start them yourself (run_command) or ask the human - do not assume they are up just because a compose file exists.` : null;
+}
+
+/**
  * Best-effort, deliberately NOT a real YAML parser - line/indentation
  * scanning for one narrow question: does the named service publish a host
  * port? Ambiguous or unparseable input just returns null (falls back to
@@ -351,6 +398,40 @@ export async function executeDbQuery(plan: DbConnectionPlan, query: string): Pro
   return output.length > MAX_QUERY_OUTPUT_CHARS
     ? `${output.slice(0, MAX_QUERY_OUTPUT_CHARS)}\n... (truncated at ${MAX_QUERY_OUTPUT_CHARS} chars - narrow the query or add LIMIT)`
     : output;
+}
+
+// Reviewer's verify_in_transaction (php artisan tinker) runs on the HOST,
+// not inside a docker container (2026-07-28, confirmed live - the
+// deprecation-noise filter this codebase already has was tuned against
+// Homebrew's host PHP 8.4 hitting a Laravel 8 app's vendor deprecations,
+// something that would never surface from inside a project's own,
+// version-matched container). A worktree has no `.env` of its own (gitignored,
+// same as vendor/) - unlike vendor, `.env` is NOT symlinked (real secrets,
+// and a far more plausible accidental edit_file target than a vendor
+// library file), so tinker fails with "Database hosts array is empty"
+// even once vendor/autoload.php is reachable. This resolves the ORIGINAL
+// root's DB connection the exact same way db_query already does, but
+// returns it as HOST-runnable env vars (DB_HOST/PORT resolved to
+// 127.0.0.1 + the real published port, never the docker-internal service
+// name) instead of a query-execution plan - only for "direct" mode, since
+// "docker-exec" mode has no host-reachable host:port a host-run tinker
+// process could use anyway (same graceful "just don't enrich" degradation
+// as everything else in this file).
+export async function resolveDbEnvOverrides(rootPath: string): Promise<Record<string, string> | null> {
+  const plan = await resolveDbConnectionPlan(rootPath);
+
+  if (!plan || plan.mode !== "direct" || !plan.host || !plan.port) {
+    return null;
+  }
+
+  return {
+    DB_CONNECTION: plan.engine === "postgres" ? "pgsql" : "mysql",
+    DB_HOST: plan.host,
+    DB_PORT: plan.port,
+    DB_DATABASE: plan.database,
+    DB_USERNAME: plan.username,
+    DB_PASSWORD: plan.password,
+  };
 }
 
 /**

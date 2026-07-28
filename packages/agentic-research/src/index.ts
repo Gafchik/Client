@@ -153,6 +153,8 @@ export interface RunAgenticResearchInput {
   findReferences?: (symbolOrFileName: string) => Promise<string>;
   /** See AgenticRunOptions.dbQuery. */
   dbQuery?: (query: string) => Promise<string>;
+  /** See AgenticRunOptions.readOtherBranch. */
+  readOtherBranch?: (input: { root?: string; ref: string; path: string; mode?: "content" | "list" | "diff" }) => Promise<string>;
   /** See AgenticRunOptions.semanticSeedFiles. */
   semanticSeedFiles?: (query: string) => Promise<string[]>;
   /** See AgenticRunOptions.knownFactsHint. */
@@ -188,6 +190,7 @@ export async function runAgenticResearch(input: RunAgenticResearchInput): Promis
     ...(input.semanticSearch ? { semanticSearch: input.semanticSearch } : {}),
     ...(input.findReferences ? { findReferences: input.findReferences } : {}),
     ...(input.dbQuery ? { dbQuery: input.dbQuery } : {}),
+    ...(input.readOtherBranch ? { readOtherBranch: input.readOtherBranch } : {}),
     ...(input.semanticSeedFiles ? { semanticSeedFiles: input.semanticSeedFiles } : {}),
     ...(input.knownFactsHint ? { knownFactsHint: input.knownFactsHint } : {}),
     ...(input.onProgress ? { onProgress: input.onProgress } : {}),

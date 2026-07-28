@@ -117,7 +117,7 @@ const TEAM_ROLE_DESCRIPTIONS = {
   researcher: "Исследует кодовую базу и ищет доказательства для ответа.",
   critic: "Проверяет ответ Researcher перед тем как показать его пользователю. Также классифицирует сообщения чата (вопрос/задача) — частые дешёвые вызовы.",
   observer: "Изучает проект в фоне между вопросами, чтобы будущие ответы были быстрее.",
-  developer: "Пишет код по задаче из чата в изолированном worktree. Пусто — используется модель Researcher.",
+  developer: "Пишет код по задаче из чата прямо в реальном проекте (без отдельного worktree — задачи на один проект выполняются по очереди). Пусто — используется модель Researcher.",
   reviewer: "Независимое ревью diff перед выдачей. Должна быть не слабее Developer по коду — слабый ревьюер шумит неверными замечаниями. Пусто — code-дефолт (Kimi K2.7 Code).",
   tester: "Проверяет РЕАЛЬНОЕ поведение (реальные HTTP-запросы, чтение БД) — не читает диф, не пишет код. Можно вызывать отдельно от Developer, например на баг-репорт. Пусто — как у Reviewer.",
   researcherEscalation: "Если Critic отклонил первый ответ Researcher — следующие ходы пойдут этой моделью вместо обычной. Дешёво по умолчанию, сильнее только когда реально понадобилось. Пусто — эскалация выключена.",
@@ -1522,113 +1522,6 @@ interface DevelopRunStatusView {
   autoMergeOutcome?: DevelopMergeOutcomeView[];
 }
 
-interface DevelopWorktreeRegistryEntryView {
-  runId: string;
-  conversationId: string;
-  projectPath: string;
-  task: string;
-  status: "running" | "completed" | "failed";
-  startedAt: string;
-  finishedAt?: string;
-  worktrees: Array<{ label: string; rootPath: string; worktreePath: string; branch: string }>;
-  autoMergeOutcome?: DevelopMergeOutcomeView[];
-  usage?: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  };
-}
-
-interface WorktreeChatGroupView {
-  projectPath: string;
-  conversationId: string;
-  entries: DevelopWorktreeRegistryEntryView[];
-  task: string;
-  startedAt: string;
-  status: "running" | "completed" | "failed";
-  worktrees: Array<DevelopWorktreeRegistryEntryView["worktrees"][number] & { runId: string }>;
-  autoMergeOutcome: DevelopMergeOutcomeView[];
-  usage: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  } | null;
-}
-
-function worktreeTreeId(runId: string, label: string): string {
-  return `${runId}:${label}`;
-}
-
-function groupWorktreeEntries(entries: DevelopWorktreeRegistryEntryView[]): Array<{
-  projectPath: string;
-  chats: WorktreeChatGroupView[];
-}> {
-  const projectBuckets = new Map<string, Map<string, DevelopWorktreeRegistryEntryView[]>>();
-
-  for (const entry of entries) {
-    const projectBucket = projectBuckets.get(entry.projectPath) ?? new Map<string, DevelopWorktreeRegistryEntryView[]>();
-    const chatBucket = projectBucket.get(entry.conversationId) ?? [];
-    chatBucket.push(entry);
-    projectBucket.set(entry.conversationId, chatBucket);
-    projectBuckets.set(entry.projectPath, projectBucket);
-  }
-
-  return [...projectBuckets.entries()]
-    .map(([projectPath, chats]) => ({
-      projectPath,
-      chats: [...chats.entries()]
-        .map(([conversationId, chatEntries]) => {
-          const sortedEntries = [...chatEntries].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
-          const latestEntry = sortedEntries[0] as DevelopWorktreeRegistryEntryView;
-          const usage = sortedEntries.reduce(
-            (accumulator, entry) => ({
-              promptTokens: accumulator.promptTokens + (entry.usage?.promptTokens ?? 0),
-              completionTokens: accumulator.completionTokens + (entry.usage?.completionTokens ?? 0),
-              totalTokens: accumulator.totalTokens + (entry.usage?.totalTokens ?? 0),
-            }),
-            { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-          );
-
-          // Dedupe by worktreePath (2026-07-19 bug fix): a correction/chain
-          // continuation reuses the SAME physical worktree under a NEW
-          // runId (see startDevelopRun's continueFrom) - the prior run's
-          // own record still has it too (nothing clears it), so without
-          // this the same on-disk worktree showed up as two separate rows.
-          // sortedEntries is newest-first, so keeping the first occurrence
-          // per path naturally picks the run whose id current actions
-          // (merge/delete) should actually address.
-          const seenWorktreePaths = new Set<string>();
-          const dedupedWorktrees = sortedEntries
-            .flatMap((entry) => entry.worktrees.map((worktree) => ({ ...worktree, runId: entry.runId })))
-            .filter((worktree) => {
-              if (seenWorktreePaths.has(worktree.worktreePath)) {
-                return false;
-              }
-              seenWorktreePaths.add(worktree.worktreePath);
-              return true;
-            });
-
-          return {
-            projectPath,
-            conversationId,
-            entries: sortedEntries,
-            task: latestEntry.task,
-            startedAt: latestEntry.startedAt,
-            status: latestEntry.status,
-            worktrees: dedupedWorktrees,
-            autoMergeOutcome: sortedEntries.flatMap((entry) => safeList(entry.autoMergeOutcome)),
-            usage: usage.totalTokens > 0 ? usage : null,
-          };
-        })
-        .sort((left, right) => right.startedAt.localeCompare(left.startedAt)),
-    }))
-    .sort((left, right) => {
-      const leftLatest = left.chats[0]?.startedAt ?? "";
-      const rightLatest = right.chats[0]?.startedAt ?? "";
-      return rightLatest.localeCompare(leftLatest);
-    });
-}
-
 function developPhaseLabel(progress?: { turn: number; filesChanged: number; phase: string }): string {
   if (!progress) {
     return "Готовлю изолированную копию проекта…";
@@ -1711,46 +1604,23 @@ function DevelopMergeOutcomeList({ outcomes }: { outcomes: DevelopMergeOutcomeVi
 function DevelopWorktreeRow({
   runId,
   worktree,
-  outcome,
-  onMerged,
   onRemoved,
 }: {
   runId: string;
   worktree: DevelopRunStatusView["worktrees"][number];
-  outcome: DevelopMergeOutcomeView | null;
-  onMerged: (outcome: DevelopMergeOutcomeView) => void;
   onRemoved: () => void;
 }) {
-  const [merging, setMerging] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  async function handleMerge() {
-    setMerging(true);
-    setActionError(null);
-
-    try {
-      const response = await fetchJsonWithTimeout<{ outcomes: DevelopMergeOutcomeView[] }>(
-        `${API_BASE_URL}/api/develop/merge-to-checkout`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runId, label: worktree.label }) },
-      );
-      const own = response.outcomes.find((item) => item.label === worktree.label);
-
-      if (own) {
-        onMerged(own);
-      }
-    } catch (mergeError) {
-      setActionError(mergeError instanceof Error ? mergeError.message : "Не удалось занести в чекаут.");
-    } finally {
-      setMerging(false);
-    }
-  }
-
-  async function handleCleanup() {
-    // Same confirm as the sidebar's bulk delete (2026-07-19) - this is the
-    // same irreversible action (real, possibly-unmerged code discarded),
-    // just triggered from a chat message instead of the Worktree Manager.
-    if (!window.confirm("Удалить этот worktree? Если diff ещё не занесён в чекаут — он будет потерян безвозвратно.")) {
+  // "Занести в чекаут" removed (2026-07-28, product-owner decision to drop
+  // worktree isolation): the Developer now writes directly in the real
+  // project - there is no separate copy left to bring in, the button was
+  // calling an endpoint that had become a no-op reporting success for
+  // nothing. `worktree.worktreePath` below is now literally the real
+  // project's own path (see createTaskSession, packages/repository-git).
+  async function handleForget() {
+    if (!window.confirm("Убрать эту задачу из списка? Правки уже в проекте (это ничего не удалит) - просто скрывает запись из списка.")) {
       return;
     }
 
@@ -1764,7 +1634,7 @@ function DevelopWorktreeRow({
       );
       onRemoved();
     } catch (cleanupError) {
-      setActionError(cleanupError instanceof Error ? cleanupError.message : "Не удалось удалить worktree.");
+      setActionError(cleanupError instanceof Error ? cleanupError.message : "Не удалось убрать из списка.");
     } finally {
       setCleaning(false);
     }
@@ -1772,17 +1642,12 @@ function DevelopWorktreeRow({
 
   return (
     <div className="develop-worktree-entry">
-      <span className="develop-worktree-meta">{worktree.label} · ветка {worktree.branch}</span>
+      <span className="develop-worktree-meta">{worktree.label} · ветка {worktree.branch} · правки уже в проекте</span>
       <CodeBlock language="bash" code={`cd ${worktree.worktreePath}`} />
 
-      {outcome ? <DevelopMergeOutcomeList outcomes={[outcome]} /> : null}
-
       <div className="action-row">
-        <button type="button" className="ghost-button" onClick={() => void handleMerge()} disabled={merging || cleaning}>
-          {merging ? "Заношу…" : "Занести в текущий чекаут"}
-        </button>
-        <button type="button" className="ghost-button danger-button" onClick={() => void handleCleanup()} disabled={merging || cleaning}>
-          {cleaning ? "Удаляю…" : "Удалить этот worktree"}
+        <button type="button" className="ghost-button" onClick={() => void handleForget()} disabled={cleaning}>
+          {cleaning ? "Убираю…" : "Убрать из списка"}
         </button>
       </div>
 
@@ -1793,41 +1658,35 @@ function DevelopWorktreeRow({
 
 function DevelopWorktreePanel({ run }: { run: DevelopRunStatusView }) {
   const [worktrees, setWorktrees] = useState(run.worktrees);
-  const [outcomes, setOutcomes] = useState<Record<string, DevelopMergeOutcomeView>>(() => {
-    const initial: Record<string, DevelopMergeOutcomeView> = {};
-
-    for (const outcome of run.autoMergeOutcome ?? []) {
-      initial[outcome.label] = outcome;
-    }
-
-    return initial;
-  });
 
   if (worktrees.length === 0) {
-    const remaining = Object.values(outcomes);
+    // run.autoMergeOutcome may still be populated for OLD runs from before
+    // worktree isolation was dropped (2026-07-28) - kept renderable for
+    // that historical data, but a new run never produces a meaningful one
+    // (there is nothing left to "bring in" - see mergeDevelopRunToRealCheckout's
+    // docstring in develop-runner.ts).
+    const legacyOutcomes = (run.autoMergeOutcome ?? []).filter((outcome) => outcome.changedFiles.length > 0);
 
-    if (remaining.length === 0) {
+    if (legacyOutcomes.length === 0) {
       return null;
     }
 
     return (
       <div className="develop-worktree-panel">
         <p className="message-label">Занесено в чекаут</p>
-        <DevelopMergeOutcomeList outcomes={remaining} />
+        <DevelopMergeOutcomeList outcomes={legacyOutcomes} />
       </div>
     );
   }
 
   return (
     <div className="develop-worktree-panel">
-      <p className="message-label">Worktree этой задачи</p>
+      <p className="message-label">Эта задача писала прямо в проект (без отдельного worktree)</p>
       {worktrees.map((worktree) => (
         <DevelopWorktreeRow
           key={worktree.label}
           runId={run.runId}
           worktree={worktree}
-          outcome={outcomes[worktree.label] ?? null}
-          onMerged={(outcome) => setOutcomes((current) => ({ ...current, [outcome.label]: outcome }))}
           onRemoved={() => setWorktrees((current) => current.filter((item) => item.label !== worktree.label))}
         />
       ))}
@@ -1939,427 +1798,6 @@ function DevelopRunMessage({ run }: { run: DevelopRunStatusView }) {
         ) : null}
       </div>
     </div>
-  );
-}
-
-function WorktreeManagerSidebar({
-  projectName,
-  conversationId,
-}: {
-  projectName: string;
-  conversationId: string | null;
-}) {
-  const [entries, setEntries] = useState<DevelopWorktreeRegistryEntryView[]>([]);
-  const [openProjects, setOpenProjects] = useState<Record<string, boolean>>({});
-  const [openChats, setOpenChats] = useState<Record<string, boolean>>({});
-  const [selectedTreeIds, setSelectedTreeIds] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState(false);
-  const [cleaning, setCleaning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const refreshTimerRef = useRef<number | null>(null);
-
-  async function loadWorktrees(signal?: AbortSignal) {
-    setError(null);
-
-    try {
-      const response = await fetchJsonWithTimeout<{ entries: DevelopWorktreeRegistryEntryView[] }>(
-        `${API_BASE_URL}/api/develop/worktrees`,
-        signal ? { signal } : undefined,
-      );
-
-      setEntries(safeList(response.entries));
-      setOpenProjects((current) => {
-        const next = { ...current };
-
-        for (const entry of safeList(response.entries)) {
-          if (next[entry.projectPath] === undefined) {
-            next[entry.projectPath] = entry.conversationId === conversationId;
-          }
-        }
-
-        return next;
-      });
-      setOpenChats((current) => {
-        const next = { ...current };
-
-        for (const entry of safeList(response.entries)) {
-          const chatKey = `${entry.projectPath}::${entry.conversationId}`;
-          if (next[chatKey] === undefined) {
-            next[chatKey] = entry.conversationId === conversationId;
-          }
-        }
-
-        return next;
-      });
-    } catch (loadError) {
-      if (!(loadError instanceof Error) || loadError.name !== "AbortError") {
-        setError(loadError instanceof Error ? loadError.message : "Не удалось загрузить worktree.");
-      }
-    }
-  }
-
-  function scheduleRefresh(delayMs = 0) {
-    if (refreshTimerRef.current !== null) {
-      window.clearTimeout(refreshTimerRef.current);
-    }
-
-    refreshTimerRef.current = window.setTimeout(() => {
-      void loadWorktrees();
-      refreshTimerRef.current = null;
-    }, delayMs);
-  }
-
-  useEffect(() => {
-    const controller = new AbortController();
-    setLoading(true);
-    void loadWorktrees(controller.signal).finally(() => setLoading(false));
-    // Was a flat 1500ms forever (2026-07-19 fix, vercel-react-best-practices
-    // §4 client-side fetching) - a background HTTP round trip every 1.5s
-    // regardless of whether the tab is even visible. Worktree state changes
-    // on the order of "a run finished" or "someone clicked a button" (this
-    // component's own actions already call scheduleRefresh(150) for that),
-    // not sub-second - 5s is still responsive for a background sidebar
-    // without the constant chatter, and pausing on document.hidden avoids
-    // polling a backgrounded tab entirely.
-    const POLL_INTERVAL_MS = 5000;
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "hidden") {
-        return;
-      }
-      void loadWorktrees();
-    }, POLL_INTERVAL_MS);
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        void loadWorktrees();
-      }
-    };
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      if (refreshTimerRef.current !== null) {
-        window.clearTimeout(refreshTimerRef.current);
-      }
-    };
-  }, [conversationId]);
-
-  const groupedProjects = groupWorktreeEntries(entries);
-  const allTreeIds = groupedProjects.flatMap((projectGroup) =>
-    projectGroup.chats.flatMap((chatGroup) => chatGroup.worktrees.map((worktree) => worktreeTreeId(worktree.runId, worktree.label))),
-  );
-  const selectedCount = selectedTreeIds.size;
-  const allSelected = allTreeIds.length > 0 && selectedTreeIds.size === allTreeIds.length;
-
-  function toggleSelectAll() {
-    if (allSelected) {
-      setSelectedTreeIds(new Set());
-      return;
-    }
-
-    setSelectedTreeIds(new Set(allTreeIds));
-  }
-
-  function toggleTreeSelection(treeIds: string[], checked: boolean) {
-    setSelectedTreeIds((current) => {
-      const next = new Set(current);
-
-      for (const treeId of treeIds) {
-        if (checked) {
-          next.add(treeId);
-        } else {
-          next.delete(treeId);
-        }
-      }
-
-      return next;
-    });
-  }
-
-  function collectSelectedTargets() {
-    const targetMap = new Map<string, { runId: string; label?: string }>();
-
-    for (const projectGroup of groupedProjects) {
-      for (const chatGroup of projectGroup.chats) {
-        for (const worktree of chatGroup.worktrees) {
-          const treeId = worktreeTreeId(worktree.runId, worktree.label);
-          if (selectedTreeIds.has(treeId)) {
-            targetMap.set(treeId, { runId: worktree.runId, label: worktree.label });
-          }
-        }
-      }
-    }
-
-    return [...targetMap.values()];
-  }
-
-  async function cleanupTargets(targets: Array<{ runId: string; label?: string }>) {
-    if (!targets.length) {
-      return;
-    }
-
-    // Explicit confirm before ANY worktree delete (2026-07-19) - unlike
-    // other "Удалить" buttons in the app, this one can discard real,
-    // never-merged code sitting only in that worktree (lived this exact
-    // risk earlier in this same session, twice, with real uncommitted diffs).
-    const confirmed = window.confirm(
-      targets.length === 1
-        ? "Удалить этот worktree? Если diff ещё не занесён в чекаут — он будет потерян безвозвратно."
-        : `Удалить ${targets.length} worktree? Если diff'ы ещё не занесены в чекаут — они будут потеряны безвозвратно.`,
-    );
-
-    if (!confirmed) {
-      return;
-    }
-
-    setCleaning(true);
-    setError(null);
-
-    try {
-      await Promise.all(
-        targets.map((target) =>
-          fetchJsonWithTimeout(`${API_BASE_URL}/api/develop/cleanup-worktree`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(target),
-          }),
-        ),
-      );
-
-      setEntries((current) =>
-        current
-          .map((entry) => {
-            const touched = targets.filter((target) => target.runId === entry.runId);
-
-            if (touched.length === 0) {
-              return entry;
-            }
-
-            const labelsToRemove = new Set(touched.map((target) => target.label).filter(Boolean) as string[]);
-
-            return {
-              ...entry,
-              worktrees: labelsToRemove.size > 0
-                ? entry.worktrees.filter((worktree) => !labelsToRemove.has(worktree.label))
-                : [],
-            };
-          })
-          .filter((entry) => entry.worktrees.length > 0),
-      );
-      setSelectedTreeIds(new Set());
-      scheduleRefresh(150);
-    } catch (cleanupError) {
-      setError(cleanupError instanceof Error ? cleanupError.message : "Не удалось удалить выбранные worktree.");
-    } finally {
-      setCleaning(false);
-    }
-  }
-
-  return (
-    <aside className="worktree-sidebar">
-      <div className="worktree-sidebar-head">
-        <p className="section-kicker">Git Worktree</p>
-        <h2>Менеджер деревьев</h2>
-        <span>{conversationId ? `${projectName} · текущий чат активен` : "Все проекты и чаты"}</span>
-      </div>
-
-      {groupedProjects.length > 0 ? (
-        <div className="worktree-sidebar-toolbar">
-          <label className="history-select-all">
-            <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
-            Все
-          </label>
-          <span className="worktree-run-meta">
-            {groupedProjects.length} проектов · {groupedProjects.reduce((count, projectGroup) => count + projectGroup.chats.length, 0)} чатов · {allTreeIds.length} деревьев
-          </span>
-        </div>
-      ) : null}
-
-      {loading && entries.length === 0 ? <p className="muted">Загружаю worktree…</p> : null}
-      {error ? <p className="message-footnote">{error}</p> : null}
-      {!loading && entries.length === 0 ? <p className="muted">Активных worktree сейчас нет.</p> : null}
-
-      <div className="worktree-sidebar-list">
-        {groupedProjects.map((projectGroup) => {
-          const projectPathKey = projectGroup.projectPath;
-          const projectOpen = openProjects[projectPathKey] ?? true;
-          const projectTargets = projectGroup.chats.flatMap((chat) => chat.worktrees.map((worktree) => ({ runId: worktree.runId, label: worktree.label })));
-          const projectTreeIds = projectGroup.chats.flatMap((chatGroup) => chatGroup.worktrees.map((worktree) => worktreeTreeId(worktree.runId, worktree.label)));
-          const projectSelected = projectTreeIds.length > 0 && projectTreeIds.every((treeId) => selectedTreeIds.has(treeId));
-
-          return (
-            <section key={projectPathKey} className="worktree-run-card">
-              <div className="worktree-run-toggle worktree-run-toggle-project">
-                <label className="worktree-select-row worktree-select-row-grow">
-                  <input
-                    type="checkbox"
-                    checked={projectSelected}
-                    onChange={(event) => toggleTreeSelection(projectTreeIds, event.target.checked)}
-                  />
-                  <span className="worktree-run-title">{projectPathKey.split("/").filter(Boolean).slice(-1)[0] ?? projectPathKey}</span>
-                </label>
-                <div className="worktree-run-actions">
-                  <span className="worktree-run-meta">{projectGroup.chats.length} чатов · {projectTargets.length} деревьев</span>
-                  <button
-                    type="button"
-                    className="worktree-accordion-button"
-                    onClick={() => setOpenProjects((current) => ({ ...current, [projectPathKey]: !projectOpen }))}
-                    aria-expanded={projectOpen}
-                    aria-label={projectOpen ? "Свернуть проект" : "Развернуть проект"}
-                  >
-                    {projectOpen ? "▾" : "▸"}
-                  </button>
-                  <button type="button" className="ghost-button danger-button" onClick={() => void cleanupTargets(projectTargets)} disabled={cleaning}>
-                    {cleaning ? "…" : "Удалить"}
-                  </button>
-                </div>
-              </div>
-
-              {projectOpen ? (
-                <div className="worktree-run-body">
-                  {projectGroup.chats.map((chatGroup) => {
-                    const chatKey = `${projectPathKey}::${chatGroup.conversationId}`;
-                    const chatTreeIds = chatGroup.worktrees.map((worktree) => worktreeTreeId(worktree.runId, worktree.label));
-                    const chatSelected = chatTreeIds.length > 0 && chatTreeIds.every((treeId) => selectedTreeIds.has(treeId));
-                    const chatOpen = openChats[chatKey] ?? chatGroup.conversationId === conversationId;
-                    const chatTargets = chatGroup.worktrees.map((worktree) => ({ runId: worktree.runId, label: worktree.label }));
-
-                    return (
-                      <section key={`${projectPathKey}:${chatGroup.conversationId}`} className="worktree-chat-card">
-                        <div className="worktree-run-toggle worktree-run-toggle-chat">
-                          <label className="worktree-select-row worktree-select-row-grow">
-                            <input
-                              type="checkbox"
-                              checked={chatSelected}
-                              onChange={(event) => toggleTreeSelection(chatTreeIds, event.target.checked)}
-                            />
-                            <span className="worktree-run-title">{chatGroup.conversationId === conversationId ? "Текущий чат" : `Чат ${chatGroup.conversationId.slice(0, 8)}`}</span>
-                          </label>
-                          <div className="worktree-run-actions">
-                            <span className="worktree-run-meta">
-                              {chatGroup.worktrees.length} деревьев · {chatGroup.status === "running" ? "в работе" : chatGroup.status === "completed" ? "готово" : "ошибка"}
-                            </span>
-                            <button
-                              type="button"
-                              className="worktree-accordion-button"
-                              onClick={() => setOpenChats((current) => ({ ...current, [chatKey]: !chatOpen }))}
-                              aria-expanded={chatOpen}
-                              aria-label={chatOpen ? "Свернуть чат" : "Развернуть чат"}
-                            >
-                              {chatOpen ? "▾" : "▸"}
-                            </button>
-                            <button type="button" className="ghost-button danger-button" onClick={() => void cleanupTargets(chatTargets)} disabled={cleaning}>
-                              {cleaning ? "…" : "Удалить"}
-                            </button>
-                          </div>
-                        </div>
-
-                        {chatOpen ? (
-                          <div className="worktree-run-body">
-                            <p className="worktree-run-task">{chatGroup.task}</p>
-                            {chatGroup.entries.length > 1 ? (
-                              <p className="worktree-run-meta">Ранов в этом чате: {chatGroup.entries.length}</p>
-                            ) : null}
-                            {chatGroup.usage ? (
-                              <p className="worktree-run-usage">
-                                {chatGroup.usage.totalTokens.toLocaleString("ru-RU")}{" "}ток. · prompt {chatGroup.usage.promptTokens.toLocaleString("ru-RU")} · completion {chatGroup.usage.completionTokens.toLocaleString("ru-RU")}
-                              </p>
-                            ) : null}
-
-                            {chatGroup.worktrees.map((worktree) => {
-                              const treeId = worktreeTreeId(worktree.runId, worktree.label);
-                              return (
-                                <div key={treeId} className="worktree-tree-block">
-                                  <label className="worktree-select-row worktree-select-row-tree">
-                                    <input
-                                      type="checkbox"
-                                      checked={selectedTreeIds.has(treeId)}
-                                      onChange={() => setSelectedTreeIds((current) => {
-                                        const next = new Set(current);
-                                        if (next.has(treeId)) {
-                                          next.delete(treeId);
-                                        } else {
-                                          next.add(treeId);
-                                        }
-                                        return next;
-                                      })}
-                                    />
-                                    <span className="worktree-run-meta">{worktree.label}</span>
-                                  </label>
-                                  <DevelopWorktreeRow
-                                    runId={worktree.runId}
-                                    worktree={worktree}
-                                    outcome={chatGroup.autoMergeOutcome.find((outcome) => outcome.label === worktree.label) ?? null}
-                                    onMerged={(mergedOutcome) => {
-                                      // Was a no-op (2026-07-19 bug fix) - a
-                                      // successful merge from this sidebar
-                                      // never showed its own outcome until
-                                      // the next 1.5s poll happened to catch
-                                      // up. Now it reflects immediately.
-                                      setEntries((current) =>
-                                        current.map((candidate) =>
-                                          candidate.runId === worktree.runId
-                                            ? {
-                                                ...candidate,
-                                                autoMergeOutcome: [
-                                                  ...safeList(candidate.autoMergeOutcome).filter((existing) => existing.label !== mergedOutcome.label),
-                                                  mergedOutcome,
-                                                ],
-                                              }
-                                            : candidate,
-                                        ),
-                                      );
-                                      scheduleRefresh(150);
-                                    }}
-                                    onRemoved={() => {
-                                      setEntries((current) =>
-                                        current
-                                          .map((candidate) =>
-                                            candidate.runId === worktree.runId
-                                              ? { ...candidate, worktrees: candidate.worktrees.filter((candidateTree) => candidateTree.label !== worktree.label) }
-                                              : candidate,
-                                          )
-                                          .filter((candidate) => candidate.worktrees.length > 0),
-                                      );
-                                      setSelectedTreeIds((current) => {
-                                        const next = new Set(current);
-                                        next.delete(treeId);
-                                        return next;
-                                      });
-                                      scheduleRefresh(150);
-                                    }}
-                                  />
-                                </div>
-                              );
-                            })}
-                          </div>
-                        ) : null}
-                      </section>
-                    );
-                  })}
-                </div>
-              ) : null}
-            </section>
-          );
-        })}
-      </div>
-
-      {selectedCount > 0 ? (
-        <div className="worktree-bulk-actions">
-          <button
-            type="button"
-            className="history-delete-selected"
-            disabled={cleaning}
-            onClick={() => {
-              void cleanupTargets(collectSelectedTargets());
-            }}
-          >
-            {cleaning ? "Удаляю…" : `Удалить выбранное (${selectedCount})`}
-          </button>
-        </div>
-      ) : null}
-    </aside>
   );
 }
 
@@ -6063,13 +5501,6 @@ export function App() {
 
         {error ? <p className="error" role="alert">{error}</p> : null}
         </section>
-
-        {activeView === "chat" ? (
-          <WorktreeManagerSidebar
-            projectName={safeText(project?.name, "Проект")}
-            conversationId={conversationId}
-          />
-        ) : null}
       </section>
 
       <InspectorDrawer

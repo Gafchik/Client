@@ -166,8 +166,19 @@ export interface TesterRunResult {
 // mid-mutation, which is worse than cutting them off mid-read. A third
 // ceiling bump if this still isn't enough should come with a proactive
 // bounce (see comment above), not another blind increase.
-const TESTER_DEFAULT_MAX_TURNS = 110;
-const TESTER_TOKEN_SAFETY_LIMIT = 1_500_000;
+// Raised again 110 -> 180, tokens 1.5M -> 3M (2026-07-28, explicit product-
+// owner decision, "чисто ради прикола"): real cost check first, not a blind
+// bump - Tester runs a single model (deepseek-v4-pro, 0.7x) with no
+// escalation, and the account's daily allowance is 51M tokens/day. A
+// full-ceiling run at the OLD 1.5M limit was already ~1.05M billed tokens
+// (0.7x), roughly 2% of the daily allowance - doubling the ceiling still
+// leaves single-task cost in the low single-digit percent range. Turn
+// ceiling raised proportionally, matching develop-loop.ts's new
+// DEFAULT_DEVELOP_CEILING_TURNS - a token-only raise just moves the
+// bottleneck to turns instead of removing it, per the exact "ran out of
+// room mid-mutation" failure class this file's own history above documents.
+const TESTER_DEFAULT_MAX_TURNS = 180;
+const TESTER_TOKEN_SAFETY_LIMIT = 3_000_000;
 
 // TESTER_EXPLORATION_BUDGET_BOUNCE_RATIO (2026-07-28, added the moment the
 // 70->110 bump above was confirmed NOT to fix anything on its own): with the
@@ -185,6 +196,19 @@ const TESTER_TOKEN_SAFETY_LIMIT = 1_500_000;
 const TESTER_EXPLORATION_BUDGET_BOUNCE_RATIO = 0.6;
 const MAX_OBSERVATION_CHARS = 20_000;
 const TESTER_READ_FILE_CHARS = 24_000;
+// History compaction (2026-07-28): the testPlan/durableNotes message slots
+// below were already built to "survive compaction" per their own comments,
+// but nothing ever actually compacted anything - every http_request/db_query/
+// read_file observation (up to MAX_OBSERVATION_CHARS=20_000 each) stayed in
+// `messages` forever and got resent on every subsequent call, same unbounded-
+// growth shape already found and fixed in the Researcher loop (loop.ts) and
+// the Developer loop (develop-loop.ts's HISTORY_COMPACT_TRIGGER_MESSAGES).
+// This loop's own ceiling history (900K->1.5M tokens, 40->70->110 turns, see
+// comments above) is the same "raise the ceiling" pattern that turned out to
+// be treating the symptom - reusing develop-loop.ts's already-tuned values
+// rather than re-guessing new ones.
+const TESTER_HISTORY_COMPACT_TRIGGER_MESSAGES = 24;
+const TESTER_HISTORY_KEEP_RECENT_MESSAGES = 24;
 
 export const TESTER_SYSTEM_PROMPT_HEADER = [
   "You are a QA engineer verifying REAL, RUNNING behavior of a project - not a code reviewer reading a diff, not a developer guessing what code would do. You were given a task or bug report; your job is to actually exercise the system (real HTTP calls, real DB reads) and report what ACTUALLY happens, not what the ticket/code suggests should happen.",
@@ -395,6 +419,61 @@ export async function runTesterTask(options: TesterRunOptions): Promise<TesterRu
       : ["Заметки (note), сохранённые за этот прогон (переживают сжатие истории):", ...durableNotes.map((note, index) => `${index + 1}. ${note}`)].join("\n");
   messages.push({ role: "user", content: renderDurableNotes() });
 
+  const seedMessageCount = messages.length;
+  let historyCompactionMessageIndex = -1;
+  // A turn is 1 assistant message + N tool-role responses (N varies with how
+  // many tools the model batched) - message-COUNT-based compaction alone
+  // could otherwise cut between an assistant message's tool_calls and one of
+  // its own tool responses, which every provider rejects as malformed.
+  // Tracks the message index right after each turn fully completes, so
+  // compaction only ever cuts at a turn boundary. Same design as
+  // develop-loop.ts's turnBoundaries.
+  const turnBoundaries: number[] = [];
+
+  function compactHistoryIfNeeded(): void {
+    if (messages.length - seedMessageCount <= TESTER_HISTORY_COMPACT_TRIGGER_MESSAGES) {
+      return;
+    }
+
+    const target = messages.length - TESTER_HISTORY_KEEP_RECENT_MESSAGES;
+    let keepFromIndex = seedMessageCount;
+
+    for (const boundary of turnBoundaries) {
+      if (boundary <= target && boundary > keepFromIndex) {
+        keepFromIndex = boundary;
+      }
+    }
+
+    if (keepFromIndex <= seedMessageCount) {
+      return;
+    }
+
+    const summaryContent = [
+      "Сводка более ранних ходов этого прогона (полные сообщения этих ходов удалены из контекста, чтобы разговор не рос бесконечно - если нужно текущее содержимое файла или повторный запрос, сделай его снова через нужный инструмент, не полагайся на память):",
+      ...actionsLog,
+    ].join("\n");
+
+    const beforeLength = messages.length;
+
+    if (historyCompactionMessageIndex === -1) {
+      messages.splice(seedMessageCount, keepFromIndex - seedMessageCount, { role: "user", content: summaryContent });
+      historyCompactionMessageIndex = seedMessageCount;
+    } else {
+      messages[historyCompactionMessageIndex] = { role: "user", content: summaryContent };
+      messages.splice(historyCompactionMessageIndex + 1, keepFromIndex - (historyCompactionMessageIndex + 1));
+    }
+
+    const shift = messages.length - beforeLength;
+
+    for (let i = turnBoundaries.length - 1; i >= 0; i -= 1) {
+      if ((turnBoundaries[i] as number) <= keepFromIndex) {
+        turnBoundaries.splice(i, 1);
+      } else {
+        turnBoundaries[i] = (turnBoundaries[i] as number) + shift;
+      }
+    }
+  }
+
   const seenDirs = new Set<string>([normalizeDirKey(".")]);
   const requestLog: TesterRunResult["requestLog"] = [];
   const actionsLog: string[] = [];
@@ -417,6 +496,8 @@ export async function runTesterTask(options: TesterRunOptions): Promise<TesterRu
   });
 
   for (let turn = 1; turn <= maxTurns; turn += 1) {
+    compactHistoryIfNeeded();
+
     if (options.shouldAbort?.()) {
       actionsLog.push(`[turn ${turn}] ABORTED by caller.`);
       return finalize({ turnsUsed: turn, stopped: "aborted" });
@@ -446,6 +527,7 @@ export async function runTesterTask(options: TesterRunOptions): Promise<TesterRu
 
     if (toolCalls.length === 0) {
       messages.push({ role: "user", content: "No tool call was made in your reply. Call one of the available tools, or task_complete(summary in Russian) if you are done." });
+      turnBoundaries.push(messages.length);
       continue;
     }
 
@@ -475,6 +557,29 @@ export async function runTesterTask(options: TesterRunOptions): Promise<TesterRu
             content: "Rejected: you called task_complete without ever calling test_plan first. Call test_plan now with the numbered list of scenarios your report just covered (retroactively is fine), then call task_complete again.",
           });
         }
+        turnBoundaries.push(messages.length);
+        continue;
+      }
+
+      // Live bug (2026-07-28): the test_plan gate above checks WHETHER a
+      // plan exists, not whether the report itself has real content - a
+      // real run called task_complete with test_plan already done but an
+      // EMPTY summary string, and this returned a "completed" result with
+      // report:"" that looked successful everywhere except the one field
+      // that actually mattered. Same soft-gate pattern as the test_plan
+      // check: reject and give the model one explicit chance to actually
+      // write the report it apparently meant to.
+      if (first.arg.trim().length < 20) {
+        actionsLog.push(`[turn ${turn}] task_complete REJECTED: summary was empty or too short (${first.arg.length} chars).`);
+        for (const toolCall of toolCalls) {
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            name: toolCall.function.name,
+            content: "Rejected: task_complete's summary was empty or far too short to be a real report. Call task_complete again with the FULL QA report text as the summary argument - what you did, what you observed, whether it matches the task.",
+          });
+        }
+        turnBoundaries.push(messages.length);
         continue;
       }
 
@@ -557,6 +662,8 @@ export async function runTesterTask(options: TesterRunOptions): Promise<TesterRu
         content: `You have used over ${Math.round(TESTER_EXPLORATION_BUDGET_BOUNCE_RATIO * 100)}% of your available turn/token budget for this task and have not called task_complete yet. Evidence-gathering tools (list_dir/read_file/grep_content/semantic_search/find_references/db_query/http_request) are now DISABLED for the rest of this run - only note, ask_user, and task_complete remain available. Write your report now based on what you have already found: state clearly what you verified, what you did NOT get to, and why - a report with honest gaps is far more useful than no report at all.`,
       });
     }
+
+    turnBoundaries.push(messages.length);
   }
 
   return finalize({ turnsUsed: maxTurns, stopped: "max_turns" });

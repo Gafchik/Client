@@ -458,6 +458,51 @@ export interface TaskWorktree {
   startCommit: string;
 }
 
+/**
+ * Direct-checkout task session (2026-07-28, explicit product-owner decision
+ * to drop worktree isolation - "так себе затея"): `worktreePath` deliberately
+ * EQUALS `rootPath` - the Developer works straight in the user's own real
+ * checkout, not a separate directory. This was a live, considered tradeoff,
+ * not a shortcut: a separate worktree directory has no vendor/node_modules,
+ * no .env (both gitignored, so `git worktree add` never brings them along),
+ * and a different directory NAME than docker-compose's own project-name
+ * convention expects - every one of these caused a real, live failure this
+ * session (missing autoloader, "Database hosts array is empty", docker
+ * commands that couldn't find the user's own running containers). None of
+ * that exists once the Developer just works in the real directory. The
+ * safety net moves from "can't touch the real thing" to "can touch it, but
+ * commit/push/migrate are still blocked" (FORBIDDEN_COMMAND_PATTERN /
+ * isSensitiveDbCommand in develop-loop.ts, both already independent of
+ * worktree vs real-checkout) plus serialization (develop-runner.ts allows
+ * only one active run per project root at a time - concurrent tasks writing
+ * the same real files was the one thing worktrees were genuinely needed
+ * for, and the product owner confirmed a single developer never works two
+ * tasks on the same project at once anyway). `startCommit`/`branch` are kept
+ * for the SAME diff-computation code collectWorktreeChanges already has
+ * (`git diff --cached <startCommit>`) - not for isolation, just as the
+ * before-snapshot a review diff is computed against.
+ */
+export async function createTaskSession(rootPath: string): Promise<TaskWorktree> {
+  const gitRoot = await resolveGitRoot(rootPath);
+
+  if (!gitRoot) {
+    throw new Error(`«${rootPath}» не является git-репозиторием — разработка без git-истории не запускается (нет диффа для ревью).`);
+  }
+
+  const normalizedRoot = normalizePath(gitRoot);
+  const head = await runGit(normalizedRoot, ["rev-parse", "HEAD"]);
+
+  if (!head.ok) {
+    throw new Error(`Не удалось определить HEAD в «${normalizedRoot}»: ${head.stderr.trim() || "git rev-parse HEAD failed"}. Возможно, репозиторий без единого коммита.`);
+  }
+
+  const startCommit = normalizeGitValue(head.stdout, "");
+  const branchResult = await runGit(normalizedRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const branch = normalizeGitValue(branchResult.stdout, "HEAD");
+
+  return { rootPath: normalizedRoot, worktreePath: normalizedRoot, branch, startCommit };
+}
+
 export async function createTaskWorktree(rootPath: string, taskId: string, label: string): Promise<TaskWorktree> {
   const gitRoot = await resolveGitRoot(rootPath);
 
@@ -486,7 +531,53 @@ export async function createTaskWorktree(rootPath: string, taskId: string, label
     throw new Error(`Не удалось создать worktree для задачи: ${added.stderr.trim() || added.stdout.trim() || "git worktree add failed"}`);
   }
 
+  await linkGitignoredDependencyDirs(normalizedRoot, worktreePath);
+
   return { rootPath: normalizedRoot, worktreePath, branch, startCommit };
+}
+
+// Reviewer's verify_in_transaction (php artisan tinker) and any run_command
+// invocation of composer/npm/etc. found the worktree's own dependency
+// directories simply missing (2026-07-28, live case: `vendor/autoload.php`
+// absent, tinker unusable, Reviewer fell back to reading the diff only).
+// `git worktree add` checks out only tracked files - vendor/node_modules are
+// gitignored everywhere, so a fresh worktree never has them, and installing
+// them per-task (composer install/npm install) would cost minutes per run
+// for zero benefit (the task rarely touches dependencies themselves).
+// Symlinking straight to the original checkout's already-installed copy is
+// the same trick node/PHP projects already use for git-worktree-based
+// workflows generally - read-only reference to real, current dependencies,
+// no reinstall, no per-project naming assumption (these two names cover the
+// overwhelming majority of PHP/Node projects generically, not any one
+// project's own layout).
+const GITIGNORED_DEPENDENCY_DIR_NAMES = ["vendor", "node_modules"];
+
+async function linkGitignoredDependencyDirs(originalRoot: string, worktreePath: string): Promise<void> {
+  for (const dirName of GITIGNORED_DEPENDENCY_DIR_NAMES) {
+    const sourcePath = path.join(originalRoot, dirName);
+    const targetPath = path.join(worktreePath, dirName);
+
+    try {
+      await fs.access(sourcePath);
+    } catch {
+      continue; // original checkout doesn't have this dependency dir either - nothing to link
+    }
+
+    try {
+      await fs.access(targetPath);
+      continue; // worktree already has something at this path (unlikely, but don't clobber it)
+    } catch {
+      // expected - proceed to link
+    }
+
+    try {
+      await fs.symlink(sourcePath, targetPath, "dir");
+    } catch {
+      // best-effort only - a failed symlink (e.g. unsupported filesystem)
+      // just means verify_in_transaction/run_command degrade to "no deps
+      // available", never a reason to fail worktree creation itself.
+    }
+  }
 }
 
 /**
@@ -502,17 +593,32 @@ export async function collectWorktreeChanges(worktree: TaskWorktree): Promise<{ 
     return { diff: "", changedFiles: [] };
   }
 
-  const [diffResult, namesResult] = await Promise.all([
-    runGit(worktree.worktreePath, ["diff", "--cached", worktree.startCommit], WORKTREE_COMMAND_TIMEOUT_MS),
-    runGit(worktree.worktreePath, ["diff", "--cached", "--name-only", worktree.startCommit], WORKTREE_COMMAND_TIMEOUT_MS),
-  ]);
+  try {
+    const [diffResult, namesResult] = await Promise.all([
+      runGit(worktree.worktreePath, ["diff", "--cached", worktree.startCommit], WORKTREE_COMMAND_TIMEOUT_MS),
+      runGit(worktree.worktreePath, ["diff", "--cached", "--name-only", worktree.startCommit], WORKTREE_COMMAND_TIMEOUT_MS),
+    ]);
 
-  return {
-    diff: diffResult.ok ? diffResult.stdout : "",
-    changedFiles: namesResult.ok
-      ? namesResult.stdout.split("\n").map((line) => normalizePath(line.trim())).filter(Boolean)
-      : [],
-  };
+    return {
+      diff: diffResult.ok ? diffResult.stdout : "",
+      changedFiles: namesResult.ok
+        ? namesResult.stdout.split("\n").map((line) => normalizePath(line.trim())).filter(Boolean)
+        : [],
+    };
+  } finally {
+    // Unstage again (2026-07-28, live bug found the moment worktree
+    // isolation was dropped): `git add -A` above used to stage a
+    // THROWAWAY worktree's own index, harmless since the whole directory
+    // was disposable. With worktreePath now equal to the real checkout
+    // (createTaskSession), leaving everything staged after every diff
+    // computation - which happens repeatedly, once per turn, for the
+    // WHOLE run - would silently leave the user's real git index in a
+    // fully-staged state they never asked for, risking `git commit`
+    // picking up more than they meant to. `git reset` unstages without
+    // touching the working tree, so the actual file changes this run made
+    // are untouched - only the index goes back to matching HEAD.
+    await runGit(worktree.worktreePath, ["reset"], WORKTREE_COMMAND_TIMEOUT_MS);
+  }
 }
 
 export interface ApplyWorktreeDiffResult {
@@ -592,6 +698,54 @@ export async function removeTaskWorktree(worktree: TaskWorktree, options?: { del
   // unexpected is still in there, leave it for a human to look at rather than
   // silently deleting it.
   await fs.rmdir(path.dirname(worktree.worktreePath)).catch(() => {});
+}
+
+/**
+ * Read another branch/commit/tag WITHOUT checking it out (2026-07-28,
+ * explicit product-owner request: "клауд умеет смотреть как в другой ветке
+ * без чекаута, наш проект тоже должен так уметь"). This matters MORE now
+ * than it would have before today - with worktree isolation dropped (see
+ * createTaskSession), the Developer works directly in the user's real
+ * checkout, so an actual `git checkout other-branch` would swap out the
+ * real working tree out from under whatever the task is doing. `git show`/
+ * `git ls-tree`/`git diff <ref>` all read directly from git's object store
+ * without touching a single file on disk - the working tree never moves.
+ *
+ * mode "content" - a file's content at that ref (git show <ref>:<path>).
+ * mode "list" - a directory's entries at that ref (git ls-tree).
+ * mode "diff" - diff between the CURRENT working tree and that ref, scoped
+ * to one path (or the whole repo if path is "." or empty) - this is the
+ * literal "compare with master" case.
+ */
+export async function readOtherBranch(
+  rootPath: string,
+  input: { ref: string; path: string; mode?: "content" | "list" | "diff" },
+): Promise<string> {
+  const mode = input.mode ?? "content";
+  const cleanPath = input.path.replace(/^\/+/, "");
+
+  if (mode === "diff") {
+    const args = cleanPath && cleanPath !== "." ? ["diff", input.ref, "--", cleanPath] : ["diff", input.ref];
+    const result = await runGit(rootPath, args, WORKTREE_COMMAND_TIMEOUT_MS);
+    if (!result.ok) {
+      return `Error: git diff against "${input.ref}" failed - ${result.stderr.trim() || "unknown ref, or not a git repository"}.`;
+    }
+    return result.stdout.trim() || "(no differences between the working tree and this ref for this path)";
+  }
+
+  if (mode === "list") {
+    const result = await runGit(rootPath, ["ls-tree", "--name-only", `${input.ref}:${cleanPath}`], WORKTREE_COMMAND_TIMEOUT_MS);
+    if (!result.ok) {
+      return `Error: could not list "${cleanPath}" at ref "${input.ref}" - ${result.stderr.trim() || "path does not exist at this ref, or it is a file (try mode: \"content\")"}.`;
+    }
+    return result.stdout.trim() || "(empty directory at this ref)";
+  }
+
+  const result = await runGit(rootPath, ["show", `${input.ref}:${cleanPath}`], WORKTREE_COMMAND_TIMEOUT_MS);
+  if (!result.ok) {
+    return `Error: could not read "${cleanPath}" at ref "${input.ref}" - ${result.stderr.trim() || "file does not exist at this ref, or it is a directory (try mode: \"list\")"}.`;
+  }
+  return result.stdout;
 }
 
 export function shouldPreferSelectiveWorkspace(repository: RepositorySnapshot, workspace: WorkspaceSnapshot): boolean {
