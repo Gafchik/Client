@@ -42,13 +42,21 @@ export interface DbConnectionPlan {
   password: string;
 }
 
-async function execCommand(command: string, args: string[], timeoutMs: number, extraEnv?: Record<string, string>): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+// Exported (2026-07-27): these five helpers were always generic
+// docker-compose/.env utilities, never actually DB-specific - the Tester
+// role's dev-server-tool.ts needs the exact same "find this project's own
+// running service" resolution db_query already has, and duplicating them
+// would just be two copies of the same docker-compose line-scanner to keep
+// in sync. Only the DB-specific pieces (DbConnectionPlan, isReadOnlyQuery,
+// buildCliInvocation, executeDbQuery) stay in this file.
+export async function execCommand(command: string, args: string[], timeoutMs: number, extraEnv?: Record<string, string>, cwd?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   try {
     const result = await execFileAsync(command, args, {
       encoding: "utf8",
       timeout: timeoutMs,
       maxBuffer: 1024 * 1024 * 4,
       env: { ...process.env, ...extraEnv },
+      ...(cwd ? { cwd } : {}),
     });
     return { ok: true, stdout: result.stdout, stderr: result.stderr };
   } catch (error) {
@@ -57,7 +65,7 @@ async function execCommand(command: string, args: string[], timeoutMs: number, e
   }
 }
 
-async function parseEnvFile(envPath: string): Promise<Record<string, string>> {
+export async function parseEnvFile(envPath: string): Promise<Record<string, string>> {
   try {
     const content = await fs.readFile(envPath, "utf8");
     const env: Record<string, string> = {};
@@ -115,7 +123,7 @@ function detectEngine(env: Record<string, string>): DbEngine | null {
 // a docker-compose service name, not a directly reachable host" (a real
 // remote host like an RDS endpoint always has dots; "localhost"/"127.0.0.1"
 // are handled separately as always-direct).
-function looksLikeDockerServiceName(host: string): boolean {
+export function looksLikeDockerServiceName(host: string): boolean {
   const normalized = host.toLowerCase();
 
   if (normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1") {
@@ -125,7 +133,7 @@ function looksLikeDockerServiceName(host: string): boolean {
   return !host.includes(".") && !/^\d+\.\d+\.\d+\.\d+$/.test(host);
 }
 
-async function findComposeFile(rootPath: string): Promise<string | null> {
+export async function findComposeFile(rootPath: string): Promise<string | null> {
   for (const name of ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"]) {
     const candidate = path.join(rootPath, name);
 
@@ -147,7 +155,7 @@ async function findComposeFile(rootPath: string): Promise<string | null> {
  * docker-exec, which works regardless of port publishing) rather than
  * risking a wrong port.
  */
-async function findPublishedHostPort(composeFilePath: string, serviceName: string): Promise<string | null> {
+export async function findPublishedHostPort(composeFilePath: string, serviceName: string): Promise<string | null> {
   let content: string;
 
   try {
@@ -209,15 +217,21 @@ async function findPublishedHostPort(composeFilePath: string, serviceName: strin
  * up the SAME project context the user's own containers are already
  * running under.
  */
-async function findRunningContainer(rootPath: string, serviceName: string): Promise<string | null> {
-  const v2 = await execCommand("docker", ["compose", "ps", "-q", serviceName], DOCKER_DISCOVERY_TIMEOUT_MS);
+export async function findRunningContainer(rootPath: string, serviceName: string): Promise<string | null> {
+  // cwd MUST be rootPath, not the server process's own directory (2026-07-28,
+  // live bug found via magendamd_backend: `docker compose ps` with no cwd
+  // override runs against whatever directory the API server itself started
+  // in, finds no compose file there, and silently fails every time this
+  // fallback is actually needed) - the docstring above always described this
+  // intent, the call just never carried it out.
+  const v2 = await execCommand("docker", ["compose", "ps", "-q", serviceName], DOCKER_DISCOVERY_TIMEOUT_MS, undefined, rootPath);
   const containerId = v2.ok ? v2.stdout.trim().split("\n")[0]?.trim() : "";
 
   if (containerId) {
     return containerId;
   }
 
-  const v1 = await execCommand("docker-compose", ["ps", "-q", serviceName], DOCKER_DISCOVERY_TIMEOUT_MS);
+  const v1 = await execCommand("docker-compose", ["ps", "-q", serviceName], DOCKER_DISCOVERY_TIMEOUT_MS, undefined, rootPath);
   const legacyId = v1.ok ? v1.stdout.trim().split("\n")[0]?.trim() : "";
   return legacyId || null;
 }

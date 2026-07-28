@@ -248,6 +248,11 @@ export async function initializePostgresSchema(): Promise<void> {
   // живёт в team-store.mapTeamRow, не в схеме.
   await runSql(`alter table teams add column if not exists developer_model text not null default ''`);
   await runSql(`alter table teams add column if not exists reviewer_model text not null default ''`);
+  // tester_model (2026-07-27, Tester role): same "empty = not set, fallback
+  // lives in team-store.mapTeamRow" convention as developer/reviewer above -
+  // falls back to reviewer_model (both roles judge real evidence rather
+  // than write code, closer in required skill than Developer).
+  await runSql(`alter table teams add column if not exists tester_model text not null default ''`);
   // researcher_escalation_model (2026-07-19, deterministic escalation
   // feature): NULL = escalation disabled, same as today. Nullable rather
   // than empty-string-default like developer/reviewer above, since "" would

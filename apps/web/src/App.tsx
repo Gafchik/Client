@@ -108,6 +108,7 @@ type TeamDraft = {
   observerModel: string;
   developerModel: string;
   reviewerModel: string;
+  testerModel: string;
   researcherEscalationModel: string;
   visionModel: string;
 };
@@ -118,6 +119,7 @@ const TEAM_ROLE_DESCRIPTIONS = {
   observer: "Изучает проект в фоне между вопросами, чтобы будущие ответы были быстрее.",
   developer: "Пишет код по задаче из чата в изолированном worktree. Пусто — используется модель Researcher.",
   reviewer: "Независимое ревью diff перед выдачей. Должна быть не слабее Developer по коду — слабый ревьюер шумит неверными замечаниями. Пусто — code-дефолт (Kimi K2.7 Code).",
+  tester: "Проверяет РЕАЛЬНОЕ поведение (реальные HTTP-запросы, чтение БД) — не читает диф, не пишет код. Можно вызывать отдельно от Developer, например на баг-репорт. Пусто — как у Reviewer.",
   researcherEscalation: "Если Critic отклонил первый ответ Researcher — следующие ходы пойдут этой моделью вместо обычной. Дешёво по умолчанию, сильнее только когда реально понадобилось. Пусто — эскалация выключена.",
   vision: "Анализирует прикреплённые к чату скриншоты — читает текст, UI-элементы и бизнес-смысл экрана. Нужна модель с поддержкой изображений. Пусто — анализ картинок выключен.",
 } as const;
@@ -3426,6 +3428,7 @@ export function App() {
     observerModel: "",
     developerModel: "",
     reviewerModel: "",
+    testerModel: "",
     researcherEscalationModel: "",
     visionModel: "",
   });
@@ -3827,6 +3830,7 @@ export function App() {
           observerModel: selectedTeam.observerModel,
           developerModel: selectedTeam.developerModel,
           reviewerModel: selectedTeam.reviewerModel,
+          testerModel: selectedTeam.testerModel ?? "",
           researcherEscalationModel: selectedTeam.researcherEscalationModel ?? "",
           visionModel: selectedTeam.visionModel ?? "",
         });
@@ -4683,6 +4687,7 @@ export function App() {
           observerModel: teamDraft.observerModel,
           developerModel: teamDraft.developerModel,
           reviewerModel: teamDraft.reviewerModel,
+          testerModel: teamDraft.testerModel,
           researcherEscalationModel: teamDraft.researcherEscalationModel,
           visionModel: teamDraft.visionModel,
           isSelected: true,
@@ -4728,6 +4733,7 @@ export function App() {
             observerModel: selected.observerModel,
             developerModel: selected.developerModel,
             reviewerModel: selected.reviewerModel,
+            testerModel: selected.testerModel ?? "",
             researcherEscalationModel: selected.researcherEscalationModel ?? "",
             visionModel: selected.visionModel ?? "",
           });
@@ -4763,6 +4769,7 @@ export function App() {
           observerModel: selected?.observerModel ?? "",
           developerModel: selected?.developerModel ?? "",
           reviewerModel: selected?.reviewerModel ?? "",
+          testerModel: selected?.testerModel ?? "",
           researcherEscalationModel: selected?.researcherEscalationModel ?? "",
           visionModel: selected?.visionModel ?? "",
         });
@@ -5607,7 +5614,7 @@ export function App() {
                 <button
                   type="button"
                   className="ghost-button"
-                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "", developerModel: "", reviewerModel: "", researcherEscalationModel: "", visionModel: "" })}
+                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "", developerModel: "", reviewerModel: "", testerModel: "", researcherEscalationModel: "", visionModel: "" })}
                 >
                   Новая
                 </button>
@@ -5754,6 +5761,28 @@ export function App() {
                   </select>
                 </label>
                 <label className="field">
+                  <span>Tester</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.tester}</span>
+                  <select
+                    value={teamDraft.testerModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, testerModel: event.target.value }))}
+                  >
+                    <option value="">Как у Reviewer</option>
+                    {teamDraft.testerModel && !safeList(providerModels).some((model) => model.id === teamDraft.testerModel) ? (
+                      <option value={teamDraft.testerModel}>{teamDraft.testerModel} (вне каталога)</option>
+                    ) : null}
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
                   <span>Observer</span>
                   <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.observer}</span>
                   <select
@@ -5837,6 +5866,16 @@ export function App() {
                         <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.reviewer}</span>
                       </div>
                       <div className="team-role-card">
+                        <strong>Tester</strong>
+                        <span>
+                          {team.testerModel || "—"}
+                          {findModelMultiplierLabel(providerModels, team.testerModel ?? "") ? (
+                            <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.testerModel ?? "")}</span>
+                          ) : null}
+                        </span>
+                        <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.tester}</span>
+                      </div>
+                      <div className="team-role-card">
                         <strong>Observer</strong>
                         <span>
                           {team.observerModel || "—"}
@@ -5884,6 +5923,7 @@ export function App() {
                             observerModel: team.observerModel,
                             developerModel: team.developerModel,
                             reviewerModel: team.reviewerModel,
+                            testerModel: team.testerModel ?? "",
                             researcherEscalationModel: team.researcherEscalationModel ?? "",
                             visionModel: team.visionModel ?? "",
                           })

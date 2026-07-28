@@ -10,6 +10,7 @@ export interface SaveTeamInput {
   observerModel: string;
   developerModel?: string;
   reviewerModel?: string;
+  testerModel?: string;
   researcherEscalationModel?: string;
   visionModel?: string;
   isSelected?: boolean;
@@ -23,6 +24,7 @@ interface TeamRow {
   observer_model: string;
   developer_model: string;
   reviewer_model: string;
+  tester_model: string;
   researcher_escalation_model: string | null;
   vision_model: string | null;
   is_selected: boolean;
@@ -84,8 +86,8 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
 
     await client.query(
       `
-        insert into teams (id, name, researcher_model, critic_model, observer_model, developer_model, reviewer_model, researcher_escalation_model, vision_model, is_selected, created_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+        insert into teams (id, name, researcher_model, critic_model, observer_model, developer_model, reviewer_model, tester_model, researcher_escalation_model, vision_model, is_selected, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
         on conflict (id) do update set
           name = $2,
           researcher_model = $3,
@@ -93,10 +95,11 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
           observer_model = $5,
           developer_model = $6,
           reviewer_model = $7,
-          researcher_escalation_model = $8,
-          vision_model = $9,
-          is_selected = $10,
-          updated_at = $11
+          tester_model = $8,
+          researcher_escalation_model = $9,
+          vision_model = $10,
+          is_selected = $11,
+          updated_at = $12
       `,
       [
         nextId,
@@ -106,6 +109,7 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
         input.observerModel.trim(),
         input.developerModel?.trim() ?? "",
         input.reviewerModel?.trim() ?? "",
+        input.testerModel?.trim() ?? "",
         input.researcherEscalationModel?.trim() || null,
         input.visionModel?.trim() || null,
         shouldBeSelected,
@@ -195,6 +199,10 @@ function mapTeamRow(row: TeamRow): TeamRecord {
     // видит, какая модель реально пойдёт в работу.
     developerModel: row.developer_model || row.researcher_model,
     reviewerModel: row.reviewer_model || DEFAULT_REVIEWER_MODEL,
+    // Tester (2026-07-27): falls back to the effective reviewerModel above
+    // (not row.reviewer_model directly) so a team with NEITHER set still
+    // gets a real model, not an empty string.
+    testerModel: row.tester_model || row.reviewer_model || DEFAULT_REVIEWER_MODEL,
     ...(row.researcher_escalation_model ? { researcherEscalationModel: row.researcher_escalation_model } : {}),
     ...(row.vision_model ? { visionModel: row.vision_model } : {}),
     isSelected: Boolean(row.is_selected),

@@ -1006,6 +1006,14 @@ export interface TeamRecord {
    * gets no hint from it).
    */
   visionModel?: string;
+  /**
+   * Tester role (2026-07-27): verifies REAL, running behavior (real HTTP
+   * calls, real DB reads) against the project - never writes code, no
+   * worktree. Empty/unset falls back to reviewerModel (both roles judge
+   * real evidence rather than write code, closer in required skill than
+   * Developer) - see team-store.mapTeamRow.
+   */
+  testerModel?: string;
   isSelected: boolean;
   createdAt: string;
   updatedAt: string;

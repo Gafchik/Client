@@ -20,6 +20,16 @@ export {
   type DevelopVerificationEntry,
   type ParsedDevelopAction,
 } from "./develop-loop.js";
+export {
+  runTesterTask,
+  TESTER_SYSTEM_PROMPT_HEADER,
+  type ParsedTesterAction,
+  type TesterHttpRequestInput,
+  type TesterHttpResult,
+  type TesterRunOptions,
+  type TesterRunResult,
+  type TesterTool,
+} from "./tester-loop.js";
 
 export interface CrawlUnitInput {
   projectRootPath: string;

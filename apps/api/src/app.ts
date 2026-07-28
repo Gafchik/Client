@@ -20,6 +20,7 @@ import { initializeSecretCrypto } from "./secret-crypto.js";
 import { analyzeAttachmentImage, classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
+import { getTesterRunStatus, startTesterRun } from "./tester-runner.js";
 
 interface PipelineRunRequest {
   task?: string;
@@ -109,6 +110,7 @@ interface SaveTeamRequest {
   observerModel?: string;
   developerModel?: string;
   reviewerModel?: string;
+  testerModel?: string;
   researcherEscalationModel?: string;
   visionModel?: string;
   isSelected?: boolean;
@@ -502,6 +504,7 @@ export function createApp() {
       observerModel: request.body.observerModel?.trim() || "",
       developerModel: request.body.developerModel?.trim() || "",
       reviewerModel: request.body.reviewerModel?.trim() || "",
+      testerModel: request.body.testerModel?.trim() || "",
       ...(request.body.researcherEscalationModel?.trim() ? { researcherEscalationModel: request.body.researcherEscalationModel.trim() } : {}),
       ...(request.body.visionModel?.trim() ? { visionModel: request.body.visionModel.trim() } : {}),
       isSelected: request.body.isSelected ?? false,
@@ -1569,6 +1572,130 @@ export function createApp() {
 
     if (!status) {
       return reply.code(404).send({ message: "Статус разработки не найден (после перезапуска сервера статусы живут только в телеметрии developer_runs)." });
+    }
+
+    return status;
+  });
+
+  // Tester role (2026-07-27, explicit product-owner request, see
+  // docs/architecture/011-developer-pipeline.md's Tester section):
+  // standalone QA-behavior verification, invocable independently of a
+  // Developer run - e.g. a production bug report the user describes with
+  // repro steps, without a code change already in flight. Cloned skeleton
+  // from POST /api/develop/run above (task/project resolution, provider,
+  // scope-directive classification) - deliberately NO worktree creation,
+  // since Tester never writes code and runs directly against the real
+  // project, same reasoning db_query already uses for resolving a
+  // project's own docker-compose services from the ORIGINAL root.
+  app.post<{
+    Body: {
+      task?: string;
+      projectPath?: string;
+      projectId?: string;
+      conversationId?: string;
+      testerModel?: string;
+    };
+  }>("/api/test/run", async (request, reply) => {
+    const task = request.body.task?.trim();
+
+    if (!task) {
+      return reply.code(400).send({ message: "Нужно указать задачу/баг-репорт для тестирования." });
+    }
+
+    if (!request.body.projectId?.trim() && !request.body.projectPath?.trim()) {
+      return reply.code(400).send({ message: "Нужно выбрать проект: ни projectId, ни projectPath не переданы." });
+    }
+
+    let projectRecord = null;
+
+    if (request.body.projectId?.trim()) {
+      try {
+        projectRecord = await resolveProjectRecord({
+          projectId: request.body.projectId,
+          projectPath: request.body.projectPath,
+        });
+      } catch (error) {
+        request.log.error(error);
+      }
+
+      if (!projectRecord && !request.body.projectPath?.trim()) {
+        return reply.code(404).send({ message: "Проект с указанным projectId не найден и projectPath не передан." });
+      }
+    }
+
+    const projectPath = request.body.projectPath?.trim() || projectRecord?.paths[0]?.rootPath || "";
+
+    if (!projectPath) {
+      return reply.code(400).send({ message: "Не удалось определить путь проекта." });
+    }
+
+    let provider = null;
+
+    try {
+      provider = await getCurrentProvider();
+    } catch (error) {
+      request.log.error(error);
+    }
+
+    const providerBaseUrl = provider?.baseUrl || defaultProviderBaseUrl;
+    const providerApiKey = provider?.apiKey || defaultProviderApiKey;
+
+    if (!providerBaseUrl || !providerApiKey) {
+      return reply.code(409).send({ message: "AI provider не настроен — тестирование требует настроенного провайдера." });
+    }
+
+    const selectedTeam = await getSelectedTeam().catch(() => null);
+
+    if (!selectedTeam) {
+      return reply.code(409).send({ message: "Не выбрана Team — Tester использует reviewer-модель команды по умолчанию." });
+    }
+
+    // Same scope-directive gate /api/develop/run already has - narrows
+    // which registered root(s) the Tester's tools (http_request, db_query)
+    // even attempt to resolve against, so a "только бек" task doesn't
+    // waste a dev-server probe on an out-of-scope frontend root (and, once
+    // Phase 2 adds browser_* tools, is exactly what will gate those too).
+    const scopeDirective = projectRecord && projectRecord.paths.length > 1
+      ? await classifyProjectScopeDirective({
+          task,
+          providerBaseUrl,
+          providerModel: selectedTeam.criticModel,
+          providerApiKey,
+          roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
+        })
+      : { restricted: false, allowedLabels: [] as string[] };
+    const effectiveProjectPaths = scopeDirective.restricted
+      ? projectRecord?.paths.filter((pathRecord) => scopeDirective.allowedLabels.includes(pathRecord.name))
+      : projectRecord?.paths;
+
+    const status = startTesterRun({
+      task,
+      projectPath: normalizePath(path.resolve(projectPath)),
+      ...(effectiveProjectPaths?.length ? { projectPaths: effectiveProjectPaths } : {}),
+      providerBaseUrl,
+      providerApiKey,
+      // Explicit per-request override (2026-07-28, model-casting on this
+      // role) takes priority over the team's configured tester_model -
+      // lets several runs against the SAME task compare different models
+      // without swapping the team's saved config between each one.
+      testerModel: request.body.testerModel?.trim() || selectedTeam.testerModel || selectedTeam.reviewerModel,
+      ...(request.body.conversationId?.trim() ? { conversationId: request.body.conversationId.trim() } : {}),
+    });
+
+    return reply.code(202).send(status);
+  });
+
+  app.get<{ Querystring: { runId?: string } }>("/api/test/status", async (request, reply) => {
+    const runId = request.query.runId?.trim();
+
+    if (!runId) {
+      return reply.code(400).send({ message: "Нужно указать runId." });
+    }
+
+    const status = getTesterRunStatus(runId);
+
+    if (!status) {
+      return reply.code(404).send({ message: "Статус тестирования не найден (in-memory only в v1 - после перезапуска сервера не восстанавливается)." });
     }
 
     return status;
