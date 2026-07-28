@@ -2521,19 +2521,51 @@ export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: stri
 
   try {
     const entries = await queryBusinessGraphEntriesAcrossPaths(roots.map((root) => root.absolutePath));
-    const freshEntries = entries.filter((entry) => !entry.isStale && entry.featureSummary.trim());
+    const withSummary = entries.filter((entry) => entry.featureSummary.trim());
 
-    if (freshEntries.length === 0) {
+    if (withSummary.length === 0) {
       return empty;
     }
 
+    // Scored, not just "any token matched" (2026-07-28, live bug: a
+    // generic task mentioning common words like "status"/"date"/"user"
+    // made `.some()` true for dozens of unrelated entries, and the
+    // unordered `.slice(0, N)` then kept whichever ones happened to come
+    // back first from the DB - the one entry that actually mattered
+    // (EhrApprove, holding the exact gotcha about Document Due's
+    // is_ehr_approve filtering) never made the cut while an empty,
+    // unrelated container did.
+    //
+    // Plain match-count alone turned out not to be enough either - on a
+    // long real task description, EVERY entry in a 310-entry corpus scored
+    // 20-35 "matches" purely from generic shared words (live-measured), so
+    // count alone barely discriminates. The one reliable, cheap signal a
+    // task genuinely naming a container gives is the container's OWN NAME
+    // appearing in the task text (here the task literally said
+    // "ehr-approve") - that gets a large bonus on top of the plain count.
+    // isStale gets a penalty rather than being either ignored or an
+    // outright disqualifier (its old behavior): EhrApprove was ALSO stale
+    // and still had the single highest raw match count of the whole
+    // corpus (35 vs runner-up 31) - a flat exclusion or a hard
+    // fresh-always-wins tier (both tried first, both live-tested here)
+    // would have kept losing to weaker fresh matches every time.
+    const NAME_MATCH_BONUS = 15;
+    const STALE_PENALTY = 3;
     const taskTokens = computeTaskSearchTokens(task);
-    const relevant = freshEntries
-      .filter((entry) => {
+    const taskLower = task.toLowerCase();
+    const relevant = withSummary
+      .map((entry) => {
         const haystack = `${entry.unitPath} ${entry.featureSummary} ${entry.keyMechanisms.join(" ")} ${entry.gotchas.join(" ")}`.toLowerCase();
-        return taskTokens.some((token) => haystack.includes(token));
+        const matchCount = taskTokens.filter((token) => haystack.includes(token)).length;
+        const unitName = (entry.unitPath.split("/").pop() ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const nameBonus = unitName.length >= 4 && taskLower.replace(/[^a-z0-9]/g, "").includes(unitName) ? NAME_MATCH_BONUS : 0;
+        const score = matchCount + nameBonus - (entry.isStale ? STALE_PENALTY : 0);
+        return { entry, score };
       })
-      .slice(0, OBSERVER_HINT_MAX_ENTRIES);
+      .filter(({ score }) => score > 0)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, OBSERVER_HINT_MAX_ENTRIES)
+      .map(({ entry }) => entry);
 
     if (relevant.length === 0) {
       return empty;
@@ -2557,7 +2589,7 @@ export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: stri
       ].join(" ");
 
     const hintLines = relevant.flatMap((entry) => [
-      `- "${toVirtualPath(roots, entry.projectRootPath, entry.unitPath)}": ${entry.featureSummary}`,
+      `- "${toVirtualPath(roots, entry.projectRootPath, entry.unitPath)}"${entry.isStale ? " (POTENTIALLY STALE - source files changed since this was last scanned, verify extra carefully)" : ""}: ${entry.featureSummary}`,
       ...(entry.keyMechanisms.length ? [`  Mechanisms: ${entry.keyMechanisms.join("; ")}`] : []),
       ...(entry.gotchas.length ? [`  Gotchas: ${entry.gotchas.join("; ")}`] : []),
     ]);

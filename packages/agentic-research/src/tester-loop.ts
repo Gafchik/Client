@@ -112,6 +112,18 @@ export interface TesterRunResult {
   totalCompletionTokens: number;
   stopped: "task_complete" | "needs-clarification" | "max_turns" | "error" | "aborted";
   error?: string;
+  // Every non-GET call this run made, successful or not (2026-07-28,
+  // explicit product-owner request after twice manually discovering left-
+  // over mutated rows this session - kimi/glm each changed real records via
+  // update-status and hit their turn/token ceiling before reverting).
+  // Deliberately NOT an attempted auto-revert: Tester is generic across
+  // whatever REST API a project happens to have, so there is no safe,
+  // non-project-specific way to know what a given endpoint's "previous
+  // value" even means (see the no-hardcoding convention this codebase
+  // already follows for db-query-tool.ts/dev-server-tool.ts). What IS
+  // generic and deterministic is surfacing every mutating call plainly, so
+  // a human never has to re-derive this by hand from raw requestLog again.
+  mutatingRequests: Array<{ turn: number; method: string; path: string; body?: string; status: number }>;
 }
 
 // Live-evidence-tuned constants live in develop-loop.ts because Developer
@@ -398,6 +410,9 @@ export async function runTesterTask(options: TesterRunOptions): Promise<TesterRu
     totalPromptTokens,
     totalCompletionTokens,
     stopped: "max_turns",
+    mutatingRequests: requestLog
+      .filter(({ request }) => request.method.toUpperCase() !== "GET")
+      .map(({ turn, request, result }) => ({ turn, method: request.method.toUpperCase(), path: request.path, ...(request.body ? { body: request.body } : {}), status: result.status })),
     ...overrides,
   });
 

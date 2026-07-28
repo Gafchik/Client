@@ -1,10 +1,11 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
 import { scanTextForSecurityFindings } from "@client/agentic-research";
 import { inspectRepository } from "@client/repository-git";
-import { normalizePath, stableId, type AttachmentStructuredContext, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
+import { normalizePath, stableId, type AttachmentStructuredContext, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProjectPathRecord, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
 import { startEmbeddingIndexer, stopEmbeddingIndexer } from "./embedding-indexer.js";
 import { initializeGraphStore } from "./graph-store.js";
@@ -21,6 +22,48 @@ import { analyzeAttachmentImage, classifyApprovalResponse, classifyAutoMergeInte
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 import { getTesterRunStatus, startTesterRun } from "./tester-runner.js";
+
+// Deterministic pre-check for classifyProjectScopeDirective (2026-07-28,
+// live case: a develop task naming a specific file
+// ("app/src/Containers/Email/Actions/SendMultiplyEmailAction.php") still got
+// a worktree for EVERY registered repo of a 3-repo project, because the task
+// text used none of the natural-language scope-trigger words
+// (taskMentionsScopeTrigger, packages/ai) the keyword gate before the LLM
+// classifier looks for - it just named a file, never said "backend only".
+// A file path that verifiably EXISTS on disk under exactly one registered
+// root is unambiguous, deterministic scope evidence - unlike a bare
+// label-name/keyword coincidence (which classifyProjectScopeDirective's own
+// prompt already warns against trusting, e.g. a repo labeled "billing"
+// coinciding with an unrelated "Billing" class), a real file cannot
+// coincidentally exist under the wrong repo. Runs before, and independent
+// of, the keyword+LLM path below - only short-circuits it when exactly one
+// root has a match; any other outcome (zero or multiple roots) falls
+// through to the existing behavior unchanged.
+function resolveScopeFromMentionedFilePaths(task: string, paths: ProjectPathRecord[]): { restricted: true; allowedLabels: string[] } | null {
+  if (paths.length <= 1) {
+    return null;
+  }
+
+  const candidatePaths = task.match(/[\w./-]+\.[a-zA-Z]{1,10}\b/g) ?? [];
+
+  if (candidatePaths.length === 0) {
+    return null;
+  }
+
+  const matchingLabels = new Set<string>();
+
+  for (const candidate of candidatePaths) {
+    const normalizedCandidate = candidate.replace(/^\.?\//, "");
+
+    for (const pathRecord of paths) {
+      if (existsSync(path.join(pathRecord.rootPath, normalizedCandidate))) {
+        matchingLabels.add(pathRecord.name);
+      }
+    }
+  }
+
+  return matchingLabels.size === 1 ? { restricted: true, allowedLabels: [...matchingLabels] } : null;
+}
 
 interface PipelineRunRequest {
   task?: string;
@@ -1064,15 +1107,18 @@ export function createApp() {
           const priorWorktreeLabels = priorDevelop?.worktrees.length
             ? new Set(priorDevelop.worktrees.map((worktree) => worktree.label))
             : null;
-          const scopeDirective = !priorWorktreeLabels && projectRecord && projectRecord.paths.length > 1
-            ? await classifyProjectScopeDirective({
-                task,
-                providerBaseUrl,
-                providerModel: selectedTeam.criticModel,
-                providerApiKey,
-                roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
-              })
-            : { restricted: false, allowedLabels: [] as string[] };
+          const fileScopeDirective = !priorWorktreeLabels && projectRecord && projectRecord.paths.length > 1 ? resolveScopeFromMentionedFilePaths(task, projectRecord.paths) : null;
+          const scopeDirective =
+            fileScopeDirective ??
+            (!priorWorktreeLabels && projectRecord && projectRecord.paths.length > 1
+              ? await classifyProjectScopeDirective({
+                  task,
+                  providerBaseUrl,
+                  providerModel: selectedTeam.criticModel,
+                  providerApiKey,
+                  roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
+                })
+              : { restricted: false, allowedLabels: [] as string[] });
           const effectiveProjectPaths = priorWorktreeLabels
             ? projectRecord?.paths.filter((pathRecord) => priorWorktreeLabels.has(pathRecord.name))
             : scopeDirective.restricted
@@ -1535,15 +1581,18 @@ export function createApp() {
     // unfiltered, and the model never tried the tool again for the rest of
     // that 39-turn run. Same classifier, same gate, so any direct caller of
     // this endpoint (not just chat) gets the same protection.
-    const scopeDirective = projectRecord && projectRecord.paths.length > 1
-      ? await classifyProjectScopeDirective({
-          task,
-          providerBaseUrl,
-          providerModel: selectedTeam.criticModel,
-          providerApiKey,
-          roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
-        })
-      : { restricted: false, allowedLabels: [] as string[] };
+    const fileScopeDirective = projectRecord && projectRecord.paths.length > 1 ? resolveScopeFromMentionedFilePaths(task, projectRecord.paths) : null;
+    const scopeDirective =
+      fileScopeDirective ??
+      (projectRecord && projectRecord.paths.length > 1
+        ? await classifyProjectScopeDirective({
+            task,
+            providerBaseUrl,
+            providerModel: selectedTeam.criticModel,
+            providerApiKey,
+            roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
+          })
+        : { restricted: false, allowedLabels: [] as string[] });
     const effectiveProjectPaths = scopeDirective.restricted
       ? projectRecord?.paths.filter((pathRecord) => scopeDirective.allowedLabels.includes(pathRecord.name))
       : projectRecord?.paths;
@@ -1655,15 +1704,18 @@ export function createApp() {
     // even attempt to resolve against, so a "только бек" task doesn't
     // waste a dev-server probe on an out-of-scope frontend root (and, once
     // Phase 2 adds browser_* tools, is exactly what will gate those too).
-    const scopeDirective = projectRecord && projectRecord.paths.length > 1
-      ? await classifyProjectScopeDirective({
-          task,
-          providerBaseUrl,
-          providerModel: selectedTeam.criticModel,
-          providerApiKey,
-          roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
-        })
-      : { restricted: false, allowedLabels: [] as string[] };
+    const fileScopeDirective = projectRecord && projectRecord.paths.length > 1 ? resolveScopeFromMentionedFilePaths(task, projectRecord.paths) : null;
+    const scopeDirective =
+      fileScopeDirective ??
+      (projectRecord && projectRecord.paths.length > 1
+        ? await classifyProjectScopeDirective({
+            task,
+            providerBaseUrl,
+            providerModel: selectedTeam.criticModel,
+            providerApiKey,
+            roots: projectRecord.paths.map((pathRecord) => ({ label: pathRecord.name, role: pathRecord.role })),
+          })
+        : { restricted: false, allowedLabels: [] as string[] });
     const effectiveProjectPaths = scopeDirective.restricted
       ? projectRecord?.paths.filter((pathRecord) => scopeDirective.allowedLabels.includes(pathRecord.name))
       : projectRecord?.paths;
