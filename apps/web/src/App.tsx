@@ -111,17 +111,19 @@ type TeamDraft = {
   testerModel: string;
   researcherEscalationModel: string;
   visionModel: string;
+  orchestratorModel: string;
 };
 
 const TEAM_ROLE_DESCRIPTIONS = {
   researcher: "Исследует кодовую базу и ищет доказательства для ответа.",
-  critic: "Проверяет ответ Researcher перед тем как показать его пользователю. Также классифицирует сообщения чата (вопрос/задача) — частые дешёвые вызовы.",
+  critic: "Проверяет ответ Researcher перед тем как показать его пользователю.",
   observer: "Изучает проект в фоне между вопросами, чтобы будущие ответы были быстрее.",
   developer: "Пишет код по задаче из чата прямо в реальном проекте (без отдельного worktree — задачи на один проект выполняются по очереди). Пусто — используется модель Researcher.",
   reviewer: "Независимое ревью diff перед выдачей. Должна быть не слабее Developer по коду — слабый ревьюер шумит неверными замечаниями. Пусто — code-дефолт (Kimi K2.7 Code).",
   tester: "Проверяет РЕАЛЬНОЕ поведение (реальные HTTP-запросы, чтение БД) — не читает диф, не пишет код. Можно вызывать отдельно от Developer, например на баг-репорт. Пусто — как у Reviewer.",
   researcherEscalation: "Если Critic отклонил первый ответ Researcher — следующие ходы пойдут этой моделью вместо обычной. Дешёво по умолчанию, сильнее только когда реально понадобилось. Пусто — эскалация выключена.",
   vision: "Анализирует прикреплённые к чату скриншоты — читает текст, UI-элементы и бизнес-смысл экрана. Нужна модель с поддержкой изображений. Пусто — анализ картинок выключен.",
+  orchestrator: "Единственная точка входа в чат — видит весь разговор и решает, звать ли Researcher/Developer/Tester или ответить самой. Переход к написанию кода — только по явному \"го, реализуй\", никогда по одной лишь детализации плана. Частые дешёвые вызовы на каждое сообщение. Пусто — используется модель Critic.",
 } as const;
 
 type ProjectDraftPath = {
@@ -2869,6 +2871,7 @@ export function App() {
     testerModel: "",
     researcherEscalationModel: "",
     visionModel: "",
+    orchestratorModel: "",
   });
   const [teams, setTeams] = useState<TeamRecord[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState<string>("");
@@ -3271,6 +3274,7 @@ export function App() {
           testerModel: selectedTeam.testerModel ?? "",
           researcherEscalationModel: selectedTeam.researcherEscalationModel ?? "",
           visionModel: selectedTeam.visionModel ?? "",
+          orchestratorModel: selectedTeam.orchestratorModel ?? "",
         });
       }
     });
@@ -4128,6 +4132,7 @@ export function App() {
           testerModel: teamDraft.testerModel,
           researcherEscalationModel: teamDraft.researcherEscalationModel,
           visionModel: teamDraft.visionModel,
+          orchestratorModel: teamDraft.orchestratorModel,
           isSelected: true,
         }),
       });
@@ -4174,6 +4179,7 @@ export function App() {
             testerModel: selected.testerModel ?? "",
             researcherEscalationModel: selected.researcherEscalationModel ?? "",
             visionModel: selected.visionModel ?? "",
+            orchestratorModel: selected.orchestratorModel ?? "",
           });
         }
       });
@@ -4210,6 +4216,7 @@ export function App() {
           testerModel: selected?.testerModel ?? "",
           researcherEscalationModel: selected?.researcherEscalationModel ?? "",
           visionModel: selected?.visionModel ?? "",
+          orchestratorModel: selected?.orchestratorModel ?? "",
         });
       });
     } catch (removeError) {
@@ -5052,7 +5059,7 @@ export function App() {
                 <button
                   type="button"
                   className="ghost-button"
-                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "", developerModel: "", reviewerModel: "", testerModel: "", researcherEscalationModel: "", visionModel: "" })}
+                  onClick={() => setTeamDraft({ id: "", name: "", researcherModel: "", criticModel: "", observerModel: "", developerModel: "", reviewerModel: "", testerModel: "", researcherEscalationModel: "", visionModel: "", orchestratorModel: "" })}
                 >
                   Новая
                 </button>
@@ -5120,6 +5127,28 @@ export function App() {
                     <option value="">Анализ картинок выключен</option>
                     {teamDraft.visionModel && !safeList(providerModels).some((model) => model.id === teamDraft.visionModel) ? (
                       <option value={teamDraft.visionModel}>{teamDraft.visionModel} (вне каталога)</option>
+                    ) : null}
+                    {groupModelsByVendor(safeList(providerModels)).map((group) => (
+                      <optgroup key={group.vendor} label={group.vendor}>
+                        {group.models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Orchestrator</span>
+                  <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.orchestrator}</span>
+                  <select
+                    value={teamDraft.orchestratorModel}
+                    onChange={(event) => setTeamDraft((current) => ({ ...current, orchestratorModel: event.target.value }))}
+                  >
+                    <option value="">Используется модель Critic</option>
+                    {teamDraft.orchestratorModel && !safeList(providerModels).some((model) => model.id === teamDraft.orchestratorModel) ? (
+                      <option value={teamDraft.orchestratorModel}>{teamDraft.orchestratorModel} (вне каталога)</option>
                     ) : null}
                     {groupModelsByVendor(safeList(providerModels)).map((group) => (
                       <optgroup key={group.vendor} label={group.vendor}>
@@ -5284,6 +5313,16 @@ export function App() {
                         <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.critic}</span>
                       </div>
                       <div className="team-role-card">
+                        <strong>Orchestrator</strong>
+                        <span>
+                          {team.orchestratorModel || team.criticModel || "—"}
+                          {findModelMultiplierLabel(providerModels, team.orchestratorModel || team.criticModel || "") ? (
+                            <span className="model-multiplier-badge"> {findModelMultiplierLabel(providerModels, team.orchestratorModel || team.criticModel || "")}</span>
+                          ) : null}
+                        </span>
+                        <span className="field-hint">{TEAM_ROLE_DESCRIPTIONS.orchestrator}</span>
+                      </div>
+                      <div className="team-role-card">
                         <strong>Developer</strong>
                         <span>
                           {team.developerModel || "—"}
@@ -5364,6 +5403,7 @@ export function App() {
                             testerModel: team.testerModel ?? "",
                             researcherEscalationModel: team.researcherEscalationModel ?? "",
                             visionModel: team.visionModel ?? "",
+                            orchestratorModel: team.orchestratorModel ?? "",
                           })
                         }
                       >

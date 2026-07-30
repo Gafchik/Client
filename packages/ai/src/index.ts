@@ -571,7 +571,12 @@ export async function classifyProjectScopeDirective(input: {
 
 export type ChatIntentKind = "question" | "develop" | "develop-correction";
 
-const EXPLICIT_RESEARCH_ONLY_PATTERN = /код\s+не\s+пиши|не\s+пиши\s+код|без\s+кода|код\s+не\s+нужен|только\s+разбор|только\s+исследуй|только\s+найди|только\s+объясни/i;
+// Bug fix (2026-07-30, live incident): "код не пишем" (collective/present
+// tense - "we don't write code") did not match the old "код не пиши"
+// (imperative-only) pattern, so a task that explicitly said this still fell
+// through to the LLM classifier with no deterministic override. Widened to
+// пиш(?:и|ем) to catch both.
+const EXPLICIT_RESEARCH_ONLY_PATTERN = /код\s+не\s+пиш(?:и|ем)|не\s+пиш(?:и|ем)\s+код|без\s+кода|код\s+не\s+нужен|только\s+разбор|только\s+исследуй|только\s+найди|только\s+объясни/i;
 const RESEARCH_DISCOVERY_PATTERN = /найди|откуда|где\s+именно|как\s+устроен|как\s+работает|собери\s+.*точк(?:и|у)\s+входа|объясни|проанализируй|расскажи|покажи\s+маршрут|какой\s+файл|какой\s+роут/i;
 const HARD_DEVELOP_PATTERN = /(^|\s)(сделай|исправь|почини|реализуй|добавь|убери|переименуй|перепиши|напиши\s+код|отрефактор|refactor|implement|fix|change|rewrite)(\s|$)/i;
 
@@ -856,8 +861,20 @@ export async function classifyChatIntent(input: {
   providerBaseUrl: string;
   providerModel: string;
   providerApiKey: string;
-  /** Last delivered develop iteration in this conversation, when one exists. */
-  priorDevelop?: { task: string; summary: string };
+  /**
+   * The single most recent prior turn in this conversation, whichever
+   * happened last - a DELIVERED code change, or a Q&A/plan answer with no
+   * code written. (2026-07-30, live incident fix): this used to only ever
+   * see a prior DEVELOP result, completely blind to a Q&A/plan turn that
+   * just happened - a real conversation ("отресерч и план" -> plan
+   * delivered -> user clarifies a detail, no go-ahead given) had NO signal
+   * that a plan-only turn had just occurred, and the classifier guessed
+   * "develop" on the clarification alone, silently starting a real
+   * multi-subtask code-writing chain the user never asked for. The caller
+   * (app.ts) resolves which of a prior develop-run/prior question-run is
+   * chronologically last and passes only that one.
+   */
+  priorTurn?: { kind: "develop" | "question"; task: string; summary: string };
   /**
    * Runs before the Q&A pipeline's own usage accumulator even exists
    * (app.ts's routing happens first) - without this, every question's real
@@ -879,19 +896,24 @@ export async function classifyChatIntent(input: {
         {
           role: "system",
           content: [
-            "The user chats with an AI senior developer about their codebase. Classify the user's latest message into exactly one kind:",
-            "- \"question\": asks to explain, find, analyze or discuss something about the project. No code modification is being requested from the assistant. IMPORTANT: \"how do I add X?\" / \"как добавить X?\" is a question (asking HOW, not asking the assistant to DO it).",
-            "- \"develop\": asks the assistant to implement, change, fix, remove, rename or refactor code (imperative request for a code change: \"добавь\", \"сделай\", \"исправь\", \"убери\", \"реализуй\", \"напиши код\"...).",
-            "- \"develop-correction\": ONLY when a previous development result exists in this conversation (it is provided below if so) AND the message is review feedback demanding changes to THAT delivered result (\"переделай\", \"нет, не так\", \"убери то, что ты добавил\", pointing out mistakes in what was just delivered). A brand-new unrelated change request is \"develop\", not a correction.",
+            "The user chats with an AI senior developer about their codebase, in ONE continuous conversation. Classify the user's latest message into exactly one kind:",
+            "- \"question\": the DEFAULT for anything that is not an explicit go-ahead to write code right now - explaining, finding, analyzing, discussing, planning, refining an existing plan, clarifying a fact for an ongoing investigation, or describing/discussing a feature idea. No code should be written for this kind. IMPORTANT: \"how do I add X?\" / \"как добавить X?\" is a question (asking HOW, not asking the assistant to DO it) - so is providing new information to help refine a plan already presented (\"Members are Employees, re-check the plan\" is still \"question\", not \"develop\", unless it ALSO contains an explicit go-ahead).",
+            "- \"develop\": ONLY when the user gives an EXPLICIT, UNAMBIGUOUS instruction to implement/write/fix code RIGHT NOW - concrete imperative verbs directly commanding the code change (\"добавь\", \"сделай\", \"исправь\", \"реализуй\", \"напиши код\", \"го, пиши\", \"начинай реализацию\"). Do NOT infer \"develop\" from: providing more detail or a clarification about a feature, enthusiasm or excitement about an idea, a plan merely being presented or discussed, or encouragement without an accompanying explicit go-ahead (\"план супер\" alone is not a go-ahead - \"план супер, реализуй\" is). When genuinely in doubt between \"question\" and \"develop\", choose \"question\" - a wrongly-started code change in the user's REAL project is a far more expensive mistake than one extra research round.",
+            "- \"develop-correction\": ONLY when a previous DEVELOP result (real delivered code, shown below if so) exists in this conversation AND the user gives the SAME kind of explicit, unambiguous instruction as \"develop\" above, but aimed at fixing that already-delivered code (\"переделай\", \"нет, не так\", \"убери то, что ты добавил\"). A comment, correction, or new detail about a PREVIOUS PLAN that was never actually implemented is \"question\", never \"develop-correction\", even if it also corrects something the plan got wrong.",
             "Reply with ONLY one line of JSON: {\"kind\": \"question\" | \"develop\" | \"develop-correction\"}.",
           ].join("\n"),
         },
         {
           role: "user",
           content: [
-            ...(input.priorDevelop
+            ...(input.priorTurn?.kind === "develop"
               ? [
-                `Previous development result in this conversation - task: "${input.priorDevelop.task}". Delivered summary: "${input.priorDevelop.summary.slice(0, 600)}".`,
+                `Previous DELIVERED CODE CHANGE in this conversation - task: "${input.priorTurn.task}". Delivered summary: "${input.priorTurn.summary.slice(0, 600)}".`,
+                "",
+              ]
+              : input.priorTurn?.kind === "question"
+              ? [
+                `Previous Q&A/PLAN turn in this conversation (no code has been written yet) - task: "${input.priorTurn.task}". Answer/plan given: "${input.priorTurn.summary.slice(0, 600)}".`,
                 "",
               ]
               : []),
@@ -923,8 +945,10 @@ export async function classifyChatIntent(input: {
     }
 
     if (parsed.kind === "develop-correction") {
-      // A correction without anything to correct collapses to a fresh task.
-      return input.priorDevelop ? "develop-correction" : "develop";
+      // A correction without a prior DEVELOP result to correct collapses to
+      // a fresh task - a prior QUESTION turn does not count here either,
+      // there is no delivered code for it to be "correcting".
+      return input.priorTurn?.kind === "develop" ? "develop-correction" : "develop";
     }
 
     return "question";

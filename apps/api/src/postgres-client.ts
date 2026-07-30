@@ -274,6 +274,11 @@ export async function initializePostgresSchema(): Promise<void> {
   // stays empty) - same nullable-means-off convention as
   // researcher_escalation_model just above, for the same reason.
   await runSql(`alter table teams add column if not exists vision_model text`);
+  // orchestrator_model (2026-07-30, single chat entry-point role): NULL =
+  // falls back to critic_model, then a live-cast default - same nullable-
+  // means-off/fallback convention as researcher_escalation_model/vision_model
+  // above, see team-store.mapTeamRow for the actual fallback chain.
+  await runSql(`alter table teams add column if not exists orchestrator_model text`);
 
   // knowledge_artifacts — полное тело каждого завершённого run'а (весь
   // research/impact/context/answer), раньше жило файлами в

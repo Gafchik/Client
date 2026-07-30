@@ -4,6 +4,7 @@ import { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult, type Obs
 import type { WorkspaceRoot } from "./tools.js";
 
 export { runAgenticLoop, type AgenticRunOptions, type AgenticRunResult, type ObserverEntryRef } from "./loop.js";
+export { callModel, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
 export { toResearchReport, toValidationResult } from "./adapter.js";
 export * from "./tools.js";
 export { listWorkUnits, listUnitFilePaths } from "./worklist.js";

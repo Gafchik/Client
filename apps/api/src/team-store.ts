@@ -13,6 +13,7 @@ export interface SaveTeamInput {
   testerModel?: string;
   researcherEscalationModel?: string;
   visionModel?: string;
+  orchestratorModel?: string;
   isSelected?: boolean;
 }
 
@@ -27,10 +28,20 @@ interface TeamRow {
   tester_model: string;
   researcher_escalation_model: string | null;
   vision_model: string | null;
+  orchestrator_model: string | null;
   is_selected: boolean;
   created_at: Date;
   updated_at: Date;
 }
+
+// Orchestrator default (2026-07-30, live 7-scenario cast vs 4 other
+// candidates, see TeamRecord.orchestratorModel's own comment): gemini-3.1-flash-lite
+// won on both speed (1629ms avg) and cost (0.5x) with zero misses on the
+// one thing that actually matters here - never confusing "clarify/plan"
+// with "go write code now". gpt-5.4-mini was a close second (1842ms, also
+// 0/0 misses on that distinction) but costs more for no measured quality
+// gain in this specific job.
+const DEFAULT_ORCHESTRATOR_MODEL = "google/gemini-3.1-flash-lite";
 
 // Проверенная вживую тройка (2026-07-14/15): gpt-5.4-mini — единственная
 // модель, ни разу не давшая уверенный неверный ответ под критиком;
@@ -103,8 +114,8 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
 
     await client.query(
       `
-        insert into teams (id, name, researcher_model, critic_model, observer_model, developer_model, reviewer_model, tester_model, researcher_escalation_model, vision_model, is_selected, created_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+        insert into teams (id, name, researcher_model, critic_model, observer_model, developer_model, reviewer_model, tester_model, researcher_escalation_model, vision_model, orchestrator_model, is_selected, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
         on conflict (id) do update set
           name = $2,
           researcher_model = $3,
@@ -115,8 +126,9 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
           tester_model = $8,
           researcher_escalation_model = $9,
           vision_model = $10,
-          is_selected = $11,
-          updated_at = $12
+          orchestrator_model = $11,
+          is_selected = $12,
+          updated_at = $13
       `,
       [
         nextId,
@@ -129,6 +141,7 @@ export async function saveTeam(input: SaveTeamInput): Promise<TeamRecord> {
         input.testerModel?.trim() ?? "",
         input.researcherEscalationModel?.trim() || null,
         input.visionModel?.trim() || null,
+        input.orchestratorModel?.trim() || null,
         shouldBeSelected,
         now,
       ],
@@ -223,6 +236,12 @@ function mapTeamRow(row: TeamRow): TeamRecord {
     testerModel: row.tester_model || DEFAULT_TESTER_MODEL,
     ...(row.researcher_escalation_model ? { researcherEscalationModel: row.researcher_escalation_model } : {}),
     ...(row.vision_model ? { visionModel: row.vision_model } : {}),
+    // Falls back to criticModel first, THEN the live-cast default (2026-07-30) -
+    // an existing team that already has a good criticModel choice keeps using
+    // it for orchestration too until the operator explicitly picks something
+    // else, same "no silent behavior change for existing teams" stance as
+    // testerModel/reviewerModel's own fallbacks above.
+    orchestratorModel: row.orchestrator_model || row.critic_model || DEFAULT_ORCHESTRATOR_MODEL,
     isSelected: Boolean(row.is_selected),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),

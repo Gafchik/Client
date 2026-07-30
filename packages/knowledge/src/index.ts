@@ -502,6 +502,28 @@ function mapKnowledgeCatalogRow(row: KnowledgeCatalogRow): KnowledgeCatalogEntry
   };
 }
 
+/**
+ * Latest QUESTION-RUN catalog row for a conversation, without loading the
+ * full (potentially heavy) artifact body - 2026-07-30, orchestrator fix:
+ * classifyChatIntent needs "was the last thing in this conversation a Q&A/
+ * plan turn with no code written" as cheaply as findLatestDevelopRunForConversation
+ * already gets the develop-side equivalent from its own in-memory record.
+ */
+export async function loadLatestQuestionCatalogEntry(projectRootPath: string, conversationId: string): Promise<KnowledgeCatalogEntry | null> {
+  const rows = await runSql<KnowledgeCatalogRow>(
+    `
+      select * from knowledge_catalog
+      where project_root_path = $1 and conversation_id = $2 and mode = 'question-run'
+      order by turn_index desc
+      limit 1
+    `,
+    [projectRootPath, conversationId],
+  );
+  const row = rows[0];
+
+  return row ? mapKnowledgeCatalogRow(row) : null;
+}
+
 export async function loadKnowledgeCatalog(_appRootPath: string, projectRootPath: string): Promise<KnowledgeCatalogEntry[]> {
   const rows = await runSql<KnowledgeCatalogRow>(
     `

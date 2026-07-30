@@ -2,7 +2,7 @@ import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadLatestQuestionCatalogEntry, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
 import { scanTextForSecurityFindings } from "@client/agentic-research";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type AttachmentStructuredContext, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProjectPathRecord, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
@@ -156,6 +156,7 @@ interface SaveTeamRequest {
   testerModel?: string;
   researcherEscalationModel?: string;
   visionModel?: string;
+  orchestratorModel?: string;
   isSelected?: boolean;
 }
 
@@ -550,6 +551,7 @@ export function createApp() {
       testerModel: request.body.testerModel?.trim() || "",
       ...(request.body.researcherEscalationModel?.trim() ? { researcherEscalationModel: request.body.researcherEscalationModel.trim() } : {}),
       ...(request.body.visionModel?.trim() ? { visionModel: request.body.visionModel.trim() } : {}),
+      ...(request.body.orchestratorModel?.trim() ? { orchestratorModel: request.body.orchestratorModel.trim() } : {}),
       isSelected: request.body.isSelected ?? false,
     });
 
@@ -1083,6 +1085,23 @@ export function createApp() {
         if (selectedTeam && providerBaseUrl && providerApiKey) {
           const conversationKey = request.body.conversationId?.trim() || "";
           const priorDevelop = conversationKey ? findLatestDevelopRunForConversation(conversationKey) : null;
+          // Orchestrator fix (2026-07-30, live incident): classifyChatIntent
+          // used to only ever see a PRIOR DEVELOP result - completely blind
+          // to a Q&A/plan turn that just happened in this same conversation.
+          // Fetched cheaply (catalog row only, no full artifact body) and
+          // compared by timestamp against priorDevelop so whichever ACTUALLY
+          // happened last is what the classifier is told about - a
+          // conversation can have both kinds of turns in its history, only
+          // the most recent one tells you what a follow-up message likely
+          // refers to.
+          const priorQuestionEntry = conversationKey
+            ? await loadLatestQuestionCatalogEntry(normalizePath(path.resolve(projectPath)), conversationKey).catch(() => null)
+            : null;
+          const priorTurn = priorQuestionEntry && (!priorDevelop || priorQuestionEntry.savedAt > priorDevelop.updatedAt)
+            ? { kind: "question" as const, task: priorQuestionEntry.task, summary: priorQuestionEntry.summary }
+            : priorDevelop?.status === "completed"
+              ? { kind: "develop" as const, task: priorDevelop.task, summary: priorDevelop.result?.summary ?? "" }
+              : null;
           // Path-scoped chat directives for the Developer pipeline (2026-07-18,
           // explicit product-owner directive: "делай только фронт"/"только
           // бек"/"только gui" must not silently leave the Developer able to
@@ -1315,12 +1334,10 @@ export function createApp() {
           const intent = await classifyChatIntent({
             task,
             providerBaseUrl,
-            providerModel: selectedTeam.criticModel,
+            providerModel: selectedTeam.orchestratorModel || selectedTeam.criticModel,
             providerApiKey,
             usage: chatIntentUsage,
-            ...(priorDevelop?.status === "completed"
-              ? { priorDevelop: { task: priorDevelop.task, summary: priorDevelop.result?.summary ?? "" } }
-              : {}),
+            ...(priorTurn ? { priorTurn } : {}),
           });
 
           if (intent === "develop" || intent === "develop-correction") {

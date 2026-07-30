@@ -1014,6 +1014,23 @@ export interface TeamRecord {
    * Developer) - see team-store.mapTeamRow.
    */
   testerModel?: string;
+  /**
+   * Orchestrator (2026-07-30, live incident + product-owner request): the
+   * single chat entry point - sees the whole conversation, decides which
+   * hand to call (Researcher/Developer/Tester) or replies directly, and
+   * writes a clean, self-contained brief for whichever hand it picks
+   * instead of forwarding raw chat history. Concretely wired in as an
+   * upgrade to classifyChatIntent (packages/ai) - now also fed the last
+   * QUESTION-run's own summary (previously only saw prior DEVELOP results),
+   * and required to see an EXPLICIT go-ahead phrase before ever classifying
+   * as develop/develop-correction, never inferred from a clarification,
+   * enthusiasm, or a plan merely being discussed. Live-cast against 5
+   * candidates on 7 scenarios (including the exact incident that motivated
+   * this) - gemini-3.1-flash-lite won on speed+cost with zero misses on the
+   * "code vs no-code" distinction. Empty/unset falls back to criticModel
+   * (today's behavior, unchanged) - see team-store.mapTeamRow.
+   */
+  orchestratorModel?: string;
   isSelected: boolean;
   createdAt: string;
   updatedAt: string;
