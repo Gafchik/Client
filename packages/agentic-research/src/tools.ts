@@ -596,7 +596,22 @@ const MAX_COMMAND_OUTPUT_CHARS = 12_000;
 // `git commit` inside the worktree once there is an accuracy track record)
 // is a deliberate future decision - see
 // docs/architecture/011-developer-pipeline.md.
-const FORBIDDEN_COMMAND_PATTERN = /\bgit\s+(push|commit|merge|rebase|reset|checkout|switch|remote|worktree|filter-branch|reflog|update-ref|symbolic-ref|branch\s+(-[dDmMfF]|--delete|--force|--move)|tag\s+(-f|--force))\b|\bnpm\s+publish\b|\bsudo\b|\brm\s+(-[a-z]*\s+)*[/~]|\bmkfs\b|\bshutdown\b|\breboot\b/i;
+// Bug fix (2026-07-30, live incident): `git checkout -- <file>` was correctly
+// blocked (git write ops), but the model then found `git clean -fd` as an
+// unblocked WORKAROUND to "tidy up" untracked files it didn't like the look
+// of (pre-existing, unrelated dirty state swept into its diff by the
+// no-worktree-isolation architecture - see §4.27) - this actually ran and
+// PERMANENTLY deleted two sibling repos' .idea/ and one .env (untracked
+// files have no git history to recover from, unlike everything else this
+// gate blocks). Same root problem as `rm` below: a command can be
+// "contained to inside the project" and still be irreversible. Added
+// git clean/stash clear/stash drop to the forbidden list, and widened `rm`
+// to catch ANY recursive/force removal (-r/-R/-rf/-fr/...) regardless of
+// whether the target path is absolute - the old pattern only blocked rm
+// against an absolute/home path, so `rm -rf .idea` (relative, inside the
+// project) was never covered even though it is exactly as destructive as
+// git clean was here.
+const FORBIDDEN_COMMAND_PATTERN = /\bgit\s+(push|commit|merge|rebase|reset|checkout|switch|remote|worktree|filter-branch|reflog|update-ref|symbolic-ref|clean|branch\s+(-[dDmMfF]|--delete|--force|--move)|tag\s+(-f|--force)|stash\s+(clear|drop))\b|\bnpm\s+publish\b|\bsudo\b|\brm\s+(-[a-zA-Z]*\s+)*[/~]|\brm\s+-[a-zA-Z]*[rR][a-zA-Z]*\b|\bmkfs\b|\bshutdown\b|\breboot\b/i;
 
 export async function runShellCommand(roots: WorkspaceRoot[], rawArg: string, extraEnv?: Record<string, string>): Promise<ShellCommandResult> {
   let command = rawArg.trim();
@@ -625,7 +640,7 @@ export async function runShellCommand(roots: WorkspaceRoot[], rawArg: string, ex
   }
 
   if (FORBIDDEN_COMMAND_PATTERN.test(command)) {
-    return { command, exitCode: 1, durationMs: 0, output: "Error: this command is not allowed. Git write operations (commit/push/merge/rebase/reset/checkout/branch -f/...) are temporarily disabled for this pipeline - use write_file/edit_file to change code, run_command only to verify (tests/linter/build). Publish/sudo/destructive filesystem operations outside the worktree are also blocked." };
+    return { command, exitCode: 1, durationMs: 0, output: "Error: this command is not allowed. Git write/history operations (commit/push/merge/rebase/reset/checkout/clean/stash clear.../branch -f/...) are temporarily disabled for this pipeline - use write_file/edit_file to change code, run_command only to verify (tests/linter/build). If you see unrelated pre-existing untracked/modified files in your diff, LEAVE THEM ALONE and say so in your summary - do not try to \"tidy up\" the checkout by deleting or reverting anything outside your own change, by any means. Publish/sudo/recursive-or-force rm/other destructive filesystem operations are also blocked." };
   }
 
   const startedAt = Date.now();

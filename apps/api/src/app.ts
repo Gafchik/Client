@@ -21,7 +21,7 @@ import { initializeSecretCrypto } from "./secret-crypto.js";
 import { analyzeAttachmentImage, classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
-import { getTesterRunStatus, startTesterRun } from "./tester-runner.js";
+import { findLatestTesterRunForConversation, getTesterRunStatus, startTesterRun } from "./tester-runner.js";
 
 // Deterministic pre-check for classifyProjectScopeDirective (2026-07-28,
 // live case: a develop task naming a specific file
@@ -1452,6 +1452,45 @@ export function createApp() {
                 : {}),
             });
             return reply.code(202).send({ kind: "develop", ...status });
+          }
+
+          // Chat -> Tester wiring (2026-07-30, live gap found: chat had NO
+          // way to reach the Tester at all - "проверь на реальном сервере"
+          // was always answered as a Q&A opinion from reading code, never a
+          // real HTTP/DB verification). Same composedTask enrichment as the
+          // develop branch above - Tester needs to know WHAT was just
+          // discussed/found/changed, not just the bare "проверь" message.
+          if (intent === "test") {
+            let composedTestTask = task;
+
+            if (priorTurn) {
+              composedTestTask = [
+                priorTurn.kind === "develop"
+                  ? `Предыдущее сообщение в этом диалоге - ДОСТАВЛЕННОЕ ИЗМЕНЕНИЕ КОДА: "${priorTurn.task}". Что сделано: "${priorTurn.summary.slice(0, 1500)}".`
+                  : `Предыдущее сообщение в этом диалоге - Q&A/план: "${priorTurn.task}". Ответ: "${priorTurn.summary.slice(0, 1500)}".`,
+                "",
+                `Текущее сообщение пользователя: "${task}"`,
+              ].join("\n");
+            }
+
+            const priorTester = conversationKey ? findLatestTesterRunForConversation(conversationKey) : null;
+
+            if (priorTester?.status === "running") {
+              return reply.code(409).send({
+                message: "По этому диалогу уже выполняется проверка — дождись её завершения, прежде чем отправлять следующее сообщение.",
+              });
+            }
+
+            const testerStatus = startTesterRun({
+              task: composedTestTask,
+              projectPath: normalizePath(path.resolve(projectPath)),
+              ...(effectiveProjectPaths?.length ? { projectPaths: effectiveProjectPaths } : {}),
+              providerBaseUrl,
+              providerApiKey,
+              testerModel: selectedTeam.testerModel || selectedTeam.reviewerModel,
+              ...(conversationKey ? { conversationId: conversationKey } : {}),
+            });
+            return reply.code(202).send({ kind: "test", ...testerStatus });
           }
         }
       } catch (error) {

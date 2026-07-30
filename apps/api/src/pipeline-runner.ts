@@ -860,10 +860,27 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     research: deterministicResearch,
     ...(fileChurn ? { fileChurn } : {}),
   });
+  // Bug fix (2026-07-30, live incident): a multi-message conversation
+  // ("добавить soft delete... отресерч и план" -> "не трогай индексы,
+  // миграцию отдельно" -> "и нужен with_trashed для админки" -> "план ок,
+  // го делай") had its 2nd/3rd messages silently downgraded to the shallow
+  // deterministic path (shouldUseChatFastPath scored them "confident enough"
+  // in isolation, purely from their own text - a short declarative
+  // constraint like "не трогай индексы" happens to keyword-match against
+  // many unrelated files/entities) - by the time the 4th message asked to
+  // implement, the "latest turn" it built on was that generic, off-topic
+  // answer, and the Developer ended up working on the WRONG entity entirely
+  // (acu_notes instead of case_types). A message that continues an existing
+  // conversation thread deserves the SAME depth of treatment the thread
+  // already committed to, regardless of how simple that one message's own
+  // text looks in isolation - the deterministic gate only ever evaluates a
+  // single message on its own, with no notion of "this is turn 3 of an
+  // ongoing investigation."
+  const isConversationContinuation = Boolean(priorConversationTurn) || Boolean(priorConversationMemoryTurn);
   const shouldEscalateToTeamMode =
     isQuestionRun
     && Boolean(configuredTeam)
-    && !shouldUseChatFastPath({ task, research: deterministicResearch, impact: probeImpact, diagnostics: probeDiagnostics });
+    && (isConversationContinuation || !shouldUseChatFastPath({ task, research: deterministicResearch, impact: probeImpact, diagnostics: probeDiagnostics }));
   const selectedTeam = shouldEscalateToTeamMode ? configuredTeam : null;
   let initialResearch: PipelineRunResult["research"] = deterministicResearch;
   let teamValidation: ValidationResult | null = null;

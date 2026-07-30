@@ -569,7 +569,7 @@ export async function classifyProjectScopeDirective(input: {
   }
 }
 
-export type ChatIntentKind = "question" | "develop" | "develop-correction";
+export type ChatIntentKind = "question" | "develop" | "develop-correction" | "test";
 
 // Bug fix (2026-07-30, live incident): "код не пишем" (collective/present
 // tense - "we don't write code") did not match the old "код не пиши"
@@ -898,9 +898,10 @@ export async function classifyChatIntent(input: {
           content: [
             "The user chats with an AI senior developer about their codebase, in ONE continuous conversation. Classify the user's latest message into exactly one kind:",
             "- \"question\": the DEFAULT for anything that is not an explicit go-ahead to write code right now - explaining, finding, analyzing, discussing, planning, refining an existing plan, clarifying a fact for an ongoing investigation, or describing/discussing a feature idea. No code should be written for this kind. IMPORTANT: \"how do I add X?\" / \"как добавить X?\" is a question (asking HOW, not asking the assistant to DO it) - so is providing new information to help refine a plan already presented (\"Members are Employees, re-check the plan\" is still \"question\", not \"develop\", unless it ALSO contains an explicit go-ahead).",
-            "- \"develop\": ONLY when the user gives an EXPLICIT, UNAMBIGUOUS instruction to implement/write/fix code RIGHT NOW - concrete imperative verbs directly commanding the code change (\"добавь\", \"сделай\", \"исправь\", \"реализуй\", \"напиши код\", \"го, пиши\", \"начинай реализацию\"). Do NOT infer \"develop\" from: providing more detail or a clarification about a feature, enthusiasm or excitement about an idea, a plan merely being presented or discussed, or encouragement without an accompanying explicit go-ahead (\"план супер\" alone is not a go-ahead - \"план супер, реализуй\" is). When genuinely in doubt between \"question\" and \"develop\", choose \"question\" - a wrongly-started code change in the user's REAL project is a far more expensive mistake than one extra research round.",
+            "- \"develop\": ONLY when the user gives an EXPLICIT, UNAMBIGUOUS instruction to implement/write/fix code RIGHT NOW - concrete imperative verbs directly commanding the code change (\"добавь\", \"сделай\", \"исправь\", \"реализуй\", \"напиши код\", \"го, пиши\", \"начинай реализацию\"). Do NOT infer \"develop\" from: providing more detail or a clarification about a feature, enthusiasm or excitement about an idea, a plan merely being presented or discussed, or encouragement without an accompanying explicit go-ahead (\"план супер\" alone is not a go-ahead - \"план супер, реализуй\" is). When genuinely in doubt between \"question\" and \"develop\", choose \"question\" - a wrongly-started code change in the user's REAL project is a far more expensive mistake than one extra research round. IMPORTANT (live incident): if a Q&A/plan turn is shown below as the previous turn (the conversation is CURRENTLY in the middle of shaping a plan, not past it), an imperative verb aimed at just ONE incidental detail of that plan (\"да и сделай ошибку на английском\", \"и добавь ещё поле X тоже\") is still \"question\" - the user is still actively adding requirements to the plan, not signaling \"stop discussing, start building\" yet. Only a HOLISTIC go-ahead for the plan AS A WHOLE (\"план ок, реализуй\", \"го, давай\", \"начинай\") counts as \"develop\" while a plan is still being actively shaped - starting to code on just the most recently mentioned detail, disconnected from everything discussed before it, is exactly the mistake this rule exists to prevent.",
             "- \"develop-correction\": ONLY when a previous DEVELOP result (real delivered code, shown below if so) exists in this conversation AND the user gives the SAME kind of explicit, unambiguous instruction as \"develop\" above, but aimed at fixing that already-delivered code (\"переделай\", \"нет, не так\", \"убери то, что ты добавил\"). A comment, correction, or new detail about a PREVIOUS PLAN that was never actually implemented is \"question\", never \"develop-correction\", even if it also corrects something the plan got wrong.",
-            "Reply with ONLY one line of JSON: {\"kind\": \"question\" | \"develop\" | \"develop-correction\"}.",
+            "- \"test\": the user asks to VERIFY/CHECK/REPRODUCE something against the REAL RUNNING system - real HTTP calls, real DB reads - not just read code or discuss whether something would work (\"проверь на реальном сервере\", \"воспроизводится ли ещё\", \"протестируй это\", \"убедись что баг ещё есть\"). This is different from \"question\": a question about whether code LOOKS correct is \"question\" (Researcher reasons from reading the code); an explicit ask to actually exercise the running system and report what ACTUALLY happens is \"test\".",
+            "Reply with ONLY one line of JSON: {\"kind\": \"question\" | \"develop\" | \"develop-correction\" | \"test\"}.",
           ].join("\n"),
         },
         {
@@ -949,6 +950,10 @@ export async function classifyChatIntent(input: {
       // a fresh task - a prior QUESTION turn does not count here either,
       // there is no delivered code for it to be "correcting".
       return input.priorTurn?.kind === "develop" ? "develop-correction" : "develop";
+    }
+
+    if (parsed.kind === "test") {
+      return "test";
     }
 
     return "question";
