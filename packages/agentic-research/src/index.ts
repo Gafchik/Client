@@ -47,13 +47,61 @@ export interface CrawlUnitInput {
   researcherEscalationModel?: string;
 }
 
+export interface CrawlUnitApiEndpoint {
+  method: string;
+  path: string;
+  controllerAction: string;
+  requestFields: string;
+  responseFields: string;
+}
+
 export interface CrawlUnitResult {
   featureSummary: string;
   keyMechanisms: string[];
   gotchas: string[];
+  /** API-surface counterpart to keyMechanisms/gotchas (2026-07-31) - see packages/knowledge's api-endpoints.ts. Empty when this unit exposes no HTTP routes of its own. */
+  apiEndpoints: CrawlUnitApiEndpoint[];
   touchedFiles: string[];
   confidence: number;
   raw: AgenticRunResult;
+}
+
+// Parses one "## API Routes" bullet line, e.g.:
+// "POST /api/v1/document/signatures -> DocumentController@signatures | request: document_id, is_signature_to_aob(bool) | response: DocumentSignatureResource"
+// Deliberately forgiving - a line that doesn't match this shape is just
+// dropped (this is LLM output, not a machine-generated format), not an error.
+function parseApiRouteLine(line: string): CrawlUnitApiEndpoint | null {
+  const parts = line.split("|").map((part) => part.trim());
+  const head = parts[0] ?? "";
+  const headMatch = /^(GET|POST|PUT|PATCH|DELETE|OPTIONS)\s+(\S+)\s*->\s*(.+)$/i.exec(head);
+
+  if (!headMatch) {
+    return null;
+  }
+
+  let requestFields = "";
+  let responseFields = "";
+
+  for (const part of parts.slice(1)) {
+    const requestMatch = /^request:\s*(.*)$/i.exec(part);
+    const responseMatch = /^response:\s*(.*)$/i.exec(part);
+
+    if (requestMatch) {
+      requestFields = (requestMatch[1] ?? "").trim();
+    }
+
+    if (responseMatch) {
+      responseFields = (responseMatch[1] ?? "").trim();
+    }
+  }
+
+  return {
+    method: (headMatch[1] ?? "").toUpperCase(),
+    path: headMatch[2] ?? "",
+    controllerAction: (headMatch[3] ?? "").trim(),
+    requestFields,
+    responseFields,
+  };
 }
 
 // Observer's task is deliberately open-ended-but-scoped: unlike a user
@@ -78,7 +126,7 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
     // "## Section Name" convention packages/ai's answer synthesizer already
     // uses (parseMarkdownSections/extractSectionBullets, moved to
     // packages/shared) instead of inventing a new format.
-    "Answer in this format: first \"## Summary\" (2-3 sentences on the substance), then \"## Key mechanisms\" (a bulleted list of concrete mechanisms/behaviors, up to 5 items), then \"## Gotchas\" (a bulleted list of things a developer might unexpectedly run into - up to 5 items, an empty list is fine if nothing noteworthy was found).",
+    "Answer in this format: first \"## Summary\" (2-3 sentences on the substance), then \"## Key mechanisms\" (a bulleted list of concrete mechanisms/behaviors, up to 5 items), then \"## Gotchas\" (a bulleted list of things a developer might unexpectedly run into - up to 5 items, an empty list is fine if nothing noteworthy was found), then \"## API Routes\" ONLY if this unit registers its own HTTP endpoints (skip this whole section entirely if it does not) - one bullet per route, in EXACTLY this shape so it can be parsed: \"METHOD /path -> Controller@action | request: field1, field2(type) | response: field1, field2\" (request/response parts are optional if you are not sure of the exact fields - the method/path/action part is what matters most).",
   ].join(" ");
 
   const raw = await runAgenticLoop({
@@ -110,6 +158,7 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
       featureSummary: `Обход не завершился выводом (${raw.stopped}${raw.error ? `: ${raw.error}` : ""}).`,
       keyMechanisms: [],
       gotchas: [],
+      apiEndpoints: [],
       touchedFiles: raw.touchedFiles,
       confidence,
       raw,
@@ -120,12 +169,19 @@ export async function crawlUnit(input: CrawlUnitInput): Promise<CrawlUnitResult>
   const summaryFromSections = extractSectionText(sections, "Summary");
   const keyMechanisms = extractSectionBullets(sections, "Key mechanisms", 5);
   const gotchas = extractSectionBullets(sections, "Gotchas", 5);
+  // Up to 20 routes/unit - generous relative to keyMechanisms/gotchas (5
+  // each) since a single controller can legitimately register many routes
+  // (index/show/store/update/destroy + custom actions), unlike a summary
+  // that should stay to a handful of the MOST important points.
+  const apiEndpoints = extractSectionBullets(sections, "API Routes", 20)
+    .map((line) => parseApiRouteLine(line))
+    .filter((entry): entry is CrawlUnitApiEndpoint => entry !== null);
   // Falls back to the raw answer verbatim when the model didn't follow the
   // "## Summary" structure (e.g. an implicit-answer turn with no headings at
   // all) - a slightly messier hint beats silently losing the answer.
   const featureSummary = summaryFromSections || raw.finalAnswer;
 
-  return { featureSummary, keyMechanisms, gotchas, touchedFiles: raw.touchedFiles, confidence, raw };
+  return { featureSummary, keyMechanisms, gotchas, apiEndpoints, touchedFiles: raw.touchedFiles, confidence, raw };
 }
 
 export interface RunAgenticResearchInput {

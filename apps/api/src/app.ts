@@ -2,7 +2,7 @@ import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadLatestQuestionCatalogEntry, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteApiEndpointsForPath, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadLatestQuestionCatalogEntry, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
 import { scanTextForSecurityFindings } from "@client/agentic-research";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type AttachmentStructuredContext, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProjectPathRecord, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
@@ -528,6 +528,7 @@ export function createApp() {
     // that could silently miss every row.
     stopObserver(projectPath);
     await deleteBusinessGraphEntriesForPath(projectPath);
+    await deleteApiEndpointsForPath(projectPath);
     return { ok: true };
   });
 

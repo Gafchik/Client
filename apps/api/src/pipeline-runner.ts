@@ -20,7 +20,7 @@ import { buildContextPackage } from "@client/context";
 import { buildGraph, getFileDependencies, getFileDependents, getSymbolDependencies, getSymbolDependents, linkHttpCallsToRoutes } from "@client/graph";
 import { analyzeImpact } from "@client/impact-analysis";
 import { runFullIndex } from "@client/indexer";
-import { appendBusinessGraphEntryCorrection, buildBackgroundProjectState, findSemanticMatchesAcrossPaths, linkChatAttachmentsToTurn, loadBestBaselineRunArtifact, loadChatAttachmentsByIds, loadConversationMemorySnapshot, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryGlossaryAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts, upsertGlossaryEntry } from "@client/knowledge";
+import { appendBusinessGraphEntryCorrection, buildBackgroundProjectState, findSemanticMatchesAcrossPaths, linkChatAttachmentsToTurn, loadBestBaselineRunArtifact, loadChatAttachmentsByIds, loadConversationMemorySnapshot, loadConversationTurns, loadLatestBackgroundRunCatalogEntry, promoteFactsFromResearch, queryApiEndpointsAcrossPaths, queryBusinessGraphEntriesAcrossPaths, queryFactsAcrossPaths, queryGlossaryAcrossPaths, queryRelevantFacts, saveKnowledgeArtifacts, upsertGlossaryEntry } from "@client/knowledge";
 import { buildExecutionPlan, buildExecutionPreview } from "@client/planner";
 import { computeFileChurnSignals, deriveRepositoryScopedPaths, inspectRepository, shouldPreferSelectiveWorkspace } from "@client/repository-git";
 import { runResearch } from "@client/research";
@@ -734,6 +734,7 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
         answerObserverHintResult.text,
         buildKnownFactsHint(questionProjectRoots, await queryFactsAcrossPaths(questionProjectRoots.map((root) => root.absolutePath))),
         buildGlossaryHint(await queryGlossaryAcrossPaths(questionProjectRoots.map((root) => root.absolutePath))),
+        buildApiEndpointsHint(questionProjectRoots, task, await queryApiEndpointsAcrossPaths(questionProjectRoots.map((root) => root.absolutePath))),
       ].filter(Boolean).join("\n\n")
     : "";
   // 2026-07-24: same entries as answerGotchasHint above, but structured
@@ -935,7 +936,12 @@ async function buildPipelineRunResult(request: PipelineExecutionRequest): Promis
     const attachmentHint = await buildAttachmentContextHint(attachmentIds);
     const teamKnownFacts = await queryFactsAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
     const teamGlossary = await queryGlossaryAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
-    const knownFactsHintText = [buildKnownFactsHint(effectiveProjectRoots, teamKnownFacts), buildGlossaryHint(teamGlossary)]
+    const teamApiEndpoints = await queryApiEndpointsAcrossPaths(effectiveProjectRoots.map((root) => root.absolutePath));
+    const knownFactsHintText = [
+      buildKnownFactsHint(effectiveProjectRoots, teamKnownFacts),
+      buildGlossaryHint(teamGlossary),
+      buildApiEndpointsHint(effectiveProjectRoots, task, teamApiEndpoints),
+    ]
       .filter(Boolean)
       .join("\n\n");
     // Architecture review finding (2026-07-16): intent classification never
@@ -2541,6 +2547,51 @@ export function buildGlossaryHint(entries: Awaited<ReturnType<typeof queryGlossa
   return [
     "Domain glossary - business terms already defined from prior questions about this project (verify against current code, terms can drift as the code evolves):",
     ...entries.slice(0, 8).map((entry) => `- ${entry.term}: ${entry.definition}`),
+  ].join("\n");
+}
+
+// API-surface hint (2026-07-31, product-owner idea): structured counterpart
+// to buildObserverHintSuffix's prose - Observer's crawl also extracts which
+// HTTP routes a unit exposes (packages/knowledge's api-endpoints.ts), so a
+// question about "what does endpoint X accept/return" or "which routes exist
+// for Y" can be answered from this table directly instead of the Researcher
+// having to grep every RouteProvider/Controller file itself. Same relevance-
+// scoring shape as buildObserverHintSuffix (task-token match against
+// path/controllerAction/unitPath), capped generously (10, vs Observer's own
+// 2) since each entry here is a single short line, not a paragraph.
+const API_ENDPOINTS_HINT_MAX_ENTRIES = 10;
+
+export function buildApiEndpointsHint(roots: WorkspaceRoot[], task: string, entries: Awaited<ReturnType<typeof queryApiEndpointsAcrossPaths>>): string {
+  const fresh = entries.filter((entry) => !entry.isStale);
+
+  if (fresh.length === 0) {
+    return "";
+  }
+
+  const taskTokens = computeTaskSearchTokens(task);
+  const relevant = fresh
+    .map((entry) => {
+      const haystack = `${entry.unitPath} ${entry.path} ${entry.controllerAction} ${entry.requestFields} ${entry.responseFields}`.toLowerCase();
+      const score = taskTokens.filter((token) => haystack.includes(token)).length;
+      return { entry, score };
+    })
+    .filter(({ score }) => score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, API_ENDPOINTS_HINT_MAX_ENTRIES)
+    .map(({ entry }) => entry);
+
+  if (relevant.length === 0) {
+    return "";
+  }
+
+  return [
+    "API routes discovered by the project's background scan (Observer) - NOT confirmed, just a lead; verify against the current code before relying on it:",
+    ...relevant.map((entry) => {
+      const virtualUnit = toVirtualPath(roots, entry.projectRootPath, entry.unitPath);
+      const reqPart = entry.requestFields ? ` | request: ${entry.requestFields}` : "";
+      const resPart = entry.responseFields ? ` | response: ${entry.responseFields}` : "";
+      return `- ${entry.method} ${entry.path} -> ${entry.controllerAction}${reqPart}${resPart} (${virtualUnit})`;
+    }),
   ].join("\n");
 }
 

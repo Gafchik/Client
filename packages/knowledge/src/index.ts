@@ -2,6 +2,7 @@ import { runSql, runWithTransaction } from "./postgres-client.js";
 import { getRedisClient } from "./redis-client.js";
 import { deleteFactsForPath } from "./facts.js";
 import { deleteBusinessGraphEntriesForPath } from "./graph-entries.js";
+import { deleteApiEndpointsForPath } from "./api-endpoints.js";
 import { pruneCodeEmbeddings } from "./code-embeddings.js";
 import { deleteGlossaryEntriesForPath } from "./glossary.js";
 import { deleteChatAttachmentsForPath } from "./attachments.js";
@@ -40,6 +41,13 @@ export {
   type BusinessGraphEntry,
   type UpsertBusinessGraphEntryInput,
 } from "./graph-entries.js";
+export {
+  deleteApiEndpointsForPath,
+  queryApiEndpointsAcrossPaths,
+  replaceApiEndpointsForUnit,
+  type ApiEndpointEntry,
+  type ReplaceApiEndpointsForUnitInput,
+} from "./api-endpoints.js";
 export {
   deleteGlossaryEntriesForPath,
   queryGlossaryAcrossPaths,
@@ -679,6 +687,7 @@ export async function forgetProjectPath(projectRootPath: string): Promise<void> 
 
   await deleteFactsForPath(projectRootPath);
   await deleteBusinessGraphEntriesForPath(projectRootPath);
+  await deleteApiEndpointsForPath(projectRootPath);
   await deleteGlossaryEntriesForPath(projectRootPath);
   await pruneCodeEmbeddings(projectRootPath, []);
   await deleteChatAttachmentsForPath(projectRootPath);

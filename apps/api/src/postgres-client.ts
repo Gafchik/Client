@@ -209,6 +209,34 @@ export async function initializePostgresSchema(): Promise<void> {
   // hash-only staleness (see graph-entries.ts's mapRow) until their next crawl.
   await runSql(`alter table business_graph_entries add column if not exists known_file_paths text[] not null default '{}'`);
 
+  // api_endpoints (2026-07-31, product-owner idea): API-surface counterpart
+  // to business_graph_entries - Observer already reads route/controller/
+  // request files while describing a unit's business logic; this captures
+  // that SAME investigation's structural byproduct (which HTTP endpoints a
+  // unit exposes, what they accept/return) as its own queryable table,
+  // multiple rows per unit (one per route) rather than one row per unit.
+  // Same content-hash staleness idiom as business_graph_entries, computed at
+  // read time in packages/knowledge/api-endpoints.ts, not stored.
+  await runSql(`
+    create table if not exists api_endpoints (
+      id text primary key,
+      project_root_path text not null,
+      unit_path text not null,
+      method text not null,
+      path text not null,
+      controller_action text not null default '',
+      request_fields text not null default '',
+      response_fields text not null default '',
+      source_file_hashes jsonb not null default '{}',
+      confidence integer not null default 50,
+      created_at timestamptz not null,
+      last_crawled_at timestamptz not null
+    )
+  `);
+  await runSql(
+    `create index if not exists idx_api_endpoints_project on api_endpoints(project_root_path, unit_path)`,
+  );
+
   // domain_glossary_entries (2026-07-17, architecture review Tier 3) — a
   // structured counterpart to project_facts: facts are one-off statements
   // ("X does Y"), this is a persistent business-term dictionary ("what does

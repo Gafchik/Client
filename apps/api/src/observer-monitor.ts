@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { crawlUnit, listUnitFilePaths, listWorkUnits } from "@client/agentic-research";
-import { hashFiles, queryBusinessGraphEntries, upsertBusinessGraphEntry } from "@client/knowledge";
+import { hashFiles, queryBusinessGraphEntries, replaceApiEndpointsForUnit, upsertBusinessGraphEntry } from "@client/knowledge";
 import { computeFileChurnSignals, type FileChurnSignal } from "@client/repository-git";
 import type { ObserverActivityInfo, ObserverProgressInfo } from "@client/shared";
 import { buildDbQueryTool } from "./db-query-tool.js";
@@ -414,6 +414,18 @@ async function crawlOneStaleUnit(
       gotchas: result.gotchas,
       sourceFileHashes,
       knownFilePaths,
+      confidence: result.confidence,
+    });
+
+    // API-surface memory (2026-07-31) - same crawl, no extra investigation
+    // cost, just an additional structured extraction from what the model
+    // already read. Empty for a unit with no HTTP routes of its own - a
+    // no-op delete+insert-nothing, not an error.
+    await replaceApiEndpointsForUnit({
+      projectRootPath,
+      unitPath: nextUnit,
+      endpoints: result.apiEndpoints,
+      sourceFileHashes,
       confidence: result.confidence,
     });
 

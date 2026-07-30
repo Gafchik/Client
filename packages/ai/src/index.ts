@@ -4081,7 +4081,23 @@ function validateProviderAnswer(
   // получили одинаковый reject по этой причине. Настоящая проверка на
   // hallucination — упомянул ли ответ реальный файл/файлы, на которые
   // опирается direct claim, а не повторил ли он текст шаблона дословно.
-  const directClaimFilePaths = brief.claimSet.directClaim?.filePaths ?? [];
+  //
+  // Bug fix (2026-07-31, live incident): a genuinely excellent, critic-
+  // approved (85%) "explain the whole project - stack + functionality, plain
+  // language, no file lists" answer (exactly what the user asked for) got
+  // discarded and replaced by a bare "opora tochki: composer.json,
+  // package.json..." stub. Root cause: for a "flow" question with no
+  // location/storage-topology scenario match, buildClaimSet's fallback
+  // directClaim is just ONE loosely-picked "strongest evidence" file
+  // (supportLevel "moderate"/"weak", NOT "strong" like a real location claim)
+  // - requiring the prose to literally name that one file is nonsensical for
+  // a broad multi-area synthesis answer, and actively punishes exactly the
+  // "no file lists, plain language" style the user explicitly asked for.
+  // Scoped to supportLevel === "strong" (the ACTUAL anchored-claim cases -
+  // "location" and "storage-topology" scenarios both set this) - a loose
+  // fallback claim never had a real single file to be "missing" in the
+  // first place.
+  const directClaimFilePaths = brief.claimSet.directClaim?.supportLevel === "strong" ? (brief.claimSet.directClaim?.filePaths ?? []) : [];
   const directClaimMissing =
     directClaimFilePaths.length > 0
     && !directClaimFilePaths.some((filePath) => {
