@@ -3441,17 +3441,20 @@ export function App() {
     });
   }
 
-  // Vision-анализ занимает 15-20с вживую (два прохода: сама модель + JSON-
-  // структурирование) - дефолтный REQUEST_TIMEOUT_MS (15s) периодически не
-  // хватало бы. Пользователь видит статус "Анализирую…" на превью, пока идёт.
+  // POST /api/attachments now returns as soon as the raw bytes are saved -
+  // vision analysis runs server-side AFTER the response, in the background
+  // (2026-07-31 fix, see packages/knowledge's createPendingChatAttachment).
+  // 45s is generous headroom for the raw upload itself (large screenshots
+  // over a slow connection), not for the analysis, which this request no
+  // longer waits on.
   const ATTACHMENT_UPLOAD_TIMEOUT_MS = 45000;
 
   // Paste only stages the image locally (instant thumbnail, no network
-  // call) - actual upload+vision-analysis happens at Send time, see
+  // call) - the actual upload happens at Send time, see
   // uploadPendingAttachment/submitPipelineRun. Before this fix the upload
   // fired immediately on paste, so an image the user pasted and then never
-  // sent (or removed) had already been vision-analyzed and left as an
-  // orphaned chat_attachments row - staging locally avoids that entirely.
+  // sent (or removed) had already created a chat_attachments row for
+  // nothing - staging locally avoids that entirely.
   function handleImagePaste(blob: File) {
     if (!projectPath.trim()) {
       setError("Сначала выбери проект - потом можно вставлять скриншоты.");
@@ -3533,12 +3536,16 @@ export function App() {
     setRunning(true);
     setError(null);
 
-    // Upload+vision-analyze pasted screenshots only now, at the moment Send
-    // was actually pressed (2026-07-23 fix - used to fire on paste, before
-    // the user committed to sending at all). attachmentsSnapshot/uploadResults
-    // are paired by index, not re-read from `pendingAttachments` state after
-    // the awaits below (setState updates from uploadPendingAttachment are
-    // async and would not be visible in this closure yet).
+    // Upload pasted screenshots only now, at the moment Send was actually
+    // pressed (2026-07-23 fix - used to fire on paste, before the user
+    // committed to sending at all). This await is now just the raw-bytes
+    // upload, not vision analysis (2026-07-31 fix) - analysis runs
+    // server-side in the background and the pipeline run below picks it up
+    // once ready, so this no longer holds up the Send button for 15-45s.
+    // attachmentsSnapshot/uploadResults are paired by index, not re-read
+    // from `pendingAttachments` state after the awaits below (setState
+    // updates from uploadPendingAttachment are async and would not be
+    // visible in this closure yet).
     const attachmentsSnapshot = pendingAttachments;
     const uploadResults = await Promise.all(
       attachmentsSnapshot.map((attachment) => uploadPendingAttachment(attachment)),

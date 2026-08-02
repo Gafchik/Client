@@ -2,7 +2,7 @@ import cors from "@fastify/cors";
 import Fastify from "fastify";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, deleteApiEndpointsForPath, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadLatestQuestionCatalogEntry, loadPipelineRunArtifact, saveChatAttachment, setSharedPool, setSharedRedisClient } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, clearSharedPool, clearSharedRedisClient, completeChatAttachmentAnalysis, createPendingChatAttachment, deleteApiEndpointsForPath, deleteBusinessGraphEntriesForPath, deleteChatAttachmentsForRuns, deleteKnowledgeRuns, loadBestBaselineCatalogEntry, loadChatAttachmentsForConversation, loadChatAttachmentWithImage, loadConversationTurns, loadKnowledgeCatalog, loadLatestBackgroundRunCatalogEntry, loadLatestConversationTurn, loadLatestPipelineRunArtifact, loadLatestQuestionCatalogEntry, loadPipelineRunArtifact, setSharedPool, setSharedRedisClient } from "@client/knowledge";
 import { scanTextForSecurityFindings } from "@client/agentic-research";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type AttachmentStructuredContext, type ConversationTurnsResponse, type ObserverStatusResponse, type PipelineRunMode, type PipelineRunStatus, type ProjectCatalogResponse, type ProjectPathRecord, type ProviderCatalogResponse, type ProviderUsageSummary, type TeamCatalogResponse } from "@client/shared";
@@ -20,7 +20,7 @@ import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProv
 import { initializeSecretCrypto } from "./secret-crypto.js";
 import { analyzeAttachmentImage, classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
-import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
+import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, reconcileOrphanedDeveloperRuns, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 import { findLatestTesterRunForConversation, getTesterRunStatus, startTesterRun } from "./tester-runner.js";
 
 // Deterministic pre-check for classifyProjectScopeDirective (2026-07-28,
@@ -302,6 +302,7 @@ export function createApp() {
     setSharedPool(getPostgresPool());
     setSharedRedisClient(getRedisClient());
     await initializePostgresSchema();
+    await reconcileOrphanedDeveloperRuns();
     await initializeSecretCrypto(appRootPath);
     await initializeProviderStore();
     await initializeTeamStore();
@@ -572,12 +573,31 @@ export function createApp() {
     mimeType: string;
     fileSizeBytes: number;
     structuredContext: AttachmentStructuredContext;
+    /** "pending" - the web client shows an "Анализирую…" placeholder and doesn't wait on it (2026-07-31 fix); the backend's own pipeline run polls for completion server-side, see pipeline-runner.ts's waitForAttachmentAnalysis. */
+    analysisStatus: "pending";
   }
 
-  // Uploaded and analyzed BEFORE the user sends the message it's attached to
-  // (2026-07-19, картинки-в-чате feature) - see linkChatAttachmentsToTurn in
-  // packages/knowledge/src/attachments.ts for why conversation_id/turn_index
-  // start empty/0 here and get backfilled once the message is actually sent.
+  const PENDING_ATTACHMENT_STRUCTURED_CONTEXT: AttachmentStructuredContext = {
+    kind: "other",
+    uiLabels: [],
+    files: [],
+    symbols: [],
+    errors: [],
+    annotations: [],
+    summary: "",
+  };
+
+  // Raw bytes saved and the id returned IMMEDIATELY (2026-07-31 fix, product-
+  // owner request: "картинка должна разбираться после отправки, а не до").
+  // Vision analysis used to run synchronously here (15-45s live) BEFORE this
+  // handler ever responded, and the web client awaited THAT before even
+  // dispatching /api/pipeline/run - so pressing Send visibly did nothing
+  // until the screenshot had been fully analyzed. Analysis now runs in the
+  // background after this response goes out; see linkChatAttachmentsToTurn
+  // in packages/knowledge/src/attachments.ts for why conversation_id/
+  // turn_index start empty/0 here and get backfilled once the message is
+  // actually sent, and pipeline-runner.ts's waitForAttachmentAnalysis for
+  // how the pipeline itself picks up the result once it's ready.
   app.post<{ Body: UploadAttachmentRequest }>("/api/attachments", async (request, reply) => {
     const projectRootPath = request.body.projectRootPath?.trim();
     const mimeType = request.body.mimeType?.trim();
@@ -609,46 +629,57 @@ export function createApp() {
       });
     }
 
-    const [selectedTeam, currentProvider] = await Promise.all([getSelectedTeam(), getCurrentProvider()]);
-    const providerBaseUrl = currentProvider?.baseUrl || defaultProviderBaseUrl;
-    const providerApiKey = currentProvider?.apiKey || defaultProviderApiKey;
-    const visionModel = selectedTeam?.visionModel?.trim() ?? "";
-
-    const analysis = await analyzeAttachmentImage({
-      imageDataBase64,
-      mimeType,
-      providerBaseUrl,
-      providerApiKey,
-      visionModel,
-      extractionModel: selectedTeam?.criticModel?.trim() || visionModel,
-    });
-
-    // Screenshots of an IDE/terminal can show a real hardcoded secret just
-    // as easily as a diff can (see scanTextForSecurityFindings's comment) -
-    // redact any matched snippet before it ever reaches Postgres or the
-    // Researcher's context, rather than just flagging it after the fact.
-    const findings = scanTextForSecurityFindings(analysis.ocrText, "screenshot OCR");
-    const sanitizedOcrText = findings.reduce(
-      (text, finding) => text.replaceAll(finding.snippet, "[REDACTED — похоже на секрет]"),
-      analysis.ocrText,
-    );
-
-    const id = await saveChatAttachment({
+    const normalizedProjectRootPath = normalizePath(path.resolve(projectRootPath));
+    const id = await createPendingChatAttachment({
       conversationId: "",
-      projectRootPath: normalizePath(path.resolve(projectRootPath)),
+      projectRootPath: normalizedProjectRootPath,
       turnIndex: 0,
       mimeType,
       imageData: imageBuffer,
-      ocrText: sanitizedOcrText,
-      structuredContext: analysis.structuredContext,
-      visionModel,
     });
+
+    // Fire-and-forget: the response below goes out BEFORE this resolves, so
+    // Send is never blocked on it. analyzeAttachmentImage itself never
+    // throws (degrades to a fallback structuredContext on any failure), so
+    // this only needs to guard the DB write completing the row.
+    void (async () => {
+      const [selectedTeam, currentProvider] = await Promise.all([getSelectedTeam(), getCurrentProvider()]);
+      const providerBaseUrl = currentProvider?.baseUrl || defaultProviderBaseUrl;
+      const providerApiKey = currentProvider?.apiKey || defaultProviderApiKey;
+      const visionModel = selectedTeam?.visionModel?.trim() ?? "";
+
+      const analysis = await analyzeAttachmentImage({
+        imageDataBase64,
+        mimeType,
+        providerBaseUrl,
+        providerApiKey,
+        visionModel,
+        extractionModel: selectedTeam?.criticModel?.trim() || visionModel,
+      });
+
+      // Screenshots of an IDE/terminal can show a real hardcoded secret just
+      // as easily as a diff can (see scanTextForSecurityFindings's comment) -
+      // redact any matched snippet before it ever reaches Postgres or the
+      // Researcher's context, rather than just flagging it after the fact.
+      const findings = scanTextForSecurityFindings(analysis.ocrText, "screenshot OCR");
+      const sanitizedOcrText = findings.reduce(
+        (text, finding) => text.replaceAll(finding.snippet, "[REDACTED — похоже на секрет]"),
+        analysis.ocrText,
+      );
+
+      await completeChatAttachmentAnalysis(id, {
+        ocrText: sanitizedOcrText,
+        structuredContext: analysis.structuredContext,
+        visionModel,
+      });
+    })();
 
     return reply.code(200).send({
       id,
       mimeType,
       fileSizeBytes: imageBuffer.byteLength,
-      structuredContext: analysis.structuredContext,
+      structuredContext: PENDING_ATTACHMENT_STRUCTURED_CONTEXT,
+      analysisStatus: "pending",
     } satisfies UploadAttachmentResponse);
   });
 

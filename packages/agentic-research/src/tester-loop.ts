@@ -1,4 +1,4 @@
-import { callModel, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
+import { callModel, describeContentPolicyBlock, isContentPolicyBlockedError, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
 import {
   dirnameOf,
   grepContent,
@@ -515,7 +515,12 @@ export async function runTesterTask(options: TesterRunOptions): Promise<TesterRu
       totalPromptTokens += result.usage?.prompt_tokens ?? 0;
       totalCompletionTokens += result.usage?.completion_tokens ?? 0;
     } catch (error) {
-      return finalize({ turnsUsed: turn, stopped: "error", error: error instanceof Error ? error.message : String(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      return finalize({
+        turnsUsed: turn,
+        stopped: "error",
+        error: isContentPolicyBlockedError(error) ? describeContentPolicyBlock(message) : message,
+      });
     }
 
     if (totalPromptTokens + totalCompletionTokens >= TESTER_TOKEN_SAFETY_LIMIT) {

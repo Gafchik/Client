@@ -1079,6 +1079,39 @@ async function buildVerificationCommandsHint(projectPath: string): Promise<strin
   ].join("\n");
 }
 
+/**
+ * Boot-time reconciliation (2026-07-31 fix) - `developer_runs` had no
+ * equivalent of pipeline-runner.ts's bootstrapPipelineRunStatuses: a row
+ * left `status = 'running'` when the process died mid-run (crash, restart,
+ * kill -9 - anything that skips finishTelemetryRow's `finally`) just stayed
+ * that way forever. Live evidence: an MD-1285 run sat "running" with 0 turns
+ * for 5+ days on magendamd_backend before this was noticed. Safe to run
+ * unconditionally at boot - `developRunStatuses` (the in-memory map
+ * getDevelopRunStatus actually reads) always starts empty on a fresh
+ * process, so ANY row still 'running' in Postgres at this point is
+ * provably orphaned, not a real in-flight run this process is about to
+ * resume tracking. Called once from app.ts's boot sequence, after
+ * initializePostgresSchema (needs the table to exist).
+ */
+export async function reconcileOrphanedDeveloperRuns(): Promise<void> {
+  try {
+    const orphaned = await runSql<{ run_id: string }>(
+      `
+        update developer_runs
+        set status = 'failed', stopped = 'error', error = 'Ран остался в статусе running после перезапуска сервера - процесс, который его выполнял, больше не существует.', finished_at = now()
+        where status = 'running'
+        returning run_id
+      `,
+    );
+
+    if (orphaned.length > 0) {
+      console.warn(`[develop-runner] reconciled ${orphaned.length} orphaned 'running' developer_runs row(s) at boot: ${orphaned.map((row) => row.run_id).join(", ")}`);
+    }
+  } catch (error) {
+    console.warn("[develop-runner] reconcileOrphanedDeveloperRuns failed:", error);
+  }
+}
+
 async function insertTelemetryRow(record: DevelopRunStatusRecord): Promise<void> {
   await runSql(
     `

@@ -3,6 +3,8 @@ import { runSql } from "./postgres-client.js";
 
 export type { AttachmentStructuredContext };
 
+export type ChatAttachmentAnalysisStatus = "pending" | "ready";
+
 export interface ChatAttachmentRecord {
   id: string;
   conversationId: string;
@@ -13,6 +15,8 @@ export interface ChatAttachmentRecord {
   ocrText: string;
   structuredContext: AttachmentStructuredContext;
   visionModel: string;
+  /** "pending" until the background Vision Analyzer pass (see completeChatAttachmentAnalysis) finishes - see createPendingChatAttachment's docstring for why this exists. */
+  analysisStatus: ChatAttachmentAnalysisStatus;
   createdAt: string;
 }
 
@@ -26,30 +30,43 @@ interface ChatAttachmentRow {
   ocr_text: string;
   structured_context: AttachmentStructuredContext;
   vision_model: string;
+  analysis_status: ChatAttachmentAnalysisStatus;
   created_at: Date;
 }
 
-export interface SaveChatAttachmentInput {
+export interface CreatePendingChatAttachmentInput {
   conversationId: string;
   projectRootPath: string;
   turnIndex: number;
   mimeType: string;
   imageData: Buffer;
-  ocrText: string;
-  structuredContext: AttachmentStructuredContext;
-  visionModel: string;
 }
 
-/** Fire-and-forget-adjacent (2026-07-19): unlike upsertBusinessGraphEntry this DOES throw on failure - an attachment the user just uploaded silently vanishing is worse than a visible error, unlike a background Observer crawl's summary. */
-export async function saveChatAttachment(input: SaveChatAttachmentInput): Promise<string> {
+/**
+ * Saves raw image bytes immediately, WITHOUT waiting on the Vision Analyzer
+ * (2026-07-31 fix, product-owner request: "картинка должна разбираться
+ * после отправки, а не до"). Before this, the app.ts endpoint ran the full
+ * two-pass vision analysis (15-45s live) BEFORE ever returning an id, which
+ * the web client then awaited BEFORE dispatching /api/pipeline/run - so
+ * pressing Send visibly did nothing until vision analysis finished, even
+ * though the analysis result isn't needed until the pipeline actually builds
+ * its context hint (buildAttachmentContextHint, apps/api's pipeline-runner.ts)
+ * well into the run. Row starts `analysis_status = 'pending'`, empty
+ * ocr_text/structured_context/vision_model - the caller (app.ts) kicks off
+ * the real analysis in the background right after this returns and calls
+ * completeChatAttachmentAnalysis when it's done. A screenshot pasted and
+ * never sent (abandoned draft) simply stays pending forever, same "orphaned
+ * draft" tradeoff linkChatAttachmentsToTurn below already makes.
+ */
+export async function createPendingChatAttachment(input: CreatePendingChatAttachmentInput): Promise<string> {
   const id = stableId(["chat-attachment", input.conversationId, input.turnIndex, Date.now()]);
   const now = new Date().toISOString();
 
   await runSql(
     `
       insert into chat_attachments
-        (id, conversation_id, project_root_path, turn_index, mime_type, file_size_bytes, image_data, ocr_text, structured_context, vision_model, created_at)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+        (id, conversation_id, project_root_path, turn_index, mime_type, file_size_bytes, image_data, analysis_status, created_at)
+      values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
     `,
     [
       id,
@@ -59,14 +76,29 @@ export async function saveChatAttachment(input: SaveChatAttachmentInput): Promis
       input.mimeType,
       input.imageData.byteLength,
       input.imageData,
-      input.ocrText,
-      JSON.stringify(input.structuredContext),
-      input.visionModel,
       now,
     ],
   );
 
   return id;
+}
+
+export interface CompleteChatAttachmentAnalysisInput {
+  ocrText: string;
+  structuredContext: AttachmentStructuredContext;
+  visionModel: string;
+}
+
+/** Fills in the Vision Analyzer's result once the background pass (kicked off right after createPendingChatAttachment) finishes, and flips analysis_status to 'ready'. Best-effort - a write failure here just leaves the attachment permanently pending (degrades to "no image context," same as any other memory channel's graceful-degradation convention), never throws into the caller's background task. */
+export async function completeChatAttachmentAnalysis(id: string, input: CompleteChatAttachmentAnalysisInput): Promise<void> {
+  try {
+    await runSql(
+      `update chat_attachments set ocr_text = $2, structured_context = $3::jsonb, vision_model = $4, analysis_status = 'ready' where id = $1`,
+      [id, input.ocrText, JSON.stringify(input.structuredContext), input.visionModel],
+    );
+  } catch (error) {
+    console.warn("[attachments] completeChatAttachmentAnalysis failed:", error);
+  }
 }
 
 /** Full record INCLUDING image bytes - only for the single-attachment "view/download" endpoint, never for bulk context loading (see loadChatAttachmentsForConversation). */
@@ -85,9 +117,13 @@ export async function loadChatAttachmentWithImage(id: string): Promise<(ChatAtta
  * already names exactly which attachments belong to THIS turn
  * (PipelineExecutionRequest.attachmentIds), so there's no need to guess by
  * conversation/turn_index, which may not even be linked yet (see
- * linkChatAttachmentsToTurn below - attachments are uploaded and analyzed
- * BEFORE the user hits send, while conversationId/turnIndex are still
- * unknown). No image bytes, same reasoning as loadChatAttachmentsForConversation.
+ * linkChatAttachmentsToTurn below - the row is created and Send is
+ * dispatched while conversationId/turnIndex are still unknown, see
+ * createPendingChatAttachment). No image bytes, same reasoning as
+ * loadChatAttachmentsForConversation. Callers that need the Vision
+ * Analyzer's result should go through pipeline-runner.ts's
+ * buildAttachmentContextHint, which polls this until analysisStatus flips
+ * to 'ready' rather than reading a possibly-still-'pending' row directly.
  */
 export async function loadChatAttachmentsByIds(ids: string[]): Promise<ChatAttachmentRecord[]> {
   if (ids.length === 0) {
@@ -96,7 +132,7 @@ export async function loadChatAttachmentsByIds(ids: string[]): Promise<ChatAttac
 
   const rows = await runSql<ChatAttachmentRow>(
     `
-      select id, conversation_id, project_root_path, turn_index, mime_type, file_size_bytes, ocr_text, structured_context, vision_model, created_at
+      select id, conversation_id, project_root_path, turn_index, mime_type, file_size_bytes, ocr_text, structured_context, vision_model, analysis_status, created_at
       from chat_attachments
       where id = any($1::text[])
     `,
@@ -138,7 +174,7 @@ export async function linkChatAttachmentsToTurn(attachmentIds: string[], convers
 export async function loadChatAttachmentsForConversation(conversationId: string): Promise<ChatAttachmentRecord[]> {
   const rows = await runSql<ChatAttachmentRow>(
     `
-      select id, conversation_id, project_root_path, turn_index, mime_type, file_size_bytes, ocr_text, structured_context, vision_model, created_at
+      select id, conversation_id, project_root_path, turn_index, mime_type, file_size_bytes, ocr_text, structured_context, vision_model, analysis_status, created_at
       from chat_attachments
       where conversation_id = $1
       order by turn_index asc, created_at asc
@@ -211,6 +247,7 @@ function mapAttachmentRow(row: ChatAttachmentRow): ChatAttachmentRecord {
     ocrText: row.ocr_text,
     structuredContext: row.structured_context,
     visionModel: row.vision_model,
+    analysisStatus: row.analysis_status,
     createdAt: new Date(row.created_at).toISOString(),
   };
 }

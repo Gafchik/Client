@@ -1,5 +1,5 @@
 import { expandRussianTechTransliteration, tokenize } from "@client/shared";
-import { callModel, type ChatMessage, type ProviderUsage, type ToolCall, type ToolDefinition } from "./provider.js";
+import { callModel, describeContentPolicyBlock, isContentPolicyBlockedError, type ChatMessage, type ProviderUsage, type ToolCall, type ToolDefinition } from "./provider.js";
 import { dirnameOf, grepContent, listDir, normalizeDirKey, readFile, toWorkspaceRelativePath, type WorkspaceRoot } from "./tools.js";
 
 // Provider call/retry/backoff mechanics (performCall/callModel and their
@@ -1225,10 +1225,11 @@ export async function runAgenticLoop(options: AgenticRunOptions): Promise<Agenti
       usage = result.usage;
       toolCalls = result.toolCalls ?? [];
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       return finalize({
         turnsUsed: turn,
         stopped: "error",
-        error: error instanceof Error ? error.message : String(error),
+        error: isContentPolicyBlockedError(error) ? describeContentPolicyBlock(message) : message,
       });
     }
 

@@ -2696,6 +2696,34 @@ export async function buildObserverHintSuffix(roots: WorkspaceRoot[], task: stri
   }
 }
 
+// Upload no longer blocks Send on vision analysis (2026-07-31 fix, see
+// packages/knowledge's createPendingChatAttachment) - /api/pipeline/run can
+// now be dispatched while an attachment's analysis_status is still
+// 'pending'. This bounded poll overlaps the wait with the rest of this
+// run's own setup (workspace scan, indexing, etc.) instead of exposing it as
+// Send-button latency the way the old synchronous upload did. Matches the
+// web client's own ATTACHMENT_UPLOAD_TIMEOUT_MS (45s) - past that, analysis
+// has almost certainly failed/hung, and buildAttachmentContextHint below
+// just proceeds without whatever is still pending (same graceful
+// degradation as any other memory channel here).
+const ATTACHMENT_ANALYSIS_WAIT_MS = 45_000;
+const ATTACHMENT_ANALYSIS_POLL_INTERVAL_MS = 1_500;
+
+async function waitForAttachmentAnalysis(attachmentIds: string[]) {
+  const deadline = Date.now() + ATTACHMENT_ANALYSIS_WAIT_MS;
+
+  for (;;) {
+    const attachments = await loadChatAttachmentsByIds(attachmentIds);
+    const stillPending = attachments.some((attachment) => attachment.analysisStatus === "pending");
+
+    if (!stillPending || Date.now() >= deadline) {
+      return attachments;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, ATTACHMENT_ANALYSIS_POLL_INTERVAL_MS));
+  }
+}
+
 /**
  * Vision Analyzer's structured read of any screenshots attached to this
  * message, formatted for the Researcher (2026-07-19, картинки-в-чате
@@ -2709,7 +2737,7 @@ export async function buildAttachmentContextHint(attachmentIds: string[] | undef
   }
 
   try {
-    const attachments = await loadChatAttachmentsByIds(attachmentIds);
+    const attachments = await waitForAttachmentAnalysis(attachmentIds);
     const withContent = attachments.filter((attachment) => attachment.structuredContext.summary.trim());
 
     if (withContent.length === 0) {

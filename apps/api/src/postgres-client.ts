@@ -348,6 +348,12 @@ export async function initializePostgresSchema(): Promise<void> {
       created_at timestamptz not null
     )
   `);
+  // 'pending' until the background Vision Analyzer pass fills in ocr_text/
+  // structured_context/vision_model (2026-07-31, see packages/knowledge's
+  // createPendingChatAttachment/completeChatAttachmentAnalysis) - existing
+  // rows all finished under the old synchronous-upload flow, so they default
+  // to 'ready' rather than getting stuck permanently pending.
+  await runSql(`alter table chat_attachments add column if not exists analysis_status text not null default 'ready'`);
   await runSql(
     `create index if not exists idx_chat_attachments_conversation on chat_attachments(conversation_id, turn_index asc)`,
   );

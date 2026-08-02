@@ -56,16 +56,19 @@ export {
   type UpsertGlossaryEntryInput,
 } from "./glossary.js";
 export {
+  completeChatAttachmentAnalysis,
+  createPendingChatAttachment,
   deleteChatAttachmentsForPath,
   deleteChatAttachmentsForRuns,
   linkChatAttachmentsToTurn,
   loadChatAttachmentsByIds,
   loadChatAttachmentsForConversation,
   loadChatAttachmentWithImage,
-  saveChatAttachment,
   type AttachmentStructuredContext,
+  type ChatAttachmentAnalysisStatus,
   type ChatAttachmentRecord,
-  type SaveChatAttachmentInput,
+  type CompleteChatAttachmentAnalysisInput,
+  type CreatePendingChatAttachmentInput,
 } from "./attachments.js";
 export {
   findSemanticMatches,

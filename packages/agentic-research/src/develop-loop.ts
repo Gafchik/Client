@@ -3,7 +3,7 @@ import { unlink, writeFile as writeTempFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 import { randomUUID } from "node:crypto";
-import { callModel, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
+import { callModel, describeContentPolicyBlock, isContentPolicyBlockedError, type ChatMessage, type ToolCall, type ToolDefinition } from "./provider.js";
 import { buildSeedGrepObservation } from "./loop.js";
 import { formatSecurityFindingsForReviewer, scanDiffForSecurityFindings } from "./security-scan.js";
 import {
@@ -413,6 +413,27 @@ function isSmallScopedTask(task: string): boolean {
 function isBugFixTask(task: string): boolean {
   const normalized = task.toLowerCase();
   return /баг|не работает|не срабатывает|не сохраня|не отобража|не открыва|не приходит|не отправля|падает|ломается|краш|crash|неправильно|некорректно|ошибк|exception|traceback|stack ?trace|500 error|перестал|глюк|фикс|почини|исправь/.test(
+    normalized,
+  );
+}
+
+// Security/auth-attention gate (2026-08-02, live evidence from real
+// develop-run telemetry: a session-management task on a real project was
+// attempted 7 times in one day and never once passed review - every round
+// the Reviewer caught the SAME missed edge case (an impersonation/"login as
+// user" carve-out), and that edge case was already sitting in the
+// knownFactsHint/observerHint text the Developer was given at the START of
+// the run (see runDevelopmentTask below). The Reviewer gets that same hint
+// text again, fresh, at review time (callReviewer's own
+// knownFactsHint/observerHint params) - the Developer only ever saw it
+// once, early, before many tool-call turns of its own. Not a knowledge gap
+// (the fact was there) - an attention gap. Deliberately generic (auth/
+// session/permission keywords, not any one project's class/table names) -
+// see docs/architecture/011 §6 and the memory note against project-specific
+// hardcoding in shared packages.
+function isSecuritySensitiveTask(task: string): boolean {
+  const normalized = task.toLowerCase();
+  return /сесси|session|авториз|аутентиф|auth\b|логин|login|permission|доступ|роль|role\b|impersonat|token|токен|пароль|password|2fa|otp|шифр|encrypt|pii|персональн.*данн|personal data/.test(
     normalized,
   );
 }
@@ -1514,11 +1535,12 @@ async function callReviewer(input: {
     // Reviewer being unavailable must not deadlock the run - the diff is
     // still delivered, honestly marked as not reviewed (the human merges by
     // hand in v1 anyway).
+    const message = error instanceof Error ? error.message : String(error);
     return {
       round: null,
       promptTokens: totalPromptTokens,
       completionTokens: totalCompletionTokens,
-      unavailableReason: error instanceof Error ? error.message : String(error),
+      unavailableReason: isContentPolicyBlockedError(error) ? describeContentPolicyBlock(message) : message,
     };
   }
 }
@@ -1551,6 +1573,10 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   const microCopyTask = isMicroCopyTask(options.task);
   const smallScopedTask = isSmallScopedTask(options.task);
   const bugFixTask = isBugFixTask(options.task);
+  // Only worth reminding about if there was actually a hint to re-check -
+  // a project with no known facts/observer entries yet has nothing for this
+  // gate to point back at.
+  const securitySensitiveTaskWithHints = isSecuritySensitiveTask(options.task) && Boolean(options.knownFactsHint || options.observerHint);
   const projectLine = isMultiRoot
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
@@ -1766,6 +1792,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   let zeroMutationBounceSent = false;
   let zeroVerificationBounceSent = false;
   let bugFixReproBounceSent = false;
+  let securityHintRecheckBounceSent = false;
   let explorationBudgetBounceSent = false;
   let noActionStreak = 0;
   let stuckTurns = 0;
@@ -1881,6 +1908,23 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       messages.push({
         role: "user",
         content: "This looks like a bug fix, but your verification journal has only one command - that shows the state AFTER your change, not that the bug was ever actually reproduced BEFORE it. Per instruction 8: reproduce the original wrong behavior with a throwaway run_command/tinker check (if you have not already), then run the SAME check again after your fix and confirm it now behaves correctly. State both results explicitly in your next summary, then call task_complete again. If genuine before-reproduction is impossible for this bug (e.g. it can only be observed in production), say so explicitly instead.",
+      });
+      return "continue-loop";
+    }
+
+    if (securitySensitiveTaskWithHints && !securityHintRecheckBounceSent && turn < maxTurns - 2) {
+      // Attention gate, not a knowledge gate (see isSecuritySensitiveTask's
+      // docstring) - the known-facts/observer hint was already shown once at
+      // the very start of this run, before potentially dozens of tool-call
+      // turns. One bounce, right before the model commits to being done,
+      // when it is actually about to decide the diff is complete - the same
+      // point in the loop the Reviewer effectively gets the SAME hint text
+      // fresh again (see callReviewer's own knownFactsHint/observerHint).
+      securityHintRecheckBounceSent = true;
+      actionsLog.push(`[turn ${turn}] task_complete bounced: security-sensitive task, reminding to re-check known gotchas before finishing.`);
+      messages.push({
+        role: "user",
+        content: "This task touches auth/session/permissions/sensitive-data handling. Before calling task_complete again: re-read the known facts / observer hints (gotchas, domain glossary) you were given at the very start of this task, and explicitly check whether any of them describe an edge case relevant to what you just changed (e.g. an impersonation/admin-acting-as-user carve-out, a role check, a token lifecycle detail). State in your next summary which specific known facts/gotchas you checked against, even if the answer is \"none applied here.\"",
       });
       return "continue-loop";
     }
@@ -2065,7 +2109,12 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       totalPromptTokens += result.usage?.prompt_tokens ?? 0;
       totalCompletionTokens += result.usage?.completion_tokens ?? 0;
     } catch (error) {
-      return finalize({ turnsUsed: turn, stopped: "error", error: error instanceof Error ? error.message : String(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      return finalize({
+        turnsUsed: turn,
+        stopped: "error",
+        error: isContentPolicyBlockedError(error) ? describeContentPolicyBlock(message) : message,
+      });
     }
 
     if (totalPromptTokens + totalCompletionTokens >= DEVELOP_TOKEN_SAFETY_LIMIT) {

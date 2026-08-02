@@ -111,6 +111,35 @@ export function getStatusCode(error: unknown): number | null {
   return null;
 }
 
+/**
+ * Detects a provider content-moderation rejection (2026-08-02, live
+ * evidence: real develop runs occasionally hit "Request was blocked due to
+ * content policy" - a 400, so isRetryableError above correctly never
+ * retries it, but the raw provider message then bubbles all the way up as
+ * this run's final error, indistinguishable from an actual infra failure).
+ * Generic pattern match on the provider's own error shape - not tied to any
+ * one project's content, applies wherever this happens.
+ */
+export function isContentPolicyBlockedError(error: unknown): boolean {
+  return error instanceof Error && getStatusCode(error) === 400 && /content[\s_-]?polic/i.test(error.message);
+}
+
+/**
+ * Rewrites a content-policy block into an honest, actionable message
+ * instead of the raw provider JSON - retrying the identical request will
+ * just get blocked again (unlike every other error class this loop
+ * handles), so the message says that explicitly instead of implying a
+ * retry might help.
+ */
+export function describeContentPolicyBlock(originalMessage: string): string {
+  return [
+    "Провайдер заблокировал запрос модерацией контента (content policy) - это не сбой пайплайна, и повтор того же запроса результат не изменит.",
+    "Часто это ложное срабатывание на реальных чувствительных данных внутри промпта (медицинские/финансовые/юридические термины, конкретные значения из кода или БД), а не на самой задаче.",
+    "Попробуй другую модель для этой роли в команде, либо сузь/перефразируй задачу так, чтобы модель не читала конкретные чувствительные значения напрямую.",
+    `Исходное сообщение провайдера: ${originalMessage.slice(0, 300)}`,
+  ].join("\n");
+}
+
 function isRetryableError(error: unknown): boolean {
   const status = getStatusCode(error);
 
