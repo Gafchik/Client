@@ -1045,6 +1045,78 @@ export async function planDevelopSubtasks(input: {
   }
 }
 
+/**
+ * Requirement checklist (2026-08-03, docs/architecture/011 §4.29 follow-up):
+ * complementary to planDevelopSubtasks above, not a replacement for it.
+ * Decomposition splits a task by ARCHITECTURAL LAYER (schema/model/service/
+ * controller/frontend) for tasks that genuinely span layers. Real tickets
+ * on a complex project just as often bundle several INDEPENDENT, same-layer
+ * requirements into one text - a main ask plus a PM clarification plus one
+ * or two separately-reported bugs, all touching the same backend module
+ * (live evidence: a real session-management ticket failed review 7 times in
+ * a row, every time missing the SAME edge case buried as one clarifying
+ * paragraph among several). Decomposition would (correctly) treat that as
+ * ONE step - it is not a layer split - so nothing else in the pipeline
+ * tracks whether every one of the bundled asks actually got addressed.
+ * This extracts that list instead, for develop-loop.ts to remind the
+ * Developer of (and hand to the Reviewer) before task_complete is allowed
+ * to go through. Deliberately conservative like planDevelopSubtasks: a task
+ * that is already one atomic ask comes back as [] (no gate, no overhead) -
+ * only a task that genuinely reads as SEVERAL separately-stated asks
+ * produces a checklist.
+ */
+export async function extractRequirementChecklist(input: {
+  task: string;
+  providerBaseUrl: string;
+  providerModel: string;
+  providerApiKey: string;
+}): Promise<string[]> {
+  const noChecklist: string[] = [];
+
+  try {
+    const endpoint = `${input.providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await performProviderRequest(endpoint, input.providerApiKey, {
+      model: input.providerModel,
+      temperature: resolveProviderTemperature(input.providerModel, 0.1),
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You read a development task (often a real ticket, sometimes with a main description PLUS added clarifications/bug reports pasted in below it) and extract the list of SEPARATELY VERIFIABLE requirements/acceptance criteria it actually states.",
+            "Only extract when the task genuinely bundles multiple distinct asks - e.g. a main behavior change plus a separately-described edge case, plus one or two separately-reported bugs. A task that is already just ONE atomic ask (even if it takes several sentences to describe) must come back as an EMPTY list - do not invent sub-points by splitting one coherent ask into artificial pieces.",
+            "Each item must be a short, self-contained, checkable statement of WHAT must be true when the work is done (not how to implement it) - e.g. \"Bill Delivery Type shows 'email' for the Emailed status, not 'mail'\", not \"fix the delivery type bug\".",
+            "2 to 8 items, in no particular order. Do not include implementation steps, file names, or anything not actually asserted by the task text.",
+            "Reply with ONLY one line of JSON: {\"requirements\": string[]}. An empty array means no separate checklist is warranted.",
+          ].join("\n"),
+        },
+        { role: "user", content: input.task },
+      ],
+    });
+    const payload = (await response.json()) as ProviderChatResponse;
+    const content = extractProviderContent(payload);
+    const jsonMatch = content ? /\{[\s\S]*\}/.exec(content) : null;
+
+    if (!jsonMatch) {
+      return noChecklist;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as { requirements?: unknown };
+
+    if (!Array.isArray(parsed.requirements)) {
+      return noChecklist;
+    }
+
+    const requirements = parsed.requirements
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => item.length >= 10);
+
+    return requirements.length >= 2 ? requirements.slice(0, 8) : noChecklist;
+  } catch {
+    return noChecklist;
+  }
+}
+
 export interface DomainGlossaryTermCandidate {
   term: string;
   definition: string;

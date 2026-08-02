@@ -72,6 +72,8 @@ export interface DevelopRunStatusRecord {
   autoMergeOnCompletion?: boolean;
   /** Set once autoMergeOnCompletion has actually fired (or a manual merge-to-checkout button/command ran) - lets the frontend show the outcome without the user having to ask again. */
   autoMergeOutcome?: MergeToBranchOutcome[];
+  /** See StartDevelopRunInput.requirementChecklist. */
+  requirementChecklist?: string[];
 }
 
 export interface DevelopWorktreeRegistryEntry {
@@ -129,6 +131,17 @@ export interface StartDevelopRunInput {
   chainInfo?: { subtaskIndex: number; totalSubtasks: number };
   /** See DevelopRunStatusRecord.autoMergeOnCompletion. */
   autoMergeOnCompletion?: boolean;
+  /**
+   * Separately-verifiable requirements extracted from the ORIGINAL task text
+   * (extractRequirementChecklist, packages/ai, docs/architecture/011 §4.29
+   * follow-up) - complementary to chainRemaining/chainInfo above, not the
+   * same split: decomposition slices by architectural layer, this lists
+   * distinct asks bundled within what may still be a single layer/step.
+   * Carried across every link of a decomposed chain the same way
+   * autoMergeOnCompletion is (maybeAdvanceChain re-passes it), so a later
+   * step is still reminded of asks an earlier step's slice didn't cover.
+   */
+  requirementChecklist?: string[];
 }
 
 const MAX_TRACKED_RUNS = 100;
@@ -330,6 +343,7 @@ export function startDevelopRun(input: StartDevelopRunInput): DevelopRunStatusRe
     worktrees: [],
     ...(input.chainInfo ? { chainInfo: input.chainInfo } : {}),
     ...(input.autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
+    ...(input.requirementChecklist?.length ? { requirementChecklist: input.requirementChecklist } : {}),
   };
 
   pruneTrackedRuns();
@@ -446,6 +460,7 @@ async function maybeAdvanceChain(record: DevelopRunStatusRecord, input: StartDev
     ...(input.attachmentIds?.length ? { attachmentIds: input.attachmentIds } : {}),
     conversationId: record.conversationId,
     ...(record.autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
+    ...(record.requirementChecklist?.length ? { requirementChecklist: record.requirementChecklist } : {}),
     continueFrom: {
       worktrees: record.worktrees,
       priorTask: record.task,
@@ -624,6 +639,7 @@ async function executeDevelopRun(record: DevelopRunStatusRecord, input: StartDev
     ...(knownFactsHint ? { knownFactsHint } : {}),
     ...(observerHint ? { observerHint } : {}),
     ...(attachmentHint ? { attachmentHint } : {}),
+    ...(input.requirementChecklist?.length ? { requirementChecklist: input.requirementChecklist } : {}),
     semanticSearch: semanticSearchTool,
     semanticSeedFiles: semanticSeedFilesTool,
     ...(findReferencesTool ? { findReferences: findReferencesTool } : {}),

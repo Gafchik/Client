@@ -225,6 +225,8 @@ export interface DevelopRunOptions {
   observerHint?: string;
   /** Vision Analyzer's structured read of screenshots attached to this develop task. */
   attachmentHint?: string;
+  /** Separately-verifiable requirements extracted from the task text (extractRequirementChecklist, packages/ai) - complementary to task decomposition, see isSecuritySensitiveTask/requirement-checklist comments below. Empty/absent for an already-atomic task. */
+  requirementChecklist?: string[];
   /**
    * Review-feedback continuation: the previous develop iteration in this
    * conversation. When worktreeCarriesChanges is true, the current worktree
@@ -1267,6 +1269,8 @@ async function callReviewer(input: {
    */
   knownFactsHint?: string;
   observerHint?: string;
+  /** Same list the Developer was reminded of before task_complete (see requirementChecklist gate below) - gives the Reviewer's existing "diff not actually doing what the task asks, or doing it partially" finding a concrete, enumerable basis instead of just re-reading the raw task text. */
+  requirementChecklist?: string[];
   /** Read-only SELECT/WITH/EXPLAIN/SHOW against the project's real DB - same tool the Developer already has. */
   dbQuery?: (query: string) => Promise<string>;
   /** Runs a PHP snippet against the real project inside a transaction WE wrap and roll back - see verifyInTransactionTinker above. */
@@ -1363,6 +1367,13 @@ async function callReviewer(input: {
         // the actual diff, don't block on the hint's wording alone.
         ...(input.observerHint ? ["", input.observerHint] : []),
         ...(input.knownFactsHint ? ["", input.knownFactsHint] : []),
+        ...(input.requirementChecklist?.length
+          ? [
+              "",
+              "The task text bundles these separately-stated requirements - check the diff against EACH one explicitly; a requirement not addressed at all is a BLOCKER under finding (1) (partial completion), even if everything else about the diff looks correct:",
+              ...input.requirementChecklist.map((requirement, index) => `${index + 1}. ${requirement}`),
+            ]
+          : []),
         // Reviewer DB verification (2026-07-27): a static read of the diff
         // cannot catch a comparison that is always false at runtime (a
         // string/int mismatch) or a query that deletes more than it should
@@ -1625,6 +1636,13 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       content: [
         projectLine,
         `Task: ${options.task}`,
+        ...(options.requirementChecklist?.length
+          ? [
+              "",
+              "This task bundles the following SEPARATELY VERIFIABLE requirements (extracted from the text above) - track all of them, not just the most obvious one; a diff that satisfies only some of them is not done:",
+              ...options.requirementChecklist.map((requirement, index) => `${index + 1}. ${requirement}`),
+            ]
+          : []),
         ...(microCopyTask
           ? [
               "",
@@ -1793,6 +1811,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   let zeroVerificationBounceSent = false;
   let bugFixReproBounceSent = false;
   let securityHintRecheckBounceSent = false;
+  let requirementChecklistBounceSent = false;
   let explorationBudgetBounceSent = false;
   let noActionStreak = 0;
   let stuckTurns = 0;
@@ -1929,6 +1948,30 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       return "continue-loop";
     }
 
+    if (options.requirementChecklist?.length && !requirementChecklistBounceSent && turn < maxTurns - 2) {
+      // Same class of attention gate as the security-hint recheck above,
+      // for the more general case (docs/architecture/011 §4.29 follow-up,
+      // extractRequirementChecklist in packages/ai): a task text bundling
+      // several separately-stated asks was shown as a numbered list at the
+      // very start of this run, before potentially dozens of tool-call
+      // turns - easy for attention to drift onto the most obvious one and
+      // silently drop a smaller one buried further down. One bounce, right
+      // before the model commits to being done. The Reviewer gets the SAME
+      // numbered list again, fresh, as a real basis for finding (1) rather
+      // than a re-read of the raw task text (see callReviewer above).
+      requirementChecklistBounceSent = true;
+      actionsLog.push(`[turn ${turn}] task_complete bounced: reminding to check diff against all ${options.requirementChecklist.length} extracted requirements.`);
+      messages.push({
+        role: "user",
+        content: [
+          "Before calling task_complete again, go through EACH of these requirements (extracted from the task text) and confirm your diff actually addresses it - not just the most obvious one:",
+          ...options.requirementChecklist.map((requirement, index) => `${index + 1}. ${requirement}`),
+          "State in your next summary, one line per item, which ones are addressed and how (or explicitly why one is not applicable) - do not just repeat a general summary.",
+        ].join("\n"),
+      });
+      return "continue-loop";
+    }
+
     const collected = await options.collectDiff();
     latestDiff = collected.diff;
     latestChangedFiles = collected.changedFiles;
@@ -1985,6 +2028,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       ...(options.computeFindingSimilarity ? { computeFindingSimilarity: options.computeFindingSimilarity } : {}),
       ...(options.knownFactsHint ? { knownFactsHint: options.knownFactsHint } : {}),
       ...(options.observerHint ? { observerHint: options.observerHint } : {}),
+      ...(options.requirementChecklist?.length ? { requirementChecklist: options.requirementChecklist } : {}),
       ...(options.dbQuery ? { dbQuery: options.dbQuery } : {}),
       projectRoots: options.projectRoots,
       diffUnchangedSinceLastReview,

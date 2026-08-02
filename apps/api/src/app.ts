@@ -18,7 +18,7 @@ import { startProjectStateMonitor, stopProjectStateMonitor } from "./project-sta
 import { deleteProject, getProjectById, initializeProjectStore, listProjects, saveProject } from "./project-store.js";
 import { deleteProvider, fetchProviderModels, getCurrentProvider, initializeProviderStore, listProviders, saveProvider, setCurrentProvider, setProviderDefaultModel } from "./provider-store.js";
 import { initializeSecretCrypto } from "./secret-crypto.js";
-import { analyzeAttachmentImage, classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, planDevelopSubtasks } from "@client/ai";
+import { analyzeAttachmentImage, classifyApprovalResponse, classifyAutoMergeIntent, classifyChatIntent, classifyPostCompletionCommand, classifyProjectScopeDirective, classifyTestsOffer, createUsageAccumulator, extractRequirementChecklist, planDevelopSubtasks } from "@client/ai";
 import { deleteTeam, getSelectedTeam, initializeTeamStore, listTeams, saveTeam, setSelectedTeam } from "./team-store.js";
 import { cleanupDevelopRunWorktrees, cleanupTelemetryDevelopRunWorktrees, findLatestDevelopRunForConversation, getDevelopRunStatus, listDevelopWorktreeEntries, listDevelopWorktreeEntriesFromTelemetry, mergeDevelopRunToRealCheckout, mergeTelemetryDevelopRunWorktrees, reconcileOrphanedDeveloperRuns, resolvePendingApproval, startDevelopRun } from "./develop-runner.js";
 import { findLatestTesterRunForConversation, getTesterRunStatus, startTesterRun } from "./tester-runner.js";
@@ -1429,26 +1429,40 @@ export function createApp() {
             // [task] on any classification failure), so this can never
             // block a develop task from starting.
             let chain: { chainRemaining: string[]; chainInfo: { subtaskIndex: number; totalSubtasks: number } } | undefined;
+            // Requirement checklist (2026-08-03, docs/architecture/011 §4.29
+            // follow-up): extracted from the FULL original task text, in
+            // parallel with layer decomposition below (independent LLM
+            // calls over the same input) - deliberately BEFORE decomposition
+            // may narrow composedTask down to just its first layer-slice,
+            // since a bundled ask can land in any slice, not just the
+            // first. Same "fresh task only" scoping as decomposition.
+            let requirementChecklist: string[] = [];
 
             if (intent === "develop") {
-              try {
-                const subtasks = await planDevelopSubtasks({
+              const [subtasks, checklist] = await Promise.all([
+                planDevelopSubtasks({
                   task: composedTask,
                   providerBaseUrl,
                   providerModel: selectedTeam.criticModel,
                   providerApiKey,
-                });
+                }).catch(() => [composedTask]),
+                extractRequirementChecklist({
+                  task: composedTask,
+                  providerBaseUrl,
+                  providerModel: selectedTeam.criticModel,
+                  providerApiKey,
+                }).catch(() => []),
+              ]);
 
-                if (subtasks.length >= 2) {
-                  composedTask = subtasks[0] as string;
-                  chain = {
-                    chainRemaining: subtasks.slice(1),
-                    chainInfo: { subtaskIndex: 0, totalSubtasks: subtasks.length },
-                  };
-                }
-              } catch {
-                // Decomposition is an optimization, never a dependency.
+              if (subtasks.length >= 2) {
+                composedTask = subtasks[0] as string;
+                chain = {
+                  chainRemaining: subtasks.slice(1),
+                  chainInfo: { subtaskIndex: 0, totalSubtasks: subtasks.length },
+                };
               }
+
+              requirementChecklist = checklist;
             }
 
             const autoMergeOnCompletion = intent === "develop"
@@ -1472,6 +1486,7 @@ export function createApp() {
                 : {}),
               task: composedTask,
               ...(chain ? chain : {}),
+              ...(requirementChecklist.length ? { requirementChecklist } : {}),
               ...(autoMergeOnCompletion ? { autoMergeOnCompletion: true } : {}),
               ...(isContinuation
                 ? {
