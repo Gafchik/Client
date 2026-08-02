@@ -294,6 +294,124 @@ export async function deleteFactsForPath(projectRootPath: string): Promise<void>
   }
 }
 
+// Memory curation (docs/architecture/011 §6, "кураторство памяти"). Two
+// unbounded-growth vectors that the existing read-time staleness recompute
+// (queryRelevantFacts/queryFactsAcrossPaths) never addresses, because it
+// only ever ADJUSTS what a read returns - it never deletes anything:
+//
+// 1. 'contradicted' rows accumulate forever - belief reconciliation
+//    (promoteFactsFromResearch/Development) marks the OLD fact contradicted
+//    and inserts the new one, but never removes the old row. The successor
+//    already carries the current belief; keeping the loser around only
+//    dilutes future hint text with a claim already known to be wrong.
+// 2. Near-duplicate 'fresh' facts can coexist - the conflict-check lookup at
+//    write time only pulls candidates that share a file path
+//    (`file_paths && $2::text[]`), so two paraphrased facts about DIFFERENT
+//    files (e.g. discovered from two separate evidence items describing the
+//    same convention) never get compared and both persist.
+//
+// Both retention windows are grace periods, not immediate deletes - a
+// contradicted fact might be a wrongly-flagged reconciliation caught by a
+// human soon after, and a stale fact might just be mid-refactor.
+const CONTRADICTED_RETENTION_DAYS = 7;
+const STALE_RETENTION_DAYS = 60;
+
+export interface FactCurationResult {
+  deletedContradicted: number;
+  deletedStale: number;
+  merged: number;
+}
+
+/**
+ * Best-effort curation pass for one project - never throws, safe to call
+ * from a periodic poll loop (see apps/api's project-state-monitor.ts) the
+ * same way Observer's own background work already runs unattended.
+ */
+export async function curateProjectFacts(projectRootPath: string): Promise<FactCurationResult> {
+  const result: FactCurationResult = { deletedContradicted: 0, deletedStale: 0, merged: 0 };
+
+  try {
+    const contradicted = await runSql<{ id: string }>(
+      `delete from project_facts
+       where project_root_path = $1 and status = 'contradicted'
+         and last_confirmed_at < now() - make_interval(days => $2)
+       returning id`,
+      [projectRootPath, CONTRADICTED_RETENTION_DAYS],
+    );
+    result.deletedContradicted = contradicted.length;
+
+    const freshRows = await runSql<ProjectFactRow>(
+      `select * from project_facts where project_root_path = $1 and status = 'fresh' order by category, last_confirmed_at desc`,
+      [projectRootPath],
+    );
+
+    const staleIds: string[] = [];
+    const staleThresholdMs = STALE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+    for (const row of freshRows) {
+      if (Date.now() - new Date(row.last_confirmed_at).getTime() < staleThresholdMs) {
+        continue;
+      }
+
+      // Never reconfirmed in STALE_RETENTION_DAYS AND the content it points
+      // at has drifted since - very likely dead weight (the code moved on,
+      // nothing re-promoted it). A fact that's old but STILL content-valid
+      // is left alone; age alone is not a reason to drop a true statement.
+      const stillValid = await isFactStillValid(projectRootPath, mapFactRow(row));
+      if (!stillValid) {
+        staleIds.push(row.id);
+      }
+    }
+
+    if (staleIds.length > 0) {
+      await runSql(`delete from project_facts where id = any($1::text[])`, [staleIds]);
+      result.deletedStale = staleIds.length;
+    }
+
+    // Dedup near-duplicate 'fresh' facts within the same category. Rows
+    // arrived ordered last_confirmed_at desc per category (query above), so
+    // within each category group the first occurrence of a near-duplicate
+    // cluster is always the most recently reconfirmed one - kept as
+    // survivor, later (older) duplicates are merged into it and dropped.
+    const staleIdSet = new Set(staleIds);
+    const byCategory = new Map<string, ProjectFactRow[]>();
+
+    for (const row of freshRows) {
+      if (staleIdSet.has(row.id)) {
+        continue;
+      }
+
+      const list = byCategory.get(row.category) ?? [];
+      list.push(row);
+      byCategory.set(row.category, list);
+    }
+
+    for (const rows of byCategory.values()) {
+      const survivors: ProjectFactRow[] = [];
+
+      for (const row of rows) {
+        const duplicateOf = survivors.find((existing) => looksLikeNearDuplicate(existing.statement, row.statement));
+
+        if (!duplicateOf) {
+          survivors.push(row);
+          continue;
+        }
+
+        await runSql(
+          `update project_facts set file_paths = array(select distinct unnest(file_paths || $2::text[])) where id = $1`,
+          [duplicateOf.id, row.file_paths],
+        );
+        await runSql(`delete from project_facts where id = $1`, [row.id]);
+        result.merged += 1;
+      }
+    }
+  } catch (error) {
+    console.warn("[facts] curateProjectFacts failed:", error);
+  }
+
+  return result;
+}
+
 interface ExistingFactRow {
   id: string;
   statement: string;

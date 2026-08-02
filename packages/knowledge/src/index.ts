@@ -30,7 +30,7 @@ function conversationMemoryCacheKey(projectRootPath: string, conversationId: str
   return `conversation-memory:${projectRootPath}:${conversationId}`;
 }
 
-export { deleteFactsForPath, promoteFactsFromDevelopment, promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts } from "./facts.js";
+export { curateProjectFacts, deleteFactsForPath, promoteFactsFromDevelopment, promoteFactsFromResearch, queryFactsAcrossPaths, queryRelevantFacts, type FactCurationResult } from "./facts.js";
 export {
   appendBusinessGraphEntryCorrection,
   deleteBusinessGraphEntriesForPath,

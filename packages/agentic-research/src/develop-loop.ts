@@ -399,6 +399,24 @@ function isSmallScopedTask(task: string): boolean {
   return narrowCue && !broadImplementationCue;
 }
 
+// Acceptance-verification gate (docs/architecture/011 §6, "верификация
+// приёмки"). The Developer's own system prompt (see instruction 8 below)
+// already ASKS for a before/after reproduction on a bug fix, but nothing
+// enforced it - a model could genuinely believe "проверено" while having
+// only run a single check AFTER the fix, with no evidence the symptom was
+// ever actually reproduced first. Deliberately narrow scope, matching the
+// product owner's explicit call: no new persisted test files, no coverage
+// requirement (§6 item 3, test-selection-by-dependency, was explicitly
+// rejected as not worth it - "почти никогда тестами не покрываем") - this
+// only asks for the SAME throwaway before/after check the prompt already
+// describes, deterministically confirmed instead of trusted on faith.
+function isBugFixTask(task: string): boolean {
+  const normalized = task.toLowerCase();
+  return /баг|не работает|не срабатывает|не сохраня|не отобража|не открыва|не приходит|не отправля|падает|ломается|краш|crash|неправильно|некорректно|ошибк|exception|traceback|stack ?trace|500 error|перестал|глюк|фикс|почини|исправь/.test(
+    normalized,
+  );
+}
+
 function buildDevelopSystemPrompt(hasSemanticSearch: boolean, isMultiRoot: boolean, hasFindReferences: boolean, hasDbQuery: boolean, hasReadOtherBranch: boolean): string {
   return [
     // Updated 2026-07-28 (worktree isolation dropped, see createTaskSession):
@@ -1532,6 +1550,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   const isMultiRoot = options.projectRoots.length > 1;
   const microCopyTask = isMicroCopyTask(options.task);
   const smallScopedTask = isSmallScopedTask(options.task);
+  const bugFixTask = isBugFixTask(options.task);
   const projectLine = isMultiRoot
     ? `Project parts: ${options.projectRoots.map((root) => `${root.label} (${root.role})`).join(", ")}`
     : `Project: ${options.projectRoots[0]?.absolutePath ?? ""}`;
@@ -1746,6 +1765,7 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
   let phase: "developing" | "reviewing" | "fixing" = "developing";
   let zeroMutationBounceSent = false;
   let zeroVerificationBounceSent = false;
+  let bugFixReproBounceSent = false;
   let explorationBudgetBounceSent = false;
   let noActionStreak = 0;
   let stuckTurns = 0;
@@ -1845,6 +1865,22 @@ export async function runDevelopmentTask(options: DevelopRunOptions): Promise<De
       messages.push({
         role: "user",
         content: "You changed files but ran NO verification command this run (the journal the reviewer sees is empty). Run the project's own checks via run_command (tests/linter/build, or at minimum a syntax check) - or, if this project truly has nothing runnable, say so explicitly in your summary - then call task_complete again.",
+      });
+      return "continue-loop";
+    }
+
+    if (bugFixTask && verificationLog.length < 2 && !bugFixReproBounceSent && turn < maxTurns - 2) {
+      // Deterministic acceptance gate (docs/architecture/011 §6) - a bug-fix
+      // task with only ONE (or zero, caught above) verification command has
+      // no evidence the symptom was ever actually reproduced before the
+      // fix, only that something passed after it. Cheap proxy, not a
+      // semantic check - matches the same "count, not judgment" style as
+      // the micro-copy/small-scoped file-count gates above.
+      bugFixReproBounceSent = true;
+      actionsLog.push(`[turn ${turn}] task_complete bounced: bug-fix task with only ${verificationLog.length} verification command(s), no before/after evidence.`);
+      messages.push({
+        role: "user",
+        content: "This looks like a bug fix, but your verification journal has only one command - that shows the state AFTER your change, not that the bug was ever actually reproduced BEFORE it. Per instruction 8: reproduce the original wrong behavior with a throwaway run_command/tinker check (if you have not already), then run the SAME check again after your fix and confirm it now behaves correctly. State both results explicitly in your next summary, then call task_complete again. If genuine before-reproduction is impossible for this bug (e.g. it can only be observed in production), say so explicitly instead.",
       });
       return "continue-loop";
     }

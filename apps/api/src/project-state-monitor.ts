@@ -1,4 +1,4 @@
-import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, loadBestBaselineCatalogEntry, loadLatestBackgroundRunCatalogEntry } from "@client/knowledge";
+import { buildBackgroundProjectState, catalogEntryToBaselineMetadata, curateProjectFacts, loadBestBaselineCatalogEntry, loadLatestBackgroundRunCatalogEntry } from "@client/knowledge";
 import { inspectRepository } from "@client/repository-git";
 import { normalizePath, stableId, type BackgroundProjectState } from "@client/shared";
 import { openWorkspaceSelective, scanWorkspaceOverview } from "@client/workspace";
@@ -53,6 +53,15 @@ const DEFAULT_MIN_AUTO_SYNC_INTERVAL_MS = 60_000;
 let monitorTimer: NodeJS.Timeout | null = null;
 let monitorRunning = false;
 const recentAutoSyncAttempts = new Map<string, number>();
+// Memory curation (docs/architecture/011 §6, "кураторство памяти") -
+// piggybacks on this existing poll instead of a separate cron mechanism.
+// Once/day per path is plenty: curateProjectFacts only prunes rows that have
+// sat contradicted/stale for days already (see CONTRADICTED_RETENTION_DAYS/
+// STALE_RETENTION_DAYS in facts.ts) - nothing time-sensitive is lost by not
+// running it on every 15s tick, and it's pure DB work (no LLM calls), so it
+// does not need the hasAnyActiveQuestionRun provider-contention guard below.
+const CURATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const recentCurationRuns = new Map<string, number>();
 
 export function startProjectStateMonitor(config: ProjectStateMonitorConfig): void {
   if (monitorTimer) {
@@ -133,8 +142,28 @@ async function observeProjectPath(
     const normalizedPath = normalizePath(overview.rootPath);
 
     await maybeEnqueueAutoBackgroundSync(config, resolvedProvider, normalizedPath, backgroundState);
+    await maybeCurateProjectMemory(normalizedPath);
   } catch {
     // Monitoring must never break the API process because of one problematic project path.
+  }
+}
+
+async function maybeCurateProjectMemory(projectPath: string): Promise<void> {
+  const now = Date.now();
+  const lastRun = recentCurationRuns.get(projectPath) ?? 0;
+
+  if (now - lastRun < CURATION_INTERVAL_MS) {
+    return;
+  }
+
+  recentCurationRuns.set(projectPath, now);
+
+  const result = await curateProjectFacts(projectPath);
+
+  if (result.deletedContradicted || result.deletedStale || result.merged) {
+    console.log(
+      `[project-state-monitor] curated facts for ${projectPath}: -${result.deletedContradicted} contradicted, -${result.deletedStale} long-stale, merged ${result.merged} near-duplicate(s)`,
+    );
   }
 }
 
